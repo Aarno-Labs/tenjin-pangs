@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PANGS manifest",
+  "type": "object",
+  "required": ["schema_version", "input_path", "input_sha256", "opts", "files", "wall_ms"]
+}

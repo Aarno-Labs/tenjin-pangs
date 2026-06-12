@@ -1,0 +1,1 @@
+{"func":"main","global":{"name":"g_counter"},"access":"mod","via":"direct","witness":"main@fixtures/synthetic/trivial/trivial.c:4:3#0"}

@@ -1,0 +1,5 @@
+[env]
+LLVM_SYS_140_PREFIX = "/home/brk/tenjin/_local/xj-llvm-14"
+
+[build]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/home/brk/tenjin/_local/xj-llvm-14/lib"]

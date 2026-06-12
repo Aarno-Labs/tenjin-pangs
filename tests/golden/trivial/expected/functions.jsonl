@@ -1,0 +1,3 @@
+{"key":"driver","file":"fixtures/synthetic/trivial/trivial.c","line":8,"external":false,"exported":false,"address_taken":false,"vararg":false,"sig":"Void([])"}
+{"key":"main","file":"fixtures/synthetic/trivial/trivial.c","line":3,"external":false,"exported":true,"address_taken":false,"vararg":false,"sig":"Integer([])"}
+{"key":"target","file":"fixtures/synthetic/trivial/trivial.c","line":12,"external":false,"exported":false,"address_taken":true,"vararg":false,"sig":"Void([Integer])"}

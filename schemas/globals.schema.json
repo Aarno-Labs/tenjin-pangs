@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PANGS globals stream",
+  "type": "object",
+  "required": ["key", "is_const", "never_written", "escape", "mutable"]
+}

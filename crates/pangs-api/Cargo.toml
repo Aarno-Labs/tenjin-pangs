@@ -1,0 +1,10 @@
+[package]
+name = "pangs-api"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+pangs-pir = { path = "../pangs-pir" }
+serde.workspace = true
+thiserror.workspace = true

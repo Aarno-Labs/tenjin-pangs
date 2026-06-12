@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "pangs_git": "unknown",
+  "llvm_version": "llvm-14-planned",
+  "input_path": "fixtures/synthetic/trivial/module.pir.json",
+  "input_sha256": "ffc42ffb68042b56a37516e30bcbb79b3566ba157d2e52032ca37e29bbf6dbaa",
+  "opts": {
+    "stage": "conservative",
+    "build_mode": "executable",
+    "exports": [],
+    "partition_budget": 1000000
+  },
+  "files": [
+    {
+      "name": "functions.jsonl",
+      "records": 3,
+      "sha256": "de36f51158f9852a0375e8e47bb3f30f7f9b5ef7fdd1edd4e9bb2c4539138d2f"
+    },
+    {
+      "name": "globals.jsonl",
+      "records": 1,
+      "sha256": "c9698a704fb31cf23348d0068fc784b6e107b441990525dc5d5ba8471549f125"
+    },
+    {
+      "name": "callgraph.jsonl",
+      "records": 4,
+      "sha256": "1361e1ff00d737118398a2013e943b002700d7d22f0a75307296cca5102bd851"
+    },
+    {
+      "name": "modref.jsonl",
+      "records": 1,
+      "sha256": "2c6b3d2b1fce28630c66c4604a970a56f8a8faf218b95d6a5261b9219d58b6a5"
+    },
+    {
+      "name": "audit.jsonl",
+      "records": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "components.json",
+      "records": 1,
+      "sha256": "22b3d82c94022d796df59f9b2cc33a6d6e57ad06b65f6a48440cb8523e365085"
+    },
+    {
+      "name": "metrics.json",
+      "records": 1,
+      "sha256": "ebd8fe11787810e1ae1dfd92f59f93afc07da2bde7b5caff2522073f6fca0760"
+    }
+  ],
+  "wall_ms": 0
+}

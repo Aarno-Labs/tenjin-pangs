@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/pangs-api",
+    "crates/pangs-pir",
+    "crates/pangs-pag",
+    "crates/pangs-solve",
+    "crates/pangs-clients",
+    "crates/pangs-cli",
+    "crates/pangs-testutil",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.40", features = ["derive"] }
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.117"
+sha2 = "0.10.8"
+tempfile = "3.10.1"
+thiserror = "1.0.61"

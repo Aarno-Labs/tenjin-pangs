@@ -1,0 +1,4 @@
+{"caller":{"func":"driver"},"callsite":"driver@fixtures/synthetic/trivial/trivial.c:9:3#0","callee":{"func":"target"},"kind":"indirect","tier":"fsa"}
+{"caller":{"func":"driver"},"callsite":"driver@fixtures/synthetic/trivial/trivial.c:9:3#0","callee":{"unknown":"omega_fnptr"},"kind":"indirect","tier":"fsa"}
+{"caller":{"func":"main"},"callsite":"main@fixtures/synthetic/trivial/trivial.c:5:3#0","callee":{"func":"driver"},"kind":"direct","tier":"direct"}
+{"caller":{"unknown":"address_escapes_to_external"},"callsite":null,"callee":{"func":"main"},"kind":"direct","tier":"fsa"}

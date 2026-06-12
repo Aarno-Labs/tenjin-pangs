@@ -1,0 +1,30 @@
+{
+  "components": [
+    {
+      "id": "c0001",
+      "frozen": true,
+      "taint": [
+        {
+          "kind": "unknown_callee",
+          "witness": null
+        },
+        {
+          "kind": "unknown_caller",
+          "witness": null
+        }
+      ],
+      "members": [
+        "driver",
+        "main",
+        "target"
+      ],
+      "mutable_globals": [
+        "g_counter"
+      ]
+    }
+  ],
+  "coverage": {
+    "mutable_globals_total": 1,
+    "in_rewritable_components": 0
+  }
+}
