@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use pangs_pir::{fsa_compatible, Access, Pir, Stmt};
+use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, Stmt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -202,6 +202,8 @@ pub struct Metrics {
     pub partition_max_size: usize,
     pub oversize_fallbacks: usize,
     pub rounds: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lowering: Option<LoweringStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +415,7 @@ impl Analysis {
                             });
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -460,6 +463,7 @@ impl Analysis {
                 Stage::Andersen => 1,
                 _ => 0,
             },
+            lowering: (!module.lowering.is_empty()).then(|| module.lowering.clone()),
         };
 
         Ok(Self {

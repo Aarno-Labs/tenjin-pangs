@@ -4,13 +4,18 @@ use std::path::Path;
 use either::Either;
 use llvm_ir::constant::Constant;
 use llvm_ir::function::{CallingConvention, FunctionDeclaration, ParameterAttribute};
-use llvm_ir::instruction::{Call, InlineAssembly, Instruction, Load, Store};
+use llvm_ir::instruction::{
+    AddrSpaceCast, Alloca, AtomicRMW, BitCast, Call, CmpXchg, Freeze, GetElementPtr,
+    InlineAssembly, Instruction, IntToPtr, Load, Phi, PtrToInt, Select, Store,
+};
 use llvm_ir::module::{DLLStorageClass, Linkage, Visibility};
 use llvm_ir::terminator::{Invoke, Terminator};
-use llvm_ir::types::{FPType, Type, TypeRef};
+use llvm_ir::types::{FPType, Type, TypeRef, Typed};
 use llvm_ir::{DebugLoc, Function, Module, Name, Operand};
 
-use crate::{AbiClass, Access, Func, Global, Loc, Param, Pir, PirError, Signature, Stmt};
+use crate::{
+    AbiClass, Access, Func, Global, Loc, LoweringStats, Param, Pir, PirError, Signature, Stmt,
+};
 
 pub fn lower_path(path: &Path) -> Result<Pir, PirError> {
     let module = match path.extension().and_then(|ext| ext.to_str()) {
@@ -26,6 +31,29 @@ pub fn lower_path(path: &Path) -> Result<Pir, PirError> {
 }
 
 fn lower_module(module: &Module) -> Pir {
+    let mut lowering = LoweringStats {
+        functions: module
+            .functions
+            .iter()
+            .filter(|f| !is_skipped_intrinsic(&f.name))
+            .count() as u64,
+        declarations: module
+            .func_declarations
+            .iter()
+            .filter(|f| !is_skipped_intrinsic(&f.name))
+            .count() as u64,
+        globals: module.global_vars.len() as u64,
+        aliases: module.global_aliases.len() as u64,
+        ifuncs: module.global_ifuncs.len() as u64,
+        ..LoweringStats::default()
+    };
+    for alias in &module.global_aliases {
+        lowering.bump_tainted(format!("alias:{}", name_key(&alias.name)));
+    }
+    for ifunc in &module.global_ifuncs {
+        lowering.bump_tainted(format!("ifunc:{}", name_key(&ifunc.name)));
+    }
+
     let func_names = module
         .functions
         .iter()
@@ -54,10 +82,12 @@ fn lower_module(module: &Module) -> Pir {
         .filter(|f| !is_skipped_intrinsic(&f.name))
     {
         functions.push(lower_function(
+            module,
             function,
             &func_names,
             &global_names,
             &address_taken,
+            &mut lowering,
         ));
     }
     for decl in module
@@ -65,52 +95,82 @@ fn lower_module(module: &Module) -> Pir {
         .iter()
         .filter(|f| !is_skipped_intrinsic(&f.name))
     {
-        functions.push(lower_decl(decl, &address_taken));
+        functions.push(lower_decl(decl, &address_taken, &mut lowering));
     }
 
     let globals = module
         .global_vars
         .iter()
-        .map(|global| Global {
-            key: name_key(&global.name),
-            file: global.debugloc.as_ref().map(loc_file),
-            line: global.debugloc.as_ref().map(|loc| loc.line),
-            is_const: global.is_constant,
-            mutable: !global.is_constant,
-            exported: is_exported(global.linkage, global.visibility, global.dll_storage_class),
+        .map(|global| {
+            if global.debugloc.is_none() {
+                lowering.bump_missing_debug_location("global");
+            }
+            Global {
+                key: name_key(&global.name),
+                file: global.debugloc.as_ref().map(loc_file),
+                line: global.debugloc.as_ref().map(|loc| loc.line),
+                is_const: global.is_constant,
+                mutable: !global.is_constant,
+                exported: is_exported(global.linkage, global.visibility, global.dll_storage_class),
+            }
         })
         .collect();
 
     Pir {
         module: module.name.clone(),
         source: Some(module.source_file_name.clone()),
+        lowering,
         functions,
         globals,
     }
 }
 
 fn lower_function(
+    module: &Module,
     function: &Function,
     func_names: &BTreeSet<String>,
     global_names: &BTreeSet<String>,
     address_taken: &BTreeSet<String>,
+    lowering: &mut LoweringStats,
 ) -> Func {
     let mut body = Vec::new();
+    if function.debugloc.is_none() {
+        lowering.bump_missing_debug_location("function");
+    }
     for block in &function.basic_blocks {
         for instr in &block.instrs {
-            lower_instruction(instr, func_names, global_names, &mut body);
+            lowering.bump_instruction(instruction_opcode(instr));
+            lower_instruction(
+                module,
+                &function.name,
+                instr,
+                func_names,
+                global_names,
+                &mut body,
+                lowering,
+            );
         }
-        lower_terminator(&block.term, func_names, &mut body);
+        lowering.bump_terminator(terminator_opcode(&block.term));
+        lower_terminator(
+            module,
+            &function.name,
+            &block.term,
+            func_names,
+            &mut body,
+            lowering,
+        );
     }
 
+    let sig = signature(
+        &function.return_type,
+        function.parameters.iter().map(|p| (&p.ty, &p.attributes)),
+        function.is_var_arg,
+        function.calling_convention,
+        lowering,
+    );
     Func {
         key: function.name.clone(),
-        sig: signature(
-            &function.return_type,
-            function.parameters.iter().map(|p| (&p.ty, &p.attributes)),
-            function.is_var_arg,
-            function.calling_convention,
-        ),
+        sig,
         file: function.debugloc.as_ref().map(loc_file),
         line: function.debugloc.as_ref().map(|loc| loc.line),
         external: false,
@@ -124,15 +184,24 @@ fn lower_function(
     }
 }
 
-fn lower_decl(decl: &FunctionDeclaration, address_taken: &BTreeSet<String>) -> Func {
+fn lower_decl(
+    decl: &FunctionDeclaration,
+    address_taken: &BTreeSet<String>,
+    lowering: &mut LoweringStats,
+) -> Func {
+    if decl.debugloc.is_none() {
+        lowering.bump_missing_debug_location("declaration");
+    }
+    let sig = signature(
+        &decl.return_type,
+        decl.parameters.iter().map(|p| (&p.ty, &p.attributes)),
+        decl.is_var_arg,
+        decl.calling_convention,
+        lowering,
+    );
     Func {
         key: decl.name.clone(),
-        sig: signature(
-            &decl.return_type,
-            decl.parameters.iter().map(|p| (&p.ty, &p.attributes)),
-            decl.is_var_arg,
-            decl.calling_convention,
-        ),
+        sig,
         file: decl.debugloc.as_ref().map(loc_file),
         line: decl.debugloc.as_ref().map(|loc| loc.line),
         external: true,
@@ -249,72 +318,253 @@ fn collect_constant_func_refs(
 }
 
 fn lower_instruction(
+    module: &Module,
+    func_name: &str,
     instr: &Instruction,
     func_names: &BTreeSet<String>,
     global_names: &BTreeSet<String>,
     body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
 ) {
     match instr {
-        Instruction::Call(call) => lower_call(call, func_names, body),
-        Instruction::Load(load) => lower_load(load, global_names, body),
-        Instruction::Store(store) => lower_store(store, global_names, body),
+        Instruction::Alloca(alloca) => lower_alloca(func_name, alloca, body, lowering),
+        Instruction::Load(load) => lower_load(func_name, load, global_names, body, lowering),
+        Instruction::Store(store) => lower_store(func_name, store, global_names, body, lowering),
+        Instruction::CmpXchg(cmpxchg) => lower_cmpxchg(func_name, cmpxchg, body, lowering),
+        Instruction::AtomicRMW(atomicrmw) => lower_atomicrmw(func_name, atomicrmw, body, lowering),
+        Instruction::GetElementPtr(gep) => lower_gep(func_name, gep, body, lowering),
+        Instruction::PtrToInt(cast) => lower_ptr_to_int(func_name, cast, body, lowering),
+        Instruction::IntToPtr(cast) => lower_int_to_ptr(func_name, cast, body, lowering),
+        Instruction::BitCast(cast) => lower_bitcast(module, func_name, cast, body, lowering),
+        Instruction::AddrSpaceCast(cast) => {
+            lower_addrspacecast(module, func_name, cast, body, lowering)
+        }
+        Instruction::Phi(phi) => lower_phi(module, func_name, phi, body, lowering),
+        Instruction::Select(select) => lower_select(module, func_name, select, body, lowering),
+        Instruction::Freeze(freeze) => lower_freeze(func_name, freeze, body, lowering),
+        Instruction::Call(call) => lower_call(module, func_name, call, func_names, body, lowering),
+        Instruction::VAArg(va_arg) => {
+            lowering.bump_tainted("va_arg");
+            push_unknown(
+                body,
+                "va_arg",
+                vec![operand_value_key(func_name, &va_arg.arg_list)],
+                vec![local_value_key(func_name, &va_arg.dest)],
+                "va_arg",
+                loc(va_arg.debugloc.as_ref()),
+                lowering,
+            );
+        }
+        _ => lowering.bump_skipped(format!(
+            "unmodeled_instruction:{}",
+            instruction_opcode(instr)
+        )),
+    }
+}
+
+fn lower_terminator(
+    module: &Module,
+    func_name: &str,
+    term: &Terminator,
+    func_names: &BTreeSet<String>,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    match term {
+        Terminator::Invoke(invoke) => {
+            lower_invoke(module, func_name, invoke, func_names, body, lowering)
+        }
+        Terminator::Ret(ret) => {
+            body.push(Stmt::Return {
+                value: ret
+                    .return_operand
+                    .as_ref()
+                    .map(|op| operand_value_key(func_name, op)),
+                loc: loc(ret.debugloc.as_ref()),
+            });
+            lowering.bump_modeled("return");
+            bump_missing_loc(lowering, "return", ret.debugloc.as_ref());
+        }
+        Terminator::CallBr(callbr) => {
+            lowering.bump_tainted("callbr");
+            if let Either::Left(_) = &callbr.function {
+                push_unknown(
+                    body,
+                    "callbr",
+                    callbr
+                        .arguments
+                        .iter()
+                        .map(|(arg, _)| operand_value_key(func_name, arg))
+                        .collect(),
+                    vec![local_value_key(func_name, &callbr.result)],
+                    "inline_asm_callbr",
+                    loc(callbr.debugloc.as_ref()),
+                    lowering,
+                );
+            }
+        }
         _ => {}
     }
 }
 
-fn lower_terminator(term: &Terminator, func_names: &BTreeSet<String>, body: &mut Vec<Stmt>) {
-    if let Terminator::Invoke(invoke) = term {
-        lower_invoke(invoke, func_names, body);
-    }
+fn lower_alloca(
+    func_name: &str,
+    alloca: &Alloca,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::Alloca {
+        dest: local_value_key(func_name, &alloca.dest),
+        ty: alloca.allocated_type.to_string(),
+        loc: loc(alloca.debugloc.as_ref()),
+    });
+    lowering.bump_modeled("alloca");
+    bump_missing_loc(lowering, "alloca", alloca.debugloc.as_ref());
 }
 
-fn lower_call(call: &Call, func_names: &BTreeSet<String>, body: &mut Vec<Stmt>) {
+fn lower_call(
+    module: &Module,
+    func_name: &str,
+    call: &Call,
+    func_names: &BTreeSet<String>,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if let Either::Left(_) = &call.function {
+        lowering.bump_tainted("inline_asm");
+        push_unknown(
+            body,
+            "call",
+            call.arguments
+                .iter()
+                .map(|(arg, _)| operand_value_key(func_name, arg))
+                .collect(),
+            call.dest
+                .as_ref()
+                .map(|dest| vec![local_value_key(func_name, dest)])
+                .unwrap_or_default(),
+            "inline_asm",
+            loc(call.debugloc.as_ref()),
+            lowering,
+        );
+        return;
+    }
+
+    if let Some(callee) = called_function_name(&call.function) {
+        if lower_intrinsic_call(module, func_name, &callee, call, body, lowering) {
+            return;
+        }
+    }
+
     let Some(sig) = call_signature_from_operand(
         &call.function,
         call.arguments.iter().map(|a| &a.1),
         call.calling_convention,
+        lowering,
     ) else {
+        lowering.bump_skipped("call_without_function_signature");
         return;
     };
     match called_function_name(&call.function) {
         Some(callee) if is_skipped_intrinsic(&callee) => {}
-        Some(callee) if func_names.contains(&callee) => body.push(Stmt::CallDirect {
-            callee,
-            sig,
-            loc: loc(call.debugloc.as_ref()),
-        }),
-        _ => body.push(Stmt::CallIndirect {
-            operand: operand_key_either(&call.function),
-            sig,
-            loc: loc(call.debugloc.as_ref()),
-        }),
+        Some(callee) if func_names.contains(&callee) => {
+            body.push(Stmt::CallDirect {
+                callee,
+                sig,
+                loc: loc(call.debugloc.as_ref()),
+            });
+            lowering.bump_modeled("call_direct");
+        }
+        _ => {
+            body.push(Stmt::CallIndirect {
+                operand: operand_key_either(func_name, &call.function),
+                sig,
+                loc: loc(call.debugloc.as_ref()),
+            });
+            lowering.bump_modeled("call_indirect");
+        }
     }
+    bump_missing_loc(lowering, "call", call.debugloc.as_ref());
 }
 
-fn lower_invoke(invoke: &Invoke, func_names: &BTreeSet<String>, body: &mut Vec<Stmt>) {
+fn lower_invoke(
+    _module: &Module,
+    func_name: &str,
+    invoke: &Invoke,
+    func_names: &BTreeSet<String>,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    lowering.bump_tainted("invoke_exception_control_flow");
+    if let Either::Left(_) = &invoke.function {
+        lowering.bump_tainted("inline_asm");
+        push_unknown(
+            body,
+            "invoke",
+            invoke
+                .arguments
+                .iter()
+                .map(|(arg, _)| operand_value_key(func_name, arg))
+                .collect(),
+            vec![local_value_key(func_name, &invoke.result)],
+            "inline_asm",
+            loc(invoke.debugloc.as_ref()),
+            lowering,
+        );
+        return;
+    }
+
     let Some(sig) = call_signature_from_operand(
         &invoke.function,
         invoke.arguments.iter().map(|a| &a.1),
         invoke.calling_convention,
+        lowering,
     ) else {
+        lowering.bump_skipped("invoke_without_function_signature");
         return;
     };
     match called_function_name(&invoke.function) {
         Some(callee) if is_skipped_intrinsic(&callee) => {}
-        Some(callee) if func_names.contains(&callee) => body.push(Stmt::CallDirect {
-            callee,
-            sig,
-            loc: loc(invoke.debugloc.as_ref()),
-        }),
-        _ => body.push(Stmt::CallIndirect {
-            operand: operand_key_either(&invoke.function),
-            sig,
-            loc: loc(invoke.debugloc.as_ref()),
-        }),
+        Some(callee) if func_names.contains(&callee) => {
+            body.push(Stmt::CallDirect {
+                callee,
+                sig,
+                loc: loc(invoke.debugloc.as_ref()),
+            });
+            lowering.bump_modeled("call_direct");
+        }
+        _ => {
+            body.push(Stmt::CallIndirect {
+                operand: operand_key_either(func_name, &invoke.function),
+                sig,
+                loc: loc(invoke.debugloc.as_ref()),
+            });
+            lowering.bump_modeled("call_indirect");
+        }
     }
+    bump_missing_loc(lowering, "invoke", invoke.debugloc.as_ref());
 }
 
-fn lower_load(load: &Load, global_names: &BTreeSet<String>, body: &mut Vec<Stmt>) {
+fn lower_load(
+    func_name: &str,
+    load: &Load,
+    global_names: &BTreeSet<String>,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::Load {
+        dest: local_value_key(func_name, &load.dest),
+        address: operand_value_key(func_name, &load.address),
+        loc: loc(load.debugloc.as_ref()),
+    });
+    lowering.bump_modeled("load");
+    bump_missing_loc(lowering, "load", load.debugloc.as_ref());
+    if load.volatile {
+        lowering.bump_modeled("volatile_load");
+    }
+    if load.atomicity.is_some() {
+        lowering.bump_modeled("atomic_load");
+    }
     if let Some(global) =
         operand_global_name(&load.address).filter(|name| global_names.contains(name))
     {
@@ -323,10 +573,30 @@ fn lower_load(load: &Load, global_names: &BTreeSet<String>, body: &mut Vec<Stmt>
             access: Access::Ref,
             loc: loc(load.debugloc.as_ref()),
         });
+        lowering.bump_modeled("global_ref");
     }
 }
 
-fn lower_store(store: &Store, global_names: &BTreeSet<String>, body: &mut Vec<Stmt>) {
+fn lower_store(
+    func_name: &str,
+    store: &Store,
+    global_names: &BTreeSet<String>,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::Store {
+        address: operand_value_key(func_name, &store.address),
+        value: operand_value_key(func_name, &store.value),
+        loc: loc(store.debugloc.as_ref()),
+    });
+    lowering.bump_modeled("store");
+    bump_missing_loc(lowering, "store", store.debugloc.as_ref());
+    if store.volatile {
+        lowering.bump_modeled("volatile_store");
+    }
+    if store.atomicity.is_some() {
+        lowering.bump_modeled("atomic_store");
+    }
     if let Some(global) =
         operand_global_name(&store.address).filter(|name| global_names.contains(name))
     {
@@ -335,13 +605,329 @@ fn lower_store(store: &Store, global_names: &BTreeSet<String>, body: &mut Vec<St
             access: Access::Mod,
             loc: loc(store.debugloc.as_ref()),
         });
+        lowering.bump_modeled("global_mod");
     }
+}
+
+fn lower_cmpxchg(
+    func_name: &str,
+    cmpxchg: &CmpXchg,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::Load {
+        dest: format!("{}.old", local_value_key(func_name, &cmpxchg.dest)),
+        address: operand_value_key(func_name, &cmpxchg.address),
+        loc: loc(cmpxchg.debugloc.as_ref()),
+    });
+    body.push(Stmt::Store {
+        address: operand_value_key(func_name, &cmpxchg.address),
+        value: operand_value_key(func_name, &cmpxchg.replacement),
+        loc: loc(cmpxchg.debugloc.as_ref()),
+    });
+    lowering.bump_modeled("cmpxchg");
+    lowering.bump_modeled("atomic_load");
+    lowering.bump_modeled("atomic_store");
+    if cmpxchg.volatile {
+        lowering.bump_modeled("volatile_cmpxchg");
+    }
+    bump_missing_loc(lowering, "cmpxchg", cmpxchg.debugloc.as_ref());
+}
+
+fn lower_atomicrmw(
+    func_name: &str,
+    atomicrmw: &AtomicRMW,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::Load {
+        dest: local_value_key(func_name, &atomicrmw.dest),
+        address: operand_value_key(func_name, &atomicrmw.address),
+        loc: loc(atomicrmw.debugloc.as_ref()),
+    });
+    body.push(Stmt::Store {
+        address: operand_value_key(func_name, &atomicrmw.address),
+        value: operand_value_key(func_name, &atomicrmw.value),
+        loc: loc(atomicrmw.debugloc.as_ref()),
+    });
+    lowering.bump_modeled("atomicrmw");
+    lowering.bump_modeled("atomic_load");
+    lowering.bump_modeled("atomic_store");
+    if atomicrmw.volatile {
+        lowering.bump_modeled("volatile_atomicrmw");
+    }
+    bump_missing_loc(lowering, "atomicrmw", atomicrmw.debugloc.as_ref());
+}
+
+fn lower_gep(
+    func_name: &str,
+    gep: &GetElementPtr,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::Gep {
+        dest: local_value_key(func_name, &gep.dest),
+        base: operand_value_key(func_name, &gep.address),
+        byte_off: gep_zero_offset(&gep.indices),
+        loc: loc(gep.debugloc.as_ref()),
+    });
+    lowering.bump_modeled("gep");
+    bump_missing_loc(lowering, "gep", gep.debugloc.as_ref());
+}
+
+fn lower_ptr_to_int(
+    func_name: &str,
+    cast: &PtrToInt,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::PtrToInt {
+        dest: local_value_key(func_name, &cast.dest),
+        source: operand_value_key(func_name, &cast.operand),
+        loc: loc(cast.debugloc.as_ref()),
+    });
+    lowering.bump_modeled("ptrtoint");
+    bump_missing_loc(lowering, "ptrtoint", cast.debugloc.as_ref());
+}
+
+fn lower_int_to_ptr(
+    func_name: &str,
+    cast: &IntToPtr,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::IntToPtr {
+        dest: local_value_key(func_name, &cast.dest),
+        source: operand_value_key(func_name, &cast.operand),
+        loc: loc(cast.debugloc.as_ref()),
+    });
+    lowering.bump_tainted("inttoptr");
+    lowering.bump_modeled("inttoptr");
+    bump_missing_loc(lowering, "inttoptr", cast.debugloc.as_ref());
+}
+
+fn lower_bitcast(
+    module: &Module,
+    func_name: &str,
+    cast: &BitCast,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if operand_has_pointer_type(module, &cast.operand) || is_pointer_like_type(&cast.to_type) {
+        body.push(Stmt::Assign {
+            dest: local_value_key(func_name, &cast.dest),
+            sources: vec![operand_value_key(func_name, &cast.operand)],
+            loc: loc(cast.debugloc.as_ref()),
+        });
+        lowering.bump_modeled("assign");
+    } else {
+        lowering.bump_skipped("bitcast_non_pointer");
+    }
+    bump_missing_loc(lowering, "bitcast", cast.debugloc.as_ref());
+}
+
+fn lower_addrspacecast(
+    module: &Module,
+    func_name: &str,
+    cast: &AddrSpaceCast,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if operand_has_pointer_type(module, &cast.operand) || is_pointer_like_type(&cast.to_type) {
+        body.push(Stmt::Assign {
+            dest: local_value_key(func_name, &cast.dest),
+            sources: vec![operand_value_key(func_name, &cast.operand)],
+            loc: loc(cast.debugloc.as_ref()),
+        });
+        lowering.bump_modeled("assign");
+    } else {
+        lowering.bump_skipped("addrspacecast_non_pointer");
+    }
+    bump_missing_loc(lowering, "addrspacecast", cast.debugloc.as_ref());
+}
+
+fn lower_phi(
+    module: &Module,
+    func_name: &str,
+    phi: &Phi,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if is_pointer_like_type(&phi.to_type) {
+        body.push(Stmt::Assign {
+            dest: local_value_key(func_name, &phi.dest),
+            sources: phi
+                .incoming_values
+                .iter()
+                .map(|(op, _)| operand_value_key(func_name, op))
+                .collect(),
+            loc: loc(phi.debugloc.as_ref()),
+        });
+        lowering.bump_modeled("assign");
+    } else if phi
+        .incoming_values
+        .iter()
+        .any(|(op, _)| operand_has_pointer_type(module, op))
+    {
+        lowering.bump_tainted("phi_pointer_operand_non_pointer_result");
+    } else {
+        lowering.bump_skipped("phi_non_pointer");
+    }
+    bump_missing_loc(lowering, "phi", phi.debugloc.as_ref());
+}
+
+fn lower_select(
+    module: &Module,
+    func_name: &str,
+    select: &Select,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if operand_has_pointer_type(module, &select.true_value)
+        || operand_has_pointer_type(module, &select.false_value)
+    {
+        body.push(Stmt::Assign {
+            dest: local_value_key(func_name, &select.dest),
+            sources: vec![
+                operand_value_key(func_name, &select.true_value),
+                operand_value_key(func_name, &select.false_value),
+            ],
+            loc: loc(select.debugloc.as_ref()),
+        });
+        lowering.bump_modeled("assign");
+    } else {
+        lowering.bump_skipped("select_non_pointer");
+    }
+    bump_missing_loc(lowering, "select", select.debugloc.as_ref());
+}
+
+fn lower_freeze(
+    func_name: &str,
+    freeze: &Freeze,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::Assign {
+        dest: local_value_key(func_name, &freeze.dest),
+        sources: vec![operand_value_key(func_name, &freeze.operand)],
+        loc: loc(freeze.debugloc.as_ref()),
+    });
+    lowering.bump_modeled("assign");
+    bump_missing_loc(lowering, "freeze", freeze.debugloc.as_ref());
+}
+
+fn lower_intrinsic_call(
+    module: &Module,
+    func_name: &str,
+    callee: &str,
+    call: &Call,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) -> bool {
+    if !callee.starts_with("llvm.") {
+        return false;
+    }
+
+    if is_skipped_intrinsic(callee)
+        || callee.starts_with("llvm.lifetime.")
+        || callee == "llvm.assume"
+        || callee.starts_with("llvm.expect.")
+        || callee.starts_with("llvm.annotation.")
+        || callee.starts_with("llvm.prefetch.")
+    {
+        lowering.bump_skipped(format!("intrinsic:{callee}"));
+        return true;
+    }
+
+    if callee.starts_with("llvm.memcpy.") || callee.starts_with("llvm.memmove.") {
+        if call.arguments.len() >= 3 {
+            body.push(Stmt::Memcpy {
+                dst: operand_value_key(func_name, &call.arguments[0].0),
+                src: operand_value_key(func_name, &call.arguments[1].0),
+                bytes: constant_int(&call.arguments[2].0),
+                loc: loc(call.debugloc.as_ref()),
+            });
+            lowering.bump_modeled(if callee.starts_with("llvm.memmove.") {
+                "memmove"
+            } else {
+                "memcpy"
+            });
+            bump_missing_loc(lowering, "memcpy", call.debugloc.as_ref());
+        } else {
+            lowering.bump_tainted("malformed_memory_intrinsic");
+        }
+        return true;
+    }
+
+    if callee.starts_with("llvm.memset.") {
+        if call.arguments.len() >= 3 {
+            body.push(Stmt::Memset {
+                dst: operand_value_key(func_name, &call.arguments[0].0),
+                value: operand_value_key(func_name, &call.arguments[1].0),
+                bytes: constant_int(&call.arguments[2].0),
+                loc: loc(call.debugloc.as_ref()),
+            });
+            lowering.bump_modeled("memset");
+            bump_missing_loc(lowering, "memset", call.debugloc.as_ref());
+        } else {
+            lowering.bump_tainted("malformed_memory_intrinsic");
+        }
+        return true;
+    }
+
+    if callee.starts_with("llvm.va_") {
+        lowering.bump_tainted(format!("intrinsic:{callee}"));
+        push_unknown(
+            body,
+            callee,
+            call.arguments
+                .iter()
+                .map(|(arg, _)| operand_value_key(func_name, arg))
+                .collect(),
+            call.dest
+                .as_ref()
+                .map(|dest| vec![local_value_key(func_name, dest)])
+                .unwrap_or_default(),
+            "varargs_intrinsic",
+            loc(call.debugloc.as_ref()),
+            lowering,
+        );
+        return true;
+    }
+
+    if call
+        .arguments
+        .iter()
+        .any(|(arg, _)| operand_has_pointer_type(module, arg))
+        || call.dest.is_some() && is_pointer_like_type(&call.get_type(&module.types))
+    {
+        lowering.bump_tainted(format!("unknown_pointer_intrinsic:{callee}"));
+        push_unknown(
+            body,
+            callee,
+            call.arguments
+                .iter()
+                .map(|(arg, _)| operand_value_key(func_name, arg))
+                .collect(),
+            call.dest
+                .as_ref()
+                .map(|dest| vec![local_value_key(func_name, dest)])
+                .unwrap_or_default(),
+            "unknown_pointer_intrinsic",
+            loc(call.debugloc.as_ref()),
+            lowering,
+        );
+    } else {
+        lowering.bump_skipped(format!("unknown_non_pointer_intrinsic:{callee}"));
+    }
+    true
 }
 
 fn call_signature_from_operand<'a>(
     function: &Either<InlineAssembly, Operand>,
     arg_attrs: impl Iterator<Item = &'a Vec<ParameterAttribute>>,
     cc: CallingConvention,
+    lowering: &mut LoweringStats,
 ) -> Option<Signature> {
     let Either::Right(operand) = function else {
         return None;
@@ -360,6 +946,7 @@ fn call_signature_from_operand<'a>(
         param_types.iter().zip(arg_attrs),
         *is_var_arg,
         cc,
+        lowering,
     ))
 }
 
@@ -368,14 +955,19 @@ fn signature<'a, 'b>(
     params: impl Iterator<Item = (&'a TypeRef, &'b Vec<ParameterAttribute>)>,
     vararg: bool,
     cc: CallingConvention,
+    lowering: &mut LoweringStats,
 ) -> Signature {
+    let cc = cc_key(cc);
+    if cc != "ccc" {
+        lowering.bump_non_ccc(cc.clone());
+    }
     Signature {
         ret: abi_class(ret),
         params: params
             .map(|(ty, attrs)| param_class(ty, attrs))
             .collect::<Vec<_>>(),
         vararg,
-        cc: cc_key(cc),
+        cc,
     }
 }
 
@@ -478,10 +1070,162 @@ fn callee_function_type(operand: &Operand) -> Option<TypeRef> {
     }
 }
 
-fn operand_key_either(function: &Either<InlineAssembly, Operand>) -> String {
+fn operand_key_either(func_name: &str, function: &Either<InlineAssembly, Operand>) -> String {
     match function {
         Either::Left(_) => "inline_asm".to_string(),
-        Either::Right(operand) => format!("{operand}"),
+        Either::Right(operand) => operand_value_key(func_name, operand),
+    }
+}
+
+fn local_value_key(func_name: &str, name: &Name) -> String {
+    format!("%{func_name}::{}", name_key(name))
+}
+
+fn operand_value_key(func_name: &str, operand: &Operand) -> String {
+    match operand {
+        Operand::LocalOperand { name, .. } => local_value_key(func_name, name),
+        Operand::ConstantOperand(cref) => constant_value_key(cref),
+        Operand::MetadataOperand => "!metadata".to_string(),
+    }
+}
+
+fn constant_value_key(constant: &Constant) -> String {
+    match constant {
+        Constant::GlobalReference { name, .. } => format!("@{}", name_key(name)),
+        Constant::BitCast(expr) => constant_value_key(&expr.operand),
+        Constant::GetElementPtr(expr) => constant_value_key(&expr.address),
+        _ => constant.to_string(),
+    }
+}
+
+fn constant_int(operand: &Operand) -> Option<u64> {
+    match operand.as_constant()? {
+        Constant::Int { value, .. } => Some(*value),
+        _ => None,
+    }
+}
+
+fn gep_zero_offset(indices: &[Operand]) -> Option<i64> {
+    if indices
+        .iter()
+        .all(|operand| matches!(constant_int(operand), Some(0)))
+    {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+fn operand_has_pointer_type(module: &Module, operand: &Operand) -> bool {
+    is_pointer_like_type(&operand.get_type(&module.types))
+}
+
+fn is_pointer_like_type(ty: &TypeRef) -> bool {
+    match ty.as_ref() {
+        Type::PointerType { .. } => true,
+        Type::VectorType { element_type, .. } => is_pointer_like_type(element_type),
+        _ => false,
+    }
+}
+
+fn push_unknown(
+    body: &mut Vec<Stmt>,
+    op: impl Into<String>,
+    operands: Vec<String>,
+    results: Vec<String>,
+    reason: impl Into<String>,
+    loc: Option<Loc>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::Unknown {
+        op: op.into(),
+        operands,
+        results,
+        reason: reason.into(),
+        loc,
+    });
+    lowering.bump_modeled("unknown");
+}
+
+fn bump_missing_loc(lowering: &mut LoweringStats, kind: &str, loc: Option<&DebugLoc>) {
+    if loc.is_none() {
+        lowering.bump_missing_debug_location(kind);
+    }
+}
+
+fn instruction_opcode(instr: &Instruction) -> &'static str {
+    match instr {
+        Instruction::Add(_) => "add",
+        Instruction::Sub(_) => "sub",
+        Instruction::Mul(_) => "mul",
+        Instruction::UDiv(_) => "udiv",
+        Instruction::SDiv(_) => "sdiv",
+        Instruction::URem(_) => "urem",
+        Instruction::SRem(_) => "srem",
+        Instruction::And(_) => "and",
+        Instruction::Or(_) => "or",
+        Instruction::Xor(_) => "xor",
+        Instruction::Shl(_) => "shl",
+        Instruction::LShr(_) => "lshr",
+        Instruction::AShr(_) => "ashr",
+        Instruction::FAdd(_) => "fadd",
+        Instruction::FSub(_) => "fsub",
+        Instruction::FMul(_) => "fmul",
+        Instruction::FDiv(_) => "fdiv",
+        Instruction::FRem(_) => "frem",
+        Instruction::FNeg(_) => "fneg",
+        Instruction::ExtractElement(_) => "extractelement",
+        Instruction::InsertElement(_) => "insertelement",
+        Instruction::ShuffleVector(_) => "shufflevector",
+        Instruction::ExtractValue(_) => "extractvalue",
+        Instruction::InsertValue(_) => "insertvalue",
+        Instruction::Alloca(_) => "alloca",
+        Instruction::Load(_) => "load",
+        Instruction::Store(_) => "store",
+        Instruction::Fence(_) => "fence",
+        Instruction::CmpXchg(_) => "cmpxchg",
+        Instruction::AtomicRMW(_) => "atomicrmw",
+        Instruction::GetElementPtr(_) => "getelementptr",
+        Instruction::Trunc(_) => "trunc",
+        Instruction::ZExt(_) => "zext",
+        Instruction::SExt(_) => "sext",
+        Instruction::FPTrunc(_) => "fptrunc",
+        Instruction::FPExt(_) => "fpext",
+        Instruction::FPToUI(_) => "fptoui",
+        Instruction::FPToSI(_) => "fptosi",
+        Instruction::UIToFP(_) => "uitofp",
+        Instruction::SIToFP(_) => "sitofp",
+        Instruction::PtrToInt(_) => "ptrtoint",
+        Instruction::IntToPtr(_) => "inttoptr",
+        Instruction::BitCast(_) => "bitcast",
+        Instruction::AddrSpaceCast(_) => "addrspacecast",
+        Instruction::ICmp(_) => "icmp",
+        Instruction::FCmp(_) => "fcmp",
+        Instruction::Phi(_) => "phi",
+        Instruction::Select(_) => "select",
+        Instruction::Freeze(_) => "freeze",
+        Instruction::Call(_) => "call",
+        Instruction::VAArg(_) => "va_arg",
+        Instruction::LandingPad(_) => "landingpad",
+        Instruction::CatchPad(_) => "catchpad",
+        Instruction::CleanupPad(_) => "cleanuppad",
+    }
+}
+
+fn terminator_opcode(term: &Terminator) -> &'static str {
+    match term {
+        Terminator::Ret(_) => "ret",
+        Terminator::Br(_) => "br",
+        Terminator::CondBr(_) => "condbr",
+        Terminator::Switch(_) => "switch",
+        Terminator::IndirectBr(_) => "indirectbr",
+        Terminator::Invoke(_) => "invoke",
+        Terminator::Resume(_) => "resume",
+        Terminator::Unreachable(_) => "unreachable",
+        Terminator::CleanupRet(_) => "cleanupret",
+        Terminator::CatchRet(_) => "catchret",
+        Terminator::CatchSwitch(_) => "catchswitch",
+        Terminator::CallBr(_) => "callbr",
     }
 }
 

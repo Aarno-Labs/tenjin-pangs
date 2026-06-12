@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -29,6 +30,8 @@ pub struct Pir {
     pub module: String,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "LoweringStats::is_empty")]
+    pub lowering: LoweringStats,
     #[serde(default)]
     pub functions: Vec<Func>,
     #[serde(default)]
@@ -101,6 +104,83 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Stmt {
+    Alloca {
+        dest: String,
+        ty: String,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    Assign {
+        dest: String,
+        #[serde(default)]
+        sources: Vec<String>,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    Load {
+        dest: String,
+        address: String,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    Store {
+        address: String,
+        value: String,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    Gep {
+        dest: String,
+        base: String,
+        #[serde(default)]
+        byte_off: Option<i64>,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    PtrToInt {
+        dest: String,
+        source: String,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    IntToPtr {
+        dest: String,
+        source: String,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    Memcpy {
+        dst: String,
+        src: String,
+        #[serde(default)]
+        bytes: Option<u64>,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    Memset {
+        dst: String,
+        value: String,
+        #[serde(default)]
+        bytes: Option<u64>,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    Unknown {
+        op: String,
+        #[serde(default)]
+        operands: Vec<String>,
+        #[serde(default)]
+        results: Vec<String>,
+        reason: String,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    Return {
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
     CallDirect {
         callee: String,
         sig: Signature,
@@ -119,6 +199,83 @@ pub enum Stmt {
         #[serde(default)]
         loc: Option<Loc>,
     },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LoweringStats {
+    #[serde(default)]
+    pub functions: u64,
+    #[serde(default)]
+    pub declarations: u64,
+    #[serde(default)]
+    pub globals: u64,
+    #[serde(default)]
+    pub aliases: u64,
+    #[serde(default)]
+    pub ifuncs: u64,
+    #[serde(default)]
+    pub instruction_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub terminator_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub modeled_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub skipped_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub tainted_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub missing_debug_locations: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub non_ccc_calling_conventions: BTreeMap<String, u64>,
+}
+
+impl LoweringStats {
+    pub fn is_empty(&self) -> bool {
+        self.functions == 0
+            && self.declarations == 0
+            && self.globals == 0
+            && self.aliases == 0
+            && self.ifuncs == 0
+            && self.instruction_counts.is_empty()
+            && self.terminator_counts.is_empty()
+            && self.modeled_counts.is_empty()
+            && self.skipped_counts.is_empty()
+            && self.tainted_counts.is_empty()
+            && self.missing_debug_locations.is_empty()
+            && self.non_ccc_calling_conventions.is_empty()
+    }
+
+    pub fn bump_instruction(&mut self, op: impl Into<String>) {
+        bump(&mut self.instruction_counts, op);
+    }
+
+    pub fn bump_terminator(&mut self, op: impl Into<String>) {
+        bump(&mut self.terminator_counts, op);
+    }
+
+    pub fn bump_modeled(&mut self, op: impl Into<String>) {
+        bump(&mut self.modeled_counts, op);
+    }
+
+    pub fn bump_skipped(&mut self, reason: impl Into<String>) {
+        bump(&mut self.skipped_counts, reason);
+    }
+
+    pub fn bump_tainted(&mut self, reason: impl Into<String>) {
+        bump(&mut self.tainted_counts, reason);
+    }
+
+    pub fn bump_missing_debug_location(&mut self, kind: impl Into<String>) {
+        bump(&mut self.missing_debug_locations, kind);
+    }
+
+    pub fn bump_non_ccc(&mut self, cc: impl Into<String>) {
+        bump(&mut self.non_ccc_calling_conventions, cc);
+    }
+}
+
+fn bump(map: &mut BTreeMap<String, u64>, key: impl Into<String>) {
+    *map.entry(key.into()).or_default() += 1;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
