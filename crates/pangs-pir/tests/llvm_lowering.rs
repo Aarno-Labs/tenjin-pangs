@@ -522,6 +522,46 @@ entry:
 }
 
 #[test]
+fn llvm_sys_names_unmodeled_arithmetic_opcodes() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("arith.ll");
+    fs::write(
+        &ll_path,
+        r#"
+define void @arith(i32 %a, i32 %b, float %x, float %y) {
+entry:
+  %sum = add i32 %a, %b
+  %diff = sub i32 %a, %b
+  %mask = and i32 %sum, %diff
+  %cmp = icmp eq i32 %sum, %diff
+  %fsum = fadd float %x, %y
+  %neg = fneg float %x
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    assert_eq!(pir.lowering.instruction_counts["add"], 1);
+    assert_eq!(pir.lowering.instruction_counts["sub"], 1);
+    assert_eq!(pir.lowering.instruction_counts["and"], 1);
+    assert_eq!(pir.lowering.instruction_counts["icmp"], 1);
+    assert_eq!(pir.lowering.instruction_counts["fadd"], 1);
+    assert_eq!(pir.lowering.instruction_counts["fneg"], 1);
+    assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:add"], 1);
+    assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:sub"], 1);
+    assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:and"], 1);
+    assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:icmp"], 1);
+    assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:fadd"], 1);
+    assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:fneg"], 1);
+    assert!(!pir
+        .lowering
+        .skipped_counts
+        .contains_key("unmodeled_instruction:other"));
+}
+
+#[test]
 fn llvm_sys_counts_resume_terminators() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("resume.ll");
