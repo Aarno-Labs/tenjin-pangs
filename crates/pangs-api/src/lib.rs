@@ -419,6 +419,18 @@ impl Analysis {
                 }
             }
         }
+        for stmt in &module.global_init {
+            if let Stmt::GlobalRef {
+                global,
+                access: Access::Mod,
+                ..
+            } = stmt
+            {
+                if let Some(&gid) = global_lookup.get(global) {
+                    globals[gid.0 as usize].never_written = false;
+                }
+            }
+        }
 
         for (idx, func) in module.functions.iter().enumerate() {
             if functions[idx].exported || (opts.build_mode == BuildMode::Library && !func.external)

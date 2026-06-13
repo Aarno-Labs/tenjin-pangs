@@ -197,3 +197,78 @@ entry:
     assert_eq!(pir.lowering.modeled_counts["cmpxchg"], 1);
     assert_eq!(pir.lowering.tainted_counts["inttoptr"], 1);
 }
+
+#[test]
+fn lowers_global_initializer_pointer_flow_from_ll() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("global_init.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@G = global i32 0
+@FP = global void ()* @target
+@FPCast = global i8* bitcast (void ()* @target to i8*)
+@GPtr = global i32* @G
+@Arr = global [4 x i8] zeroinitializer
+@GepPtr = global i8* getelementptr ([4 x i8], [4 x i8]* @Arr, i64 0, i64 1)
+@Table = global [2 x void ()*] [void ()* @target, void ()* @other]
+
+define void @target() {
+entry:
+  ret void
+}
+
+define void @other() {
+entry:
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    assert!(
+        pir.functions
+            .iter()
+            .find(|f| f.key == "target")
+            .unwrap()
+            .address_taken
+    );
+    assert!(
+        pir.functions
+            .iter()
+            .find(|f| f.key == "other")
+            .unwrap()
+            .address_taken
+    );
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == "@FP" && value == "@target"
+    )));
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == "@GPtr" && value == "@G"
+    )));
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Assign { sources, .. } if sources == &vec!["@target".to_string()]
+    )));
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Gep {
+            base,
+            byte_off: None,
+            ..
+        } if base == "@Arr"
+    )));
+    assert_eq!(
+        pir.global_init
+            .iter()
+            .filter(|stmt| matches!(stmt, Stmt::Store { address, value, .. } if address == "@Table" && (value == "@target" || value == "@other")))
+            .count(),
+        2
+    );
+    assert!(pir.lowering.modeled_counts["global_init_store"] >= 5);
+    assert!(pir.lowering.modeled_counts["global_init_assign"] >= 1);
+    assert_eq!(pir.lowering.modeled_counts["global_init_gep"], 1);
+}

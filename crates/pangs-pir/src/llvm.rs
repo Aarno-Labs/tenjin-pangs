@@ -115,6 +115,7 @@ fn lower_module(module: &Module) -> Pir {
             }
         })
         .collect();
+    let global_init = lower_global_initializers(module, &global_names, &mut lowering);
 
     Pir {
         module: module.name.clone(),
@@ -122,6 +123,216 @@ fn lower_module(module: &Module) -> Pir {
         lowering,
         functions,
         globals,
+        global_init,
+    }
+}
+
+fn lower_global_initializers(
+    module: &Module,
+    global_names: &BTreeSet<String>,
+    lowering: &mut LoweringStats,
+) -> Vec<Stmt> {
+    let mut body = Vec::new();
+    let mut temp_ordinal = 0_u64;
+
+    for global in &module.global_vars {
+        let Some(initializer) = &global.initializer else {
+            continue;
+        };
+        let global_key = name_key(&global.name);
+        let address = format!("@{global_key}");
+        body.push(Stmt::GlobalRef {
+            global: global_key,
+            access: Access::Mod,
+            loc: loc(global.debugloc.as_ref()),
+        });
+        lowering.bump_modeled("global_init_mod");
+
+        if !lower_global_initializer_value(
+            module,
+            &address,
+            initializer,
+            global_names,
+            &mut body,
+            &mut temp_ordinal,
+            lowering,
+        ) {
+            lowering.bump_skipped("global_initializer_non_pointer");
+        }
+    }
+
+    body
+}
+
+fn lower_global_initializer_value(
+    module: &Module,
+    address: &str,
+    constant: &Constant,
+    global_names: &BTreeSet<String>,
+    body: &mut Vec<Stmt>,
+    temp_ordinal: &mut u64,
+    lowering: &mut LoweringStats,
+) -> bool {
+    match constant {
+        Constant::Struct { values, .. }
+        | Constant::Array {
+            elements: values, ..
+        } => {
+            let mut found = false;
+            for value in values {
+                found |= lower_global_initializer_value(
+                    module,
+                    address,
+                    value,
+                    global_names,
+                    body,
+                    temp_ordinal,
+                    lowering,
+                );
+            }
+            found
+        }
+        Constant::Vector(values) => {
+            let mut found = false;
+            for value in values {
+                found |= lower_global_initializer_value(
+                    module,
+                    address,
+                    value,
+                    global_names,
+                    body,
+                    temp_ordinal,
+                    lowering,
+                );
+            }
+            found
+        }
+        _ if constant_has_pointer_flow(module, constant) => {
+            let value = lower_constant_expr_value(module, constant, body, temp_ordinal, lowering);
+            body.push(Stmt::Store {
+                address: address.to_string(),
+                value: value.clone(),
+                loc: None,
+            });
+            lowering.bump_modeled("global_init_store");
+            if let Some(global) =
+                constant_global_name(constant).filter(|name| global_names.contains(name))
+            {
+                body.push(Stmt::GlobalRef {
+                    global,
+                    access: Access::Ref,
+                    loc: None,
+                });
+                lowering.bump_modeled("global_init_ref");
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn lower_constant_expr_value(
+    module: &Module,
+    constant: &Constant,
+    body: &mut Vec<Stmt>,
+    temp_ordinal: &mut u64,
+    lowering: &mut LoweringStats,
+) -> String {
+    match constant {
+        Constant::GlobalReference { name, .. } => format!("@{}", name_key(name)),
+        Constant::BitCast(expr) => {
+            let source =
+                lower_constant_expr_value(module, &expr.operand, body, temp_ordinal, lowering);
+            let dest = global_init_temp(temp_ordinal);
+            body.push(Stmt::Assign {
+                dest: dest.clone(),
+                sources: vec![source],
+                loc: None,
+            });
+            lowering.bump_modeled("global_init_assign");
+            dest
+        }
+        Constant::AddrSpaceCast(expr) => {
+            let source =
+                lower_constant_expr_value(module, &expr.operand, body, temp_ordinal, lowering);
+            let dest = global_init_temp(temp_ordinal);
+            body.push(Stmt::Assign {
+                dest: dest.clone(),
+                sources: vec![source],
+                loc: None,
+            });
+            lowering.bump_modeled("global_init_assign");
+            dest
+        }
+        Constant::GetElementPtr(expr) => {
+            let base =
+                lower_constant_expr_value(module, &expr.address, body, temp_ordinal, lowering);
+            let dest = global_init_temp(temp_ordinal);
+            body.push(Stmt::Gep {
+                dest: dest.clone(),
+                base,
+                byte_off: constant_gep_zero_offset(&expr.indices),
+                loc: None,
+            });
+            lowering.bump_modeled("global_init_gep");
+            dest
+        }
+        Constant::PtrToInt(expr) => {
+            let source =
+                lower_constant_expr_value(module, &expr.operand, body, temp_ordinal, lowering);
+            let dest = global_init_temp(temp_ordinal);
+            body.push(Stmt::PtrToInt {
+                dest: dest.clone(),
+                source,
+                loc: None,
+            });
+            lowering.bump_modeled("global_init_ptrtoint");
+            lowering.bump_tainted("global_initializer_ptrtoint");
+            dest
+        }
+        Constant::IntToPtr(expr) => {
+            let source = constant_value_key(&expr.operand);
+            let dest = global_init_temp(temp_ordinal);
+            body.push(Stmt::IntToPtr {
+                dest: dest.clone(),
+                source,
+                loc: None,
+            });
+            lowering.bump_modeled("global_init_inttoptr");
+            lowering.bump_tainted("global_initializer_inttoptr");
+            dest
+        }
+        Constant::Select(expr) => {
+            let true_value =
+                lower_constant_expr_value(module, &expr.true_value, body, temp_ordinal, lowering);
+            let false_value =
+                lower_constant_expr_value(module, &expr.false_value, body, temp_ordinal, lowering);
+            let dest = global_init_temp(temp_ordinal);
+            body.push(Stmt::Assign {
+                dest: dest.clone(),
+                sources: vec![true_value, false_value],
+                loc: None,
+            });
+            lowering.bump_modeled("global_init_select");
+            dest
+        }
+        _ => {
+            let dest = global_init_temp(temp_ordinal);
+            lowering.bump_tainted(format!(
+                "global_initializer_unmodeled_pointer_constant:{}",
+                constant_opcode(constant)
+            ));
+            push_unknown(
+                body,
+                format!("constant_expr:{}", constant_opcode(constant)),
+                constant_pointer_operand_keys(module, constant),
+                vec![dest.clone()],
+                "global_initializer_pointer_constant",
+                None,
+                lowering,
+            );
+            dest
+        }
     }
 }
 
@@ -1113,6 +1324,198 @@ fn gep_zero_offset(indices: &[Operand]) -> Option<i64> {
         Some(0)
     } else {
         None
+    }
+}
+
+fn constant_gep_zero_offset(indices: &[llvm_ir::constant::ConstantRef]) -> Option<i64> {
+    if indices
+        .iter()
+        .all(|constant| matches!(constant.as_ref(), Constant::Int { value: 0, .. }))
+    {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+fn global_init_temp(temp_ordinal: &mut u64) -> String {
+    let value = format!("@__global_init::{}", *temp_ordinal);
+    *temp_ordinal += 1;
+    value
+}
+
+fn constant_has_pointer_flow(module: &Module, constant: &Constant) -> bool {
+    match constant {
+        Constant::GlobalReference { .. } => true,
+        Constant::Struct { values, .. }
+        | Constant::Array {
+            elements: values, ..
+        }
+        | Constant::Vector(values) => values
+            .iter()
+            .any(|value| constant_has_pointer_flow(module, value)),
+        Constant::BitCast(expr) => {
+            constant_has_pointer_flow(module, &expr.operand) || is_pointer_like_type(&expr.to_type)
+        }
+        Constant::AddrSpaceCast(expr) => {
+            constant_has_pointer_flow(module, &expr.operand) || is_pointer_like_type(&expr.to_type)
+        }
+        Constant::GetElementPtr(_) => true,
+        Constant::PtrToInt(expr) => constant_has_pointer_flow(module, &expr.operand),
+        Constant::IntToPtr(_) => true,
+        Constant::ExtractElement(expr) => constant_has_pointer_flow(module, &expr.vector),
+        Constant::InsertElement(expr) => {
+            constant_has_pointer_flow(module, &expr.vector)
+                || constant_has_pointer_flow(module, &expr.element)
+        }
+        Constant::ShuffleVector(expr) => {
+            constant_has_pointer_flow(module, &expr.operand0)
+                || constant_has_pointer_flow(module, &expr.operand1)
+        }
+        Constant::ExtractValue(expr) => constant_has_pointer_flow(module, &expr.aggregate),
+        Constant::InsertValue(expr) => {
+            constant_has_pointer_flow(module, &expr.aggregate)
+                || constant_has_pointer_flow(module, &expr.element)
+        }
+        Constant::Select(expr) => {
+            constant_has_pointer_flow(module, &expr.true_value)
+                || constant_has_pointer_flow(module, &expr.false_value)
+        }
+        Constant::Null(_) | Constant::AggregateZero(_) | Constant::Undef(_) => false,
+        Constant::Poison(_) => false,
+        _ => is_pointer_like_type(&constant.get_type(&module.types)),
+    }
+}
+
+fn constant_pointer_operand_keys(module: &Module, constant: &Constant) -> Vec<String> {
+    let mut values = BTreeSet::new();
+    collect_constant_pointer_operand_keys(module, constant, &mut values);
+    values.into_iter().collect()
+}
+
+fn collect_constant_pointer_operand_keys(
+    module: &Module,
+    constant: &Constant,
+    out: &mut BTreeSet<String>,
+) {
+    match constant {
+        Constant::GlobalReference { .. } => {
+            out.insert(constant_value_key(constant));
+        }
+        Constant::Struct { values, .. }
+        | Constant::Array {
+            elements: values, ..
+        }
+        | Constant::Vector(values) => {
+            for value in values {
+                collect_constant_pointer_operand_keys(module, value, out);
+            }
+        }
+        Constant::BitCast(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.operand, out);
+        }
+        Constant::AddrSpaceCast(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.operand, out);
+        }
+        Constant::GetElementPtr(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.address, out);
+            for index in &expr.indices {
+                collect_constant_pointer_operand_keys(module, index, out);
+            }
+        }
+        Constant::PtrToInt(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.operand, out);
+        }
+        Constant::IntToPtr(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.operand, out);
+        }
+        Constant::ExtractElement(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.vector, out);
+            collect_constant_pointer_operand_keys(module, &expr.index, out);
+        }
+        Constant::InsertElement(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.vector, out);
+            collect_constant_pointer_operand_keys(module, &expr.element, out);
+            collect_constant_pointer_operand_keys(module, &expr.index, out);
+        }
+        Constant::ShuffleVector(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.operand0, out);
+            collect_constant_pointer_operand_keys(module, &expr.operand1, out);
+            collect_constant_pointer_operand_keys(module, &expr.mask, out);
+        }
+        Constant::ExtractValue(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.aggregate, out);
+        }
+        Constant::InsertValue(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.aggregate, out);
+            collect_constant_pointer_operand_keys(module, &expr.element, out);
+        }
+        Constant::Select(expr) => {
+            collect_constant_pointer_operand_keys(module, &expr.condition, out);
+            collect_constant_pointer_operand_keys(module, &expr.true_value, out);
+            collect_constant_pointer_operand_keys(module, &expr.false_value, out);
+        }
+        _ if is_pointer_like_type(&constant.get_type(&module.types)) => {
+            out.insert(constant_value_key(constant));
+        }
+        _ => {}
+    }
+}
+
+fn constant_opcode(constant: &Constant) -> &'static str {
+    match constant {
+        Constant::Int { .. } => "int",
+        Constant::Float(_) => "float",
+        Constant::Null(_) => "null",
+        Constant::AggregateZero(_) => "aggregate_zero",
+        Constant::Struct { .. } => "struct",
+        Constant::Array { .. } => "array",
+        Constant::Vector(_) => "vector",
+        Constant::Undef(_) => "undef",
+        Constant::Poison(_) => "poison",
+        Constant::BlockAddress => "block_address",
+        Constant::GlobalReference { .. } => "global_reference",
+        Constant::TokenNone => "token_none",
+        Constant::Add(_) => "add",
+        Constant::Sub(_) => "sub",
+        Constant::Mul(_) => "mul",
+        Constant::UDiv(_) => "udiv",
+        Constant::SDiv(_) => "sdiv",
+        Constant::URem(_) => "urem",
+        Constant::SRem(_) => "srem",
+        Constant::And(_) => "and",
+        Constant::Or(_) => "or",
+        Constant::Xor(_) => "xor",
+        Constant::Shl(_) => "shl",
+        Constant::LShr(_) => "lshr",
+        Constant::AShr(_) => "ashr",
+        Constant::FAdd(_) => "fadd",
+        Constant::FSub(_) => "fsub",
+        Constant::FMul(_) => "fmul",
+        Constant::FDiv(_) => "fdiv",
+        Constant::FRem(_) => "frem",
+        Constant::ExtractElement(_) => "extractelement",
+        Constant::InsertElement(_) => "insertelement",
+        Constant::ShuffleVector(_) => "shufflevector",
+        Constant::ExtractValue(_) => "extractvalue",
+        Constant::InsertValue(_) => "insertvalue",
+        Constant::GetElementPtr(_) => "getelementptr",
+        Constant::Trunc(_) => "trunc",
+        Constant::ZExt(_) => "zext",
+        Constant::SExt(_) => "sext",
+        Constant::FPTrunc(_) => "fptrunc",
+        Constant::FPExt(_) => "fpext",
+        Constant::FPToUI(_) => "fptoui",
+        Constant::FPToSI(_) => "fptosi",
+        Constant::UIToFP(_) => "uitofp",
+        Constant::SIToFP(_) => "sitofp",
+        Constant::PtrToInt(_) => "ptrtoint",
+        Constant::IntToPtr(_) => "inttoptr",
+        Constant::BitCast(_) => "bitcast",
+        Constant::AddrSpaceCast(_) => "addrspacecast",
+        Constant::ICmp(_) => "icmp",
+        Constant::FCmp(_) => "fcmp",
+        Constant::Select(_) => "select",
     }
 }
 

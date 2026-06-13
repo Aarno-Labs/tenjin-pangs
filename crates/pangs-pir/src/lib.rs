@@ -36,6 +36,8 @@ pub struct Pir {
     pub functions: Vec<Func>,
     #[serde(default)]
     pub globals: Vec<Global>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub global_init: Vec<Stmt>,
 }
 
 impl Pir {
