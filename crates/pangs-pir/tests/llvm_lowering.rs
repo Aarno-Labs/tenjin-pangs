@@ -212,6 +212,8 @@ fn lowers_global_initializer_pointer_flow_from_ll() {
 @Arr = global [4 x i8] zeroinitializer
 @GepPtr = global i8* getelementptr ([4 x i8], [4 x i8]* @Arr, i64 0, i64 1)
 @Table = global [2 x void ()*] [void ()* @target, void ()* @other]
+%Record = type { i32, void ()* }
+@Record = global %Record { i32 7, void ()* @target }
 
 define void @target() {
 entry:
@@ -261,16 +263,48 @@ entry:
             ..
         } if base == "@Arr"
     )));
-    assert_eq!(
-        pir.global_init
-            .iter()
-            .filter(|stmt| matches!(stmt, Stmt::Store { address, value, .. } if address == "@Table" && (value == "@target" || value == "@other")))
-            .count(),
-        2
-    );
-    assert!(pir.lowering.modeled_counts["global_init_store"] >= 5);
+    let second_table_slot = pir
+        .global_init
+        .iter()
+        .find_map(|stmt| match stmt {
+            Stmt::Gep {
+                dest,
+                base,
+                byte_off: Some(8),
+                ..
+            } if base == "@Table" => Some(dest.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == "@Table" && value == "@target"
+    )));
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == &second_table_slot && value == "@other"
+    )));
+    let record_field = pir
+        .global_init
+        .iter()
+        .find_map(|stmt| match stmt {
+            Stmt::Gep {
+                dest,
+                base,
+                byte_off: Some(8),
+                ..
+            } if base == "@Record" => Some(dest.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == &record_field && value == "@target"
+    )));
+    assert!(pir.lowering.modeled_counts["global_init_store"] >= 6);
     assert!(pir.lowering.modeled_counts["global_init_assign"] >= 1);
     assert_eq!(pir.lowering.modeled_counts["global_init_gep"], 1);
+    assert!(pir.lowering.modeled_counts["global_init_field_gep"] >= 2);
     assert_eq!(
         pir.lowering.modeled_counts["global_init_gep_byte_offset"],
         1

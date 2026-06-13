@@ -229,15 +229,56 @@ fn lower_global_initializer_value(
     lowering: &mut LoweringStats,
 ) -> bool {
     match constant {
-        Constant::Struct { values, .. }
-        | Constant::Array {
-            elements: values, ..
+        Constant::Struct {
+            values, is_packed, ..
         } => {
             let mut found = false;
-            for value in values {
-                found |= lower_global_initializer_value(
+            let element_types = values
+                .iter()
+                .map(|value| value.get_type(&module.types))
+                .collect::<Vec<_>>();
+            for (index, value) in values.iter().enumerate() {
+                let field_address = struct_field_address(
                     module,
                     address,
+                    &element_types,
+                    *is_packed,
+                    index,
+                    body,
+                    temp_ordinal,
+                    lowering,
+                );
+                found |= lower_global_initializer_value(
+                    module,
+                    &field_address,
+                    value,
+                    global_names,
+                    aliases,
+                    body,
+                    temp_ordinal,
+                    lowering,
+                );
+            }
+            found
+        }
+        Constant::Array {
+            element_type,
+            elements: values,
+        } => {
+            let mut found = false;
+            for (index, value) in values.iter().enumerate() {
+                let field_address = sequential_element_address(
+                    module,
+                    address,
+                    element_type,
+                    index,
+                    body,
+                    temp_ordinal,
+                    lowering,
+                );
+                found |= lower_global_initializer_value(
+                    module,
+                    &field_address,
                     value,
                     global_names,
                     aliases,
@@ -250,10 +291,25 @@ fn lower_global_initializer_value(
         }
         Constant::Vector(values) => {
             let mut found = false;
-            for value in values {
+            let element_type = values.first().map(|value| value.get_type(&module.types));
+            for (index, value) in values.iter().enumerate() {
+                let field_address = element_type
+                    .as_ref()
+                    .map(|element_type| {
+                        sequential_element_address(
+                            module,
+                            address,
+                            element_type,
+                            index,
+                            body,
+                            temp_ordinal,
+                            lowering,
+                        )
+                    })
+                    .unwrap_or_else(|| address.to_string());
                 found |= lower_global_initializer_value(
                     module,
-                    address,
+                    &field_address,
                     value,
                     global_names,
                     aliases,
@@ -287,6 +343,63 @@ fn lower_global_initializer_value(
             true
         }
         _ => false,
+    }
+}
+
+fn struct_field_address(
+    module: &Module,
+    base: &str,
+    element_types: &[TypeRef],
+    is_packed: bool,
+    index: usize,
+    body: &mut Vec<Stmt>,
+    temp_ordinal: &mut u64,
+    lowering: &mut LoweringStats,
+) -> String {
+    let byte_off = struct_field_offset(module, element_types, is_packed, index)
+        .and_then(|byte_off| i64::try_from(byte_off).ok());
+    global_init_element_address(base, byte_off, body, temp_ordinal, lowering)
+}
+
+fn sequential_element_address(
+    module: &Module,
+    base: &str,
+    element_type: &TypeRef,
+    index: usize,
+    body: &mut Vec<Stmt>,
+    temp_ordinal: &mut u64,
+    lowering: &mut LoweringStats,
+) -> String {
+    let byte_off = type_alloc_size(module, element_type)
+        .and_then(|stride| i128::from(stride).checked_mul(i128::try_from(index).ok()?))
+        .and_then(|byte_off| i64::try_from(byte_off).ok());
+    global_init_element_address(base, byte_off, body, temp_ordinal, lowering)
+}
+
+fn global_init_element_address(
+    base: &str,
+    byte_off: Option<i64>,
+    body: &mut Vec<Stmt>,
+    temp_ordinal: &mut u64,
+    lowering: &mut LoweringStats,
+) -> String {
+    match byte_off {
+        Some(0) => base.to_string(),
+        Some(byte_off) => {
+            let dest = global_init_temp(temp_ordinal);
+            body.push(Stmt::Gep {
+                dest: dest.clone(),
+                base: base.to_string(),
+                byte_off: Some(byte_off),
+                loc: None,
+            });
+            lowering.bump_modeled("global_init_field_gep");
+            dest
+        }
+        None => {
+            lowering.bump_skipped("global_init_aggregate_unknown_offset");
+            base.to_string()
+        }
     }
 }
 
