@@ -10,7 +10,7 @@ use llvm_ir::instruction::{
     Load, Phi, PtrToInt, Select, ShuffleVector, Store,
 };
 use llvm_ir::module::{DLLStorageClass, GlobalAlias, Linkage, Visibility};
-use llvm_ir::terminator::{Invoke, Terminator};
+use llvm_ir::terminator::{CallBr, Invoke, Terminator};
 use llvm_ir::types::{FPType, NamedStructDef, Type, TypeRef, Typed};
 use llvm_ir::{DebugLoc, Function, Module, Name, Operand};
 
@@ -879,24 +879,9 @@ fn lower_terminator(
             lowering.bump_modeled("return");
             bump_missing_loc(lowering, "return", ret.debugloc.as_ref());
         }
-        Terminator::CallBr(callbr) => {
-            lowering.bump_tainted("callbr");
-            if let Either::Left(_) = &callbr.function {
-                push_unknown(
-                    body,
-                    "callbr",
-                    callbr
-                        .arguments
-                        .iter()
-                        .map(|(arg, _)| operand_value_key(func_name, arg))
-                        .collect(),
-                    vec![local_value_key(func_name, &callbr.result)],
-                    "inline_asm_callbr",
-                    loc(callbr.debugloc.as_ref()),
-                    lowering,
-                );
-            }
-        }
+        Terminator::CallBr(callbr) => lower_callbr(
+            module, func_name, callbr, func_names, aliases, body, lowering,
+        ),
         _ => {}
     }
 }
@@ -1080,6 +1065,72 @@ fn lower_invoke(
         }
     }
     bump_missing_loc(lowering, "invoke", invoke.debugloc.as_ref());
+}
+
+fn lower_callbr(
+    module: &Module,
+    func_name: &str,
+    callbr: &CallBr,
+    func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    lowering.bump_tainted("callbr");
+    if let Either::Left(_) = &callbr.function {
+        push_unknown(
+            body,
+            "callbr",
+            callbr
+                .arguments
+                .iter()
+                .map(|(arg, _)| operand_value_key(func_name, arg))
+                .collect(),
+            vec![local_value_key(func_name, &callbr.result)],
+            "inline_asm_callbr",
+            loc(callbr.debugloc.as_ref()),
+            lowering,
+        );
+        bump_missing_loc(lowering, "callbr", callbr.debugloc.as_ref());
+        return;
+    }
+
+    let Some(sig) = call_signature_from_operand(
+        module,
+        &callbr.function,
+        callbr.arguments.iter().map(|a| &a.1),
+        callbr.calling_convention,
+        lowering,
+    ) else {
+        lowering.bump_skipped("callbr_without_function_signature");
+        bump_missing_loc(lowering, "callbr", callbr.debugloc.as_ref());
+        return;
+    };
+
+    match called_function_name(&callbr.function) {
+        Some(callee) if is_skipped_intrinsic(&callee) => {}
+        Some(callee) if resolve_function_name(&callee, func_names, aliases).is_some() => {
+            let resolved = resolve_function_name(&callee, func_names, aliases).unwrap();
+            if resolved != callee {
+                lowering.bump_modeled("alias_call_direct");
+            }
+            body.push(Stmt::CallDirect {
+                callee: resolved,
+                sig,
+                loc: loc(callbr.debugloc.as_ref()),
+            });
+            lowering.bump_modeled("call_direct");
+        }
+        _ => {
+            body.push(Stmt::CallIndirect {
+                operand: operand_key_either(func_name, &callbr.function),
+                sig,
+                loc: loc(callbr.debugloc.as_ref()),
+            });
+            lowering.bump_modeled("call_indirect");
+        }
+    }
+    bump_missing_loc(lowering, "callbr", callbr.debugloc.as_ref());
 }
 
 fn lower_ifunc_call(
@@ -2590,7 +2641,10 @@ fn name_key(name: &Name) -> String {
 
 #[cfg(test)]
 mod tests {
+    use either::Either;
+    use llvm_ir::instruction::InlineAssembly;
     use llvm_ir::module::{ThreadLocalMode, UnnamedAddr};
+    use llvm_ir::terminator::CallBr;
 
     use super::*;
 
@@ -2660,6 +2714,88 @@ entry:
         assert_eq!(lowering.modeled_counts["alias_global_resolved"], 1);
         assert_eq!(lowering.tainted_counts["alias_interposable:WeakAlias"], 1);
         assert_eq!(lowering.tainted_counts["alias_unresolved:MissingAlias"], 1);
+    }
+
+    #[test]
+    fn lower_callbr_models_direct_targets_and_taints_inline_asm() {
+        let module = Module::from_ir_str(
+            r#"
+declare i32 @target(i32)
+define i32 @caller(i32 %x) {
+entry:
+  ret i32 %x
+}
+"#,
+        )
+        .unwrap();
+        let i32_ty = module.types.i32();
+        let func_ty = module
+            .types
+            .func_type(i32_ty.clone(), vec![i32_ty.clone()], false);
+        let target = Operand::ConstantOperand(ConstantRef::new(Constant::GlobalReference {
+            name: Name::from("target"),
+            ty: func_ty.clone(),
+        }));
+        let arg = Operand::LocalOperand {
+            name: Name::from("x"),
+            ty: i32_ty.clone(),
+        };
+
+        let mut body = Vec::new();
+        let mut lowering = LoweringStats::default();
+        lower_callbr(
+            &module,
+            "caller",
+            &CallBr {
+                function: Either::Right(target),
+                arguments: vec![(arg.clone(), Vec::new())],
+                return_attributes: Vec::new(),
+                result: Name::from("res"),
+                return_label: Name::from("normal"),
+                other_labels: (),
+                function_attributes: Vec::new(),
+                calling_convention: CallingConvention::C,
+                debugloc: None,
+            },
+            &BTreeSet::from(["target".to_string()]),
+            &AliasMap::default(),
+            &mut body,
+            &mut lowering,
+        );
+
+        assert!(body.iter().any(|stmt| matches!(
+            stmt,
+            Stmt::CallDirect { callee, .. } if callee == "target"
+        )));
+        assert_eq!(lowering.tainted_counts["callbr"], 1);
+        assert_eq!(lowering.modeled_counts["call_direct"], 1);
+
+        body.clear();
+        lower_callbr(
+            &module,
+            "caller",
+            &CallBr {
+                function: Either::Left(InlineAssembly { ty: func_ty }),
+                arguments: vec![(arg, Vec::new())],
+                return_attributes: Vec::new(),
+                result: Name::from("asmres"),
+                return_label: Name::from("normal"),
+                other_labels: (),
+                function_attributes: Vec::new(),
+                calling_convention: CallingConvention::C,
+                debugloc: None,
+            },
+            &BTreeSet::new(),
+            &AliasMap::default(),
+            &mut body,
+            &mut lowering,
+        );
+
+        assert!(body.iter().any(|stmt| matches!(
+            stmt,
+            Stmt::Unknown { op, reason, .. } if op == "callbr" && reason == "inline_asm_callbr"
+        )));
+        assert_eq!(lowering.tainted_counts["callbr"], 2);
     }
 
     fn test_alias(

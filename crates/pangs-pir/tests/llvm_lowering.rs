@@ -486,6 +486,47 @@ entry:
 }
 
 #[test]
+fn lowers_invoke_as_direct_call_and_taints_exception_flow() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("invoke.ll");
+    fs::write(
+        &ll_path,
+        r#"
+declare i32 @may_throw()
+declare i32 @__gxx_personality_v0(...)
+
+define i32 @caller() personality i32 (...)* @__gxx_personality_v0 {
+entry:
+  %res = invoke i32 @may_throw() to label %ok unwind label %lpad
+
+ok:
+  ret i32 %res
+
+lpad:
+  %lp = landingpad { i8*, i32 }
+          cleanup
+  ret i32 0
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    let caller = pir.functions.iter().find(|f| f.key == "caller").unwrap();
+    assert!(caller.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::CallDirect { callee, sig, .. }
+            if callee == "may_throw" && sig.ret == pangs_pir::AbiClass::Integer
+    )));
+    assert_eq!(pir.lowering.terminator_counts["invoke"], 1);
+    assert_eq!(
+        pir.lowering.tainted_counts["invoke_exception_control_flow"],
+        1
+    );
+    assert_eq!(pir.lowering.tainted_counts["personality_function"], 1);
+}
+
+#[test]
 fn taints_pointer_vectors_and_models_aggregate_pointer_fields() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("aggregate_eh.ll");
