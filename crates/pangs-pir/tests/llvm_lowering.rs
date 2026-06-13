@@ -2,10 +2,14 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use pangs_pir::{Param, Pir, Stmt};
+use pangs_pir::{LlvmBackend, Param, Pir, Stmt};
 use tempfile::TempDir;
 
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
+
+fn pir_from_llvm_sys(path: &Path) -> Pir {
+    Pir::from_path_with_backend(path, LlvmBackend::LlvmSys).unwrap()
+}
 
 #[test]
 fn lowers_llvm14_bitcode_function_pointer_smoke() {
@@ -84,6 +88,82 @@ void driver(void) {
 }
 
 #[test]
+fn llvm_sys_lowers_llvm14_bitcode_function_pointer_smoke() {
+    assert!(
+        Path::new(CLANG_14).exists(),
+        "LLVM-14 clang is required for the M1.1 lowering smoke test"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let c_path = tmp.path().join("fp.c");
+    let bc_path = tmp.path().join("fp.bc");
+    fs::write(
+        &c_path,
+        r#"
+int g_counter;
+void target(long value);
+void (*fp)(long) = target;
+
+void target(long value) {
+  g_counter = (int)value;
+}
+
+void driver(void) {
+  fp(7);
+}
+"#,
+    )
+    .unwrap();
+
+    let status = Command::new(CLANG_14)
+        .arg("-O0")
+        .arg("-g")
+        .arg("-emit-llvm")
+        .arg("-c")
+        .arg(&c_path)
+        .arg("-o")
+        .arg(&bc_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let pir = pir_from_llvm_sys(&bc_path);
+    let target = pir.functions.iter().find(|f| f.key == "target").unwrap();
+    assert!(target.address_taken);
+    assert!(target
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Alloca { .. })));
+    assert!(target
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Load { .. })));
+    assert!(target
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Store { .. })));
+    assert!(target
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Return { .. })));
+
+    let driver = pir.functions.iter().find(|f| f.key == "driver").unwrap();
+    assert!(driver
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::CallIndirect { .. })));
+
+    assert!(pir
+        .globals
+        .iter()
+        .any(|global| global.key == "g_counter" && global.mutable));
+    assert!(pir.lowering.instruction_counts["alloca"] >= 1);
+    assert!(pir.lowering.modeled_counts["load"] >= 1);
+    assert!(pir.lowering.modeled_counts["store"] >= 1);
+    assert_eq!(pir.lowering.globals, 2);
+}
+
+#[test]
 fn lowers_large_struct_byval_and_sret_from_bitcode() {
     assert!(
         Path::new(CLANG_14).exists(),
@@ -126,6 +206,68 @@ struct Big ret_big(void *p, void *q, void *r) {
     assert!(status.success());
 
     let pir = Pir::from_path(&bc_path).unwrap();
+    let ret_big = pir.functions.iter().find(|f| f.key == "ret_big").unwrap();
+    assert!(matches!(
+        ret_big.sig.params.first(),
+        Some(Param::Sret { size: 24 })
+    ));
+    assert!(ret_big.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::CallDirect { callee, sig, .. }
+            if callee == "sink"
+                && matches!(sig.params.as_slice(), [Param::Byval { size: 24 }])
+    )));
+    let sink = pir.functions.iter().find(|f| f.key == "sink").unwrap();
+    assert!(sink.external);
+    assert!(matches!(
+        sink.sig.params.as_slice(),
+        [Param::Byval { size: 24 }]
+    ));
+}
+
+#[test]
+fn llvm_sys_lowers_large_struct_byval_and_sret_from_bitcode() {
+    assert!(
+        Path::new(CLANG_14).exists(),
+        "LLVM-14 clang is required for the M1.1 lowering ABI fixture"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let c_path = tmp.path().join("agg.c");
+    let bc_path = tmp.path().join("agg.bc");
+    fs::write(
+        &c_path,
+        r#"
+struct Big {
+  void *a;
+  void *b;
+  void *c;
+};
+
+extern void sink(struct Big);
+
+struct Big ret_big(void *p, void *q, void *r) {
+  struct Big x = {p, q, r};
+  sink(x);
+  return x;
+}
+"#,
+    )
+    .unwrap();
+
+    let status = Command::new(CLANG_14)
+        .arg("-O0")
+        .arg("-g0")
+        .arg("-emit-llvm")
+        .arg("-c")
+        .arg(&c_path)
+        .arg("-o")
+        .arg(&bc_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let pir = pir_from_llvm_sys(&bc_path);
     let ret_big = pir.functions.iter().find(|f| f.key == "ret_big").unwrap();
     assert!(matches!(
         ret_big.sig.params.first(),
@@ -290,7 +432,120 @@ entry:
     )
     .unwrap();
 
-    let pir = Pir::from_path(&ll_path).unwrap();
+    let pir = pir_from_llvm_sys(&ll_path);
+    assert!(
+        pir.functions
+            .iter()
+            .find(|f| f.key == "target")
+            .unwrap()
+            .address_taken
+    );
+    assert!(
+        pir.functions
+            .iter()
+            .find(|f| f.key == "other")
+            .unwrap()
+            .address_taken
+    );
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == "@FP" && value == "@target"
+    )));
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == "@GPtr" && value == "@G"
+    )));
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Assign { sources, .. } if sources == &vec!["@target".to_string()]
+    )));
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Gep {
+            base,
+            byte_off: Some(1),
+            ..
+        } if base == "@Arr"
+    )));
+    let second_table_slot = pir
+        .global_init
+        .iter()
+        .find_map(|stmt| match stmt {
+            Stmt::Gep {
+                dest,
+                base,
+                byte_off: Some(8),
+                ..
+            } if base == "@Table" => Some(dest.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == "@Table" && value == "@target"
+    )));
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == &second_table_slot && value == "@other"
+    )));
+    let record_field = pir
+        .global_init
+        .iter()
+        .find_map(|stmt| match stmt {
+            Stmt::Gep {
+                dest,
+                base,
+                byte_off: Some(8),
+                ..
+            } if base == "@Record" => Some(dest.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == &record_field && value == "@target"
+    )));
+    assert!(pir.lowering.modeled_counts["global_init_store"] >= 6);
+    assert!(pir.lowering.modeled_counts["global_init_assign"] >= 1);
+    assert_eq!(pir.lowering.modeled_counts["global_init_gep"], 1);
+    assert!(pir.lowering.modeled_counts["global_init_field_gep"] >= 2);
+    assert_eq!(
+        pir.lowering.modeled_counts["global_init_gep_byte_offset"],
+        1
+    );
+}
+
+#[test]
+fn llvm_sys_lowers_global_initializer_pointer_flow_from_ll() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("global_init.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@G = global i32 0
+@FP = global void ()* @target
+@FPCast = global i8* bitcast (void ()* @target to i8*)
+@GPtr = global i32* @G
+@Arr = global [4 x i8] zeroinitializer
+@GepPtr = global i8* getelementptr ([4 x i8], [4 x i8]* @Arr, i64 0, i64 1)
+@Table = global [2 x void ()*] [void ()* @target, void ()* @other]
+%Record = type { i32, void ()* }
+@Record = global %Record { i32 7, void ()* @target }
+
+define void @target() {
+entry:
+  ret void
+}
+
+define void @other() {
+entry:
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
     assert!(
         pir.functions
             .iter()

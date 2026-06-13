@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod llvm;
+mod llvm_sys;
 
 #[derive(Debug, Error)]
 pub enum PirError {
@@ -42,12 +43,22 @@ pub struct Pir {
 
 impl Pir {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, PirError> {
+        Self::from_path_with_backend(path, LlvmBackend::LlvmIr)
+    }
+
+    pub fn from_path_with_backend(
+        path: impl AsRef<Path>,
+        backend: LlvmBackend,
+    ) -> Result<Self, PirError> {
         let path = path.as_ref();
         if matches!(
             path.extension().and_then(|ext| ext.to_str()),
             Some("bc" | "ll")
         ) {
-            return llvm::lower_path(path);
+            return match backend {
+                LlvmBackend::LlvmIr => llvm::lower_path(path),
+                LlvmBackend::LlvmSys => llvm_sys::lower_path(path),
+            };
         }
         let data = fs::read_to_string(path).map_err(|source| PirError::Read {
             path: path.display().to_string(),
@@ -58,6 +69,12 @@ impl Pir {
             source,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlvmBackend {
+    LlvmIr,
+    LlvmSys,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

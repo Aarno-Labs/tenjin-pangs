@@ -324,42 +324,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a44e38b5a8002de59bc4c5717f5f07dcf8f132d1281bb7be1befdeda1b943438"
 dependencies = [
  "either",
- "llvm-sys 120.3.2",
- "llvm-sys 130.1.2",
- "llvm-sys 140.1.3",
- "llvm-sys 150.2.1",
- "llvm-sys 160.2.1",
- "llvm-sys 170.4.0",
- "llvm-sys 181.3.0",
- "llvm-sys 191.1.0",
+ "llvm-sys",
  "log",
  "ordered-float",
-]
-
-[[package]]
-name = "llvm-sys"
-version = "120.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "624f2692f436769c7eb85a13eeca3f6fb9705a4b2bd0473ac9577c90f19e21ef"
-dependencies = [
- "cc",
- "lazy_static",
- "libc",
- "regex",
- "semver 0.11.0",
-]
-
-[[package]]
-name = "llvm-sys"
-version = "130.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c20142c91fc4bde4036edbaf0d112f79667831d612efbaabe862ab9748fdd67c"
-dependencies = [
- "cc",
- "lazy_static",
- "libc",
- "regex",
- "semver 0.11.0",
 ]
 
 [[package]]
@@ -372,75 +339,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "regex",
- "semver 1.0.28",
-]
-
-[[package]]
-name = "llvm-sys"
-version = "150.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa55828745895d37233756307ded95a235b058aeb89cd12717ec7c3912089ee9"
-dependencies = [
- "cc",
- "lazy_static",
- "libc",
- "regex",
- "semver 1.0.28",
-]
-
-[[package]]
-name = "llvm-sys"
-version = "160.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e73861901245d32e1c3d8b35b639cf100859b4cd0c9da56fe0273040acbb3ea4"
-dependencies = [
- "cc",
- "lazy_static",
- "libc",
- "regex",
- "semver 1.0.28",
-]
-
-[[package]]
-name = "llvm-sys"
-version = "170.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a5e5f51e78d53a09a9e7763d700d34859f3cc45a8fb9eaad2e8555bc84ff2a0"
-dependencies = [
- "anyhow",
- "cc",
- "lazy_static",
- "libc",
- "regex-lite",
- "semver 1.0.28",
-]
-
-[[package]]
-name = "llvm-sys"
-version = "181.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e24aad69cbdb0c6ebe777262e9e6314dceba0d6e6a2a63e47563ccd293a2eda8"
-dependencies = [
- "anyhow",
- "cc",
- "lazy_static",
- "libc",
- "regex-lite",
- "semver 1.0.28",
-]
-
-[[package]]
-name = "llvm-sys"
-version = "191.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0ad1fffbdac72a40b55aa58b31aa0efe925e277941b6705f128692b27f1d506"
-dependencies = [
- "anyhow",
- "cc",
- "lazy_static",
- "libc",
- "regex-lite",
- "semver 1.0.28",
+ "semver",
 ]
 
 [[package]]
@@ -529,6 +428,7 @@ version = "0.1.0"
 dependencies = [
  "either",
  "llvm-ir",
+ "llvm-sys",
  "serde",
  "serde_json",
  "tempfile",
@@ -546,16 +446,6 @@ dependencies = [
  "anyhow",
  "pangs-api",
  "pangs-pir",
-]
-
-[[package]]
-name = "pest"
-version = "2.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0848c601009d37dfa3430c4666e147e49cdcf1b92ecd3e63657d8a5f19da662"
-dependencies = [
- "memchr",
- "ucd-trie",
 ]
 
 [[package]]
@@ -616,12 +506,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "regex-lite"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53a49587ad06b26609c52e423de037e7f57f20d53535d66e08c695f347df952a"
-
-[[package]]
 name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -642,27 +526,9 @@ dependencies = [
 
 [[package]]
 name = "semver"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f301af10236f6df4160f7c3f04eec6dbc70ace82d23326abad5edee88801c6b6"
-dependencies = [
- "semver-parser",
-]
-
-[[package]]
-name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-
-[[package]]
-name = "semver-parser"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9900206b54a3527fdc7b8a938bffd94a568bac4f4aa8113b209df75a09c0dec2"
-dependencies = [
- "pest",
-]
 
 [[package]]
 name = "serde"
@@ -781,12 +647,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
-name = "ucd-trie"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -859,7 +719,7 @@ dependencies = [
  "bitflags",
  "hashbrown 0.15.5",
  "indexmap",
- "semver 1.0.28",
+ "semver",
 ]
 
 [[package]]
@@ -963,7 +823,7 @@ dependencies = [
  "id-arena",
  "indexmap",
  "log",
- "semver 1.0.28",
+ "semver",
  "serde",
  "serde_derive",
  "serde_json",
