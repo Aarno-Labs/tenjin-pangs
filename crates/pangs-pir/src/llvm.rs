@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use either::Either;
-use llvm_ir::constant::Constant;
+use llvm_ir::constant::{Constant, ConstantRef};
 use llvm_ir::function::{CallingConvention, FunctionDeclaration, ParameterAttribute};
 use llvm_ir::instruction::{
     AddrSpaceCast, Alloca, AtomicRMW, BitCast, Call, CmpXchg, Freeze, GetElementPtr,
@@ -10,7 +10,7 @@ use llvm_ir::instruction::{
 };
 use llvm_ir::module::{DLLStorageClass, Linkage, Visibility};
 use llvm_ir::terminator::{Invoke, Terminator};
-use llvm_ir::types::{FPType, Type, TypeRef, Typed};
+use llvm_ir::types::{FPType, NamedStructDef, Type, TypeRef, Typed};
 use llvm_ir::{DebugLoc, Function, Module, Name, Operand};
 
 use crate::{
@@ -271,7 +271,7 @@ fn lower_constant_expr_value(
             body.push(Stmt::Gep {
                 dest: dest.clone(),
                 base,
-                byte_off: constant_gep_zero_offset(&expr.indices),
+                byte_off: constant_gep_byte_offset(module, expr, lowering),
                 loc: None,
             });
             lowering.bump_modeled("global_init_gep");
@@ -543,7 +543,7 @@ fn lower_instruction(
         Instruction::Store(store) => lower_store(func_name, store, global_names, body, lowering),
         Instruction::CmpXchg(cmpxchg) => lower_cmpxchg(func_name, cmpxchg, body, lowering),
         Instruction::AtomicRMW(atomicrmw) => lower_atomicrmw(func_name, atomicrmw, body, lowering),
-        Instruction::GetElementPtr(gep) => lower_gep(func_name, gep, body, lowering),
+        Instruction::GetElementPtr(gep) => lower_gep(module, func_name, gep, body, lowering),
         Instruction::PtrToInt(cast) => lower_ptr_to_int(func_name, cast, body, lowering),
         Instruction::IntToPtr(cast) => lower_int_to_ptr(func_name, cast, body, lowering),
         Instruction::BitCast(cast) => lower_bitcast(module, func_name, cast, body, lowering),
@@ -871,6 +871,7 @@ fn lower_atomicrmw(
 }
 
 fn lower_gep(
+    module: &Module,
     func_name: &str,
     gep: &GetElementPtr,
     body: &mut Vec<Stmt>,
@@ -879,7 +880,7 @@ fn lower_gep(
     body.push(Stmt::Gep {
         dest: local_value_key(func_name, &gep.dest),
         base: operand_value_key(func_name, &gep.address),
-        byte_off: gep_zero_offset(&gep.indices),
+        byte_off: gep_byte_offset(module, &gep.source_element_type, &gep.indices, lowering),
         loc: loc(gep.debugloc.as_ref()),
     });
     lowering.bump_modeled("gep");
@@ -1316,25 +1317,301 @@ fn constant_int(operand: &Operand) -> Option<u64> {
     }
 }
 
-fn gep_zero_offset(indices: &[Operand]) -> Option<i64> {
-    if indices
+fn gep_byte_offset(
+    module: &Module,
+    source_element_type: &TypeRef,
+    indices: &[Operand],
+    lowering: &mut LoweringStats,
+) -> Option<i64> {
+    let indices = indices
         .iter()
-        .all(|operand| matches!(constant_int(operand), Some(0)))
-    {
-        Some(0)
+        .map(constant_i64_from_operand)
+        .collect::<Option<Vec<_>>>();
+    let Some(indices) = indices else {
+        lowering.bump_skipped("gep_dynamic_index");
+        return None;
+    };
+    let result = gep_offset_from_indices(module, source_element_type, &indices);
+    if result.is_some() {
+        lowering.bump_modeled("gep_byte_offset");
     } else {
-        None
+        lowering.bump_skipped("gep_unsupported_offset");
+    }
+    result
+}
+
+fn constant_gep_byte_offset(
+    module: &Module,
+    gep: &llvm_ir::constant::GetElementPtr,
+    lowering: &mut LoweringStats,
+) -> Option<i64> {
+    let Some(source_element_type) = pointer_pointee_type(&gep.address.get_type(&module.types))
+    else {
+        lowering.bump_skipped("constant_gep_non_pointer_base");
+        return None;
+    };
+    let indices = gep
+        .indices
+        .iter()
+        .map(constant_i64)
+        .collect::<Option<Vec<_>>>();
+    let Some(indices) = indices else {
+        lowering.bump_skipped("constant_gep_dynamic_index");
+        return None;
+    };
+    let result = gep_offset_from_indices(module, &source_element_type, &indices);
+    if result.is_some() {
+        lowering.bump_modeled("global_init_gep_byte_offset");
+    } else {
+        lowering.bump_skipped("constant_gep_unsupported_offset");
+    }
+    result
+}
+
+fn gep_offset_from_indices(
+    module: &Module,
+    source_element_type: &TypeRef,
+    indices: &[i64],
+) -> Option<i64> {
+    let mut offset = 0_i128;
+    let mut current = source_element_type.clone();
+
+    for (idx_pos, index) in indices.iter().copied().enumerate() {
+        if idx_pos == 0 {
+            let size = i128::from(type_alloc_size(module, &current)?);
+            offset = offset.checked_add(i128::from(index).checked_mul(size)?)?;
+            continue;
+        }
+
+        current = resolve_named_type(module, &current)?;
+        match current.as_ref() {
+            Type::ArrayType { element_type, .. } => {
+                let stride = i128::from(type_alloc_size(module, element_type)?);
+                offset = offset.checked_add(i128::from(index).checked_mul(stride)?)?;
+                current = element_type.clone();
+            }
+            Type::StructType {
+                element_types,
+                is_packed,
+            } => {
+                if index < 0 {
+                    return None;
+                }
+                let field_index = usize::try_from(index).ok()?;
+                if field_index >= element_types.len() {
+                    return None;
+                }
+                offset = offset.checked_add(i128::from(struct_field_offset(
+                    module,
+                    element_types,
+                    *is_packed,
+                    field_index,
+                )?))?;
+                current = element_types[field_index].clone();
+            }
+            Type::VectorType {
+                element_type,
+                scalable,
+                ..
+            } => {
+                if *scalable {
+                    return None;
+                }
+                let stride = i128::from(type_alloc_size(module, element_type)?);
+                offset = offset.checked_add(i128::from(index).checked_mul(stride)?)?;
+                current = element_type.clone();
+            }
+            _ => return None,
+        }
+    }
+
+    i64::try_from(offset).ok()
+}
+
+fn struct_field_offset(
+    module: &Module,
+    element_types: &[TypeRef],
+    is_packed: bool,
+    field_index: usize,
+) -> Option<u64> {
+    let mut offset = 0_u64;
+    for (idx, element_type) in element_types.iter().enumerate() {
+        if !is_packed {
+            offset = align_to(offset, type_abi_align(module, element_type)?)?;
+        }
+        if idx == field_index {
+            return Some(offset);
+        }
+        offset = offset.checked_add(type_alloc_size(module, element_type)?)?;
+    }
+    None
+}
+
+fn type_alloc_size(module: &Module, ty: &TypeRef) -> Option<u64> {
+    let ty = resolve_named_type(module, ty)?;
+    let store_size = type_store_size(module, &ty)?;
+    let align = type_abi_align(module, &ty)?;
+    align_to(store_size, align)
+}
+
+fn type_store_size(module: &Module, ty: &TypeRef) -> Option<u64> {
+    let ty = resolve_named_type(module, ty)?;
+    match ty.as_ref() {
+        Type::VoidType => Some(0),
+        Type::IntegerType { bits } => Some(u64::from(*bits).div_ceil(8)),
+        Type::PointerType { addr_space, .. } => Some(u64::from(
+            module
+                .data_layout
+                .alignments
+                .ptr_alignment(*addr_space)
+                .size
+                .div_ceil(8),
+        )),
+        Type::FPType(fpt) => Some(u64::from(fp_size_bits(*fpt).div_ceil(8))),
+        Type::ArrayType {
+            element_type,
+            num_elements,
+        } => type_alloc_size(module, element_type)?.checked_mul(*num_elements as u64),
+        Type::StructType {
+            element_types,
+            is_packed,
+        } => {
+            let mut offset = 0_u64;
+            let mut max_align = 1_u64;
+            for element_type in element_types {
+                let align = if *is_packed {
+                    1
+                } else {
+                    type_abi_align(module, element_type)?
+                };
+                max_align = max_align.max(align);
+                offset = align_to(offset, align)?;
+                offset = offset.checked_add(type_alloc_size(module, element_type)?)?;
+            }
+            if *is_packed {
+                Some(offset)
+            } else {
+                align_to(offset, max_align)
+            }
+        }
+        Type::VectorType {
+            element_type,
+            num_elements,
+            scalable,
+        } => {
+            if *scalable {
+                None
+            } else {
+                type_store_size(module, element_type)?.checked_mul(*num_elements as u64)
+            }
+        }
+        Type::FuncType { .. } => None,
+        Type::NamedStructType { .. } => unreachable!("named structs are resolved above"),
+        Type::X86_MMXType => Some(8),
+        Type::X86_AMXType => None,
+        Type::MetadataType | Type::LabelType | Type::TokenType => None,
     }
 }
 
-fn constant_gep_zero_offset(indices: &[llvm_ir::constant::ConstantRef]) -> Option<i64> {
-    if indices
-        .iter()
-        .all(|constant| matches!(constant.as_ref(), Constant::Int { value: 0, .. }))
-    {
-        Some(0)
+fn type_abi_align(module: &Module, ty: &TypeRef) -> Option<u64> {
+    let ty = resolve_named_type(module, ty)?;
+    match ty.as_ref() {
+        Type::VoidType => Some(1),
+        Type::StructType {
+            element_types,
+            is_packed,
+        } => {
+            if *is_packed {
+                Some(1)
+            } else {
+                element_types
+                    .iter()
+                    .try_fold(1_u64, |max_align, element_type| {
+                        Some(max_align.max(type_abi_align(module, element_type)?))
+                    })
+            }
+        }
+        Type::ArrayType { element_type, .. } => type_abi_align(module, element_type),
+        Type::FuncType { .. } => None,
+        Type::MetadataType | Type::LabelType | Type::TokenType | Type::X86_AMXType => None,
+        _ => Some(
+            u64::from(
+                module
+                    .data_layout
+                    .alignments
+                    .type_alignment(ty.as_ref())
+                    .abi
+                    .div_ceil(8),
+            )
+            .max(1),
+        ),
+    }
+}
+
+fn resolve_named_type(module: &Module, ty: &TypeRef) -> Option<TypeRef> {
+    match ty.as_ref() {
+        Type::NamedStructType { name } => match module.types.named_struct_def(name)? {
+            NamedStructDef::Defined(ty) => Some(ty.clone()),
+            NamedStructDef::Opaque => None,
+        },
+        _ => Some(ty.clone()),
+    }
+}
+
+fn pointer_pointee_type(ty: &TypeRef) -> Option<TypeRef> {
+    match ty.as_ref() {
+        Type::PointerType { pointee_type, .. } => Some(pointee_type.clone()),
+        _ => None,
+    }
+}
+
+fn align_to(value: u64, align: u64) -> Option<u64> {
+    if align <= 1 {
+        return Some(value);
+    }
+    let remainder = value % align;
+    if remainder == 0 {
+        Some(value)
     } else {
-        None
+        value.checked_add(align - remainder)
+    }
+}
+
+fn fp_size_bits(fpt: FPType) -> u32 {
+    match fpt {
+        FPType::Half => 16,
+        FPType::BFloat => 16,
+        FPType::Single => 32,
+        FPType::Double => 64,
+        FPType::FP128 => 128,
+        FPType::X86_FP80 => 80,
+        FPType::PPC_FP128 => 128,
+    }
+}
+
+fn constant_i64_from_operand(operand: &Operand) -> Option<i64> {
+    constant_i64_value(operand.as_constant()?)
+}
+
+fn constant_i64(constant: &ConstantRef) -> Option<i64> {
+    constant_i64_value(constant.as_ref())
+}
+
+fn constant_i64_value(constant: &Constant) -> Option<i64> {
+    let Constant::Int { bits, value } = constant else {
+        return None;
+    };
+    if *bits == 0 || *bits > 64 {
+        return None;
+    }
+    let sign_bit = 1_u64.checked_shl(bits - 1)?;
+    if value & sign_bit == 0 {
+        i64::try_from(*value).ok()
+    } else if *bits == 64 {
+        Some(*value as i64)
+    } else {
+        let extended = value | (!0_u64).checked_shl(*bits)?;
+        Some(extended as i64)
     }
 }
 

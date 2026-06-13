@@ -257,7 +257,7 @@ entry:
         stmt,
         Stmt::Gep {
             base,
-            byte_off: None,
+            byte_off: Some(1),
             ..
         } if base == "@Arr"
     )));
@@ -271,4 +271,73 @@ entry:
     assert!(pir.lowering.modeled_counts["global_init_store"] >= 5);
     assert!(pir.lowering.modeled_counts["global_init_assign"] >= 1);
     assert_eq!(pir.lowering.modeled_counts["global_init_gep"], 1);
+    assert_eq!(
+        pir.lowering.modeled_counts["global_init_gep_byte_offset"],
+        1
+    );
+}
+
+#[test]
+fn computes_gep_byte_offsets_from_ll() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("gep_offsets.ll");
+    fs::write(
+        &ll_path,
+        r#"
+%S = type { i8, i32, i8* }
+%Inner = type { i16, i8* }
+%Outer = type { i8, [3 x %Inner] }
+
+define void @gep_offsets(i32* %arr, %S* %s, %Outer* %o, i64 %idx) {
+entry:
+  %arr_gep = getelementptr i32, i32* %arr, i64 3
+  %struct_gep = getelementptr %S, %S* %s, i64 0, i32 1
+  %nested_gep = getelementptr %Outer, %Outer* %o, i64 0, i32 1, i64 2, i32 1
+  %dynamic_gep = getelementptr i32, i32* %arr, i64 %idx
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    let func = pir
+        .functions
+        .iter()
+        .find(|f| f.key == "gep_offsets")
+        .unwrap();
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Gep {
+            dest,
+            byte_off: Some(12),
+            ..
+        } if dest.ends_with("::arr_gep")
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Gep {
+            dest,
+            byte_off: Some(4),
+            ..
+        } if dest.ends_with("::struct_gep")
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Gep {
+            dest,
+            byte_off: Some(48),
+            ..
+        } if dest.ends_with("::nested_gep")
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Gep {
+            dest,
+            byte_off: None,
+            ..
+        } if dest.ends_with("::dynamic_gep")
+    )));
+    assert_eq!(pir.lowering.modeled_counts["gep_byte_offset"], 3);
+    assert_eq!(pir.lowering.skipped_counts["gep_dynamic_index"], 1);
 }
