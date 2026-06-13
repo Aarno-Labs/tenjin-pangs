@@ -296,6 +296,119 @@ entry:
 }
 
 #[test]
+fn lowers_addrspacecast_pointer_flow_from_ll() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("addrspacecast.ll");
+    fs::write(
+        &ll_path,
+        r#"
+define i8* @casts(i8* %p) {
+entry:
+  %to_as1 = addrspacecast i8* %p to i8 addrspace(1)*
+  %back = addrspacecast i8 addrspace(1)* %to_as1 to i8*
+  ret i8* %back
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    let casts = pir.functions.iter().find(|f| f.key == "casts").unwrap();
+    let assigns = casts
+        .body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Assign { dest, sources, .. } => Some((dest.as_str(), sources.as_slice())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(assigns
+        .iter()
+        .any(|(dest, sources)| *dest == "%casts::to_as1" && *sources == ["%casts::p"]));
+    assert!(assigns
+        .iter()
+        .any(|(dest, sources)| *dest == "%casts::back" && *sources == ["%casts::to_as1"]));
+    assert_eq!(pir.lowering.instruction_counts["addrspacecast"], 2);
+    assert_eq!(pir.lowering.modeled_counts["assign"], 2);
+    assert!(!pir
+        .lowering
+        .skipped_counts
+        .contains_key("addrspacecast_non_pointer"));
+}
+
+#[test]
+fn lowers_volatile_and_atomic_global_accesses_from_ll() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("volatile_atomic.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@GP = global i8* null
+
+define i8* @touch(i8* %p) {
+entry:
+  store volatile i8* %p, i8** @GP
+  %v = load volatile i8*, i8** @GP
+  store atomic i8* %p, i8** @GP seq_cst, align 8
+  %a = load atomic i8*, i8** @GP seq_cst, align 8
+  ret i8* %a
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    let touch = pir.functions.iter().find(|f| f.key == "touch").unwrap();
+    assert_eq!(
+        touch
+            .body
+            .iter()
+            .filter(|stmt| matches!(stmt, Stmt::Store { address, .. } if address == "@GP"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        touch
+            .body
+            .iter()
+            .filter(|stmt| matches!(stmt, Stmt::Load { address, .. } if address == "@GP"))
+            .count(),
+        2
+    );
+    assert_eq!(pir.lowering.modeled_counts["volatile_store"], 1);
+    assert_eq!(pir.lowering.modeled_counts["volatile_load"], 1);
+    assert_eq!(pir.lowering.modeled_counts["atomic_store"], 1);
+    assert_eq!(pir.lowering.modeled_counts["atomic_load"], 1);
+    assert_eq!(pir.lowering.modeled_counts["global_mod"], 2);
+    assert_eq!(pir.lowering.modeled_counts["global_ref"], 2);
+}
+
+#[test]
+fn lowers_inline_asm_calls_as_unknown_and_taints_them() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("inline_asm.ll");
+    fs::write(
+        &ll_path,
+        r#"
+define void @asm_call() {
+entry:
+  call void asm sideeffect "", ""()
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    let asm_call = pir.functions.iter().find(|f| f.key == "asm_call").unwrap();
+    assert!(asm_call.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { op, reason, .. } if op == "call" && reason == "inline_asm"
+    )));
+    assert_eq!(pir.lowering.tainted_counts["inline_asm"], 1);
+}
+
+#[test]
 fn lowers_large_struct_byval_and_sret_from_bitcode() {
     assert!(
         Path::new(CLANG_14).exists(),

@@ -546,6 +546,9 @@ unsafe fn lower_call_site(
 ) {
     let called = LLVMGetCalledValue(inst);
     if !LLVMIsAInlineAsm(called).is_null() {
+        if inline_reason == "inline_asm" {
+            lowering.bump_tainted("inline_asm");
+        }
         push_unknown(
             body,
             op,
