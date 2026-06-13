@@ -113,7 +113,7 @@ fn lower_module(module: &Module) -> Pir {
         .iter()
         .filter(|f| !is_skipped_intrinsic(&f.name))
     {
-        functions.push(lower_decl(decl, &address_taken, &mut lowering));
+        functions.push(lower_decl(module, decl, &address_taken, &mut lowering));
     }
 
     let globals = module
@@ -593,6 +593,7 @@ fn lower_function(
     }
 
     let sig = signature(
+        module,
         &function.return_type,
         function.parameters.iter().map(|p| (&p.ty, &p.attributes)),
         function.is_var_arg,
@@ -616,6 +617,7 @@ fn lower_function(
 }
 
 fn lower_decl(
+    module: &Module,
     decl: &FunctionDeclaration,
     address_taken: &BTreeSet<String>,
     lowering: &mut LoweringStats,
@@ -624,6 +626,7 @@ fn lower_decl(
         lowering.bump_missing_debug_location("declaration");
     }
     let sig = signature(
+        module,
         &decl.return_type,
         decl.parameters.iter().map(|p| (&p.ty, &p.attributes)),
         decl.is_var_arg,
@@ -963,6 +966,7 @@ fn lower_call(
     }
 
     let Some(sig) = call_signature_from_operand(
+        module,
         &call.function,
         call.arguments.iter().map(|a| &a.1),
         call.calling_convention,
@@ -998,7 +1002,7 @@ fn lower_call(
 }
 
 fn lower_invoke(
-    _module: &Module,
+    module: &Module,
     func_name: &str,
     invoke: &Invoke,
     func_names: &BTreeSet<String>,
@@ -1043,6 +1047,7 @@ fn lower_invoke(
     }
 
     let Some(sig) = call_signature_from_operand(
+        module,
         &invoke.function,
         invoke.arguments.iter().map(|a| &a.1),
         invoke.calling_convention,
@@ -1678,6 +1683,7 @@ fn lower_intrinsic_call(
 }
 
 fn call_signature_from_operand<'a>(
+    module: &Module,
     function: &Either<InlineAssembly, Operand>,
     arg_attrs: impl Iterator<Item = &'a Vec<ParameterAttribute>>,
     cc: CallingConvention,
@@ -1696,6 +1702,7 @@ fn call_signature_from_operand<'a>(
         return None;
     };
     Some(signature(
+        module,
         result_type,
         param_types.iter().zip(arg_attrs),
         *is_var_arg,
@@ -1705,6 +1712,7 @@ fn call_signature_from_operand<'a>(
 }
 
 fn signature<'a, 'b>(
+    module: &Module,
     ret: &TypeRef,
     params: impl Iterator<Item = (&'a TypeRef, &'b Vec<ParameterAttribute>)>,
     vararg: bool,
@@ -1718,24 +1726,24 @@ fn signature<'a, 'b>(
     Signature {
         ret: abi_class(ret),
         params: params
-            .map(|(ty, attrs)| param_class(ty, attrs))
+            .map(|(ty, attrs)| param_class(module, ty, attrs))
             .collect::<Vec<_>>(),
         vararg,
         cc,
     }
 }
 
-fn param_class(ty: &TypeRef, attrs: &[ParameterAttribute]) -> Param {
+fn param_class(module: &Module, ty: &TypeRef, attrs: &[ParameterAttribute]) -> Param {
     for attr in attrs {
         match attr {
             ParameterAttribute::ByVal(ty) => {
                 return Param::Byval {
-                    size: type_size_key(ty),
+                    size: type_size_key(module, ty),
                 }
             }
             ParameterAttribute::SRet(ty) => {
                 return Param::Sret {
-                    size: type_size_key(ty),
+                    size: type_size_key(module, ty),
                 }
             }
             _ => {}
@@ -1764,7 +1772,10 @@ fn abi_class(ty: &TypeRef) -> AbiClass {
     }
 }
 
-fn type_size_key(ty: &TypeRef) -> u64 {
+fn type_size_key(module: &Module, ty: &TypeRef) -> u64 {
+    if let Some(size) = type_alloc_size(module, ty) {
+        return size;
+    }
     match ty.as_ref() {
         Type::IntegerType { bits } => u64::from(*bits).div_ceil(8),
         Type::PointerType { .. } => 8,
@@ -1775,8 +1786,11 @@ fn type_size_key(ty: &TypeRef) -> u64 {
         Type::ArrayType {
             element_type,
             num_elements,
-        } => type_size_key(element_type).saturating_mul(*num_elements as u64),
-        Type::StructType { element_types, .. } => element_types.iter().map(type_size_key).sum(),
+        } => type_size_key(module, element_type).saturating_mul(*num_elements as u64),
+        Type::StructType { element_types, .. } => element_types
+            .iter()
+            .map(|ty| type_size_key(module, ty))
+            .sum(),
         _ => 0,
     }
 }

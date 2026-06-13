@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use pangs_pir::{Pir, Stmt};
+use pangs_pir::{Param, Pir, Stmt};
 use tempfile::TempDir;
 
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
@@ -81,6 +81,68 @@ void driver(void) {
     assert!(pir.lowering.modeled_counts["load"] >= 1);
     assert!(pir.lowering.modeled_counts["store"] >= 1);
     assert_eq!(pir.lowering.globals, 2);
+}
+
+#[test]
+fn lowers_large_struct_byval_and_sret_from_bitcode() {
+    assert!(
+        Path::new(CLANG_14).exists(),
+        "LLVM-14 clang is required for the M1.1 lowering ABI fixture"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let c_path = tmp.path().join("agg.c");
+    let bc_path = tmp.path().join("agg.bc");
+    fs::write(
+        &c_path,
+        r#"
+struct Big {
+  void *a;
+  void *b;
+  void *c;
+};
+
+extern void sink(struct Big);
+
+struct Big ret_big(void *p, void *q, void *r) {
+  struct Big x = {p, q, r};
+  sink(x);
+  return x;
+}
+"#,
+    )
+    .unwrap();
+
+    let status = Command::new(CLANG_14)
+        .arg("-O0")
+        .arg("-g0")
+        .arg("-emit-llvm")
+        .arg("-c")
+        .arg(&c_path)
+        .arg("-o")
+        .arg(&bc_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let pir = Pir::from_path(&bc_path).unwrap();
+    let ret_big = pir.functions.iter().find(|f| f.key == "ret_big").unwrap();
+    assert!(matches!(
+        ret_big.sig.params.first(),
+        Some(Param::Sret { size: 24 })
+    ));
+    assert!(ret_big.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::CallDirect { callee, sig, .. }
+            if callee == "sink"
+                && matches!(sig.params.as_slice(), [Param::Byval { size: 24 }])
+    )));
+    let sink = pir.functions.iter().find(|f| f.key == "sink").unwrap();
+    assert!(sink.external);
+    assert!(matches!(
+        sink.sig.params.as_slice(),
+        [Param::Byval { size: 24 }]
+    ));
 }
 
 #[test]
