@@ -5,8 +5,9 @@ use either::Either;
 use llvm_ir::constant::{Constant, ConstantRef};
 use llvm_ir::function::{CallingConvention, FunctionDeclaration, ParameterAttribute};
 use llvm_ir::instruction::{
-    AddrSpaceCast, Alloca, AtomicRMW, BitCast, Call, CmpXchg, Freeze, GetElementPtr,
-    InlineAssembly, Instruction, IntToPtr, Load, Phi, PtrToInt, Select, Store,
+    AddrSpaceCast, Alloca, AtomicRMW, BitCast, Call, CmpXchg, ExtractElement, ExtractValue, Freeze,
+    GetElementPtr, InlineAssembly, InsertElement, InsertValue, Instruction, IntToPtr, LandingPad,
+    Load, Phi, PtrToInt, Select, ShuffleVector, Store,
 };
 use llvm_ir::module::{DLLStorageClass, GlobalAlias, Linkage, Visibility};
 use llvm_ir::terminator::{Invoke, Terminator};
@@ -562,6 +563,7 @@ fn lower_function(
     if function.debugloc.is_none() {
         lowering.bump_missing_debug_location("function");
     }
+    lower_personality_function(module, function, aliases, lowering);
     for block in &function.basic_blocks {
         for instr in &block.instrs {
             lowering.bump_instruction(instruction_opcode(instr));
@@ -652,6 +654,9 @@ fn collect_address_taken(
         }
     }
     for function in &module.functions {
+        if let Some(personality) = &function.personality_function {
+            collect_constant_func_refs(personality, func_names, aliases, &mut out);
+        }
         for block in &function.basic_blocks {
             for instr in &block.instrs {
                 collect_instr_address_taken(instr, func_names, aliases, &mut out);
@@ -792,6 +797,24 @@ fn lower_instruction(
         Instruction::Phi(phi) => lower_phi(module, func_name, phi, body, lowering),
         Instruction::Select(select) => lower_select(module, func_name, select, body, lowering),
         Instruction::Freeze(freeze) => lower_freeze(func_name, freeze, body, lowering),
+        Instruction::ExtractElement(extract) => {
+            lower_extract_element(module, func_name, extract, body, lowering)
+        }
+        Instruction::InsertElement(insert) => {
+            lower_insert_element(module, func_name, insert, body, lowering)
+        }
+        Instruction::ShuffleVector(shuffle) => {
+            lower_shuffle_vector(module, func_name, shuffle, body, lowering)
+        }
+        Instruction::ExtractValue(extract) => {
+            lower_extract_value(module, func_name, extract, body, lowering)
+        }
+        Instruction::InsertValue(insert) => {
+            lower_insert_value(module, func_name, insert, body, lowering)
+        }
+        Instruction::LandingPad(landingpad) => {
+            lower_landingpad(module, func_name, landingpad, body, lowering)
+        }
         Instruction::Call(call) => lower_call(
             module,
             func_name,
@@ -1354,6 +1377,197 @@ fn lower_freeze(
     });
     lowering.bump_modeled("assign");
     bump_missing_loc(lowering, "freeze", freeze.debugloc.as_ref());
+}
+
+fn lower_personality_function(
+    module: &Module,
+    function: &Function,
+    aliases: &AliasMap,
+    lowering: &mut LoweringStats,
+) {
+    let Some(personality) = &function.personality_function else {
+        return;
+    };
+    if constant_has_pointer_flow(module, personality) {
+        lowering.bump_tainted("personality_function");
+        for operand in constant_pointer_operand_keys(module, personality, aliases) {
+            lowering.bump_tainted(format!("personality_operand:{operand}"));
+        }
+    }
+}
+
+fn lower_extract_element(
+    module: &Module,
+    func_name: &str,
+    extract: &ExtractElement,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if is_pointer_vector_type(&extract.vector.get_type(&module.types)) {
+        lowering.bump_tainted("pointer_vector:extractelement");
+        push_unknown(
+            body,
+            "extractelement",
+            vec![
+                operand_value_key(func_name, &extract.vector),
+                operand_value_key(func_name, &extract.index),
+            ],
+            vec![local_value_key(func_name, &extract.dest)],
+            "pointer_vector",
+            loc(extract.debugloc.as_ref()),
+            lowering,
+        );
+    } else {
+        lowering.bump_skipped("extractelement_non_pointer_vector");
+    }
+    bump_missing_loc(lowering, "extractelement", extract.debugloc.as_ref());
+}
+
+fn lower_insert_element(
+    module: &Module,
+    func_name: &str,
+    insert: &InsertElement,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if is_pointer_vector_type(&insert.vector.get_type(&module.types))
+        || operand_has_pointer_type(module, &insert.element)
+    {
+        lowering.bump_tainted("pointer_vector:insertelement");
+        push_unknown(
+            body,
+            "insertelement",
+            vec![
+                operand_value_key(func_name, &insert.vector),
+                operand_value_key(func_name, &insert.element),
+                operand_value_key(func_name, &insert.index),
+            ],
+            vec![local_value_key(func_name, &insert.dest)],
+            "pointer_vector",
+            loc(insert.debugloc.as_ref()),
+            lowering,
+        );
+    } else {
+        lowering.bump_skipped("insertelement_non_pointer_vector");
+    }
+    bump_missing_loc(lowering, "insertelement", insert.debugloc.as_ref());
+}
+
+fn lower_shuffle_vector(
+    module: &Module,
+    func_name: &str,
+    shuffle: &ShuffleVector,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if is_pointer_vector_type(&shuffle.operand0.get_type(&module.types))
+        || is_pointer_vector_type(&shuffle.operand1.get_type(&module.types))
+        || is_pointer_vector_type(&shuffle.get_type(&module.types))
+    {
+        lowering.bump_tainted("pointer_vector:shufflevector");
+        push_unknown(
+            body,
+            "shufflevector",
+            vec![
+                operand_value_key(func_name, &shuffle.operand0),
+                operand_value_key(func_name, &shuffle.operand1),
+                constant_value_key(&shuffle.mask),
+            ],
+            vec![local_value_key(func_name, &shuffle.dest)],
+            "pointer_vector",
+            loc(shuffle.debugloc.as_ref()),
+            lowering,
+        );
+    } else {
+        lowering.bump_skipped("shufflevector_non_pointer_vector");
+    }
+    bump_missing_loc(lowering, "shufflevector", shuffle.debugloc.as_ref());
+}
+
+fn lower_extract_value(
+    module: &Module,
+    func_name: &str,
+    extract: &ExtractValue,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    let result_type = extract.get_type(&module.types);
+    if is_pointer_vector_type(&result_type) {
+        lowering.bump_tainted("pointer_vector:extractvalue");
+        push_unknown(
+            body,
+            "extractvalue",
+            vec![operand_value_key(func_name, &extract.aggregate)],
+            vec![local_value_key(func_name, &extract.dest)],
+            "pointer_vector",
+            loc(extract.debugloc.as_ref()),
+            lowering,
+        );
+    } else if is_pointer_like_type(&result_type) {
+        body.push(Stmt::Assign {
+            dest: local_value_key(func_name, &extract.dest),
+            sources: vec![operand_value_key(func_name, &extract.aggregate)],
+            loc: loc(extract.debugloc.as_ref()),
+        });
+        lowering.bump_modeled("extractvalue");
+        lowering.bump_modeled("assign");
+    } else if operand_type_contains_pointer(module, &extract.aggregate) {
+        lowering.bump_tainted("extractvalue_pointer_aggregate_non_pointer_result");
+    } else {
+        lowering.bump_skipped("extractvalue_non_pointer");
+    }
+    bump_missing_loc(lowering, "extractvalue", extract.debugloc.as_ref());
+}
+
+fn lower_insert_value(
+    module: &Module,
+    func_name: &str,
+    insert: &InsertValue,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if type_contains_pointer(module, &insert.get_type(&module.types))
+        || operand_type_contains_pointer(module, &insert.element)
+    {
+        body.push(Stmt::Assign {
+            dest: local_value_key(func_name, &insert.dest),
+            sources: vec![
+                operand_value_key(func_name, &insert.aggregate),
+                operand_value_key(func_name, &insert.element),
+            ],
+            loc: loc(insert.debugloc.as_ref()),
+        });
+        lowering.bump_modeled("insertvalue");
+        lowering.bump_modeled("assign");
+        lowering.bump_tainted("insertvalue_coarse");
+    } else {
+        lowering.bump_skipped("insertvalue_non_pointer");
+    }
+    bump_missing_loc(lowering, "insertvalue", insert.debugloc.as_ref());
+}
+
+fn lower_landingpad(
+    module: &Module,
+    func_name: &str,
+    landingpad: &LandingPad,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if type_contains_pointer(module, &landingpad.result_type) {
+        lowering.bump_tainted("landingpad_pointer_result");
+        push_unknown(
+            body,
+            "landingpad",
+            Vec::new(),
+            vec![local_value_key(func_name, &landingpad.dest)],
+            "landingpad_pointer_result",
+            loc(landingpad.debugloc.as_ref()),
+            lowering,
+        );
+    } else {
+        lowering.bump_skipped("landingpad_non_pointer");
+    }
+    bump_missing_loc(lowering, "landingpad", landingpad.debugloc.as_ref());
 }
 
 fn lower_intrinsic_call(
@@ -2172,10 +2386,45 @@ fn operand_has_pointer_type(module: &Module, operand: &Operand) -> bool {
     is_pointer_like_type(&operand.get_type(&module.types))
 }
 
+fn operand_type_contains_pointer(module: &Module, operand: &Operand) -> bool {
+    type_contains_pointer(module, &operand.get_type(&module.types))
+}
+
 fn is_pointer_like_type(ty: &TypeRef) -> bool {
     match ty.as_ref() {
         Type::PointerType { .. } => true,
         Type::VectorType { element_type, .. } => is_pointer_like_type(element_type),
+        _ => false,
+    }
+}
+
+fn is_pointer_vector_type(ty: &TypeRef) -> bool {
+    match ty.as_ref() {
+        Type::VectorType { element_type, .. } => type_contains_pointer_shallow(element_type),
+        _ => false,
+    }
+}
+
+fn type_contains_pointer(module: &Module, ty: &TypeRef) -> bool {
+    let Some(ty) = resolve_named_type(module, ty) else {
+        return false;
+    };
+    match ty.as_ref() {
+        Type::PointerType { .. } => true,
+        Type::ArrayType { element_type, .. } | Type::VectorType { element_type, .. } => {
+            type_contains_pointer(module, element_type)
+        }
+        Type::StructType { element_types, .. } => element_types
+            .iter()
+            .any(|element_type| type_contains_pointer(module, element_type)),
+        _ => false,
+    }
+}
+
+fn type_contains_pointer_shallow(ty: &TypeRef) -> bool {
+    match ty.as_ref() {
+        Type::PointerType { .. } => true,
+        Type::VectorType { element_type, .. } => type_contains_pointer_shallow(element_type),
         _ => false,
     }
 }

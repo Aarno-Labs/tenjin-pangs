@@ -422,3 +422,102 @@ entry:
     assert_eq!(pir.lowering.tainted_counts["ifunc:IfuncTarget"], 1);
     assert_eq!(pir.lowering.tainted_counts["ifunc_callee:IfuncTarget"], 1);
 }
+
+#[test]
+fn taints_pointer_vectors_and_models_aggregate_pointer_fields() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("aggregate_eh.ll");
+    fs::write(
+        &ll_path,
+        r#"
+declare i32 @__gxx_personality_v0(...)
+declare i32 @may_throw()
+
+define i8* @agg_and_eh(i8* %p, i8* %q) personality i32 (...)* @__gxx_personality_v0 {
+entry:
+  %vec0 = insertelement <2 x i8*> poison, i8* %p, i64 0
+  %vec1 = insertelement <2 x i8*> %vec0, i8* %q, i64 1
+  %elt = extractelement <2 x i8*> %vec1, i64 0
+  %agg0 = insertvalue { i8*, i32 } undef, i8* %p, 0
+  %agg1 = insertvalue { i8*, i32 } %agg0, i32 7, 1
+  %field = extractvalue { i8*, i32 } %agg1, 0
+  invoke i32 @may_throw() to label %ok unwind label %lpad
+
+ok:
+  ret i8* %field
+
+lpad:
+  %lp = landingpad { i8*, i32 }
+          cleanup
+  %ehptr = extractvalue { i8*, i32 } %lp, 0
+  ret i8* %ehptr
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    assert!(
+        pir.functions
+            .iter()
+            .find(|f| f.key == "__gxx_personality_v0")
+            .unwrap()
+            .address_taken
+    );
+    let func = pir
+        .functions
+        .iter()
+        .find(|f| f.key == "agg_and_eh")
+        .unwrap();
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { op, reason, .. } if op == "insertelement" && reason == "pointer_vector"
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { op, reason, .. } if op == "extractelement" && reason == "pointer_vector"
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Assign { dest, sources, .. }
+            if dest.ends_with("::agg0") && sources.contains(&"%agg_and_eh::p".to_string())
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Assign { dest, sources, .. }
+            if dest.ends_with("::field") && sources == &vec!["%agg_and_eh::agg1".to_string()]
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown {
+            op,
+            reason,
+            results,
+            ..
+        } if op == "landingpad"
+            && reason == "landingpad_pointer_result"
+            && results == &vec!["%agg_and_eh::lp".to_string()]
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Assign { dest, sources, .. }
+            if dest.ends_with("::ehptr") && sources == &vec!["%agg_and_eh::lp".to_string()]
+    )));
+    assert_eq!(pir.lowering.tainted_counts["personality_function"], 1);
+    assert_eq!(
+        pir.lowering.tainted_counts["personality_operand:@__gxx_personality_v0"],
+        1
+    );
+    assert_eq!(
+        pir.lowering.tainted_counts["pointer_vector:insertelement"],
+        2
+    );
+    assert_eq!(
+        pir.lowering.tainted_counts["pointer_vector:extractelement"],
+        1
+    );
+    assert_eq!(pir.lowering.tainted_counts["landingpad_pointer_result"], 1);
+    assert_eq!(pir.lowering.tainted_counts["insertvalue_coarse"], 2);
+    assert_eq!(pir.lowering.modeled_counts["insertvalue"], 2);
+    assert_eq!(pir.lowering.modeled_counts["extractvalue"], 2);
+}
