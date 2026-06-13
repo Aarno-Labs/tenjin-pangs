@@ -284,10 +284,11 @@ unsafe fn lower_function(
         let mut inst = LLVMGetFirstInstruction(block);
         while !inst.is_null() {
             let opcode = LLVMGetInstructionOpcode(inst);
+            let key = opcode_key_for_inst(inst, opcode);
             if LLVMIsATerminatorInst(inst).is_null() {
-                lowering.bump_instruction(opcode_key(opcode));
+                lowering.bump_instruction(key);
             } else {
-                lowering.bump_terminator(opcode_key(opcode));
+                lowering.bump_terminator(key);
             }
             lower_instruction(ctx, &mut fctx, inst, opcode, &mut body, lowering);
             inst = LLVMGetNextInstruction(inst);
@@ -1219,6 +1220,30 @@ unsafe fn lower_constant_expr_value(
                 lowering.bump_tainted("global_initializer_inttoptr");
                 dest
             }
+            LLVMOpcode::LLVMSelect => {
+                let true_value = lower_constant_expr_value(
+                    ctx,
+                    LLVMGetOperand(constant, 1),
+                    body,
+                    temp_ordinal,
+                    lowering,
+                );
+                let false_value = lower_constant_expr_value(
+                    ctx,
+                    LLVMGetOperand(constant, 2),
+                    body,
+                    temp_ordinal,
+                    lowering,
+                );
+                let dest = global_init_temp(temp_ordinal);
+                body.push(Stmt::Assign {
+                    dest: dest.clone(),
+                    sources: vec![true_value, false_value],
+                    loc: None,
+                });
+                lowering.bump_modeled("global_init_select");
+                dest
+            }
             other => {
                 let dest = global_init_temp(temp_ordinal);
                 lowering.bump_tainted(format!(
@@ -2031,6 +2056,19 @@ fn resolve_symbol_name(ctx: &ModuleCtx, name: &str) -> Option<String> {
     }
 }
 
+unsafe fn opcode_key_for_inst(inst: LLVMValueRef, opcode: LLVMOpcode) -> &'static str {
+    match opcode {
+        LLVMOpcode::LLVMBr => {
+            if LLVMGetNumOperands(inst) == 3 {
+                "condbr"
+            } else {
+                "br"
+            }
+        }
+        _ => opcode_key(opcode),
+    }
+}
+
 fn opcode_key(opcode: LLVMOpcode) -> &'static str {
     match opcode {
         LLVMOpcode::LLVMRet => "ret",
@@ -2038,17 +2076,33 @@ fn opcode_key(opcode: LLVMOpcode) -> &'static str {
         LLVMOpcode::LLVMSwitch => "switch",
         LLVMOpcode::LLVMIndirectBr => "indirectbr",
         LLVMOpcode::LLVMInvoke => "invoke",
+        LLVMOpcode::LLVMResume => "resume",
         LLVMOpcode::LLVMUnreachable => "unreachable",
         LLVMOpcode::LLVMCallBr => "callbr",
+        LLVMOpcode::LLVMCleanupRet => "cleanupret",
+        LLVMOpcode::LLVMCatchRet => "catchret",
+        LLVMOpcode::LLVMCatchSwitch => "catchswitch",
         LLVMOpcode::LLVMAlloca => "alloca",
         LLVMOpcode::LLVMLoad => "load",
         LLVMOpcode::LLVMStore => "store",
         LLVMOpcode::LLVMGetElementPtr => "getelementptr",
+        LLVMOpcode::LLVMTrunc => "trunc",
+        LLVMOpcode::LLVMZExt => "zext",
+        LLVMOpcode::LLVMSExt => "sext",
+        LLVMOpcode::LLVMFPTrunc => "fptrunc",
+        LLVMOpcode::LLVMFPExt => "fpext",
+        LLVMOpcode::LLVMFPToUI => "fptoui",
+        LLVMOpcode::LLVMFPToSI => "fptosi",
+        LLVMOpcode::LLVMUIToFP => "uitofp",
+        LLVMOpcode::LLVMSIToFP => "sitofp",
         LLVMOpcode::LLVMPtrToInt => "ptrtoint",
         LLVMOpcode::LLVMIntToPtr => "inttoptr",
         LLVMOpcode::LLVMBitCast => "bitcast",
         LLVMOpcode::LLVMAddrSpaceCast => "addrspacecast",
+        LLVMOpcode::LLVMICmp => "icmp",
+        LLVMOpcode::LLVMFCmp => "fcmp",
         LLVMOpcode::LLVMCall => "call",
+        LLVMOpcode::LLVMFence => "fence",
         LLVMOpcode::LLVMPHI => "phi",
         LLVMOpcode::LLVMSelect => "select",
         LLVMOpcode::LLVMExtractElement => "extractelement",
@@ -2059,6 +2113,8 @@ fn opcode_key(opcode: LLVMOpcode) -> &'static str {
         LLVMOpcode::LLVMFreeze => "freeze",
         LLVMOpcode::LLVMVAArg => "va_arg",
         LLVMOpcode::LLVMLandingPad => "landingpad",
+        LLVMOpcode::LLVMCatchPad => "catchpad",
+        LLVMOpcode::LLVMCleanupPad => "cleanuppad",
         LLVMOpcode::LLVMAtomicCmpXchg => "cmpxchg",
         LLVMOpcode::LLVMAtomicRMW => "atomicrmw",
         _ => "other",

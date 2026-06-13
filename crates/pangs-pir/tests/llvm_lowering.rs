@@ -396,6 +396,8 @@ entry:
 
     assert_eq!(pir.lowering.instruction_counts["atomicrmw"], 1);
     assert_eq!(pir.lowering.instruction_counts["cmpxchg"], 1);
+    assert_eq!(pir.lowering.terminator_counts["condbr"], 1);
+    assert_eq!(pir.lowering.terminator_counts["br"], 2);
     assert_eq!(pir.lowering.modeled_counts["memcpy"], 1);
     assert_eq!(pir.lowering.modeled_counts["atomicrmw"], 1);
     assert_eq!(pir.lowering.modeled_counts["cmpxchg"], 1);
@@ -511,10 +513,45 @@ entry:
 
     assert_eq!(pir.lowering.instruction_counts["atomicrmw"], 1);
     assert_eq!(pir.lowering.instruction_counts["cmpxchg"], 1);
+    assert_eq!(pir.lowering.terminator_counts["condbr"], 1);
+    assert_eq!(pir.lowering.terminator_counts["br"], 2);
     assert_eq!(pir.lowering.modeled_counts["memcpy"], 1);
     assert_eq!(pir.lowering.modeled_counts["atomicrmw"], 1);
     assert_eq!(pir.lowering.modeled_counts["cmpxchg"], 1);
     assert_eq!(pir.lowering.tainted_counts["inttoptr"], 1);
+}
+
+#[test]
+fn llvm_sys_counts_resume_terminators() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("resume.ll");
+    fs::write(
+        &ll_path,
+        r#"
+declare i32 @__gxx_personality_v0(...)
+declare i32 @may_throw()
+
+define void @caller() personality i32 (...)* @__gxx_personality_v0 {
+entry:
+  invoke i32 @may_throw() to label %ok unwind label %lpad
+
+ok:
+  ret void
+
+lpad:
+  %lp = landingpad { i8*, i32 }
+          cleanup
+  resume { i8*, i32 } %lp
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    assert_eq!(pir.lowering.terminator_counts["invoke"], 1);
+    assert_eq!(pir.lowering.terminator_counts["resume"], 1);
+    assert!(!pir.lowering.terminator_counts.contains_key("other"));
+    assert_eq!(pir.lowering.instruction_counts["landingpad"], 1);
 }
 
 #[test]
