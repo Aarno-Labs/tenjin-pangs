@@ -1011,12 +1011,12 @@ unsafe fn lower_intrinsic_call(
             callee,
             call_operand_keys(fctx, inst),
             call_result_keys(fctx, inst),
-            "pointer_intrinsic",
+            "unknown_pointer_intrinsic",
             loc(inst),
             lowering,
         );
     } else {
-        lowering.bump_skipped(format!("intrinsic:{callee}"));
+        lowering.bump_skipped(format!("unknown_non_pointer_intrinsic:{callee}"));
     }
     true
 }

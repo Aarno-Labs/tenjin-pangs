@@ -29,31 +29,31 @@ enum Command {
         exports: Option<PathBuf>,
         #[arg(long)]
         validate: bool,
-        #[arg(long, default_value = "llvm-ir")]
+        #[arg(long, default_value = "llvm-sys")]
         llvm_backend: LlvmBackendArg,
     },
     Stats {
         module: PathBuf,
-        #[arg(long, default_value = "llvm-ir")]
+        #[arg(long, default_value = "llvm-sys")]
         llvm_backend: LlvmBackendArg,
     },
     DumpPir {
         module: PathBuf,
         #[arg(long)]
         func: Option<String>,
-        #[arg(long, default_value = "llvm-ir")]
+        #[arg(long, default_value = "llvm-sys")]
         llvm_backend: LlvmBackendArg,
     },
     DumpPag {
         module: PathBuf,
         #[arg(long)]
         func: Option<String>,
-        #[arg(long, default_value = "llvm-ir")]
+        #[arg(long, default_value = "llvm-sys")]
         llvm_backend: LlvmBackendArg,
     },
     CheckPag {
         module: PathBuf,
-        #[arg(long, default_value = "llvm-ir")]
+        #[arg(long, default_value = "llvm-sys")]
         llvm_backend: LlvmBackendArg,
     },
     Report {

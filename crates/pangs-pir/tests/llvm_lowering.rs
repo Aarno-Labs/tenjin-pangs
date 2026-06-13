@@ -562,6 +562,80 @@ entry:
 }
 
 #[test]
+fn lowers_unknown_intrinsics_with_pointer_and_non_pointer_shapes() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("unknown_intrinsics.ll");
+    fs::write(
+        &ll_path,
+        r#"
+declare i8* @llvm.ptrmask.p0i8.i64(i8*, i64)
+declare i32 @llvm.smax.i32(i32, i32)
+
+define i8* @probe(i8* %p, i32 %a, i32 %b) {
+entry:
+  %masked = call i8* @llvm.ptrmask.p0i8.i64(i8* %p, i64 255)
+  %v = call i32 @llvm.smax.i32(i32 %a, i32 %b)
+  ret i8* %masked
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    let func = pir.functions.iter().find(|f| f.key == "probe").unwrap();
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { op, reason, .. }
+            if op == "llvm.ptrmask.p0i8.i64" && reason == "unknown_pointer_intrinsic"
+    )));
+    assert_eq!(
+        pir.lowering.tainted_counts["unknown_pointer_intrinsic:llvm.ptrmask.p0i8.i64"],
+        1
+    );
+    assert_eq!(
+        pir.lowering.skipped_counts["unknown_non_pointer_intrinsic:llvm.smax.i32"],
+        1
+    );
+}
+
+#[test]
+fn llvm_sys_lowers_unknown_intrinsics_with_pointer_and_non_pointer_shapes() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("unknown_intrinsics.ll");
+    fs::write(
+        &ll_path,
+        r#"
+declare i8* @llvm.ptrmask.p0i8.i64(i8*, i64)
+declare i32 @llvm.smax.i32(i32, i32)
+
+define i8* @probe(i8* %p, i32 %a, i32 %b) {
+entry:
+  %masked = call i8* @llvm.ptrmask.p0i8.i64(i8* %p, i64 255)
+  %v = call i32 @llvm.smax.i32(i32 %a, i32 %b)
+  ret i8* %masked
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    let func = pir.functions.iter().find(|f| f.key == "probe").unwrap();
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { op, reason, .. }
+            if op == "llvm.ptrmask.p0i8.i64" && reason == "unknown_pointer_intrinsic"
+    )));
+    assert_eq!(
+        pir.lowering.tainted_counts["unknown_pointer_intrinsic:llvm.ptrmask.p0i8.i64"],
+        1
+    );
+    assert_eq!(
+        pir.lowering.skipped_counts["unknown_non_pointer_intrinsic:llvm.smax.i32"],
+        1
+    );
+}
+
+#[test]
 fn llvm_sys_counts_resume_terminators() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("resume.ll");

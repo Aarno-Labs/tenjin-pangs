@@ -43,7 +43,7 @@ pub struct Pir {
 
 impl Pir {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, PirError> {
-        Self::from_path_with_backend(path, LlvmBackend::LlvmIr)
+        Self::from_path_with_backend(path, LlvmBackend::LlvmSys)
     }
 
     pub fn from_path_with_backend(
