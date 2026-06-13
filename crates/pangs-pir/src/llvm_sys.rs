@@ -12,7 +12,9 @@ use llvm_sys::prelude::*;
 use llvm_sys::target::{
     LLVMABISizeOfType, LLVMGetModuleDataLayout, LLVMOffsetOfElement, LLVMTargetDataRef,
 };
-use llvm_sys::{LLVMDLLStorageClass, LLVMLinkage, LLVMOpcode, LLVMTypeKind, LLVMVisibility};
+use llvm_sys::{
+    LLVMAtomicOrdering, LLVMDLLStorageClass, LLVMLinkage, LLVMOpcode, LLVMTypeKind, LLVMVisibility,
+};
 
 use crate::{
     AbiClass, Access, Func, Global, Loc, LoweringStats, Param, Pir, PirError, Signature, Stmt,
@@ -359,6 +361,12 @@ unsafe fn lower_instruction(
                 loc: loc(inst),
             });
             lowering.bump_modeled("load");
+            if LLVMGetVolatile(inst) != 0 {
+                lowering.bump_modeled("volatile_load");
+            }
+            if is_atomic_memory_inst(inst) {
+                lowering.bump_modeled("atomic_load");
+            }
             bump_missing_loc(lowering, "load", inst);
             if let Some(global) = operand_global_name(ctx, address) {
                 body.push(Stmt::GlobalRef {
@@ -378,6 +386,12 @@ unsafe fn lower_instruction(
                 loc: loc(inst),
             });
             lowering.bump_modeled("store");
+            if LLVMGetVolatile(inst) != 0 {
+                lowering.bump_modeled("volatile_store");
+            }
+            if is_atomic_memory_inst(inst) {
+                lowering.bump_modeled("atomic_store");
+            }
             bump_missing_loc(lowering, "store", inst);
             if let Some(global) = operand_global_name(ctx, address) {
                 body.push(Stmt::GlobalRef {
@@ -447,12 +461,18 @@ unsafe fn lower_instruction(
         LLVMOpcode::LLVMCall => lower_call(ctx, fctx, inst, body, lowering),
         LLVMOpcode::LLVMInvoke => lower_invoke(ctx, fctx, inst, body, lowering),
         LLVMOpcode::LLVMCallBr => lower_callbr(ctx, fctx, inst, body, lowering),
+        LLVMOpcode::LLVMPHI => lower_phi(fctx, inst, body, lowering),
+        LLVMOpcode::LLVMSelect => lower_select(fctx, inst, body, lowering),
+        LLVMOpcode::LLVMFreeze => lower_freeze(fctx, inst, body, lowering),
         LLVMOpcode::LLVMExtractElement => lower_extract_element(fctx, inst, body, lowering),
         LLVMOpcode::LLVMInsertElement => lower_insert_element(inst, fctx, body, lowering),
         LLVMOpcode::LLVMShuffleVector => lower_shuffle_vector(fctx, inst, body, lowering),
         LLVMOpcode::LLVMExtractValue => lower_extract_value(fctx, inst, body, lowering),
         LLVMOpcode::LLVMInsertValue => lower_insert_value(inst, fctx, body, lowering),
         LLVMOpcode::LLVMLandingPad => lower_landingpad(inst, fctx, body, lowering),
+        LLVMOpcode::LLVMAtomicCmpXchg => lower_cmpxchg(ctx, fctx, inst, body, lowering),
+        LLVMOpcode::LLVMAtomicRMW => lower_atomicrmw(ctx, fctx, inst, body, lowering),
+        LLVMOpcode::LLVMVAArg => lower_va_arg(fctx, inst, body, lowering),
         LLVMOpcode::LLVMRet => {
             let value = if LLVMGetNumOperands(inst) == 0 {
                 None
@@ -543,8 +563,7 @@ unsafe fn lower_call_site(
             lowering.bump_skipped("dbg_intrinsic");
             return;
         }
-        if callee.starts_with("llvm.") {
-            lowering.bump_skipped(format!("intrinsic:{callee}"));
+        if lower_intrinsic_call(ctx, fctx, &callee, inst, body, lowering) {
             return;
         }
         if ctx.ifunc_names.contains(&callee) {
@@ -599,6 +618,69 @@ unsafe fn lower_ifunc_call(
         loc(inst),
         lowering,
     );
+}
+
+unsafe fn lower_phi(
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if is_pointer_like_type(LLVMTypeOf(inst)) {
+        let incoming = LLVMCountIncoming(inst);
+        body.push(Stmt::Assign {
+            dest: fctx.local_key(inst),
+            sources: (0..incoming)
+                .map(|index| fctx.operand_key(LLVMGetIncomingValue(inst, index)))
+                .collect(),
+            loc: loc(inst),
+        });
+        lowering.bump_modeled("assign");
+    } else if (0..LLVMCountIncoming(inst))
+        .any(|index| is_pointer_like_type(LLVMTypeOf(LLVMGetIncomingValue(inst, index))))
+    {
+        lowering.bump_tainted("phi_pointer_operand_non_pointer_result");
+    } else {
+        lowering.bump_skipped("phi_non_pointer");
+    }
+    bump_missing_loc(lowering, "phi", inst);
+}
+
+unsafe fn lower_select(
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    let true_value = LLVMGetOperand(inst, 1);
+    let false_value = LLVMGetOperand(inst, 2);
+    if is_pointer_like_type(LLVMTypeOf(true_value)) || is_pointer_like_type(LLVMTypeOf(false_value))
+    {
+        body.push(Stmt::Assign {
+            dest: fctx.local_key(inst),
+            sources: vec![fctx.operand_key(true_value), fctx.operand_key(false_value)],
+            loc: loc(inst),
+        });
+        lowering.bump_modeled("assign");
+    } else {
+        lowering.bump_skipped("select_non_pointer");
+    }
+    bump_missing_loc(lowering, "select", inst);
+}
+
+unsafe fn lower_freeze(
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    body.push(Stmt::Assign {
+        dest: fctx.local_key(inst),
+        sources: vec![fctx.operand_key(LLVMGetOperand(inst, 0))],
+        loc: loc(inst),
+    });
+    lowering.bump_modeled("assign");
+    bump_missing_loc(lowering, "freeze", inst);
 }
 
 unsafe fn lower_extract_element(
@@ -767,6 +849,175 @@ unsafe fn lower_landingpad(
         lowering.bump_skipped("landingpad_non_pointer");
     }
     bump_missing_loc(lowering, "landingpad", inst);
+}
+
+unsafe fn lower_cmpxchg(
+    _ctx: &ModuleCtx,
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    let address = LLVMGetOperand(inst, 0);
+    let replacement = LLVMGetOperand(inst, 2);
+    body.push(Stmt::Load {
+        dest: format!("{}.old", fctx.local_key(inst)),
+        address: fctx.operand_key(address),
+        loc: loc(inst),
+    });
+    body.push(Stmt::Store {
+        address: fctx.operand_key(address),
+        value: fctx.operand_key(replacement),
+        loc: loc(inst),
+    });
+    lowering.bump_modeled("cmpxchg");
+    lowering.bump_modeled("atomic_load");
+    lowering.bump_modeled("atomic_store");
+    if LLVMGetVolatile(inst) != 0 {
+        lowering.bump_modeled("volatile_cmpxchg");
+    }
+    bump_missing_loc(lowering, "cmpxchg", inst);
+}
+
+unsafe fn lower_atomicrmw(
+    _ctx: &ModuleCtx,
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    let address = LLVMGetOperand(inst, 0);
+    let value = LLVMGetOperand(inst, 1);
+    body.push(Stmt::Load {
+        dest: fctx.local_key(inst),
+        address: fctx.operand_key(address),
+        loc: loc(inst),
+    });
+    body.push(Stmt::Store {
+        address: fctx.operand_key(address),
+        value: fctx.operand_key(value),
+        loc: loc(inst),
+    });
+    lowering.bump_modeled("atomicrmw");
+    lowering.bump_modeled("atomic_load");
+    lowering.bump_modeled("atomic_store");
+    if LLVMGetVolatile(inst) != 0 {
+        lowering.bump_modeled("volatile_atomicrmw");
+    }
+    bump_missing_loc(lowering, "atomicrmw", inst);
+}
+
+unsafe fn lower_va_arg(
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    lowering.bump_tainted("va_arg");
+    push_unknown(
+        body,
+        "va_arg",
+        vec![fctx.operand_key(LLVMGetOperand(inst, 0))],
+        vec![fctx.local_key(inst)],
+        "va_arg",
+        loc(inst),
+        lowering,
+    );
+    bump_missing_loc(lowering, "va_arg", inst);
+}
+
+unsafe fn lower_intrinsic_call(
+    _ctx: &ModuleCtx,
+    fctx: &mut FunctionCtx,
+    callee: &str,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) -> bool {
+    if !callee.starts_with("llvm.") {
+        return false;
+    }
+
+    if is_skipped_intrinsic(callee)
+        || callee.starts_with("llvm.lifetime.")
+        || callee == "llvm.assume"
+        || callee.starts_with("llvm.expect.")
+        || callee.starts_with("llvm.annotation.")
+        || callee.starts_with("llvm.prefetch.")
+    {
+        lowering.bump_skipped(format!("intrinsic:{callee}"));
+        return true;
+    }
+
+    if callee.starts_with("llvm.memcpy.") || callee.starts_with("llvm.memmove.") {
+        if LLVMGetNumArgOperands(inst) >= 3 {
+            body.push(Stmt::Memcpy {
+                dst: fctx.operand_key(LLVMGetOperand(inst, 0)),
+                src: fctx.operand_key(LLVMGetOperand(inst, 1)),
+                bytes: constant_u64(LLVMGetOperand(inst, 2)),
+                loc: loc(inst),
+            });
+            lowering.bump_modeled(if callee.starts_with("llvm.memmove.") {
+                "memmove"
+            } else {
+                "memcpy"
+            });
+            bump_missing_loc(lowering, "memcpy", inst);
+        } else {
+            lowering.bump_tainted("malformed_memory_intrinsic");
+        }
+        return true;
+    }
+
+    if callee.starts_with("llvm.memset.") {
+        if LLVMGetNumArgOperands(inst) >= 3 {
+            body.push(Stmt::Memset {
+                dst: fctx.operand_key(LLVMGetOperand(inst, 0)),
+                value: fctx.operand_key(LLVMGetOperand(inst, 1)),
+                bytes: constant_u64(LLVMGetOperand(inst, 2)),
+                loc: loc(inst),
+            });
+            lowering.bump_modeled("memset");
+            bump_missing_loc(lowering, "memset", inst);
+        } else {
+            lowering.bump_tainted("malformed_memory_intrinsic");
+        }
+        return true;
+    }
+
+    if callee.starts_with("llvm.va_") {
+        lowering.bump_tainted(format!("intrinsic:{callee}"));
+        push_unknown(
+            body,
+            callee,
+            call_operand_keys(fctx, inst),
+            call_result_keys(fctx, inst),
+            "varargs_intrinsic",
+            loc(inst),
+            lowering,
+        );
+        return true;
+    }
+
+    if (0..LLVMGetNumArgOperands(inst))
+        .any(|index| is_pointer_like_type(LLVMTypeOf(LLVMGetOperand(inst, index))))
+        || (LLVMGetTypeKind(LLVMTypeOf(inst)) != LLVMTypeKind::LLVMVoidTypeKind
+            && is_pointer_like_type(LLVMTypeOf(inst)))
+    {
+        lowering.bump_tainted(format!("unknown_pointer_intrinsic:{callee}"));
+        push_unknown(
+            body,
+            callee,
+            call_operand_keys(fctx, inst),
+            call_result_keys(fctx, inst),
+            "pointer_intrinsic",
+            loc(inst),
+            lowering,
+        );
+    } else {
+        lowering.bump_skipped(format!("intrinsic:{callee}"));
+    }
+    true
 }
 
 unsafe fn lower_global_initializers(
@@ -1633,6 +1884,17 @@ unsafe fn constant_i64(value: LLVMValueRef) -> Option<i64> {
     Some(LLVMConstIntGetSExtValue(value))
 }
 
+unsafe fn constant_u64(value: LLVMValueRef) -> Option<u64> {
+    if LLVMIsAConstantInt(value).is_null() {
+        return None;
+    }
+    Some(LLVMConstIntGetZExtValue(value))
+}
+
+unsafe fn is_atomic_memory_inst(inst: LLVMValueRef) -> bool {
+    LLVMGetOrdering(inst) != LLVMAtomicOrdering::LLVMAtomicOrderingNotAtomic
+}
+
 unsafe fn collect_functions(module: LLVMModuleRef) -> Vec<LLVMValueRef> {
     let mut out = Vec::new();
     let mut current = LLVMGetFirstFunction(module);
@@ -1787,11 +2049,15 @@ fn opcode_key(opcode: LLVMOpcode) -> &'static str {
         LLVMOpcode::LLVMBitCast => "bitcast",
         LLVMOpcode::LLVMAddrSpaceCast => "addrspacecast",
         LLVMOpcode::LLVMCall => "call",
+        LLVMOpcode::LLVMPHI => "phi",
+        LLVMOpcode::LLVMSelect => "select",
         LLVMOpcode::LLVMExtractElement => "extractelement",
         LLVMOpcode::LLVMInsertElement => "insertelement",
         LLVMOpcode::LLVMShuffleVector => "shufflevector",
         LLVMOpcode::LLVMExtractValue => "extractvalue",
         LLVMOpcode::LLVMInsertValue => "insertvalue",
+        LLVMOpcode::LLVMFreeze => "freeze",
+        LLVMOpcode::LLVMVAArg => "va_arg",
         LLVMOpcode::LLVMLandingPad => "landingpad",
         LLVMOpcode::LLVMAtomicCmpXchg => "cmpxchg",
         LLVMOpcode::LLVMAtomicRMW => "atomicrmw",
