@@ -224,6 +224,78 @@ entry:
 }
 
 #[test]
+fn lowers_vararg_and_x87_signatures_from_ll() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("abi_rows.ll");
+    fs::write(
+        &ll_path,
+        r#"
+declare i32 @vararg_target(i8*, ...)
+declare x86_fp80 @x87_id(x86_fp80)
+declare void @accept_short_cb(void (i8*)*)
+
+define void @short_cb(i8* %p) {
+entry:
+  ret void
+}
+
+define void @driver(i8* %p, i64 %bits, x86_fp80 %xf) {
+entry:
+  call i32 (i8*, ...) @vararg_target(i8* %p, i64 %bits, i8* %p)
+  call x86_fp80 @x87_id(x86_fp80 %xf)
+  call void @accept_short_cb(void (i8*)* @short_cb)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+
+    let vararg_target = pir
+        .functions
+        .iter()
+        .find(|f| f.key == "vararg_target")
+        .unwrap();
+    assert!(vararg_target.external);
+    assert!(vararg_target.sig.vararg);
+    assert_eq!(vararg_target.sig.params.as_slice(), &[Param::Integer]);
+    assert_eq!(vararg_target.sig.ret, pangs_pir::AbiClass::Integer);
+
+    let x87_id = pir.functions.iter().find(|f| f.key == "x87_id").unwrap();
+    assert!(x87_id.external);
+    assert_eq!(x87_id.sig.params.as_slice(), &[Param::X87]);
+    assert_eq!(x87_id.sig.ret, pangs_pir::AbiClass::X87);
+
+    let accept_short_cb = pir
+        .functions
+        .iter()
+        .find(|f| f.key == "accept_short_cb")
+        .unwrap();
+    assert_eq!(accept_short_cb.sig.params.as_slice(), &[Param::Integer]);
+
+    let short_cb = pir.functions.iter().find(|f| f.key == "short_cb").unwrap();
+    assert!(short_cb.address_taken);
+
+    let driver = pir.functions.iter().find(|f| f.key == "driver").unwrap();
+    assert!(driver.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::CallDirect { callee, sig, .. }
+            if callee == "vararg_target"
+                && sig.vararg
+                && sig.params.as_slice() == [Param::Integer]
+                && sig.ret == pangs_pir::AbiClass::Integer
+    )));
+    assert!(driver.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::CallDirect { callee, sig, .. }
+            if callee == "x87_id"
+                && sig.params.as_slice() == [Param::X87]
+                && sig.ret == pangs_pir::AbiClass::X87
+    )));
+}
+
+#[test]
 fn lowers_large_struct_byval_and_sret_from_bitcode() {
     assert!(
         Path::new(CLANG_14).exists(),
