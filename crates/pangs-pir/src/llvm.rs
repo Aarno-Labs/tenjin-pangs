@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use either::Either;
@@ -8,7 +8,7 @@ use llvm_ir::instruction::{
     AddrSpaceCast, Alloca, AtomicRMW, BitCast, Call, CmpXchg, Freeze, GetElementPtr,
     InlineAssembly, Instruction, IntToPtr, Load, Phi, PtrToInt, Select, Store,
 };
-use llvm_ir::module::{DLLStorageClass, Linkage, Visibility};
+use llvm_ir::module::{DLLStorageClass, GlobalAlias, Linkage, Visibility};
 use llvm_ir::terminator::{Invoke, Terminator};
 use llvm_ir::types::{FPType, NamedStructDef, Type, TypeRef, Typed};
 use llvm_ir::{DebugLoc, Function, Module, Name, Operand};
@@ -16,6 +16,14 @@ use llvm_ir::{DebugLoc, Function, Module, Name, Operand};
 use crate::{
     AbiClass, Access, Func, Global, Loc, LoweringStats, Param, Pir, PirError, Signature, Stmt,
 };
+
+type AliasMap = BTreeMap<String, AliasTarget>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AliasTarget {
+    Function(String),
+    Global(String),
+}
 
 pub fn lower_path(path: &Path) -> Result<Pir, PirError> {
     let module = match path.extension().and_then(|ext| ext.to_str()) {
@@ -47,13 +55,6 @@ fn lower_module(module: &Module) -> Pir {
         ifuncs: module.global_ifuncs.len() as u64,
         ..LoweringStats::default()
     };
-    for alias in &module.global_aliases {
-        lowering.bump_tainted(format!("alias:{}", name_key(&alias.name)));
-    }
-    for ifunc in &module.global_ifuncs {
-        lowering.bump_tainted(format!("ifunc:{}", name_key(&ifunc.name)));
-    }
-
     let func_names = module
         .functions
         .iter()
@@ -72,8 +73,22 @@ fn lower_module(module: &Module) -> Pir {
         .iter()
         .map(|g| name_key(&g.name))
         .collect::<BTreeSet<_>>();
+    let ifunc_names = module
+        .global_ifuncs
+        .iter()
+        .map(|ifunc| name_key(&ifunc.name))
+        .collect::<BTreeSet<_>>();
+    let aliases = collect_aliases(
+        &module.global_aliases,
+        &func_names,
+        &global_names,
+        &mut lowering,
+    );
+    for ifunc in &module.global_ifuncs {
+        lowering.bump_tainted(format!("ifunc:{}", name_key(&ifunc.name)));
+    }
 
-    let address_taken = collect_address_taken(module, &func_names);
+    let address_taken = collect_address_taken(module, &func_names, &aliases);
 
     let mut functions = Vec::new();
     for function in module
@@ -86,6 +101,8 @@ fn lower_module(module: &Module) -> Pir {
             function,
             &func_names,
             &global_names,
+            &aliases,
+            &ifunc_names,
             &address_taken,
             &mut lowering,
         ));
@@ -115,7 +132,7 @@ fn lower_module(module: &Module) -> Pir {
             }
         })
         .collect();
-    let global_init = lower_global_initializers(module, &global_names, &mut lowering);
+    let global_init = lower_global_initializers(module, &global_names, &aliases, &mut lowering);
 
     Pir {
         module: module.name.clone(),
@@ -127,9 +144,45 @@ fn lower_module(module: &Module) -> Pir {
     }
 }
 
+fn collect_aliases(
+    global_aliases: &[GlobalAlias],
+    func_names: &BTreeSet<String>,
+    global_names: &BTreeSet<String>,
+    lowering: &mut LoweringStats,
+) -> AliasMap {
+    let mut aliases = AliasMap::new();
+    for alias in global_aliases {
+        let alias_key = name_key(&alias.name);
+        if !is_non_interposable_alias(alias) {
+            lowering.bump_tainted(format!("alias_interposable:{alias_key}"));
+            continue;
+        }
+
+        let Some(target) = constant_global_name(&alias.aliasee) else {
+            lowering.bump_tainted(format!("alias_unresolved:{alias_key}"));
+            continue;
+        };
+        if func_names.contains(&target) {
+            aliases.insert(alias_key, AliasTarget::Function(target));
+            lowering.bump_modeled("alias_function_resolved");
+        } else if global_names.contains(&target) {
+            aliases.insert(alias_key, AliasTarget::Global(target));
+            lowering.bump_modeled("alias_global_resolved");
+        } else {
+            lowering.bump_tainted(format!("alias_unresolved:{alias_key}"));
+        }
+    }
+    aliases
+}
+
+fn is_non_interposable_alias(alias: &GlobalAlias) -> bool {
+    matches!(alias.linkage, Linkage::Private | Linkage::Internal)
+}
+
 fn lower_global_initializers(
     module: &Module,
     global_names: &BTreeSet<String>,
+    aliases: &AliasMap,
     lowering: &mut LoweringStats,
 ) -> Vec<Stmt> {
     let mut body = Vec::new();
@@ -153,6 +206,7 @@ fn lower_global_initializers(
             &address,
             initializer,
             global_names,
+            aliases,
             &mut body,
             &mut temp_ordinal,
             lowering,
@@ -169,6 +223,7 @@ fn lower_global_initializer_value(
     address: &str,
     constant: &Constant,
     global_names: &BTreeSet<String>,
+    aliases: &AliasMap,
     body: &mut Vec<Stmt>,
     temp_ordinal: &mut u64,
     lowering: &mut LoweringStats,
@@ -185,6 +240,7 @@ fn lower_global_initializer_value(
                     address,
                     value,
                     global_names,
+                    aliases,
                     body,
                     temp_ordinal,
                     lowering,
@@ -200,6 +256,7 @@ fn lower_global_initializer_value(
                     address,
                     value,
                     global_names,
+                    aliases,
                     body,
                     temp_ordinal,
                     lowering,
@@ -208,15 +265,17 @@ fn lower_global_initializer_value(
             found
         }
         _ if constant_has_pointer_flow(module, constant) => {
-            let value = lower_constant_expr_value(module, constant, body, temp_ordinal, lowering);
+            let value =
+                lower_constant_expr_value(module, constant, aliases, body, temp_ordinal, lowering);
             body.push(Stmt::Store {
                 address: address.to_string(),
                 value: value.clone(),
                 loc: None,
             });
             lowering.bump_modeled("global_init_store");
-            if let Some(global) =
-                constant_global_name(constant).filter(|name| global_names.contains(name))
+            if let Some(global) = constant_global_name(constant)
+                .and_then(|name| resolve_global_alias(&name, aliases).or(Some(name)))
+                .filter(|name| global_names.contains(name))
             {
                 body.push(Stmt::GlobalRef {
                     global,
@@ -234,15 +293,25 @@ fn lower_global_initializer_value(
 fn lower_constant_expr_value(
     module: &Module,
     constant: &Constant,
+    aliases: &AliasMap,
     body: &mut Vec<Stmt>,
     temp_ordinal: &mut u64,
     lowering: &mut LoweringStats,
 ) -> String {
     match constant {
-        Constant::GlobalReference { name, .. } => format!("@{}", name_key(name)),
+        Constant::GlobalReference { name, .. } => {
+            let name = name_key(name);
+            format!("@{}", resolve_symbol_alias(&name, aliases).unwrap_or(name))
+        }
         Constant::BitCast(expr) => {
-            let source =
-                lower_constant_expr_value(module, &expr.operand, body, temp_ordinal, lowering);
+            let source = lower_constant_expr_value(
+                module,
+                &expr.operand,
+                aliases,
+                body,
+                temp_ordinal,
+                lowering,
+            );
             let dest = global_init_temp(temp_ordinal);
             body.push(Stmt::Assign {
                 dest: dest.clone(),
@@ -253,8 +322,14 @@ fn lower_constant_expr_value(
             dest
         }
         Constant::AddrSpaceCast(expr) => {
-            let source =
-                lower_constant_expr_value(module, &expr.operand, body, temp_ordinal, lowering);
+            let source = lower_constant_expr_value(
+                module,
+                &expr.operand,
+                aliases,
+                body,
+                temp_ordinal,
+                lowering,
+            );
             let dest = global_init_temp(temp_ordinal);
             body.push(Stmt::Assign {
                 dest: dest.clone(),
@@ -265,8 +340,14 @@ fn lower_constant_expr_value(
             dest
         }
         Constant::GetElementPtr(expr) => {
-            let base =
-                lower_constant_expr_value(module, &expr.address, body, temp_ordinal, lowering);
+            let base = lower_constant_expr_value(
+                module,
+                &expr.address,
+                aliases,
+                body,
+                temp_ordinal,
+                lowering,
+            );
             let dest = global_init_temp(temp_ordinal);
             body.push(Stmt::Gep {
                 dest: dest.clone(),
@@ -278,8 +359,14 @@ fn lower_constant_expr_value(
             dest
         }
         Constant::PtrToInt(expr) => {
-            let source =
-                lower_constant_expr_value(module, &expr.operand, body, temp_ordinal, lowering);
+            let source = lower_constant_expr_value(
+                module,
+                &expr.operand,
+                aliases,
+                body,
+                temp_ordinal,
+                lowering,
+            );
             let dest = global_init_temp(temp_ordinal);
             body.push(Stmt::PtrToInt {
                 dest: dest.clone(),
@@ -303,10 +390,22 @@ fn lower_constant_expr_value(
             dest
         }
         Constant::Select(expr) => {
-            let true_value =
-                lower_constant_expr_value(module, &expr.true_value, body, temp_ordinal, lowering);
-            let false_value =
-                lower_constant_expr_value(module, &expr.false_value, body, temp_ordinal, lowering);
+            let true_value = lower_constant_expr_value(
+                module,
+                &expr.true_value,
+                aliases,
+                body,
+                temp_ordinal,
+                lowering,
+            );
+            let false_value = lower_constant_expr_value(
+                module,
+                &expr.false_value,
+                aliases,
+                body,
+                temp_ordinal,
+                lowering,
+            );
             let dest = global_init_temp(temp_ordinal);
             body.push(Stmt::Assign {
                 dest: dest.clone(),
@@ -325,7 +424,7 @@ fn lower_constant_expr_value(
             push_unknown(
                 body,
                 format!("constant_expr:{}", constant_opcode(constant)),
-                constant_pointer_operand_keys(module, constant),
+                constant_pointer_operand_keys(module, constant, aliases),
                 vec![dest.clone()],
                 "global_initializer_pointer_constant",
                 None,
@@ -341,6 +440,8 @@ fn lower_function(
     function: &Function,
     func_names: &BTreeSet<String>,
     global_names: &BTreeSet<String>,
+    aliases: &AliasMap,
+    ifunc_names: &BTreeSet<String>,
     address_taken: &BTreeSet<String>,
     lowering: &mut LoweringStats,
 ) -> Func {
@@ -357,6 +458,8 @@ fn lower_function(
                 instr,
                 func_names,
                 global_names,
+                aliases,
+                ifunc_names,
                 &mut body,
                 lowering,
             );
@@ -367,6 +470,8 @@ fn lower_function(
             &function.name,
             &block.term,
             func_names,
+            aliases,
+            ifunc_names,
             &mut body,
             lowering,
         );
@@ -422,19 +527,23 @@ fn lower_decl(
     }
 }
 
-fn collect_address_taken(module: &Module, func_names: &BTreeSet<String>) -> BTreeSet<String> {
+fn collect_address_taken(
+    module: &Module,
+    func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
+) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for global in &module.global_vars {
         if let Some(init) = &global.initializer {
-            collect_constant_func_refs(init, func_names, &mut out);
+            collect_constant_func_refs(init, func_names, aliases, &mut out);
         }
     }
     for function in &module.functions {
         for block in &function.basic_blocks {
             for instr in &block.instrs {
-                collect_instr_address_taken(instr, func_names, &mut out);
+                collect_instr_address_taken(instr, func_names, aliases, &mut out);
             }
-            collect_term_address_taken(&block.term, func_names, &mut out);
+            collect_term_address_taken(&block.term, func_names, aliases, &mut out);
         }
     }
     out
@@ -443,20 +552,21 @@ fn collect_address_taken(module: &Module, func_names: &BTreeSet<String>) -> BTre
 fn collect_instr_address_taken(
     instr: &Instruction,
     func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
     out: &mut BTreeSet<String>,
 ) {
     match instr {
         Instruction::Call(call) => {
             if called_function_name(&call.function).is_none() {
-                collect_either_operand_func_refs(&call.function, func_names, out);
+                collect_either_operand_func_refs(&call.function, func_names, aliases, out);
             }
             for (arg, _) in &call.arguments {
-                collect_operand_func_refs(arg, func_names, out);
+                collect_operand_func_refs(arg, func_names, aliases, out);
             }
         }
         Instruction::Store(store) => {
-            collect_operand_func_refs(&store.value, func_names, out);
-            collect_operand_func_refs(&store.address, func_names, out);
+            collect_operand_func_refs(&store.value, func_names, aliases, out);
+            collect_operand_func_refs(&store.address, func_names, aliases, out);
         }
         _ => {}
     }
@@ -465,14 +575,15 @@ fn collect_instr_address_taken(
 fn collect_term_address_taken(
     term: &Terminator,
     func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
     out: &mut BTreeSet<String>,
 ) {
     if let Terminator::Invoke(invoke) = term {
         if called_function_name(&invoke.function).is_none() {
-            collect_either_operand_func_refs(&invoke.function, func_names, out);
+            collect_either_operand_func_refs(&invoke.function, func_names, aliases, out);
         }
         for (arg, _) in &invoke.arguments {
-            collect_operand_func_refs(arg, func_names, out);
+            collect_operand_func_refs(arg, func_names, aliases, out);
         }
     }
 }
@@ -480,32 +591,37 @@ fn collect_term_address_taken(
 fn collect_either_operand_func_refs(
     function: &Either<InlineAssembly, Operand>,
     func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
     out: &mut BTreeSet<String>,
 ) {
     if let Either::Right(operand) = function {
-        collect_operand_func_refs(operand, func_names, out);
+        collect_operand_func_refs(operand, func_names, aliases, out);
     }
 }
 
 fn collect_operand_func_refs(
     operand: &Operand,
     func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
     out: &mut BTreeSet<String>,
 ) {
     if let Operand::ConstantOperand(constant) = operand {
-        collect_constant_func_refs(constant, func_names, out);
+        collect_constant_func_refs(constant, func_names, aliases, out);
     }
 }
 
 fn collect_constant_func_refs(
     constant: &Constant,
     func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
     out: &mut BTreeSet<String>,
 ) {
     match constant {
         Constant::GlobalReference { name, .. } => {
             let key = name_key(name);
-            if func_names.contains(&key) {
+            if let Some(target) = resolve_function_alias(&key, aliases) {
+                out.insert(target);
+            } else if func_names.contains(&key) {
                 out.insert(key);
             }
         }
@@ -514,16 +630,20 @@ fn collect_constant_func_refs(
             elements: values, ..
         } => {
             for value in values {
-                collect_constant_func_refs(value, func_names, out);
+                collect_constant_func_refs(value, func_names, aliases, out);
             }
         }
         Constant::Vector(values) => {
             for value in values {
-                collect_constant_func_refs(value, func_names, out);
+                collect_constant_func_refs(value, func_names, aliases, out);
             }
         }
-        Constant::BitCast(expr) => collect_constant_func_refs(&expr.operand, func_names, out),
-        Constant::GetElementPtr(expr) => collect_constant_func_refs(&expr.address, func_names, out),
+        Constant::BitCast(expr) => {
+            collect_constant_func_refs(&expr.operand, func_names, aliases, out)
+        }
+        Constant::GetElementPtr(expr) => {
+            collect_constant_func_refs(&expr.address, func_names, aliases, out)
+        }
         _ => {}
     }
 }
@@ -534,13 +654,19 @@ fn lower_instruction(
     instr: &Instruction,
     func_names: &BTreeSet<String>,
     global_names: &BTreeSet<String>,
+    aliases: &AliasMap,
+    ifunc_names: &BTreeSet<String>,
     body: &mut Vec<Stmt>,
     lowering: &mut LoweringStats,
 ) {
     match instr {
         Instruction::Alloca(alloca) => lower_alloca(func_name, alloca, body, lowering),
-        Instruction::Load(load) => lower_load(func_name, load, global_names, body, lowering),
-        Instruction::Store(store) => lower_store(func_name, store, global_names, body, lowering),
+        Instruction::Load(load) => {
+            lower_load(func_name, load, global_names, aliases, body, lowering)
+        }
+        Instruction::Store(store) => {
+            lower_store(func_name, store, global_names, aliases, body, lowering)
+        }
         Instruction::CmpXchg(cmpxchg) => lower_cmpxchg(func_name, cmpxchg, body, lowering),
         Instruction::AtomicRMW(atomicrmw) => lower_atomicrmw(func_name, atomicrmw, body, lowering),
         Instruction::GetElementPtr(gep) => lower_gep(module, func_name, gep, body, lowering),
@@ -553,7 +679,16 @@ fn lower_instruction(
         Instruction::Phi(phi) => lower_phi(module, func_name, phi, body, lowering),
         Instruction::Select(select) => lower_select(module, func_name, select, body, lowering),
         Instruction::Freeze(freeze) => lower_freeze(func_name, freeze, body, lowering),
-        Instruction::Call(call) => lower_call(module, func_name, call, func_names, body, lowering),
+        Instruction::Call(call) => lower_call(
+            module,
+            func_name,
+            call,
+            func_names,
+            aliases,
+            ifunc_names,
+            body,
+            lowering,
+        ),
         Instruction::VAArg(va_arg) => {
             lowering.bump_tainted("va_arg");
             push_unknown(
@@ -578,13 +713,22 @@ fn lower_terminator(
     func_name: &str,
     term: &Terminator,
     func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
+    ifunc_names: &BTreeSet<String>,
     body: &mut Vec<Stmt>,
     lowering: &mut LoweringStats,
 ) {
     match term {
-        Terminator::Invoke(invoke) => {
-            lower_invoke(module, func_name, invoke, func_names, body, lowering)
-        }
+        Terminator::Invoke(invoke) => lower_invoke(
+            module,
+            func_name,
+            invoke,
+            func_names,
+            aliases,
+            ifunc_names,
+            body,
+            lowering,
+        ),
         Terminator::Ret(ret) => {
             body.push(Stmt::Return {
                 value: ret
@@ -638,6 +782,8 @@ fn lower_call(
     func_name: &str,
     call: &Call,
     func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
+    ifunc_names: &BTreeSet<String>,
     body: &mut Vec<Stmt>,
     lowering: &mut LoweringStats,
 ) {
@@ -665,6 +811,19 @@ fn lower_call(
         if lower_intrinsic_call(module, func_name, &callee, call, body, lowering) {
             return;
         }
+        if ifunc_names.contains(&callee) {
+            lower_ifunc_call(
+                func_name,
+                "call",
+                &callee,
+                &call.arguments,
+                call.dest.as_ref(),
+                loc(call.debugloc.as_ref()),
+                body,
+                lowering,
+            );
+            return;
+        }
     }
 
     let Some(sig) = call_signature_from_operand(
@@ -678,9 +837,13 @@ fn lower_call(
     };
     match called_function_name(&call.function) {
         Some(callee) if is_skipped_intrinsic(&callee) => {}
-        Some(callee) if func_names.contains(&callee) => {
+        Some(callee) if resolve_function_name(&callee, func_names, aliases).is_some() => {
+            let resolved = resolve_function_name(&callee, func_names, aliases).unwrap();
+            if resolved != callee {
+                lowering.bump_modeled("alias_call_direct");
+            }
             body.push(Stmt::CallDirect {
-                callee,
+                callee: resolved,
                 sig,
                 loc: loc(call.debugloc.as_ref()),
             });
@@ -703,6 +866,8 @@ fn lower_invoke(
     func_name: &str,
     invoke: &Invoke,
     func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
+    ifunc_names: &BTreeSet<String>,
     body: &mut Vec<Stmt>,
     lowering: &mut LoweringStats,
 ) {
@@ -725,6 +890,22 @@ fn lower_invoke(
         return;
     }
 
+    if let Some(callee) = called_function_name(&invoke.function) {
+        if ifunc_names.contains(&callee) {
+            lower_ifunc_call(
+                func_name,
+                "invoke",
+                &callee,
+                &invoke.arguments,
+                Some(&invoke.result),
+                loc(invoke.debugloc.as_ref()),
+                body,
+                lowering,
+            );
+            return;
+        }
+    }
+
     let Some(sig) = call_signature_from_operand(
         &invoke.function,
         invoke.arguments.iter().map(|a| &a.1),
@@ -736,9 +917,13 @@ fn lower_invoke(
     };
     match called_function_name(&invoke.function) {
         Some(callee) if is_skipped_intrinsic(&callee) => {}
-        Some(callee) if func_names.contains(&callee) => {
+        Some(callee) if resolve_function_name(&callee, func_names, aliases).is_some() => {
+            let resolved = resolve_function_name(&callee, func_names, aliases).unwrap();
+            if resolved != callee {
+                lowering.bump_modeled("alias_call_direct");
+            }
             body.push(Stmt::CallDirect {
-                callee,
+                callee: resolved,
                 sig,
                 loc: loc(invoke.debugloc.as_ref()),
             });
@@ -756,10 +941,37 @@ fn lower_invoke(
     bump_missing_loc(lowering, "invoke", invoke.debugloc.as_ref());
 }
 
+fn lower_ifunc_call(
+    func_name: &str,
+    op: &str,
+    callee: &str,
+    arguments: &[(Operand, Vec<ParameterAttribute>)],
+    dest: Option<&Name>,
+    loc: Option<Loc>,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    lowering.bump_tainted(format!("ifunc_callee:{callee}"));
+    push_unknown(
+        body,
+        op,
+        arguments
+            .iter()
+            .map(|(arg, _)| operand_value_key(func_name, arg))
+            .collect(),
+        dest.map(|dest| vec![local_value_key(func_name, dest)])
+            .unwrap_or_default(),
+        "ifunc_callee",
+        loc,
+        lowering,
+    );
+}
+
 fn lower_load(
     func_name: &str,
     load: &Load,
     global_names: &BTreeSet<String>,
+    aliases: &AliasMap,
     body: &mut Vec<Stmt>,
     lowering: &mut LoweringStats,
 ) {
@@ -776,8 +988,9 @@ fn lower_load(
     if load.atomicity.is_some() {
         lowering.bump_modeled("atomic_load");
     }
-    if let Some(global) =
-        operand_global_name(&load.address).filter(|name| global_names.contains(name))
+    if let Some(global) = operand_global_name(&load.address)
+        .and_then(|name| resolve_global_alias(&name, aliases).or(Some(name)))
+        .filter(|name| global_names.contains(name))
     {
         body.push(Stmt::GlobalRef {
             global,
@@ -792,6 +1005,7 @@ fn lower_store(
     func_name: &str,
     store: &Store,
     global_names: &BTreeSet<String>,
+    aliases: &AliasMap,
     body: &mut Vec<Stmt>,
     lowering: &mut LoweringStats,
 ) {
@@ -808,8 +1022,9 @@ fn lower_store(
     if store.atomicity.is_some() {
         lowering.bump_modeled("atomic_store");
     }
-    if let Some(global) =
-        operand_global_name(&store.address).filter(|name| global_names.contains(name))
+    if let Some(global) = operand_global_name(&store.address)
+        .and_then(|name| resolve_global_alias(&name, aliases).or(Some(name)))
+        .filter(|name| global_names.contains(name))
     {
         body.push(Stmt::GlobalRef {
             global,
@@ -1262,6 +1477,41 @@ fn constant_global_name(constant: &Constant) -> Option<String> {
     }
 }
 
+fn resolve_function_name(
+    name: &str,
+    func_names: &BTreeSet<String>,
+    aliases: &AliasMap,
+) -> Option<String> {
+    if func_names.contains(name) {
+        Some(name.to_string())
+    } else {
+        resolve_function_alias(name, aliases)
+    }
+}
+
+fn resolve_function_alias(name: &str, aliases: &AliasMap) -> Option<String> {
+    match aliases.get(name) {
+        Some(AliasTarget::Function(target)) => Some(target.clone()),
+        _ => None,
+    }
+}
+
+fn resolve_global_alias(name: &str, aliases: &AliasMap) -> Option<String> {
+    match aliases.get(name) {
+        Some(AliasTarget::Global(target)) => Some(target.clone()),
+        _ => None,
+    }
+}
+
+fn resolve_symbol_alias(name: &str, aliases: &AliasMap) -> Option<String> {
+    match aliases.get(name) {
+        Some(AliasTarget::Function(target)) | Some(AliasTarget::Global(target)) => {
+            Some(target.clone())
+        }
+        None => None,
+    }
+}
+
 fn callee_function_type(operand: &Operand) -> Option<TypeRef> {
     match operand {
         Operand::LocalOperand { ty, .. } => match ty.as_ref() {
@@ -1664,20 +1914,29 @@ fn constant_has_pointer_flow(module: &Module, constant: &Constant) -> bool {
     }
 }
 
-fn constant_pointer_operand_keys(module: &Module, constant: &Constant) -> Vec<String> {
+fn constant_pointer_operand_keys(
+    module: &Module,
+    constant: &Constant,
+    aliases: &AliasMap,
+) -> Vec<String> {
     let mut values = BTreeSet::new();
-    collect_constant_pointer_operand_keys(module, constant, &mut values);
+    collect_constant_pointer_operand_keys(module, constant, aliases, &mut values);
     values.into_iter().collect()
 }
 
 fn collect_constant_pointer_operand_keys(
     module: &Module,
     constant: &Constant,
+    aliases: &AliasMap,
     out: &mut BTreeSet<String>,
 ) {
     match constant {
-        Constant::GlobalReference { .. } => {
-            out.insert(constant_value_key(constant));
+        Constant::GlobalReference { name, .. } => {
+            let name = name_key(name);
+            out.insert(format!(
+                "@{}",
+                resolve_symbol_alias(&name, aliases).unwrap_or(name)
+            ));
         }
         Constant::Struct { values, .. }
         | Constant::Array {
@@ -1685,52 +1944,52 @@ fn collect_constant_pointer_operand_keys(
         }
         | Constant::Vector(values) => {
             for value in values {
-                collect_constant_pointer_operand_keys(module, value, out);
+                collect_constant_pointer_operand_keys(module, value, aliases, out);
             }
         }
         Constant::BitCast(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.operand, out);
+            collect_constant_pointer_operand_keys(module, &expr.operand, aliases, out);
         }
         Constant::AddrSpaceCast(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.operand, out);
+            collect_constant_pointer_operand_keys(module, &expr.operand, aliases, out);
         }
         Constant::GetElementPtr(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.address, out);
+            collect_constant_pointer_operand_keys(module, &expr.address, aliases, out);
             for index in &expr.indices {
-                collect_constant_pointer_operand_keys(module, index, out);
+                collect_constant_pointer_operand_keys(module, index, aliases, out);
             }
         }
         Constant::PtrToInt(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.operand, out);
+            collect_constant_pointer_operand_keys(module, &expr.operand, aliases, out);
         }
         Constant::IntToPtr(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.operand, out);
+            collect_constant_pointer_operand_keys(module, &expr.operand, aliases, out);
         }
         Constant::ExtractElement(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.vector, out);
-            collect_constant_pointer_operand_keys(module, &expr.index, out);
+            collect_constant_pointer_operand_keys(module, &expr.vector, aliases, out);
+            collect_constant_pointer_operand_keys(module, &expr.index, aliases, out);
         }
         Constant::InsertElement(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.vector, out);
-            collect_constant_pointer_operand_keys(module, &expr.element, out);
-            collect_constant_pointer_operand_keys(module, &expr.index, out);
+            collect_constant_pointer_operand_keys(module, &expr.vector, aliases, out);
+            collect_constant_pointer_operand_keys(module, &expr.element, aliases, out);
+            collect_constant_pointer_operand_keys(module, &expr.index, aliases, out);
         }
         Constant::ShuffleVector(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.operand0, out);
-            collect_constant_pointer_operand_keys(module, &expr.operand1, out);
-            collect_constant_pointer_operand_keys(module, &expr.mask, out);
+            collect_constant_pointer_operand_keys(module, &expr.operand0, aliases, out);
+            collect_constant_pointer_operand_keys(module, &expr.operand1, aliases, out);
+            collect_constant_pointer_operand_keys(module, &expr.mask, aliases, out);
         }
         Constant::ExtractValue(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.aggregate, out);
+            collect_constant_pointer_operand_keys(module, &expr.aggregate, aliases, out);
         }
         Constant::InsertValue(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.aggregate, out);
-            collect_constant_pointer_operand_keys(module, &expr.element, out);
+            collect_constant_pointer_operand_keys(module, &expr.aggregate, aliases, out);
+            collect_constant_pointer_operand_keys(module, &expr.element, aliases, out);
         }
         Constant::Select(expr) => {
-            collect_constant_pointer_operand_keys(module, &expr.condition, out);
-            collect_constant_pointer_operand_keys(module, &expr.true_value, out);
-            collect_constant_pointer_operand_keys(module, &expr.false_value, out);
+            collect_constant_pointer_operand_keys(module, &expr.condition, aliases, out);
+            collect_constant_pointer_operand_keys(module, &expr.true_value, aliases, out);
+            collect_constant_pointer_operand_keys(module, &expr.false_value, aliases, out);
         }
         _ if is_pointer_like_type(&constant.get_type(&module.types)) => {
             out.insert(constant_value_key(constant));
@@ -1950,5 +2209,103 @@ fn name_key(name: &Name) -> String {
     match name {
         Name::Name(name) => (**name).clone(),
         Name::Number(num) => num.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use llvm_ir::module::{ThreadLocalMode, UnnamedAddr};
+
+    use super::*;
+
+    #[test]
+    fn collect_aliases_resolves_local_targets_and_taints_interposable() {
+        let module = Module::from_ir_str(
+            r#"
+@G = global i32 0
+define void @target() {
+entry:
+  ret void
+}
+"#,
+        )
+        .unwrap();
+        let func_ty = module
+            .types
+            .func_type(module.types.void(), Vec::new(), false);
+        let func_ptr_ty = module.types.pointer_to(func_ty.clone());
+        let i32_ty = module.types.i32();
+        let i32_ptr_ty = module.types.pointer_to(i32_ty.clone());
+        let aliases = vec![
+            test_alias(
+                "FAlias",
+                "target",
+                Linkage::Internal,
+                func_ty.clone(),
+                func_ptr_ty,
+            ),
+            test_alias(
+                "GAlias",
+                "G",
+                Linkage::Private,
+                i32_ty.clone(),
+                i32_ptr_ty.clone(),
+            ),
+            test_alias(
+                "WeakAlias",
+                "target",
+                Linkage::WeakAny,
+                func_ty,
+                i32_ptr_ty.clone(),
+            ),
+            test_alias(
+                "MissingAlias",
+                "missing",
+                Linkage::Internal,
+                i32_ty,
+                i32_ptr_ty,
+            ),
+        ];
+        let func_names = BTreeSet::from(["target".to_string()]);
+        let global_names = BTreeSet::from(["G".to_string()]);
+        let mut lowering = LoweringStats::default();
+
+        let resolved = collect_aliases(&aliases, &func_names, &global_names, &mut lowering);
+
+        assert_eq!(
+            resolved.get("FAlias"),
+            Some(&AliasTarget::Function("target".to_string()))
+        );
+        assert_eq!(
+            resolved.get("GAlias"),
+            Some(&AliasTarget::Global("G".to_string()))
+        );
+        assert_eq!(lowering.modeled_counts["alias_function_resolved"], 1);
+        assert_eq!(lowering.modeled_counts["alias_global_resolved"], 1);
+        assert_eq!(lowering.tainted_counts["alias_interposable:WeakAlias"], 1);
+        assert_eq!(lowering.tainted_counts["alias_unresolved:MissingAlias"], 1);
+    }
+
+    fn test_alias(
+        alias: &str,
+        target: &str,
+        linkage: Linkage,
+        target_ty: TypeRef,
+        alias_ty: TypeRef,
+    ) -> GlobalAlias {
+        GlobalAlias {
+            name: Name::from(alias),
+            aliasee: ConstantRef::new(Constant::GlobalReference {
+                name: Name::from(target),
+                ty: target_ty,
+            }),
+            linkage,
+            visibility: Visibility::Default,
+            ty: alias_ty,
+            addr_space: 0,
+            dll_storage_class: DLLStorageClass::Default,
+            thread_local_mode: ThreadLocalMode::NotThreadLocal,
+            unnamed_addr: None::<UnnamedAddr>,
+        }
     }
 }

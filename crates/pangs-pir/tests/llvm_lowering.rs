@@ -341,3 +341,50 @@ entry:
     assert_eq!(pir.lowering.modeled_counts["gep_byte_offset"], 3);
     assert_eq!(pir.lowering.skipped_counts["gep_dynamic_index"], 1);
 }
+
+#[test]
+fn lowers_ifunc_callee_as_unknown() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("ifunc.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@IfuncTarget = ifunc void (), void ()* ()* @resolve
+
+define void @target() {
+entry:
+  ret void
+}
+
+define void ()* @resolve() {
+entry:
+  ret void ()* @target
+}
+
+define void @ifunc_caller() {
+entry:
+  call void @IfuncTarget()
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    let caller = pir
+        .functions
+        .iter()
+        .find(|f| f.key == "ifunc_caller")
+        .unwrap();
+    assert!(caller.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown {
+            reason,
+            op,
+            ..
+        } if reason == "ifunc_callee" && op == "call"
+    )));
+    assert_eq!(pir.lowering.ifuncs, 1);
+    assert_eq!(pir.lowering.tainted_counts["ifunc:IfuncTarget"], 1);
+    assert_eq!(pir.lowering.tainted_counts["ifunc_callee:IfuncTarget"], 1);
+}
