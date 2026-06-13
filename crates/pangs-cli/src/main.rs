@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use pangs_api::{Analysis, BuildMode, Opts, Stage};
-use pangs_pir::{LlvmBackend, Pir};
+use pangs_pir::Pir;
 
 #[derive(Debug, Parser)]
 #[command(name = "pangs")]
@@ -29,32 +29,22 @@ enum Command {
         exports: Option<PathBuf>,
         #[arg(long)]
         validate: bool,
-        #[arg(long, default_value = "llvm-sys")]
-        llvm_backend: LlvmBackendArg,
     },
     Stats {
         module: PathBuf,
-        #[arg(long, default_value = "llvm-sys")]
-        llvm_backend: LlvmBackendArg,
     },
     DumpPir {
         module: PathBuf,
         #[arg(long)]
         func: Option<String>,
-        #[arg(long, default_value = "llvm-sys")]
-        llvm_backend: LlvmBackendArg,
     },
     DumpPag {
         module: PathBuf,
         #[arg(long)]
         func: Option<String>,
-        #[arg(long, default_value = "llvm-sys")]
-        llvm_backend: LlvmBackendArg,
     },
     CheckPag {
         module: PathBuf,
-        #[arg(long, default_value = "llvm-sys")]
-        llvm_backend: LlvmBackendArg,
     },
     Report {
         dir: PathBuf,
@@ -93,21 +83,6 @@ impl From<BuildModeArg> for BuildMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum LlvmBackendArg {
-    LlvmIr,
-    LlvmSys,
-}
-
-impl From<LlvmBackendArg> for LlvmBackend {
-    fn from(value: LlvmBackendArg) -> Self {
-        match value {
-            LlvmBackendArg::LlvmIr => LlvmBackend::LlvmIr,
-            LlvmBackendArg::LlvmSys => LlvmBackend::LlvmSys,
-        }
-    }
-}
-
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err:#}");
@@ -125,9 +100,8 @@ fn run() -> Result<()> {
             build_mode,
             exports,
             validate,
-            llvm_backend,
         } => {
-            let pir = Pir::from_path_with_backend(&module, llvm_backend.into())?;
+            let pir = Pir::from_path(&module)?;
             let opts = Opts {
                 stage: stage.into(),
                 build_mode: build_mode.into(),
@@ -141,32 +115,21 @@ fn run() -> Result<()> {
             let analysis = Analysis::run(&pir, &opts)?;
             pangs_clients::export_analysis(&analysis, &opts, &module, &out, validate)?;
         }
-        Command::Stats {
-            module,
-            llvm_backend,
-        } => {
-            let pir = Pir::from_path_with_backend(&module, llvm_backend.into())?;
+        Command::Stats { module } => {
+            let pir = Pir::from_path(&module)?;
             let opts = Opts::default();
             let analysis = Analysis::run(&pir, &opts)?;
             println!("{}", serde_json::to_string_pretty(analysis.metrics())?);
         }
-        Command::DumpPir {
-            module,
-            func,
-            llvm_backend,
-        } => {
-            let mut pir = Pir::from_path_with_backend(&module, llvm_backend.into())?;
+        Command::DumpPir { module, func } => {
+            let mut pir = Pir::from_path(&module)?;
             if let Some(func_key) = func {
                 pir.functions.retain(|f| f.key == func_key);
             }
             println!("{}", serde_json::to_string_pretty(&pir)?);
         }
-        Command::DumpPag {
-            module,
-            func,
-            llvm_backend,
-        } => {
-            let _pir = Pir::from_path_with_backend(&module, llvm_backend.into())?;
+        Command::DumpPag { module, func } => {
+            let _pir = Pir::from_path(&module)?;
             println!(
                 "{}",
                 serde_json::json!({
@@ -175,11 +138,8 @@ fn run() -> Result<()> {
                 })
             );
         }
-        Command::CheckPag {
-            module,
-            llvm_backend,
-        } => {
-            let _pir = Pir::from_path_with_backend(&module, llvm_backend.into())?;
+        Command::CheckPag { module } => {
+            let _pir = Pir::from_path(&module)?;
             eprintln!("check-pag: no PAG invariants enabled before M1.3");
         }
         Command::Report { dir } => {

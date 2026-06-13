@@ -1,14 +1,20 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use pangs_pir::{LlvmBackend, Param, Pir, Stmt};
+use pangs_pir::{Param, Pir, Stmt};
 use tempfile::TempDir;
 
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
 
+fn m1_1_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_1")
+        .join(name)
+}
+
 fn pir_from_llvm_sys(path: &Path) -> Pir {
-    Pir::from_path_with_backend(path, LlvmBackend::LlvmSys).unwrap()
+    Pir::from_path(path).unwrap()
 }
 
 #[test]
@@ -19,25 +25,8 @@ fn lowers_llvm14_bitcode_function_pointer_smoke() {
     );
 
     let tmp = TempDir::new().unwrap();
-    let c_path = tmp.path().join("fp.c");
     let bc_path = tmp.path().join("fp.bc");
-    fs::write(
-        &c_path,
-        r#"
-int g_counter;
-void target(long value);
-void (*fp)(long) = target;
-
-void target(long value) {
-  g_counter = (int)value;
-}
-
-void driver(void) {
-  fp(7);
-}
-"#,
-    )
-    .unwrap();
+    let c_path = m1_1_fixture("fp_smoke.c");
 
     let status = Command::new(CLANG_14)
         .arg("-O0")
@@ -95,25 +84,8 @@ fn llvm_sys_lowers_llvm14_bitcode_function_pointer_smoke() {
     );
 
     let tmp = TempDir::new().unwrap();
-    let c_path = tmp.path().join("fp.c");
     let bc_path = tmp.path().join("fp.bc");
-    fs::write(
-        &c_path,
-        r#"
-int g_counter;
-void target(long value);
-void (*fp)(long) = target;
-
-void target(long value) {
-  g_counter = (int)value;
-}
-
-void driver(void) {
-  fp(7);
-}
-"#,
-    )
-    .unwrap();
+    let c_path = m1_1_fixture("fp_smoke.c");
 
     let status = Command::new(CLANG_14)
         .arg("-O0")
@@ -127,7 +99,7 @@ void driver(void) {
         .unwrap();
     assert!(status.success());
 
-    let pir = pir_from_llvm_sys(&bc_path);
+    let pir = Pir::from_path(&bc_path).unwrap();
     let target = pir.functions.iter().find(|f| f.key == "target").unwrap();
     assert!(target.address_taken);
     assert!(target
@@ -165,42 +137,7 @@ void driver(void) {
 
 #[test]
 fn lowers_address_taken_through_callbacks_varargs_and_stores() {
-    let tmp = TempDir::new().unwrap();
-    let ll_path = tmp.path().join("address_taken.ll");
-    fs::write(
-        &ll_path,
-        r#"
-declare void @accept_cb(void ()*)
-declare void @accept_vararg(i32, ...)
-
-define void @cb_arg() {
-entry:
-  ret void
-}
-
-define void @cb_vararg() {
-entry:
-  ret void
-}
-
-define void @cb_store() {
-entry:
-  ret void
-}
-
-define void @driver() {
-entry:
-  %slot = alloca void ()*
-  call void @accept_cb(void ()* @cb_arg)
-  call void (i32, ...) @accept_vararg(i32 7, void ()* @cb_vararg)
-  store void ()* @cb_store, void ()** %slot
-  ret void
-}
-"#,
-    )
-    .unwrap();
-
-    let pir = Pir::from_path(&ll_path).unwrap();
+    let pir = Pir::from_path(m1_1_fixture("address_taken.ll")).unwrap();
     for name in ["cb_arg", "cb_vararg", "cb_store"] {
         assert!(
             pir.functions
@@ -225,32 +162,7 @@ entry:
 
 #[test]
 fn lowers_vararg_and_x87_signatures_from_ll() {
-    let tmp = TempDir::new().unwrap();
-    let ll_path = tmp.path().join("abi_rows.ll");
-    fs::write(
-        &ll_path,
-        r#"
-declare i32 @vararg_target(i8*, ...)
-declare x86_fp80 @x87_id(x86_fp80)
-declare void @accept_short_cb(void (i8*)*)
-
-define void @short_cb(i8* %p) {
-entry:
-  ret void
-}
-
-define void @driver(i8* %p, i64 %bits, x86_fp80 %xf) {
-entry:
-  call i32 (i8*, ...) @vararg_target(i8* %p, i64 %bits, i8* %p)
-  call x86_fp80 @x87_id(x86_fp80 %xf)
-  call void @accept_short_cb(void (i8*)* @short_cb)
-  ret void
-}
-"#,
-    )
-    .unwrap();
-
-    let pir = Pir::from_path(&ll_path).unwrap();
+    let pir = Pir::from_path(m1_1_fixture("abi_rows.ll")).unwrap();
 
     let vararg_target = pir
         .functions
@@ -297,22 +209,7 @@ entry:
 
 #[test]
 fn lowers_addrspacecast_pointer_flow_from_ll() {
-    let tmp = TempDir::new().unwrap();
-    let ll_path = tmp.path().join("addrspacecast.ll");
-    fs::write(
-        &ll_path,
-        r#"
-define i8* @casts(i8* %p) {
-entry:
-  %to_as1 = addrspacecast i8* %p to i8 addrspace(1)*
-  %back = addrspacecast i8 addrspace(1)* %to_as1 to i8*
-  ret i8* %back
-}
-"#,
-    )
-    .unwrap();
-
-    let pir = Pir::from_path(&ll_path).unwrap();
+    let pir = Pir::from_path(m1_1_fixture("addrspacecast.ll")).unwrap();
     let casts = pir.functions.iter().find(|f| f.key == "casts").unwrap();
     let assigns = casts
         .body
@@ -338,26 +235,7 @@ entry:
 
 #[test]
 fn lowers_volatile_and_atomic_global_accesses_from_ll() {
-    let tmp = TempDir::new().unwrap();
-    let ll_path = tmp.path().join("volatile_atomic.ll");
-    fs::write(
-        &ll_path,
-        r#"
-@GP = global i8* null
-
-define i8* @touch(i8* %p) {
-entry:
-  store volatile i8* %p, i8** @GP
-  %v = load volatile i8*, i8** @GP
-  store atomic i8* %p, i8** @GP seq_cst, align 8
-  %a = load atomic i8*, i8** @GP seq_cst, align 8
-  ret i8* %a
-}
-"#,
-    )
-    .unwrap();
-
-    let pir = Pir::from_path(&ll_path).unwrap();
+    let pir = Pir::from_path(m1_1_fixture("volatile_atomic.ll")).unwrap();
     let touch = pir.functions.iter().find(|f| f.key == "touch").unwrap();
     assert_eq!(
         touch
@@ -385,21 +263,7 @@ entry:
 
 #[test]
 fn lowers_inline_asm_calls_as_unknown_and_taints_them() {
-    let tmp = TempDir::new().unwrap();
-    let ll_path = tmp.path().join("inline_asm.ll");
-    fs::write(
-        &ll_path,
-        r#"
-define void @asm_call() {
-entry:
-  call void asm sideeffect "", ""()
-  ret void
-}
-"#,
-    )
-    .unwrap();
-
-    let pir = Pir::from_path(&ll_path).unwrap();
+    let pir = Pir::from_path(m1_1_fixture("inline_asm.ll")).unwrap();
     let asm_call = pir.functions.iter().find(|f| f.key == "asm_call").unwrap();
     assert!(asm_call.body.iter().any(|stmt| matches!(
         stmt,
@@ -416,27 +280,8 @@ fn lowers_large_struct_byval_and_sret_from_bitcode() {
     );
 
     let tmp = TempDir::new().unwrap();
-    let c_path = tmp.path().join("agg.c");
     let bc_path = tmp.path().join("agg.bc");
-    fs::write(
-        &c_path,
-        r#"
-struct Big {
-  void *a;
-  void *b;
-  void *c;
-};
-
-extern void sink(struct Big);
-
-struct Big ret_big(void *p, void *q, void *r) {
-  struct Big x = {p, q, r};
-  sink(x);
-  return x;
-}
-"#,
-    )
-    .unwrap();
+    let c_path = m1_1_fixture("byval_sret.c");
 
     let status = Command::new(CLANG_14)
         .arg("-O0")
@@ -478,27 +323,8 @@ fn llvm_sys_lowers_large_struct_byval_and_sret_from_bitcode() {
     );
 
     let tmp = TempDir::new().unwrap();
-    let c_path = tmp.path().join("agg.c");
     let bc_path = tmp.path().join("agg.bc");
-    fs::write(
-        &c_path,
-        r#"
-struct Big {
-  void *a;
-  void *b;
-  void *c;
-};
-
-extern void sink(struct Big);
-
-struct Big ret_big(void *p, void *q, void *r) {
-  struct Big x = {p, q, r};
-  sink(x);
-  return x;
-}
-"#,
-    )
-    .unwrap();
+    let c_path = m1_1_fixture("byval_sret.c");
 
     let status = Command::new(CLANG_14)
         .arg("-O0")
@@ -512,7 +338,7 @@ struct Big ret_big(void *p, void *q, void *r) {
         .unwrap();
     assert!(status.success());
 
-    let pir = pir_from_llvm_sys(&bc_path);
+    let pir = Pir::from_path(&bc_path).unwrap();
     let ret_big = pir.functions.iter().find(|f| f.key == "ret_big").unwrap();
     assert!(matches!(
         ret_big.sig.params.first(),
@@ -933,7 +759,7 @@ fn lowers_global_initializer_select_pointer_flow_from_ll() {
         .iter()
         .find_map(|stmt| match stmt {
             Stmt::Assign { dest, sources, .. }
-                if sources == &vec!["@A".to_string(), "@B".to_string()] =>
+                if sources.iter().map(String::as_str).eq(["@A", "@B"]) =>
             {
                 Some(dest.clone())
             }
@@ -968,7 +794,7 @@ fn llvm_sys_lowers_global_initializer_select_pointer_flow_from_ll() {
         .iter()
         .find_map(|stmt| match stmt {
             Stmt::Assign { dest, sources, .. }
-                if sources == &vec!["@A".to_string(), "@B".to_string()] =>
+                if sources.iter().map(String::as_str).eq(["@A", "@B"]) =>
             {
                 Some(dest.clone())
             }
@@ -1038,7 +864,7 @@ entry:
     )));
     assert!(pir.global_init.iter().any(|stmt| matches!(
         stmt,
-        Stmt::Assign { sources, .. } if sources == &vec!["@target".to_string()]
+        Stmt::Assign { sources, .. } if sources.iter().map(String::as_str).eq(["@target"])
     )));
     assert!(pir.global_init.iter().any(|stmt| matches!(
         stmt,
@@ -1151,7 +977,7 @@ entry:
     )));
     assert!(pir.global_init.iter().any(|stmt| matches!(
         stmt,
-        Stmt::Assign { sources, .. } if sources == &vec!["@target".to_string()]
+        Stmt::Assign { sources, .. } if sources.iter().map(String::as_str).eq(["@target"])
     )));
     assert!(pir.global_init.iter().any(|stmt| matches!(
         stmt,
@@ -1239,7 +1065,7 @@ entry:
     let caller = pir.functions.iter().find(|f| f.key == "caller").unwrap();
     assert!(caller.body.iter().any(|stmt| matches!(
         stmt,
-        Stmt::GlobalRef { global, access, .. } if global == "G" && *access == pangs_pir::Access::Ref
+        Stmt::GlobalRef { global, access, .. } if global == "G" && access == &pangs_pir::Access::Ref
     )));
     assert!(caller.body.iter().any(|stmt| matches!(
         stmt,
@@ -1449,7 +1275,8 @@ lpad:
     assert!(func.body.iter().any(|stmt| matches!(
         stmt,
         Stmt::Assign { dest, sources, .. }
-            if dest.ends_with("::field") && sources == &vec!["%agg_and_eh::agg1".to_string()]
+            if dest.ends_with("::field")
+                && sources.iter().map(String::as_str).eq(["%agg_and_eh::agg1"])
     )));
     assert!(func.body.iter().any(|stmt| matches!(
         stmt,
@@ -1460,12 +1287,13 @@ lpad:
             ..
         } if op == "landingpad"
             && reason == "landingpad_pointer_result"
-            && results == &vec!["%agg_and_eh::lp".to_string()]
+            && results.iter().map(String::as_str).eq(["%agg_and_eh::lp"])
     )));
     assert!(func.body.iter().any(|stmt| matches!(
         stmt,
         Stmt::Assign { dest, sources, .. }
-            if dest.ends_with("::ehptr") && sources == &vec!["%agg_and_eh::lp".to_string()]
+            if dest.ends_with("::ehptr")
+                && sources.iter().map(String::as_str).eq(["%agg_and_eh::lp"])
     )));
     assert_eq!(pir.lowering.tainted_counts["personality_function"], 1);
     assert_eq!(
