@@ -164,6 +164,66 @@ void driver(void) {
 }
 
 #[test]
+fn lowers_address_taken_through_callbacks_varargs_and_stores() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("address_taken.ll");
+    fs::write(
+        &ll_path,
+        r#"
+declare void @accept_cb(void ()*)
+declare void @accept_vararg(i32, ...)
+
+define void @cb_arg() {
+entry:
+  ret void
+}
+
+define void @cb_vararg() {
+entry:
+  ret void
+}
+
+define void @cb_store() {
+entry:
+  ret void
+}
+
+define void @driver() {
+entry:
+  %slot = alloca void ()*
+  call void @accept_cb(void ()* @cb_arg)
+  call void (i32, ...) @accept_vararg(i32 7, void ()* @cb_vararg)
+  store void ()* @cb_store, void ()** %slot
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    for name in ["cb_arg", "cb_vararg", "cb_store"] {
+        assert!(
+            pir.functions
+                .iter()
+                .find(|f| f.key == name)
+                .unwrap()
+                .address_taken
+        );
+    }
+    let accept_vararg = pir
+        .functions
+        .iter()
+        .find(|f| f.key == "accept_vararg")
+        .unwrap();
+    assert!(accept_vararg.sig.vararg);
+    let driver = pir.functions.iter().find(|f| f.key == "driver").unwrap();
+    assert!(driver.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::CallDirect { callee, sig, .. } if callee == "accept_vararg" && sig.vararg
+    )));
+}
+
+#[test]
 fn lowers_large_struct_byval_and_sret_from_bitcode() {
     assert!(
         Path::new(CLANG_14).exists(),

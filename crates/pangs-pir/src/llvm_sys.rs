@@ -1301,8 +1301,60 @@ unsafe fn collect_address_taken(
         if LLVMHasPersonalityFn(*function) != 0 {
             collect_constant_func_refs(ctx, LLVMGetPersonalityFn(*function), &mut out);
         }
+        let mut block = LLVMGetFirstBasicBlock(*function);
+        while !block.is_null() {
+            let mut inst = LLVMGetFirstInstruction(block);
+            while !inst.is_null() {
+                collect_inst_address_taken(ctx, inst, &mut out);
+                inst = LLVMGetNextInstruction(inst);
+            }
+            block = LLVMGetNextBasicBlock(block);
+        }
     }
     out
+}
+
+unsafe fn collect_inst_address_taken(
+    ctx: &ModuleCtx,
+    inst: LLVMValueRef,
+    out: &mut BTreeSet<String>,
+) {
+    match LLVMGetInstructionOpcode(inst) {
+        LLVMOpcode::LLVMCall | LLVMOpcode::LLVMInvoke | LLVMOpcode::LLVMCallBr => {
+            let called = LLVMGetCalledValue(inst);
+            if !LLVMIsAInlineAsm(called).is_null() {
+                return;
+            }
+            if !matches!(
+                direct_symbol_name(called).as_deref(),
+                Some(name) if resolve_function_name(ctx, name).is_some()
+            ) {
+                collect_value_func_refs(ctx, called, out);
+            }
+            for index in 0..LLVMGetNumArgOperands(inst) {
+                collect_value_func_refs(ctx, LLVMGetOperand(inst, index), out);
+            }
+        }
+        LLVMOpcode::LLVMStore => {
+            collect_value_func_refs(ctx, LLVMGetOperand(inst, 0), out);
+            collect_value_func_refs(ctx, LLVMGetOperand(inst, 1), out);
+        }
+        _ => {}
+    }
+}
+
+unsafe fn collect_value_func_refs(
+    ctx: &ModuleCtx,
+    value: LLVMValueRef,
+    out: &mut BTreeSet<String>,
+) {
+    if !LLVMIsAConstant(value).is_null()
+        || !LLVMIsAFunction(value).is_null()
+        || !LLVMIsAGlobalAlias(value).is_null()
+        || !LLVMIsAGlobalIFunc(value).is_null()
+    {
+        collect_constant_func_refs(ctx, value, out);
+    }
 }
 
 unsafe fn collect_constant_func_refs(
