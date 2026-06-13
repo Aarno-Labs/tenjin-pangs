@@ -18,6 +18,14 @@ use crate::{
     AbiClass, Access, Func, Global, Loc, LoweringStats, Param, Pir, PirError, Signature, Stmt,
 };
 
+type AliasMap = BTreeMap<String, AliasTarget>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AliasTarget {
+    Function(String),
+    Global(String),
+}
+
 pub fn lower_path(path: &Path) -> Result<Pir, PirError> {
     let module = ParsedModule::from_path(path)?;
     Ok(unsafe { lower_module(module.module) })
@@ -94,6 +102,8 @@ struct ModuleCtx {
     data_layout: LLVMTargetDataRef,
     func_names: BTreeSet<String>,
     global_names: BTreeSet<String>,
+    aliases: AliasMap,
+    ifunc_names: BTreeSet<String>,
 }
 
 struct FunctionCtx {
@@ -168,11 +178,6 @@ unsafe fn lower_module(module: LLVMModuleRef) -> Pir {
         .iter()
         .map(|global| value_name(*global))
         .collect::<BTreeSet<_>>();
-    let ctx = ModuleCtx {
-        data_layout: LLVMGetModuleDataLayout(module),
-        func_names,
-        global_names,
-    };
 
     let mut lowering = LoweringStats {
         functions: functions
@@ -193,7 +198,24 @@ unsafe fn lower_module(module: LLVMModuleRef) -> Pir {
         ..LoweringStats::default()
     };
 
-    let address_taken = collect_address_taken(&ctx, &globals);
+    let alias_map = collect_alias_map(&aliases, &func_names, &global_names, &mut lowering);
+    let ifunc_names = ifuncs
+        .iter()
+        .map(|ifunc| value_name(*ifunc))
+        .collect::<BTreeSet<_>>();
+    for ifunc in &ifuncs {
+        lowering.bump_tainted(format!("ifunc:{}", value_name(*ifunc)));
+    }
+
+    let ctx = ModuleCtx {
+        data_layout: LLVMGetModuleDataLayout(module),
+        func_names,
+        global_names,
+        aliases: alias_map,
+        ifunc_names,
+    };
+
+    let address_taken = collect_address_taken(&ctx, &globals, &aliases, &functions);
 
     let mut pir_functions = Vec::new();
     for function in functions {
@@ -253,13 +275,18 @@ unsafe fn lower_function(
     let key = value_name(function);
     let mut body = Vec::new();
     let mut fctx = FunctionCtx::new(key.clone());
+    lower_personality_function(ctx, function, lowering);
 
     let mut block = LLVMGetFirstBasicBlock(function);
     while !block.is_null() {
         let mut inst = LLVMGetFirstInstruction(block);
         while !inst.is_null() {
             let opcode = LLVMGetInstructionOpcode(inst);
-            lowering.bump_instruction(opcode_key(opcode));
+            if LLVMIsATerminatorInst(inst).is_null() {
+                lowering.bump_instruction(opcode_key(opcode));
+            } else {
+                lowering.bump_terminator(opcode_key(opcode));
+            }
             lower_instruction(ctx, &mut fctx, inst, opcode, &mut body, lowering);
             inst = LLVMGetNextInstruction(inst);
         }
@@ -333,9 +360,7 @@ unsafe fn lower_instruction(
             });
             lowering.bump_modeled("load");
             bump_missing_loc(lowering, "load", inst);
-            if let Some(global) =
-                operand_global_name(address).filter(|name| ctx.global_names.contains(name))
-            {
+            if let Some(global) = operand_global_name(ctx, address) {
                 body.push(Stmt::GlobalRef {
                     global,
                     access: Access::Ref,
@@ -354,9 +379,7 @@ unsafe fn lower_instruction(
             });
             lowering.bump_modeled("store");
             bump_missing_loc(lowering, "store", inst);
-            if let Some(global) =
-                operand_global_name(address).filter(|name| ctx.global_names.contains(name))
-            {
+            if let Some(global) = operand_global_name(ctx, address) {
                 body.push(Stmt::GlobalRef {
                     global,
                     access: Access::Mod,
@@ -422,6 +445,14 @@ unsafe fn lower_instruction(
             bump_missing_loc(lowering, "inttoptr", inst);
         }
         LLVMOpcode::LLVMCall => lower_call(ctx, fctx, inst, body, lowering),
+        LLVMOpcode::LLVMInvoke => lower_invoke(ctx, fctx, inst, body, lowering),
+        LLVMOpcode::LLVMCallBr => lower_callbr(ctx, fctx, inst, body, lowering),
+        LLVMOpcode::LLVMExtractElement => lower_extract_element(fctx, inst, body, lowering),
+        LLVMOpcode::LLVMInsertElement => lower_insert_element(inst, fctx, body, lowering),
+        LLVMOpcode::LLVMShuffleVector => lower_shuffle_vector(fctx, inst, body, lowering),
+        LLVMOpcode::LLVMExtractValue => lower_extract_value(fctx, inst, body, lowering),
+        LLVMOpcode::LLVMInsertValue => lower_insert_value(inst, fctx, body, lowering),
+        LLVMOpcode::LLVMLandingPad => lower_landingpad(inst, fctx, body, lowering),
         LLVMOpcode::LLVMRet => {
             let value = if LLVMGetNumOperands(inst) == 0 {
                 None
@@ -435,7 +466,11 @@ unsafe fn lower_instruction(
             lowering.bump_modeled("return");
             bump_missing_loc(lowering, "return", inst);
         }
-        _ => lowering.bump_skipped(format!("unmodeled_instruction:{}", opcode_key(opcode))),
+        _ => {
+            if LLVMIsATerminatorInst(inst).is_null() {
+                lowering.bump_skipped(format!("unmodeled_instruction:{}", opcode_key(opcode)));
+            }
+        }
     }
 }
 
@@ -446,22 +481,64 @@ unsafe fn lower_call(
     body: &mut Vec<Stmt>,
     lowering: &mut LoweringStats,
 ) {
+    lower_call_site(ctx, fctx, inst, "call", "inline_asm", body, lowering);
+}
+
+unsafe fn lower_invoke(
+    ctx: &ModuleCtx,
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    lowering.bump_tainted("invoke_exception_control_flow");
+    lower_call_site(ctx, fctx, inst, "invoke", "inline_asm", body, lowering);
+}
+
+unsafe fn lower_callbr(
+    ctx: &ModuleCtx,
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    lowering.bump_tainted("callbr");
+    lower_call_site(
+        ctx,
+        fctx,
+        inst,
+        "callbr",
+        "inline_asm_callbr",
+        body,
+        lowering,
+    );
+}
+
+unsafe fn lower_call_site(
+    ctx: &ModuleCtx,
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    op: &str,
+    inline_reason: &str,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
     let called = LLVMGetCalledValue(inst);
     if !LLVMIsAInlineAsm(called).is_null() {
-        lowering.bump_tainted("inline_asm_call");
         push_unknown(
             body,
-            "call",
+            op,
             call_operand_keys(fctx, inst),
             call_result_keys(fctx, inst),
-            "inline_asm_call",
+            inline_reason,
             loc(inst),
             lowering,
         );
+        bump_missing_loc(lowering, op, inst);
         return;
     }
 
-    if let Some(callee) = direct_callee_name(called) {
+    if let Some(callee) = direct_symbol_name(called) {
         if callee.starts_with("llvm.dbg.") {
             lowering.bump_skipped("dbg_intrinsic");
             return;
@@ -470,21 +547,226 @@ unsafe fn lower_call(
             lowering.bump_skipped(format!("intrinsic:{callee}"));
             return;
         }
-        body.push(Stmt::CallDirect {
-            callee,
-            sig: call_signature(ctx, inst, lowering),
-            loc: loc(inst),
-        });
-        lowering.bump_modeled("call_direct");
-    } else {
-        body.push(Stmt::CallIndirect {
-            operand: fctx.operand_key(called),
-            sig: call_signature(ctx, inst, lowering),
-            loc: loc(inst),
-        });
-        lowering.bump_modeled("call_indirect");
+        if ctx.ifunc_names.contains(&callee) {
+            lower_ifunc_call(fctx, op, &callee, inst, body, lowering);
+            bump_missing_loc(lowering, op, inst);
+            return;
+        }
     }
-    bump_missing_loc(lowering, "call", inst);
+
+    let sig = call_signature(ctx, inst, lowering);
+    match direct_symbol_name(called) {
+        Some(callee) if is_skipped_intrinsic(&callee) => {}
+        Some(callee) if resolve_function_name(ctx, &callee).is_some() => {
+            let resolved = resolve_function_name(ctx, &callee).unwrap();
+            if resolved != callee {
+                lowering.bump_modeled("alias_call_direct");
+            }
+            body.push(Stmt::CallDirect {
+                callee: resolved,
+                sig,
+                loc: loc(inst),
+            });
+            lowering.bump_modeled("call_direct");
+        }
+        _ => {
+            body.push(Stmt::CallIndirect {
+                operand: fctx.operand_key(called),
+                sig,
+                loc: loc(inst),
+            });
+            lowering.bump_modeled("call_indirect");
+        }
+    }
+    bump_missing_loc(lowering, op, inst);
+}
+
+unsafe fn lower_ifunc_call(
+    fctx: &mut FunctionCtx,
+    op: &str,
+    callee: &str,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    lowering.bump_tainted(format!("ifunc_callee:{callee}"));
+    push_unknown(
+        body,
+        op,
+        call_operand_keys(fctx, inst),
+        call_result_keys(fctx, inst),
+        "ifunc_callee",
+        loc(inst),
+        lowering,
+    );
+}
+
+unsafe fn lower_extract_element(
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if is_pointer_vector_type(LLVMTypeOf(LLVMGetOperand(inst, 0))) {
+        lowering.bump_tainted("pointer_vector:extractelement");
+        push_unknown(
+            body,
+            "extractelement",
+            vec![
+                fctx.operand_key(LLVMGetOperand(inst, 0)),
+                fctx.operand_key(LLVMGetOperand(inst, 1)),
+            ],
+            vec![fctx.local_key(inst)],
+            "pointer_vector",
+            loc(inst),
+            lowering,
+        );
+    } else {
+        lowering.bump_skipped("extractelement_non_pointer_vector");
+    }
+    bump_missing_loc(lowering, "extractelement", inst);
+}
+
+unsafe fn lower_insert_element(
+    inst: LLVMValueRef,
+    fctx: &mut FunctionCtx,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if is_pointer_vector_type(LLVMTypeOf(LLVMGetOperand(inst, 0)))
+        || is_pointer_like_type(LLVMTypeOf(LLVMGetOperand(inst, 1)))
+    {
+        lowering.bump_tainted("pointer_vector:insertelement");
+        push_unknown(
+            body,
+            "insertelement",
+            vec![
+                fctx.operand_key(LLVMGetOperand(inst, 0)),
+                fctx.operand_key(LLVMGetOperand(inst, 1)),
+                fctx.operand_key(LLVMGetOperand(inst, 2)),
+            ],
+            vec![fctx.local_key(inst)],
+            "pointer_vector",
+            loc(inst),
+            lowering,
+        );
+    } else {
+        lowering.bump_skipped("insertelement_non_pointer_vector");
+    }
+    bump_missing_loc(lowering, "insertelement", inst);
+}
+
+unsafe fn lower_shuffle_vector(
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if is_pointer_vector_type(LLVMTypeOf(LLVMGetOperand(inst, 0)))
+        || is_pointer_vector_type(LLVMTypeOf(LLVMGetOperand(inst, 1)))
+        || is_pointer_vector_type(LLVMTypeOf(inst))
+    {
+        lowering.bump_tainted("pointer_vector:shufflevector");
+        push_unknown(
+            body,
+            "shufflevector",
+            vec![
+                fctx.operand_key(LLVMGetOperand(inst, 0)),
+                fctx.operand_key(LLVMGetOperand(inst, 1)),
+                value_string(LLVMGetOperand(inst, 2)),
+            ],
+            vec![fctx.local_key(inst)],
+            "pointer_vector",
+            loc(inst),
+            lowering,
+        );
+    } else {
+        lowering.bump_skipped("shufflevector_non_pointer_vector");
+    }
+    bump_missing_loc(lowering, "shufflevector", inst);
+}
+
+unsafe fn lower_extract_value(
+    fctx: &mut FunctionCtx,
+    inst: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    let result_type = LLVMTypeOf(inst);
+    if is_pointer_vector_type(result_type) {
+        lowering.bump_tainted("pointer_vector:extractvalue");
+        push_unknown(
+            body,
+            "extractvalue",
+            vec![fctx.operand_key(LLVMGetOperand(inst, 0))],
+            vec![fctx.local_key(inst)],
+            "pointer_vector",
+            loc(inst),
+            lowering,
+        );
+    } else if is_pointer_like_type(result_type) {
+        body.push(Stmt::Assign {
+            dest: fctx.local_key(inst),
+            sources: vec![fctx.operand_key(LLVMGetOperand(inst, 0))],
+            loc: loc(inst),
+        });
+        lowering.bump_modeled("extractvalue");
+        lowering.bump_modeled("assign");
+    } else if type_contains_pointer(LLVMTypeOf(LLVMGetOperand(inst, 0))) {
+        lowering.bump_tainted("extractvalue_pointer_aggregate_non_pointer_result");
+    } else {
+        lowering.bump_skipped("extractvalue_non_pointer");
+    }
+    bump_missing_loc(lowering, "extractvalue", inst);
+}
+
+unsafe fn lower_insert_value(
+    inst: LLVMValueRef,
+    fctx: &mut FunctionCtx,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if type_contains_pointer(LLVMTypeOf(inst))
+        || type_contains_pointer(LLVMTypeOf(LLVMGetOperand(inst, 1)))
+    {
+        body.push(Stmt::Assign {
+            dest: fctx.local_key(inst),
+            sources: vec![
+                fctx.operand_key(LLVMGetOperand(inst, 0)),
+                fctx.operand_key(LLVMGetOperand(inst, 1)),
+            ],
+            loc: loc(inst),
+        });
+        lowering.bump_modeled("insertvalue");
+        lowering.bump_modeled("assign");
+        lowering.bump_tainted("insertvalue_coarse");
+    } else {
+        lowering.bump_skipped("insertvalue_non_pointer");
+    }
+    bump_missing_loc(lowering, "insertvalue", inst);
+}
+
+unsafe fn lower_landingpad(
+    inst: LLVMValueRef,
+    fctx: &mut FunctionCtx,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    if type_contains_pointer(LLVMTypeOf(inst)) {
+        lowering.bump_tainted("landingpad_pointer_result");
+        push_unknown(
+            body,
+            "landingpad",
+            Vec::new(),
+            vec![fctx.local_key(inst)],
+            "landingpad_pointer_result",
+            loc(inst),
+            lowering,
+        );
+    } else {
+        lowering.bump_skipped("landingpad_non_pointer");
+    }
+    bump_missing_loc(lowering, "landingpad", inst);
 }
 
 unsafe fn lower_global_initializers(
@@ -591,9 +873,7 @@ unsafe fn lower_global_initializer_value(
             loc: None,
         });
         lowering.bump_modeled("global_init_store");
-        if let Some(global) =
-            operand_global_name(constant).filter(|name| ctx.global_names.contains(name))
-        {
+        if let Some(global) = operand_global_name(ctx, constant) {
             body.push(Stmt::GlobalRef {
                 global,
                 access: Access::Ref,
@@ -618,7 +898,8 @@ unsafe fn lower_constant_expr_value(
         || !LLVMIsAGlobalAlias(constant).is_null()
         || !LLVMIsAGlobalIFunc(constant).is_null()
     {
-        return format!("@{}", value_name(constant));
+        let name = value_name(constant);
+        return format!("@{}", resolve_symbol_name(ctx, &name).unwrap_or(name));
     }
     if !LLVMIsAConstantExpr(constant).is_null() {
         match LLVMGetConstOpcode(constant) {
@@ -696,7 +977,7 @@ unsafe fn lower_constant_expr_value(
                 push_unknown(
                     body,
                     format!("constant_expr:{}", opcode_key(other)),
-                    constant_pointer_operand_keys(constant),
+                    constant_pointer_operand_keys(ctx, constant),
                     vec![dest.clone()],
                     "global_initializer_pointer_constant",
                     None,
@@ -711,7 +992,7 @@ unsafe fn lower_constant_expr_value(
         push_unknown(
             body,
             "constant_expr:constant",
-            constant_pointer_operand_keys(constant),
+            constant_pointer_operand_keys(ctx, constant),
             vec![dest.clone()],
             "global_initializer_pointer_constant",
             None,
@@ -721,12 +1002,28 @@ unsafe fn lower_constant_expr_value(
     }
 }
 
-unsafe fn collect_address_taken(ctx: &ModuleCtx, globals: &[LLVMValueRef]) -> BTreeSet<String> {
+unsafe fn collect_address_taken(
+    ctx: &ModuleCtx,
+    globals: &[LLVMValueRef],
+    aliases: &[LLVMValueRef],
+    functions: &[LLVMValueRef],
+) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for global in globals {
         let initializer = LLVMGetInitializer(*global);
         if !initializer.is_null() {
             collect_constant_func_refs(ctx, initializer, &mut out);
+        }
+    }
+    for alias in aliases {
+        let aliasee = LLVMAliasGetAliasee(*alias);
+        if !aliasee.is_null() {
+            collect_constant_func_refs(ctx, aliasee, &mut out);
+        }
+    }
+    for function in functions {
+        if LLVMHasPersonalityFn(*function) != 0 {
+            collect_constant_func_refs(ctx, LLVMGetPersonalityFn(*function), &mut out);
         }
     }
     out
@@ -737,9 +1034,9 @@ unsafe fn collect_constant_func_refs(
     constant: LLVMValueRef,
     out: &mut BTreeSet<String>,
 ) {
-    if let Some(name) = direct_callee_name(constant) {
-        if ctx.func_names.contains(&name) {
-            out.insert(name);
+    if let Some(name) = direct_symbol_name(constant) {
+        if let Some(resolved) = resolve_function_name(ctx, &name) {
+            out.insert(resolved);
         }
         return;
     }
@@ -753,6 +1050,23 @@ unsafe fn collect_constant_func_refs(
         let count = LLVMGetNumOperands(constant);
         for index in 0..count {
             collect_constant_func_refs(ctx, LLVMGetOperand(constant, index as u32), out);
+        }
+    }
+}
+
+unsafe fn lower_personality_function(
+    ctx: &ModuleCtx,
+    function: LLVMValueRef,
+    lowering: &mut LoweringStats,
+) {
+    if LLVMHasPersonalityFn(function) == 0 {
+        return;
+    }
+    let personality = LLVMGetPersonalityFn(function);
+    if constant_has_pointer_flow(personality) {
+        lowering.bump_tainted("personality_function");
+        for operand in constant_pointer_operand_keys(ctx, personality) {
+            lowering.bump_tainted(format!("personality_operand:{operand}"));
         }
     }
 }
@@ -1111,27 +1425,25 @@ unsafe fn constant_has_pointer_flow(constant: LLVMValueRef) -> bool {
     is_pointer_like_type(LLVMTypeOf(constant))
 }
 
-unsafe fn constant_pointer_operand_keys(constant: LLVMValueRef) -> Vec<String> {
+unsafe fn constant_pointer_operand_keys(ctx: &ModuleCtx, constant: LLVMValueRef) -> Vec<String> {
     let mut out = BTreeSet::new();
-    collect_constant_pointer_operand_keys(constant, &mut out);
+    collect_constant_pointer_operand_keys(ctx, constant, &mut out);
     out.into_iter().collect()
 }
 
 unsafe fn collect_constant_pointer_operand_keys(
+    ctx: &ModuleCtx,
     constant: LLVMValueRef,
     out: &mut BTreeSet<String>,
 ) {
-    if !LLVMIsAFunction(constant).is_null()
-        || !LLVMIsAGlobalVariable(constant).is_null()
-        || !LLVMIsAGlobalAlias(constant).is_null()
-        || !LLVMIsAGlobalIFunc(constant).is_null()
-    {
-        out.insert(format!("@{}", value_name(constant)));
+    if let Some(name) = direct_symbol_name(constant) {
+        let resolved = resolve_symbol_name(ctx, &name).unwrap_or(name);
+        out.insert(format!("@{resolved}"));
         return;
     }
     let count = LLVMGetNumOperands(constant);
     for index in 0..count {
-        collect_constant_pointer_operand_keys(LLVMGetOperand(constant, index as u32), out);
+        collect_constant_pointer_operand_keys(ctx, LLVMGetOperand(constant, index as u32), out);
     }
 }
 
@@ -1152,14 +1464,17 @@ unsafe fn call_result_keys(fctx: &mut FunctionCtx, inst: LLVMValueRef) -> Vec<St
     }
 }
 
-unsafe fn direct_callee_name(value: LLVMValueRef) -> Option<String> {
-    if !LLVMIsAFunction(value).is_null() {
+unsafe fn direct_symbol_name(value: LLVMValueRef) -> Option<String> {
+    if !LLVMIsAFunction(value).is_null()
+        || !LLVMIsAGlobalAlias(value).is_null()
+        || !LLVMIsAGlobalIFunc(value).is_null()
+    {
         return Some(value_name(value));
     }
     if !LLVMIsAConstantExpr(value).is_null() {
         match LLVMGetConstOpcode(value) {
             LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast => {
-                return direct_callee_name(LLVMGetOperand(value, 0));
+                return direct_symbol_name(LLVMGetOperand(value, 0));
             }
             _ => {}
         }
@@ -1167,16 +1482,17 @@ unsafe fn direct_callee_name(value: LLVMValueRef) -> Option<String> {
     None
 }
 
-unsafe fn operand_global_name(value: LLVMValueRef) -> Option<String> {
-    if !LLVMIsAGlobalVariable(value).is_null() {
-        return Some(value_name(value));
+unsafe fn operand_global_name(ctx: &ModuleCtx, value: LLVMValueRef) -> Option<String> {
+    if !LLVMIsAGlobalVariable(value).is_null() || !LLVMIsAGlobalAlias(value).is_null() {
+        let name = value_name(value);
+        return resolve_global_name(ctx, &name);
     }
     if !LLVMIsAConstantExpr(value).is_null() {
         match LLVMGetConstOpcode(value) {
             LLVMOpcode::LLVMBitCast
             | LLVMOpcode::LLVMAddrSpaceCast
             | LLVMOpcode::LLVMGetElementPtr => {
-                return operand_global_name(LLVMGetOperand(value, 0));
+                return operand_global_name(ctx, LLVMGetOperand(value, 0));
             }
             _ => {}
         }
@@ -1185,7 +1501,51 @@ unsafe fn operand_global_name(value: LLVMValueRef) -> Option<String> {
 }
 
 unsafe fn is_pointer_like_type(ty: LLVMTypeRef) -> bool {
-    LLVMGetTypeKind(ty) == LLVMTypeKind::LLVMPointerTypeKind
+    type_contains_pointer_shallow(ty)
+}
+
+unsafe fn is_pointer_vector_type(ty: LLVMTypeRef) -> bool {
+    match LLVMGetTypeKind(ty) {
+        LLVMTypeKind::LLVMVectorTypeKind => type_contains_pointer_shallow(LLVMGetElementType(ty)),
+        _ => false,
+    }
+}
+
+unsafe fn type_contains_pointer(ty: LLVMTypeRef) -> bool {
+    let mut visited = BTreeSet::new();
+    type_contains_pointer_impl(ty, &mut visited)
+}
+
+unsafe fn type_contains_pointer_impl(ty: LLVMTypeRef, visited: &mut BTreeSet<usize>) -> bool {
+    if !visited.insert(ty as usize) {
+        return false;
+    }
+    match LLVMGetTypeKind(ty) {
+        LLVMTypeKind::LLVMPointerTypeKind => true,
+        LLVMTypeKind::LLVMArrayTypeKind | LLVMTypeKind::LLVMVectorTypeKind => {
+            type_contains_pointer_impl(LLVMGetElementType(ty), visited)
+        }
+        LLVMTypeKind::LLVMStructTypeKind => {
+            if LLVMIsOpaqueStruct(ty) != 0 {
+                return false;
+            }
+            let count = LLVMCountStructElementTypes(ty);
+            let mut elements = vec![ptr::null_mut(); count as usize];
+            LLVMGetStructElementTypes(ty, elements.as_mut_ptr());
+            elements
+                .into_iter()
+                .any(|element| type_contains_pointer_impl(element, visited))
+        }
+        _ => false,
+    }
+}
+
+unsafe fn type_contains_pointer_shallow(ty: LLVMTypeRef) -> bool {
+    match LLVMGetTypeKind(ty) {
+        LLVMTypeKind::LLVMPointerTypeKind => true,
+        LLVMTypeKind::LLVMVectorTypeKind => type_contains_pointer_shallow(LLVMGetElementType(ty)),
+        _ => false,
+    }
 }
 
 unsafe fn loc(value: LLVMValueRef) -> Option<Loc> {
@@ -1311,6 +1671,102 @@ unsafe fn collect_ifuncs(module: LLVMModuleRef) -> Vec<LLVMValueRef> {
         current = LLVMGetNextGlobalIFunc(current);
     }
     out
+}
+
+unsafe fn collect_alias_map(
+    aliases: &[LLVMValueRef],
+    func_names: &BTreeSet<String>,
+    global_names: &BTreeSet<String>,
+    lowering: &mut LoweringStats,
+) -> AliasMap {
+    let mut out = AliasMap::new();
+    for alias in aliases {
+        let alias_key = value_name(*alias);
+        if !is_non_interposable_alias(*alias) {
+            lowering.bump_tainted(format!("alias_interposable:{alias_key}"));
+            continue;
+        }
+        let Some(target) = constant_symbol_name(LLVMAliasGetAliasee(*alias)) else {
+            lowering.bump_tainted(format!("alias_unresolved:{alias_key}"));
+            continue;
+        };
+        if func_names.contains(&target) {
+            out.insert(alias_key, AliasTarget::Function(target));
+            lowering.bump_modeled("alias_function_resolved");
+        } else if global_names.contains(&target) {
+            out.insert(alias_key, AliasTarget::Global(target));
+            lowering.bump_modeled("alias_global_resolved");
+        } else {
+            lowering.bump_tainted(format!("alias_unresolved:{alias_key}"));
+        }
+    }
+    out
+}
+
+unsafe fn is_non_interposable_alias(alias: LLVMValueRef) -> bool {
+    matches!(
+        LLVMGetLinkage(alias),
+        LLVMLinkage::LLVMPrivateLinkage | LLVMLinkage::LLVMInternalLinkage
+    )
+}
+
+unsafe fn constant_symbol_name(constant: LLVMValueRef) -> Option<String> {
+    if !LLVMIsAFunction(constant).is_null()
+        || !LLVMIsAGlobalVariable(constant).is_null()
+        || !LLVMIsAGlobalAlias(constant).is_null()
+        || !LLVMIsAGlobalIFunc(constant).is_null()
+    {
+        return Some(value_name(constant));
+    }
+    if !LLVMIsAConstantExpr(constant).is_null() {
+        match LLVMGetConstOpcode(constant) {
+            LLVMOpcode::LLVMBitCast
+            | LLVMOpcode::LLVMAddrSpaceCast
+            | LLVMOpcode::LLVMGetElementPtr => {
+                return constant_symbol_name(LLVMGetOperand(constant, 0));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn resolve_function_name(ctx: &ModuleCtx, name: &str) -> Option<String> {
+    if ctx.func_names.contains(name) {
+        Some(name.to_string())
+    } else {
+        match ctx.aliases.get(name) {
+            Some(AliasTarget::Function(target)) => Some(target.clone()),
+            _ => None,
+        }
+    }
+}
+
+fn resolve_global_name(ctx: &ModuleCtx, name: &str) -> Option<String> {
+    if ctx.global_names.contains(name) {
+        Some(name.to_string())
+    } else {
+        match ctx.aliases.get(name) {
+            Some(AliasTarget::Global(target)) => Some(target.clone()),
+            _ => None,
+        }
+    }
+}
+
+fn resolve_symbol_name(ctx: &ModuleCtx, name: &str) -> Option<String> {
+    if ctx.func_names.contains(name)
+        || ctx.global_names.contains(name)
+        || ctx.ifunc_names.contains(name)
+    {
+        Some(name.to_string())
+    } else {
+        match ctx.aliases.get(name) {
+            Some(AliasTarget::Function(target)) | Some(AliasTarget::Global(target)) => {
+                Some(target.clone())
+            }
+            None => None,
+        }
+    }
 }
 
 fn opcode_key(opcode: LLVMOpcode) -> &'static str {

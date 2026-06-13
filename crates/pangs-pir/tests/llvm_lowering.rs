@@ -629,6 +629,283 @@ entry:
 }
 
 #[test]
+fn llvm_sys_resolves_internal_aliases() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("aliases.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@G = global i32 0
+@GA = internal alias i32, i32* @G
+@FnAlias = internal alias void (), void ()* @target
+
+define void @target() {
+entry:
+  ret void
+}
+
+define void @caller() {
+entry:
+  %v = load i32, i32* @GA
+  call void @FnAlias()
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    let caller = pir.functions.iter().find(|f| f.key == "caller").unwrap();
+    assert!(caller.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::GlobalRef { global, access, .. } if global == "G" && *access == pangs_pir::Access::Ref
+    )));
+    assert!(caller.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::CallDirect { callee, .. } if callee == "target"
+    )));
+    assert_eq!(pir.lowering.modeled_counts["alias_global_resolved"], 1);
+    assert_eq!(pir.lowering.modeled_counts["alias_function_resolved"], 1);
+    assert_eq!(pir.lowering.modeled_counts["alias_call_direct"], 1);
+}
+
+#[test]
+fn llvm_sys_lowers_ifunc_callee_as_unknown() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("ifunc.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@IfuncTarget = ifunc void (), void ()* ()* @resolve
+
+define void @target() {
+entry:
+  ret void
+}
+
+define void ()* @resolve() {
+entry:
+  ret void ()* @target
+}
+
+define void @ifunc_caller() {
+entry:
+  call void @IfuncTarget()
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    let caller = pir
+        .functions
+        .iter()
+        .find(|f| f.key == "ifunc_caller")
+        .unwrap();
+    assert!(caller.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { reason, op, .. } if reason == "ifunc_callee" && op == "call"
+    )));
+    assert_eq!(pir.lowering.ifuncs, 1);
+    assert_eq!(pir.lowering.tainted_counts["ifunc:IfuncTarget"], 1);
+    assert_eq!(pir.lowering.tainted_counts["ifunc_callee:IfuncTarget"], 1);
+}
+
+#[test]
+fn llvm_sys_lowers_invoke_and_taints_exception_flow() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("invoke.ll");
+    fs::write(
+        &ll_path,
+        r#"
+declare i32 @may_throw()
+declare i32 @__gxx_personality_v0(...)
+
+define i32 @caller() personality i32 (...)* @__gxx_personality_v0 {
+entry:
+  %res = invoke i32 @may_throw() to label %ok unwind label %lpad
+
+ok:
+  ret i32 %res
+
+lpad:
+  %lp = landingpad { i8*, i32 }
+          cleanup
+  ret i32 0
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    let caller = pir.functions.iter().find(|f| f.key == "caller").unwrap();
+    assert!(caller.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::CallDirect { callee, sig, .. }
+            if callee == "may_throw" && sig.ret == pangs_pir::AbiClass::Integer
+    )));
+    assert_eq!(pir.lowering.terminator_counts["invoke"], 1);
+    assert_eq!(
+        pir.lowering.tainted_counts["invoke_exception_control_flow"],
+        1
+    );
+    assert_eq!(pir.lowering.tainted_counts["personality_function"], 1);
+    assert!(
+        pir.functions
+            .iter()
+            .find(|f| f.key == "__gxx_personality_v0")
+            .unwrap()
+            .address_taken
+    );
+}
+
+#[test]
+fn llvm_sys_lowers_clang14_asm_goto_bitcode() {
+    assert!(
+        Path::new(CLANG_14).exists(),
+        "LLVM-14 clang is required for the asm goto lowering test"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let c_path = tmp.path().join("asm_goto.c");
+    let bc_path = tmp.path().join("asm_goto.bc");
+    fs::write(
+        &c_path,
+        r#"
+void target(void);
+
+void caller(void) {
+  asm goto ("" :::: hit);
+  target();
+hit:
+  return;
+}
+"#,
+    )
+    .unwrap();
+
+    let status = Command::new(CLANG_14)
+        .arg("-O0")
+        .arg("-emit-llvm")
+        .arg("-c")
+        .arg(&c_path)
+        .arg("-o")
+        .arg(&bc_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let pir = pir_from_llvm_sys(&bc_path);
+    let caller = pir.functions.iter().find(|f| f.key == "caller").unwrap();
+    assert!(caller.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { op, reason, .. } if op == "callbr" && reason == "inline_asm_callbr"
+    )));
+    assert_eq!(pir.lowering.terminator_counts["callbr"], 1);
+    assert_eq!(pir.lowering.tainted_counts["callbr"], 1);
+}
+
+#[test]
+fn llvm_sys_taints_pointer_vectors_and_models_aggregate_pointer_fields() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("aggregate_eh.ll");
+    fs::write(
+        &ll_path,
+        r#"
+declare i32 @__gxx_personality_v0(...)
+declare i32 @may_throw()
+
+define i8* @agg_and_eh(i8* %p, i8* %q) personality i32 (...)* @__gxx_personality_v0 {
+entry:
+  %vec0 = insertelement <2 x i8*> poison, i8* %p, i64 0
+  %vec1 = insertelement <2 x i8*> %vec0, i8* %q, i64 1
+  %elt = extractelement <2 x i8*> %vec1, i64 0
+  %agg0 = insertvalue { i8*, i32 } undef, i8* %p, 0
+  %agg1 = insertvalue { i8*, i32 } %agg0, i32 7, 1
+  %field = extractvalue { i8*, i32 } %agg1, 0
+  invoke i32 @may_throw() to label %ok unwind label %lpad
+
+ok:
+  ret i8* %field
+
+lpad:
+  %lp = landingpad { i8*, i32 }
+          cleanup
+  %ehptr = extractvalue { i8*, i32 } %lp, 0
+  ret i8* %ehptr
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    assert!(
+        pir.functions
+            .iter()
+            .find(|f| f.key == "__gxx_personality_v0")
+            .unwrap()
+            .address_taken
+    );
+    let func = pir
+        .functions
+        .iter()
+        .find(|f| f.key == "agg_and_eh")
+        .unwrap();
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { op, reason, .. } if op == "insertelement" && reason == "pointer_vector"
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { op, reason, .. } if op == "extractelement" && reason == "pointer_vector"
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Assign { dest, sources, .. }
+            if dest.ends_with("::agg0") && sources.contains(&"%agg_and_eh::p".to_string())
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Assign { dest, sources, .. }
+            if dest.ends_with("::field") && sources == &vec!["%agg_and_eh::agg1".to_string()]
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown {
+            op,
+            reason,
+            results,
+            ..
+        } if op == "landingpad"
+            && reason == "landingpad_pointer_result"
+            && results == &vec!["%agg_and_eh::lp".to_string()]
+    )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Assign { dest, sources, .. }
+            if dest.ends_with("::ehptr") && sources == &vec!["%agg_and_eh::lp".to_string()]
+    )));
+    assert_eq!(pir.lowering.tainted_counts["personality_function"], 1);
+    assert_eq!(
+        pir.lowering.tainted_counts["personality_operand:@__gxx_personality_v0"],
+        1
+    );
+    assert_eq!(
+        pir.lowering.tainted_counts["pointer_vector:insertelement"],
+        2
+    );
+    assert_eq!(
+        pir.lowering.tainted_counts["pointer_vector:extractelement"],
+        1
+    );
+    assert_eq!(pir.lowering.tainted_counts["landingpad_pointer_result"], 1);
+    assert_eq!(pir.lowering.tainted_counts["insertvalue_coarse"], 2);
+    assert_eq!(pir.lowering.modeled_counts["insertvalue"], 2);
+    assert_eq!(pir.lowering.modeled_counts["extractvalue"], 2);
+}
+
+#[test]
 fn computes_gep_byte_offsets_from_ll() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("gep_offsets.ll");
