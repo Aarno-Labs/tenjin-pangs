@@ -555,6 +555,76 @@ lpad:
 }
 
 #[test]
+fn lowers_global_initializer_select_pointer_flow_from_ll() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("global_init_select.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@A = extern_weak global i8
+@B = extern_weak global i8
+@Sel = global i8* select (i1 icmp eq (i8* @A, i8* @B), i8* @A, i8* @B)
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    let selected = pir
+        .global_init
+        .iter()
+        .find_map(|stmt| match stmt {
+            Stmt::Assign { dest, sources, .. }
+                if sources == &vec!["@A".to_string(), "@B".to_string()] =>
+            {
+                Some(dest.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == "@Sel" && value == &selected
+    )));
+    assert_eq!(pir.lowering.modeled_counts["global_init_select"], 1);
+    assert_eq!(pir.lowering.modeled_counts["global_init_store"], 1);
+}
+
+#[test]
+fn llvm_sys_lowers_global_initializer_select_pointer_flow_from_ll() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("global_init_select.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@A = extern_weak global i8
+@B = extern_weak global i8
+@Sel = global i8* select (i1 icmp eq (i8* @A, i8* @B), i8* @A, i8* @B)
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    let selected = pir
+        .global_init
+        .iter()
+        .find_map(|stmt| match stmt {
+            Stmt::Assign { dest, sources, .. }
+                if sources == &vec!["@A".to_string(), "@B".to_string()] =>
+            {
+                Some(dest.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store { address, value, .. } if address == "@Sel" && value == &selected
+    )));
+    assert_eq!(pir.lowering.modeled_counts["global_init_select"], 1);
+    assert_eq!(pir.lowering.modeled_counts["global_init_store"], 1);
+}
+
+#[test]
 fn lowers_global_initializer_pointer_flow_from_ll() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("global_init.ll");
