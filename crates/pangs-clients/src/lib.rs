@@ -165,14 +165,26 @@ pub fn report(outdir: &Path) -> Result<String> {
         &fs::read_to_string(&metrics_path)
             .with_context(|| format!("read {}", metrics_path.display()))?,
     )?;
+    let manifest_path = outdir.join("manifest.json");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read {}", manifest_path.display()))?,
+    )?;
+    let wall_ms = manifest["wall_ms"].as_u64().unwrap_or(0);
     Ok(format!(
-        "functions: {}\nglobals: {}\ncall edges: {}\naudit findings: {}\nmutable globals rewritable: {}/{}\n",
+        "functions: {}\nglobals: {}\ncall edges: {}\naudit findings: {}\nmutable globals rewritable: {}/{}\npipeline wall: {} ms\nanalysis wall: {} us\npag build: {} us\nsolve: {} us\ntransitive modref: {} us\ncomponents: {} us\n",
         metrics.functions,
         metrics.globals,
         metrics.call_edges,
         metrics.audit_findings,
         metrics.in_rewritable_components,
         metrics.mutable_globals_total,
+        wall_ms,
+        metrics.analysis_wall_us,
+        metrics.pag_build_us,
+        metrics.solve_us,
+        metrics.transitive_modref_us,
+        metrics.components_us,
     ))
 }
 
@@ -448,7 +460,7 @@ mod tests {
     use pangs_pir::Pir;
     use tempfile::TempDir;
 
-    use super::{export_analysis, validate_export_dir};
+    use super::{export_analysis, report, validate_export_dir};
 
     #[test]
     fn validate_export_dir_rejects_schema_mismatch() {
@@ -475,6 +487,32 @@ mod tests {
         let err = validate_export_dir(outdir.path()).unwrap_err().to_string();
         assert!(err.contains("metrics.json"));
         assert!(err.contains("schema validation failed"));
+    }
+
+    #[test]
+    fn report_includes_pipeline_and_phase_timings() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let pir = Pir::from_path(&fixture).unwrap();
+        let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
+        let outdir = TempDir::new().unwrap();
+
+        export_analysis(
+            &analysis,
+            &Opts::default(),
+            &fixture,
+            outdir.path(),
+            false,
+            Instant::now(),
+        )
+        .unwrap();
+
+        let text = report(outdir.path()).unwrap();
+        assert!(text.contains("pipeline wall: "));
+        assert!(text.contains("analysis wall: "));
+        assert!(text.contains("pag build: "));
+        assert!(text.contains("solve: "));
+        assert!(text.contains("transitive modref: "));
+        assert!(text.contains("components: "));
     }
 
     fn workspace_root() -> PathBuf {
