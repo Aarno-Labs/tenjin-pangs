@@ -1066,3 +1066,52 @@ fn audit_surface_fixture_reports_varargs_and_boundary_findings() {
     }));
     assert_eq!(analysis.metrics().audit_findings, 6);
 }
+
+#[test]
+fn steens_only_audits_int_punning_when_it_reaches_function_pointers() {
+    let ptr_only = Pir::from_path(m1_4_fixture("ptrtoint_escape.pir.json")).unwrap();
+    let ptr_only_analysis = Analysis::run(
+        &ptr_only,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    assert!(!ptr_only_analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "fnptr_ptrtoint" || finding.kind == "fnptr_inttoptr"));
+
+    let fnptr = Pir::from_path(m1_5_fixture("fnptr_int_punning.pir.json")).unwrap();
+    let fnptr_analysis = Analysis::run(
+        &fnptr,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let kinds = fnptr_analysis
+        .audit_findings()
+        .iter()
+        .map(|finding| finding.kind.as_str())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"fnptr_ptrtoint"));
+    assert!(kinds.contains(&"fnptr_inttoptr"));
+    assert!(fnptr_analysis.metrics().audit_findings >= 2);
+    let component = fnptr_analysis
+        .component(fnptr_analysis.component_of(fnptr_analysis.lookup_func("driver").unwrap()));
+    assert!(component
+        .taint
+        .iter()
+        .any(|taint| taint.kind == "fnptr_ptrtoint"
+            && taint.witness.as_deref() == Some("driver@!noloc#0")));
+    assert!(component
+        .taint
+        .iter()
+        .any(|taint| taint.kind == "fnptr_inttoptr"
+            && taint.witness.as_deref() == Some("driver@!noloc#0")));
+}

@@ -742,6 +742,36 @@ fn analyze_audit_surface_exports_boundary_and_vararg_findings() {
     assert_eq!(metrics["audit_findings"], 6);
 }
 
+#[test]
+fn analyze_steens_exports_fnptr_int_punning_audits_but_not_non_fn_ptrtoint() {
+    let tmp = TempDir::new().unwrap();
+
+    let fnptr_fixture = m1_5_fixture("fnptr_int_punning.pir.json");
+    let fnptr_out = tmp.path().join("fnptr");
+    run_analyze_stage(&fnptr_fixture, &fnptr_out, "steens");
+
+    let fnptr_audit: Vec<Value> = fs::read_to_string(fnptr_out.join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(fnptr_audit
+        .iter()
+        .any(|row| row["kind"] == "fnptr_ptrtoint"));
+    assert!(fnptr_audit
+        .iter()
+        .any(|row| row["kind"] == "fnptr_inttoptr"));
+
+    let plain_fixture = m1_4_fixture("ptrtoint_escape.pir.json");
+    let plain_out = tmp.path().join("plain");
+    run_analyze_stage(&plain_fixture, &plain_out, "steens");
+
+    let plain_audit = fs::read_to_string(plain_out.join("audit.jsonl")).unwrap();
+    assert!(!plain_audit.contains("fnptr_ptrtoint"));
+    assert!(!plain_audit.contains("fnptr_inttoptr"));
+}
+
 fn run_analyze(fixture: &Path, out: &Path) {
     run_analyze_stage(fixture, out, "conservative");
 }

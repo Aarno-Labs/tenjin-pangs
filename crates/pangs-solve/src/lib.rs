@@ -23,6 +23,8 @@ pub struct SolveResult {
     #[serde(default)]
     pub globals: BTreeMap<String, GlobalResolution>,
     #[serde(default)]
+    pub nodes: BTreeMap<String, NodeResolution>,
+    #[serde(default)]
     pub metrics: SolveMetrics,
 }
 
@@ -39,6 +41,11 @@ pub struct IndirectCallResolution {
 pub struct GlobalResolution {
     pub escape_external: bool,
     pub never_written: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NodeResolution {
+    pub reaches_function_pointer: bool,
 }
 
 pub fn solve_steensgaard(pir: &Pir, pag: &Pag, build_mode: BuildMode) -> SolveResult {
@@ -351,6 +358,32 @@ impl<'a> Solver<'a> {
             );
         }
 
+        let mut nodes = BTreeMap::new();
+        for node in &self.pag.nodes {
+            if !matches!(
+                node.kind,
+                NodeKind::Value { .. } | NodeKind::Param { .. } | NodeKind::Return { .. }
+            ) {
+                continue;
+            }
+            let root = self.class_of(node.id);
+            let reaches_function_pointer = self.classes[root]
+                .pointee
+                .map(|p| {
+                    let pointee = self.find(p);
+                    !self.classes[pointee].fn_objs.is_empty()
+                        || self.classes[pointee].ext
+                        || !self.classes[pointee].icall_sites.is_empty()
+                })
+                .unwrap_or(false);
+            nodes.insert(
+                node.label.clone(),
+                NodeResolution {
+                    reaches_function_pointer,
+                },
+            );
+        }
+
         let mut sizes = Vec::new();
         for index in 0..self.classes.len() {
             let root = self.find(index);
@@ -372,6 +405,7 @@ impl<'a> Solver<'a> {
             indirect_calls,
             unknown_callers,
             globals,
+            nodes,
             metrics,
         }
     }

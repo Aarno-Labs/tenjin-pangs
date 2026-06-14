@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
 use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, Stmt};
-use pangs_solve::solve_steensgaard;
+use pangs_solve::{solve_steensgaard, NodeResolution};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -209,6 +209,22 @@ pub struct Metrics {
     pub lowering: Option<LoweringStats>,
 }
 
+#[derive(Debug)]
+enum DeferredAudit {
+    PtrToInt {
+        caller: FuncId,
+        owner: String,
+        operand: String,
+        loc: Option<pangs_pir::Loc>,
+    },
+    IntToPtr {
+        caller: FuncId,
+        owner: String,
+        result: String,
+        loc: Option<pangs_pir::Loc>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table<I, T> {
     rows: Vec<T>,
@@ -332,6 +348,7 @@ impl Analysis {
         let mut modrefs = Vec::new();
         let mut findings = Vec::new();
         let mut audit_taints = BTreeMap::<FuncId, Vec<Taint>>::new();
+        let mut deferred_audits = Vec::<DeferredAudit>::new();
         let mut indirect_callsites = Vec::new();
         let mut solver_metrics = None;
         let address_taken: Vec<_> = module
@@ -425,6 +442,22 @@ impl Analysis {
                             witness,
                         );
                     }
+                    Stmt::PtrToInt { source, loc, .. } => {
+                        deferred_audits.push(DeferredAudit::PtrToInt {
+                            caller,
+                            owner: func.key.clone(),
+                            operand: source.clone(),
+                            loc: loc.clone(),
+                        });
+                    }
+                    Stmt::IntToPtr { dest, loc, .. } => {
+                        deferred_audits.push(DeferredAudit::IntToPtr {
+                            caller,
+                            owner: func.key.clone(),
+                            result: dest.clone(),
+                            loc: loc.clone(),
+                        });
+                    }
                     Stmt::GlobalRef {
                         global,
                         access,
@@ -504,6 +537,13 @@ impl Analysis {
                 );
                 let solved = solve_steensgaard(module, &pag, opts.build_mode.into());
                 solver_metrics = Some(solved.metrics.clone());
+                emit_deferred_steens_audits(
+                    &mut findings,
+                    &mut audit_taints,
+                    module,
+                    &solved.nodes,
+                    deferred_audits,
+                );
                 let callsite_by_key: HashMap<_, _> = callsites
                     .iter()
                     .enumerate()
@@ -730,6 +770,82 @@ impl Analysis {
             }
         }
         ComponentId(0)
+    }
+}
+
+fn emit_deferred_steens_audits(
+    findings: &mut Vec<Finding>,
+    audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
+    module: &Pir,
+    node_summaries: &BTreeMap<String, NodeResolution>,
+    deferred: Vec<DeferredAudit>,
+) {
+    for item in deferred {
+        match item {
+            DeferredAudit::PtrToInt {
+                caller,
+                owner,
+                operand,
+                loc,
+            } => {
+                let label = pag_value_label(module, &owner, &operand);
+                if node_summaries
+                    .get(&label)
+                    .map(|node| node.reaches_function_pointer)
+                    .unwrap_or(false)
+                {
+                    push_audit_finding(
+                        findings,
+                        audit_taints,
+                        caller,
+                        "fnptr_ptrtoint",
+                        &loc,
+                        vec![format!("value:{operand}")],
+                        Some(audit_witness(&owner, &loc)),
+                    );
+                }
+            }
+            DeferredAudit::IntToPtr {
+                caller,
+                owner,
+                result,
+                loc,
+            } => {
+                let label = pag_value_label(module, &owner, &result);
+                if node_summaries
+                    .get(&label)
+                    .map(|node| node.reaches_function_pointer)
+                    .unwrap_or(false)
+                {
+                    push_audit_finding(
+                        findings,
+                        audit_taints,
+                        caller,
+                        "fnptr_inttoptr",
+                        &loc,
+                        vec![format!("value:{result}")],
+                        Some(audit_witness(&owner, &loc)),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn pag_value_label(module: &Pir, owner: &str, value: &str) -> String {
+    if module.globals.iter().any(|global| global.key == value) {
+        format!("sym:global:{value}")
+    } else if module.functions.iter().any(|func| func.key == value) {
+        format!("sym:function:{value}")
+    } else {
+        format!("val:{owner}:{value}")
+    }
+}
+
+fn audit_witness(owner: &str, loc: &Option<pangs_pir::Loc>) -> String {
+    match loc {
+        Some(loc) => format!("{owner}@{}:{}:{}#0", loc.file, loc.line, loc.col),
+        None => format!("{owner}@!noloc#0"),
     }
 }
 

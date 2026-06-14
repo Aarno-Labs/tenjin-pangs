@@ -1,0 +1,51 @@
+{
+  "module": "m1_5_fnptr_int_punning",
+  "functions": [
+    {
+      "key": "cb",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "address_taken": true,
+      "body": []
+    },
+    {
+      "key": "driver",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "assign",
+          "dest": "%fp",
+          "sources": ["cb"]
+        },
+        {
+          "kind": "ptr_to_int",
+          "dest": "%bits",
+          "source": "%fp"
+        },
+        {
+          "kind": "int_to_ptr",
+          "dest": "%fp2",
+          "source": "%bits"
+        },
+        {
+          "kind": "call_indirect",
+          "operand": "%fp2",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": [],
+            "cc": "ccc"
+          },
+          "args": []
+        }
+      ]
+    }
+  ],
+  "globals": []
+}
