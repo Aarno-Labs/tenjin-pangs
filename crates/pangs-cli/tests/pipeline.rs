@@ -558,13 +558,63 @@ fn analyze_steens_exports_narrowed_indirect_targets() {
     assert_eq!(metrics["rounds"], 1);
 }
 
+#[test]
+fn analyze_steens_improves_rewritable_coverage_over_conservative() {
+    let fixture = m1_4_fixture("address_taken_local_only.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out_conservative = tmp.path().join("conservative");
+    let out_steens = tmp.path().join("steens");
+
+    run_analyze_stage(&fixture, &out_conservative, "conservative");
+    run_analyze_stage(&fixture, &out_steens, "steens");
+
+    let conservative_components: Value = serde_json::from_str(
+        &fs::read_to_string(out_conservative.join("components.json")).unwrap(),
+    )
+    .unwrap();
+    let steens_components: Value =
+        serde_json::from_str(&fs::read_to_string(out_steens.join("components.json")).unwrap())
+            .unwrap();
+
+    assert_eq!(
+        conservative_components["coverage"]["mutable_globals_total"],
+        1
+    );
+    assert_eq!(
+        conservative_components["coverage"]["in_rewritable_components"],
+        0
+    );
+    assert_eq!(steens_components["coverage"]["mutable_globals_total"], 1);
+    assert_eq!(steens_components["coverage"]["in_rewritable_components"], 1);
+    assert_eq!(
+        conservative_components["components"][0]["frozen"],
+        Value::Bool(true)
+    );
+    assert_eq!(
+        steens_components["components"][0]["frozen"],
+        Value::Bool(false)
+    );
+
+    let conservative_callgraph =
+        fs::read_to_string(out_conservative.join("callgraph.jsonl")).unwrap();
+    let steens_callgraph = fs::read_to_string(out_steens.join("callgraph.jsonl")).unwrap();
+    assert!(conservative_callgraph.contains("\"unknown\":\"address_escapes_to_external\""));
+    assert!(!steens_callgraph.contains("\"unknown\":\"address_escapes_to_external\""));
+}
+
 fn run_analyze(fixture: &Path, out: &Path) {
+    run_analyze_stage(fixture, out, "conservative");
+}
+
+fn run_analyze_stage(fixture: &Path, out: &Path, stage: &str) {
     let status = Command::new(env!("CARGO_BIN_EXE_pangs"))
         .arg("analyze")
         .arg(fixture)
         .arg("-o")
         .arg(out)
         .arg("--validate")
+        .arg("--stage")
+        .arg(stage)
         .arg("--build-mode")
         .arg("executable")
         .status()

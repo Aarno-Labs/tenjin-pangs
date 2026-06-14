@@ -1,0 +1,28 @@
+{
+  "module": "m1_4.address_taken_local_only",
+  "functions": [
+    {
+      "key": "cb",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "address_taken": true,
+      "body": [
+        {
+          "kind": "global_ref",
+          "global": "@G",
+          "access": "mod"
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@G",
+      "exported": false,
+      "mutable": true
+    }
+  ]
+}

@@ -957,3 +957,34 @@ fn steens_escaped_function_parameter_binding_escapes_stored_targets() {
     assert!(!analysis.globals()[esc].never_written);
     assert!(analysis.globals()[local].never_written);
 }
+
+#[test]
+fn steens_unfreezes_address_taken_but_unescaped_components() {
+    let pir = Pir::from_path(m1_4_fixture("address_taken_local_only.pir.json")).unwrap();
+    let conservative = Analysis::run(&pir, &Opts::default()).unwrap();
+    let steens = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let cb_conservative = conservative.lookup_func("cb").unwrap();
+    let cb_steens = steens.lookup_func("cb").unwrap();
+
+    assert!(conservative.callers(cb_conservative).any(unknown_caller));
+    assert!(!steens.callers(cb_steens).any(unknown_caller));
+    assert_eq!(conservative.metrics().mutable_globals_total, 1);
+    assert_eq!(conservative.metrics().in_rewritable_components, 0);
+    assert_eq!(steens.metrics().mutable_globals_total, 1);
+    assert_eq!(steens.metrics().in_rewritable_components, 1);
+    assert!(
+        conservative
+            .component(conservative.component_of(cb_conservative))
+            .frozen
+    );
+    assert!(!steens.component(steens.component_of(cb_steens)).frozen);
+}
