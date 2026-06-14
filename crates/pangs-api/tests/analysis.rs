@@ -111,6 +111,8 @@ fn indirect_call_component_taint_uses_callsite_witness_and_matches_external_targ
                 body: vec![Stmt::CallIndirect {
                     operand: "%fp".to_string(),
                     sig: target_sig.clone(),
+                    args: vec![],
+                    dest: None,
                     loc: None,
                 }],
             },
@@ -233,6 +235,8 @@ fn modref_api_closes_over_direct_calls_but_export_rows_stay_local() {
                 body: vec![Stmt::CallDirect {
                     callee: "leaf".to_string(),
                     sig: sig(AbiClass::Void, vec![]),
+                    args: vec![],
+                    dest: None,
                     loc: None,
                 }],
             },
@@ -300,6 +304,8 @@ fn modref_api_closes_over_fsa_indirect_targets() {
                 body: vec![Stmt::CallIndirect {
                     operand: "%fp".to_string(),
                     sig: target_sig.clone(),
+                    args: vec![],
+                    dest: None,
                     loc: None,
                 }],
             },
@@ -362,6 +368,8 @@ fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
                 body: vec![Stmt::CallDirect {
                     callee: "driver".to_string(),
                     sig: sig(AbiClass::Void, vec![]),
+                    args: vec![],
+                    dest: None,
                     loc: None,
                 }],
             },
@@ -431,6 +439,8 @@ fn direct_external_call_taints_only_the_connected_component() {
                 body: vec![Stmt::CallDirect {
                     callee: "driver".to_string(),
                     sig: sig(AbiClass::Void, vec![]),
+                    args: vec![],
+                    dest: None,
                     loc: None,
                 }],
             },
@@ -451,6 +461,8 @@ fn direct_external_call_taints_only_the_connected_component() {
                     Stmt::CallDirect {
                         callee: "puts".to_string(),
                         sig: sig(AbiClass::Integer, vec![Param::Integer]),
+                        args: vec![],
+                        dest: None,
                         loc: None,
                     },
                 ],

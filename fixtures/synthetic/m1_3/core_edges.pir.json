@@ -115,14 +115,30 @@
         },
         {
           "kind": "call_direct",
+          "callee": "id_i32",
+          "sig": {
+            "ret": { "class": "integer" },
+            "params": [{ "class": "integer" }]
+          },
+          "args": ["%bits"],
+          "dest": "%rv",
+          "loc": {
+            "file": "fixtures/synthetic/m1_3/core_edges.c",
+            "line": 13,
+            "col": 3
+          }
+        },
+        {
+          "kind": "call_direct",
           "callee": "ext_decl",
           "sig": {
             "ret": { "class": "void" },
             "params": []
           },
+          "args": [],
           "loc": {
             "file": "fixtures/synthetic/m1_3/core_edges.c",
-            "line": 13,
+            "line": 14,
             "col": 3
           }
         },
@@ -134,27 +150,38 @@
             "params": [{ "class": "integer" }],
             "vararg": true
           },
+          "args": ["%bits"],
           "loc": {
             "file": "fixtures/synthetic/m1_3/core_edges.c",
-            "line": 14,
+            "line": 15,
             "col": 3
           }
         },
         {
           "kind": "return",
-          "value": "%bits",
+          "value": "%rv",
           "loc": {
             "file": "fixtures/synthetic/m1_3/core_edges.c",
-            "line": 15,
+            "line": 16,
             "col": 3
           }
         }
       ]
     },
     {
+      "key": "id_i32",
+      "file": "fixtures/synthetic/m1_3/core_edges.c",
+      "line": 19,
+      "sig": {
+        "ret": { "class": "integer" },
+        "params": [{ "class": "integer" }]
+      },
+      "body": []
+    },
+    {
       "key": "target",
       "file": "fixtures/synthetic/m1_3/core_edges.c",
-      "line": 18,
+      "line": 22,
       "address_taken": true,
       "sig": {
         "ret": { "class": "void" },
@@ -165,7 +192,7 @@
     {
       "key": "ext_decl",
       "file": "fixtures/synthetic/m1_3/core_edges.c",
-      "line": 20,
+      "line": 24,
       "external": true,
       "sig": {
         "ret": { "class": "void" },

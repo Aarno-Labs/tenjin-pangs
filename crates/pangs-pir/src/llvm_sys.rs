@@ -578,6 +578,8 @@ unsafe fn lower_call_site(
     }
 
     let sig = call_signature(ctx, inst, lowering);
+    let args = call_operand_keys(fctx, inst);
+    let dest = call_result_key(fctx, inst);
     match direct_symbol_name(called) {
         Some(callee) if is_skipped_intrinsic(&callee) => {}
         Some(callee) if resolve_function_name(ctx, &callee).is_some() => {
@@ -588,6 +590,8 @@ unsafe fn lower_call_site(
             body.push(Stmt::CallDirect {
                 callee: resolved,
                 sig,
+                args,
+                dest,
                 loc: loc(inst),
             });
             lowering.bump_modeled("call_direct");
@@ -596,6 +600,8 @@ unsafe fn lower_call_site(
             body.push(Stmt::CallIndirect {
                 operand: fctx.operand_key(called),
                 sig,
+                args,
+                dest,
                 loc: loc(inst),
             });
             lowering.bump_modeled("call_indirect");
@@ -1792,6 +1798,14 @@ unsafe fn call_result_keys(fctx: &mut FunctionCtx, inst: LLVMValueRef) -> Vec<St
         Vec::new()
     } else {
         vec![fctx.local_key(inst)]
+    }
+}
+
+unsafe fn call_result_key(fctx: &mut FunctionCtx, inst: LLVMValueRef) -> Option<String> {
+    if LLVMGetTypeKind(LLVMTypeOf(inst)) == LLVMTypeKind::LLVMVoidTypeKind {
+        None
+    } else {
+        Some(fctx.local_key(inst))
     }
 }
 

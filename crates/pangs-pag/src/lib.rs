@@ -80,6 +80,12 @@ impl Pag {
                 if let Some(operand) = callsite.operand {
                     keep_nodes.insert(operand);
                 }
+                for arg in &callsite.args {
+                    keep_nodes.insert(*arg);
+                }
+                if let Some(result) = callsite.result {
+                    keep_nodes.insert(result);
+                }
             }
         }
 
@@ -153,6 +159,8 @@ impl Pag {
             .map(|(index, mut callsite)| {
                 callsite.id = CallsiteId(index as u32);
                 callsite.operand = callsite.operand.map(|id| node_map[&id]);
+                callsite.args = callsite.args.into_iter().map(|id| node_map[&id]).collect();
+                callsite.result = callsite.result.map(|id| node_map[&id]);
                 callsite
             })
             .collect();
@@ -287,6 +295,32 @@ impl Pag {
                     None => issues.push(ValidationIssue::DanglingCallsiteOperand {
                         callsite: callsite.id,
                         node: operand,
+                    }),
+                }
+            }
+            for arg in &callsite.args {
+                match self.nodes.get(arg.0 as usize) {
+                    Some(node) if node.kind.is_value_like() => {}
+                    Some(node) => issues.push(ValidationIssue::CallsiteOperandInvariant {
+                        callsite: callsite.id,
+                        detail: format!("expected value-like arg, saw {:?}", node.kind),
+                    }),
+                    None => issues.push(ValidationIssue::DanglingCallsiteOperand {
+                        callsite: callsite.id,
+                        node: *arg,
+                    }),
+                }
+            }
+            if let Some(result) = callsite.result {
+                match self.nodes.get(result.0 as usize) {
+                    Some(node) if node.kind.is_value_like() => {}
+                    Some(node) => issues.push(ValidationIssue::CallsiteOperandInvariant {
+                        callsite: callsite.id,
+                        detail: format!("expected value-like result, saw {:?}", node.kind),
+                    }),
+                    None => issues.push(ValidationIssue::DanglingCallsiteOperand {
+                        callsite: callsite.id,
+                        node: result,
                     }),
                 }
             }
@@ -436,6 +470,10 @@ pub struct Callsite {
     pub callee: Option<String>,
     #[serde(default)]
     pub operand: Option<NodeId>,
+    #[serde(default)]
+    pub args: Vec<NodeId>,
+    #[serde(default)]
+    pub result: Option<NodeId>,
     pub sig: Signature,
     #[serde(default)]
     pub external_boundary: bool,
@@ -818,7 +856,20 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
-            Stmt::CallDirect { callee, sig, loc } => {
+            Stmt::CallDirect {
+                callee,
+                sig,
+                args,
+                dest,
+                loc,
+            } => {
+                let arg_nodes: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.operand_node(func_index, owner_scope(&owner), arg))
+                    .collect();
+                let result = dest
+                    .as_ref()
+                    .map(|dest| self.value_node(func_index, owner_scope(&owner), dest));
                 let external_boundary = self
                     .functions
                     .get(callee)
@@ -830,10 +881,47 @@ impl<'a> Builder<'a> {
                     CallKind::Direct,
                     Some(callee.clone()),
                     None,
+                    arg_nodes.clone(),
+                    result,
                     sig.clone(),
                     external_boundary,
                     loc.clone(),
                 );
+                if let Some(callee_index) = self.functions.get(callee).copied() {
+                    if let Some(callee_func) = self.pir.functions.get(callee_index) {
+                        if !callee_func.external {
+                            for (arg, param_index) in arg_nodes
+                                .iter()
+                                .copied()
+                                .zip(0..callee_func.sig.params.len())
+                            {
+                                if let Some(param) = self
+                                    .node_ids
+                                    .get(&NodeKey::Param(callee_index, param_index))
+                                {
+                                    self.add_edge(
+                                        EdgeKind::Assign,
+                                        arg,
+                                        *param,
+                                        owner.clone(),
+                                        loc.clone(),
+                                    );
+                                }
+                            }
+                            if let Some(result) = result {
+                                if let Some(ret) = self.return_node(callee_index) {
+                                    self.add_edge(
+                                        EdgeKind::Assign,
+                                        ret,
+                                        result,
+                                        owner.clone(),
+                                        loc.clone(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 if external_boundary {
                     self.add_seed(
                         OmegaSeedKind::ExternalCallBoundary,
@@ -853,13 +941,28 @@ impl<'a> Builder<'a> {
                     );
                 }
             }
-            Stmt::CallIndirect { operand, sig, loc } => {
+            Stmt::CallIndirect {
+                operand,
+                sig,
+                args,
+                dest,
+                loc,
+            } => {
                 let node = self.operand_node(func_index, owner_scope(&owner), operand);
+                let arg_nodes: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.operand_node(func_index, owner_scope(&owner), arg))
+                    .collect();
+                let result = dest
+                    .as_ref()
+                    .map(|dest| self.value_node(func_index, owner_scope(&owner), dest));
                 let callsite = self.add_callsite(
                     func_index,
                     CallKind::Indirect,
                     None,
                     Some(node),
+                    arg_nodes,
+                    result,
                     sig.clone(),
                     false,
                     loc.clone(),
@@ -914,6 +1017,8 @@ impl<'a> Builder<'a> {
         kind: CallKind,
         callee: Option<String>,
         operand: Option<NodeId>,
+        args: Vec<NodeId>,
+        result: Option<NodeId>,
         sig: Signature,
         external_boundary: bool,
         loc: Option<Loc>,
@@ -935,6 +1040,8 @@ impl<'a> Builder<'a> {
             kind,
             callee,
             operand,
+            args,
+            result,
             sig,
             external_boundary,
             loc,

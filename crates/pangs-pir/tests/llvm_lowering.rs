@@ -136,6 +136,33 @@ fn llvm_sys_lowers_llvm14_bitcode_function_pointer_smoke() {
 }
 
 #[test]
+fn lowers_call_args_and_results_from_ll() {
+    let pir = Pir::from_path(m1_1_fixture("call_shapes.ll")).unwrap();
+    let driver = pir.functions.iter().find(|f| f.key == "driver").unwrap();
+
+    assert!(driver.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::CallDirect {
+            callee,
+            args,
+            dest,
+            ..
+        } if callee == "id" && args.len() == 1 && dest.as_deref() == Some("%driver::direct")
+    )));
+    assert!(driver.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::CallIndirect {
+            operand,
+            args,
+            dest,
+            ..
+        } if operand == "%driver::fp"
+            && args.as_slice() == ["%driver::direct"]
+            && dest.as_deref() == Some("%driver::indirect")
+    )));
+}
+
+#[test]
 fn lowers_address_taken_through_callbacks_varargs_and_stores() {
     let pir = Pir::from_path(m1_1_fixture("address_taken.ll")).unwrap();
     for name in ["cb_arg", "cb_vararg", "cb_store"] {
@@ -156,7 +183,8 @@ fn lowers_address_taken_through_callbacks_varargs_and_stores() {
     let driver = pir.functions.iter().find(|f| f.key == "driver").unwrap();
     assert!(driver.body.iter().any(|stmt| matches!(
         stmt,
-        Stmt::CallDirect { callee, sig, .. } if callee == "accept_vararg" && sig.vararg
+        Stmt::CallDirect { callee, sig, args, .. }
+            if callee == "accept_vararg" && sig.vararg && args.len() == 2
     )));
 }
 
@@ -192,16 +220,18 @@ fn lowers_vararg_and_x87_signatures_from_ll() {
     let driver = pir.functions.iter().find(|f| f.key == "driver").unwrap();
     assert!(driver.body.iter().any(|stmt| matches!(
         stmt,
-        Stmt::CallDirect { callee, sig, .. }
+        Stmt::CallDirect { callee, sig, args, .. }
             if callee == "vararg_target"
                 && sig.vararg
+                && args.len() == 3
                 && sig.params.as_slice() == [Param::Integer]
                 && sig.ret == pangs_pir::AbiClass::Integer
     )));
     assert!(driver.body.iter().any(|stmt| matches!(
         stmt,
-        Stmt::CallDirect { callee, sig, .. }
+        Stmt::CallDirect { callee, sig, args, .. }
             if callee == "x87_id"
+                && args.len() == 1
                 && sig.params.as_slice() == [Param::X87]
                 && sig.ret == pangs_pir::AbiClass::X87
     )));

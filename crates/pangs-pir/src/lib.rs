@@ -187,11 +187,19 @@ pub enum Stmt {
         callee: String,
         sig: Signature,
         #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        dest: Option<String>,
+        #[serde(default)]
         loc: Option<Loc>,
     },
     CallIndirect {
         operand: String,
         sig: Signature,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        dest: Option<String>,
         #[serde(default)]
         loc: Option<Loc>,
     },

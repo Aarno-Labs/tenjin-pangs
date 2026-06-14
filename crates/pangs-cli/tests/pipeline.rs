@@ -416,7 +416,12 @@ fn dump_pag_emits_core_graph_and_function_filter() {
 
     let pag: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(pag["module"], "m1_3_core");
-    assert_eq!(pag["callsites"].as_array().unwrap().len(), 2);
+    assert_eq!(pag["callsites"].as_array().unwrap().len(), 3);
+    assert!(pag["callsites"].as_array().unwrap().iter().any(|callsite| {
+        callsite["callee"] == "id_i32"
+            && callsite["args"].as_array().unwrap().len() == 1
+            && callsite["result"].is_number()
+    }));
     assert!(pag["edges"]
         .as_array()
         .unwrap()

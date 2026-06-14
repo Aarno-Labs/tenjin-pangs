@@ -35,6 +35,8 @@ fn builds_core_nodes_edges_callsites_and_seeds() {
         .iter()
         .any(|node| node.label == "sym:global:g_box"));
     assert!(pag.nodes.iter().any(|node| node.label == "ret:main"));
+    assert!(pag.nodes.iter().any(|node| node.label == "param:id_i32:0"));
+    assert!(pag.nodes.iter().any(|node| node.label == "ret:id_i32"));
 
     assert!(pag
         .edges
@@ -56,8 +58,45 @@ fn builds_core_nodes_edges_callsites_and_seeds() {
         .edges
         .iter()
         .any(|edge| matches!(edge.kind, pangs_pag::EdgeKind::Gep { byte_off: Some(8) })));
+    let bits = pag
+        .nodes
+        .iter()
+        .find(|node| node.label == "val:main:%bits")
+        .unwrap()
+        .id;
+    let rv = pag
+        .nodes
+        .iter()
+        .find(|node| node.label == "val:main:%rv")
+        .unwrap()
+        .id;
+    let callee_param = pag
+        .nodes
+        .iter()
+        .find(|node| node.label == "param:id_i32:0")
+        .unwrap()
+        .id;
+    let callee_ret = pag
+        .nodes
+        .iter()
+        .find(|node| node.label == "ret:id_i32")
+        .unwrap()
+        .id;
+    assert!(pag.edges.iter().any(|edge| {
+        matches!(edge.kind, pangs_pag::EdgeKind::Assign)
+            && edge.src == bits
+            && edge.dst == callee_param
+    }));
+    assert!(pag.edges.iter().any(|edge| {
+        matches!(edge.kind, pangs_pag::EdgeKind::Assign) && edge.src == callee_ret && edge.dst == rv
+    }));
 
-    assert_eq!(pag.callsites.len(), 2);
+    assert_eq!(pag.callsites.len(), 3);
+    assert!(pag.callsites.iter().any(|callsite| {
+        callsite.callee.as_deref() == Some("id_i32")
+            && callsite.args.len() == 1
+            && callsite.result == Some(rv)
+    }));
     assert!(pag.callsites.iter().any(
         |callsite| callsite.callee.as_deref() == Some("ext_decl") && callsite.external_boundary
     ));
@@ -66,6 +105,7 @@ fn builds_core_nodes_edges_callsites_and_seeds() {
         .iter()
         .any(|callsite| callsite.callee.is_none()
             && callsite.operand.is_some()
+            && callsite.args.len() == 1
             && callsite.sig.vararg));
 
     assert!(pag
