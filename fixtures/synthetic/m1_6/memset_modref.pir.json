@@ -1,0 +1,58 @@
+{
+  "module": "m1_6_memset_modref",
+  "functions": [
+    {
+      "key": "main",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "assign",
+          "dest": "%gp",
+          "sources": ["@Aliased"],
+          "loc": { "file": "m1_6_memset.c", "line": 1, "col": 1 }
+        },
+        {
+          "kind": "memset",
+          "dst": "%gp",
+          "value": "%byte",
+          "bytes": 8,
+          "loc": { "file": "m1_6_memset.c", "line": 2, "col": 1 }
+        },
+        {
+          "kind": "int_to_ptr",
+          "dest": "%unk",
+          "source": "%bits",
+          "loc": { "file": "m1_6_memset.c", "line": 3, "col": 1 }
+        },
+        {
+          "kind": "memset",
+          "dst": "%unk",
+          "value": "%byte",
+          "bytes": 8,
+          "loc": { "file": "m1_6_memset.c", "line": 4, "col": 1 }
+        },
+        {
+          "kind": "memset",
+          "dst": "@DirectDst",
+          "value": "%byte",
+          "bytes": 8,
+          "loc": { "file": "m1_6_memset.c", "line": 5, "col": 1 }
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@Aliased",
+      "mutable": true
+    },
+    {
+      "key": "@DirectDst",
+      "mutable": true
+    }
+  ]
+}

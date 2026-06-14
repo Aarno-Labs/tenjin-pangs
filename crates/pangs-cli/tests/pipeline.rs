@@ -1050,6 +1050,58 @@ fn analyze_steens_keeps_pointer_modref_exports_local_while_callgraph_narrows_ind
         .any(|row| row["func"] == "setup" || row["func"] == "main"));
 }
 
+#[test]
+fn analyze_steens_exports_memset_pointer_modref_rows() {
+    let fixture = m1_6_fixture("memset_modref.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "steens");
+
+    let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["name"] == "@Aliased"
+            && row["access"] == "mod"
+            && row["via"] == "aliased"
+            && row["witness"] == "main@m1_6_memset.c:2:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["unknown"] == "omega_store"
+            && row["access"] == "mod"
+            && row["via"] == "unknown"
+            && row["witness"] == "main@m1_6_memset.c:4:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["name"] == "@DirectDst"
+            && row["access"] == "mod"
+            && row["via"] == "aliased"
+            && row["witness"] == "main@m1_6_memset.c:5:1#0"
+    }));
+    assert!(!modref.iter().any(|row| row["access"] == "ref"));
+
+    let components: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("components.json")).unwrap()).unwrap();
+    assert!(components["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|component| {
+            component["members"] == serde_json::json!(["main"])
+                && component["frozen"] == true
+                && component["taint"].as_array().unwrap().iter().any(|taint| {
+                    taint["kind"] == "unknown_global"
+                        && taint["witness"] == "main@m1_6_memset.c:4:1#0"
+                })
+        }));
+}
+
 fn run_analyze(fixture: &Path, out: &Path) {
     run_analyze_stage(fixture, out, "conservative");
 }

@@ -1506,3 +1506,56 @@ fn steens_modref_closure_carries_pointer_rows_through_direct_and_indirect_calls(
             && mr.witness.as_deref() == Some("other@m1_6_icall.c:30:1#0")
     }));
 }
+
+#[test]
+fn steens_memset_modref_exports_direct_aliased_and_unknown_store_rows() {
+    let fixture = m1_6_fixture("memset_modref.pir.json");
+    let analysis = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let main = analysis.lookup_func("main").unwrap();
+    let aliased = analysis.lookup_global("@Aliased").unwrap();
+    let direct_dst = analysis.lookup_global("@DirectDst").unwrap();
+    let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();
+
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(aliased)
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6_memset.c:2:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Unknown("omega_store".to_string())
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Unknown
+            && mr.witness.as_deref() == Some("main@m1_6_memset.c:4:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(direct_dst)
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6_memset.c:5:1#0")
+    }));
+    assert!(!raw_modrefs.iter().any(|mr| mr.access == Access::Ref));
+
+    let component = analysis
+        .components()
+        .iter()
+        .find(|component| component.members == vec![main])
+        .unwrap();
+    assert!(component.frozen);
+    assert!(component.taint.iter().any(|taint| {
+        taint.kind == "unknown_global"
+            && taint.witness.as_deref() == Some("main@m1_6_memset.c:4:1#0")
+    }));
+}

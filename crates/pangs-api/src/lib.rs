@@ -715,6 +715,14 @@ impl Analysis {
                     &solved.nodes,
                     &mut noloc_ord,
                 );
+                push_pointer_memset_modrefs_from_pir(
+                    &mut modrefs,
+                    module,
+                    &func_lookup,
+                    &global_lookup,
+                    &solved.nodes,
+                    &mut noloc_ord,
+                );
             }
         }
 
@@ -1350,6 +1358,62 @@ fn push_pointer_modrefs_from_pag(
                     access,
                     via: Via::Unknown,
                     witness: witness.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn push_pointer_memset_modrefs_from_pir(
+    modrefs: &mut Vec<ModRef>,
+    module: &Pir,
+    func_lookup: &HashMap<String, FuncId>,
+    global_lookup: &HashMap<String, GlobalId>,
+    nodes: &BTreeMap<String, NodeResolution>,
+    noloc_ord: &mut BTreeMap<(String, String), u32>,
+) {
+    for func in &module.functions {
+        let Some(&func_id) = func_lookup.get(&func.key) else {
+            continue;
+        };
+        for stmt in &func.body {
+            let Stmt::Memset { dst, loc, .. } = stmt else {
+                continue;
+            };
+            if let Some(&gid) = global_lookup.get(dst) {
+                modrefs.push(ModRef {
+                    func: func_id,
+                    global: GlobalTarget::Name(gid),
+                    access: Access::Mod,
+                    via: Via::Aliased,
+                    witness: witness_key(&func.key, loc, noloc_ord, "global"),
+                });
+                continue;
+            }
+            let label = pag_value_label(module, &func.key, dst);
+            let Some(resolution) = nodes.get(&label) else {
+                continue;
+            };
+            let witness = witness_key(&func.key, loc, noloc_ord, "global");
+            for global_key in &resolution.pointee_globals {
+                let Some(&gid) = global_lookup.get(global_key) else {
+                    continue;
+                };
+                modrefs.push(ModRef {
+                    func: func_id,
+                    global: GlobalTarget::Name(gid),
+                    access: Access::Mod,
+                    via: Via::Aliased,
+                    witness: witness.clone(),
+                });
+            }
+            if resolution.external {
+                modrefs.push(ModRef {
+                    func: func_id,
+                    global: GlobalTarget::Unknown("omega_store".to_string()),
+                    access: Access::Mod,
+                    via: Via::Unknown,
+                    witness,
                 });
             }
         }
