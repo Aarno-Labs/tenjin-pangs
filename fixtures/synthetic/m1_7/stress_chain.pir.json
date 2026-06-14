@@ -1,0 +1,118 @@
+{
+  "module": "m1_7_stress_chain",
+  "functions": [
+    {
+      "key": "main",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        {
+          "kind": "call_direct",
+          "callee": "f01",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": [],
+          "loc": { "file": "m1_7_stress.c", "line": 1, "col": 1 }
+        },
+        {
+          "kind": "call_direct",
+          "callee": "f02",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": [],
+          "loc": { "file": "m1_7_stress.c", "line": 2, "col": 1 }
+        }
+      ]
+    },
+    {
+      "key": "f01",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "global_ref", "global": "@G0", "access": "ref", "loc": { "file": "m1_7_stress.c", "line": 10, "col": 1 } },
+        { "kind": "call_direct", "callee": "f03", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 11, "col": 1 } },
+        { "kind": "call_direct", "callee": "f04", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 12, "col": 1 } }
+      ]
+    },
+    {
+      "key": "f02",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "global_ref", "global": "@G1", "access": "mod", "loc": { "file": "m1_7_stress.c", "line": 20, "col": 1 } },
+        { "kind": "call_direct", "callee": "f04", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 21, "col": 1 } },
+        { "kind": "call_direct", "callee": "f05", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 22, "col": 1 } }
+      ]
+    },
+    {
+      "key": "f03",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "global_ref", "global": "@G2", "access": "ref", "loc": { "file": "m1_7_stress.c", "line": 30, "col": 1 } },
+        { "kind": "call_direct", "callee": "f06", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 31, "col": 1 } },
+        { "kind": "call_direct", "callee": "f07", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 32, "col": 1 } }
+      ]
+    },
+    {
+      "key": "f04",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "global_ref", "global": "@G3", "access": "mod", "loc": { "file": "m1_7_stress.c", "line": 40, "col": 1 } },
+        { "kind": "call_direct", "callee": "f07", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 41, "col": 1 } },
+        { "kind": "call_direct", "callee": "f08", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 42, "col": 1 } }
+      ]
+    },
+    {
+      "key": "f05",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "global_ref", "global": "@G4", "access": "ref", "loc": { "file": "m1_7_stress.c", "line": 50, "col": 1 } },
+        { "kind": "call_direct", "callee": "f08", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 51, "col": 1 } },
+        { "kind": "call_direct", "callee": "f09", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 52, "col": 1 } }
+      ]
+    },
+    {
+      "key": "f06",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "global_ref", "global": "@G5", "access": "mod", "loc": { "file": "m1_7_stress.c", "line": 60, "col": 1 } },
+        { "kind": "call_direct", "callee": "f09", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 61, "col": 1 } },
+        { "kind": "call_direct", "callee": "f10", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 62, "col": 1 } }
+      ]
+    },
+    {
+      "key": "f07",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "global_ref", "global": "@G0", "access": "mod", "loc": { "file": "m1_7_stress.c", "line": 70, "col": 1 } },
+        { "kind": "call_direct", "callee": "f10", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 71, "col": 1 } }
+      ]
+    },
+    {
+      "key": "f08",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "global_ref", "global": "@G1", "access": "ref", "loc": { "file": "m1_7_stress.c", "line": 80, "col": 1 } },
+        { "kind": "call_direct", "callee": "f10", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 81, "col": 1 } }
+      ]
+    },
+    {
+      "key": "f09",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "global_ref", "global": "@G2", "access": "mod", "loc": { "file": "m1_7_stress.c", "line": 90, "col": 1 } },
+        { "kind": "call_direct", "callee": "f10", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [], "loc": { "file": "m1_7_stress.c", "line": 91, "col": 1 } }
+      ]
+    },
+    {
+      "key": "f10",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "global_ref", "global": "@G3", "access": "ref", "loc": { "file": "m1_7_stress.c", "line": 100, "col": 1 } }
+      ]
+    }
+  ],
+  "globals": [
+    { "key": "@G0", "mutable": true },
+    { "key": "@G1", "mutable": true },
+    { "key": "@G2", "mutable": true },
+    { "key": "@G3", "mutable": true },
+    { "key": "@G4", "mutable": true },
+    { "key": "@G5", "mutable": true }
+  ]
+}

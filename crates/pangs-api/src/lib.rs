@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::Instant;
 
 use pangs_pag::{BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts};
 use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, Stmt};
@@ -205,6 +206,11 @@ pub struct Metrics {
     pub partition_max_size: usize,
     pub oversize_fallbacks: usize,
     pub rounds: usize,
+    pub analysis_wall_us: u64,
+    pub pag_build_us: u64,
+    pub solve_us: u64,
+    pub transitive_modref_us: u64,
+    pub components_us: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lowering: Option<LoweringStats>,
 }
@@ -336,6 +342,7 @@ pub struct Analysis {
 
 impl Analysis {
     pub fn run(module: &Pir, opts: &Opts) -> Result<Self, AnalysisError> {
+        let analysis_started = Instant::now();
         let mut func_lookup = HashMap::new();
         let mut functions = Vec::new();
         for (idx, func) in module.functions.iter().enumerate() {
@@ -390,6 +397,8 @@ impl Analysis {
         let mut deferred_audits = Vec::<DeferredAudit>::new();
         let mut indirect_callsites = Vec::new();
         let mut solver_metrics = None;
+        let mut pag_build_us = 0;
+        let mut solve_us = 0;
         let address_taken: Vec<_> = module
             .functions
             .iter()
@@ -623,6 +632,7 @@ impl Analysis {
                 }
             }
             Stage::Steens | Stage::Andersen => {
+                let pag_started = Instant::now();
                 let pag = Pag::from_pir(
                     module,
                     &PagOpts {
@@ -630,7 +640,10 @@ impl Analysis {
                         exports: opts.exports.clone(),
                     },
                 );
+                pag_build_us = pag_started.elapsed().as_micros() as u64;
+                let solve_started = Instant::now();
                 let solved = solve_steensgaard(module, &pag, opts.build_mode.into());
+                solve_us = solve_started.elapsed().as_micros() as u64;
                 solver_metrics = Some(solved.metrics.clone());
                 emit_deferred_steens_audits(
                     &mut findings,
@@ -731,6 +744,7 @@ impl Analysis {
         modrefs.sort_by_key(|mr| modref_sort_key(mr, &functions, &globals));
         modrefs.dedup_by_key(|mr| modref_sort_key(mr, &functions, &globals));
 
+        let transitive_started = Instant::now();
         let transitive_modrefs = compute_transitive_modrefs(
             functions.len(),
             &functions,
@@ -738,6 +752,7 @@ impl Analysis {
             &call_edges,
             &modrefs,
         );
+        let transitive_modref_us = transitive_started.elapsed().as_micros() as u64;
         findings.sort_by_key(|finding| {
             (
                 finding.kind.clone(),
@@ -755,6 +770,7 @@ impl Analysis {
             )
         });
 
+        let components_started = Instant::now();
         let components = compute_components(
             &functions,
             &globals,
@@ -763,6 +779,7 @@ impl Analysis {
             &modrefs,
             &audit_taints,
         );
+        let components_us = components_started.elapsed().as_micros() as u64;
         let mutable_globals_total = globals.iter().filter(|g| g.mutable).count();
         let in_rewritable_components = components
             .iter()
@@ -785,6 +802,11 @@ impl Analysis {
             partition_max_size: 0,
             oversize_fallbacks: 0,
             rounds: 0,
+            analysis_wall_us: 0,
+            pag_build_us,
+            solve_us,
+            transitive_modref_us,
+            components_us,
             lowering: (!module.lowering.is_empty()).then(|| module.lowering.clone()),
         };
 
@@ -800,6 +822,10 @@ impl Analysis {
             }
         } else {
             metrics
+        };
+        let metrics = Metrics {
+            analysis_wall_us: analysis_started.elapsed().as_micros() as u64,
+            ..metrics
         };
 
         Ok(Self {
@@ -1499,57 +1525,60 @@ fn compute_components(
         .collect();
     components.sort_by_key(|members| funcs[members[0].0 as usize].key.clone());
 
+    let mut modrefs_by_func = vec![Vec::<&ModRef>::new(); funcs.len()];
+    for mr in modrefs {
+        modrefs_by_func[mr.func.0 as usize].push(mr);
+    }
+    let mut unknown_callee_witnesses = vec![Vec::<Option<String>>::new(); funcs.len()];
+    let mut unknown_caller = vec![false; funcs.len()];
+    for edge in edges {
+        if matches!(edge.callee, Callee::Unknown(_)) {
+            if let Caller::Func(fid) = edge.caller {
+                unknown_callee_witnesses[fid.0 as usize]
+                    .push(edge.callsite.map(|id| callsites[id.0 as usize].key.clone()));
+            }
+        }
+        if matches!(edge.caller, Caller::Unknown(_)) {
+            if let Callee::Func(fid) = edge.callee {
+                unknown_caller[fid.0 as usize] = true;
+            }
+        }
+    }
+
     components
         .into_iter()
         .enumerate()
         .map(|(idx, members)| {
-            let member_set: BTreeSet<_> = members.iter().copied().collect();
             let mut mutable_globals = BTreeSet::new();
-            for mr in modrefs {
-                if member_set.contains(&mr.func) {
+            let mut taint = Vec::new();
+            for member in &members {
+                for mr in &modrefs_by_func[member.0 as usize] {
                     if let GlobalTarget::Name(gid) = mr.global {
                         if globals[gid.0 as usize].mutable {
                             mutable_globals.insert(gid);
                         }
                     }
+                    if matches!(mr.global, GlobalTarget::Unknown(_)) {
+                        taint.push(Taint {
+                            kind: "unknown_global".to_string(),
+                            witness: mr.witness.clone(),
+                        });
+                    }
                 }
-            }
-            let mut taint = Vec::new();
-            for mr in modrefs {
-                if member_set.contains(&mr.func) && matches!(mr.global, GlobalTarget::Unknown(_)) {
+                for witness in &unknown_callee_witnesses[member.0 as usize] {
                     taint.push(Taint {
-                        kind: "unknown_global".to_string(),
-                        witness: mr.witness.clone(),
+                        kind: "unknown_callee".to_string(),
+                        witness: witness.clone(),
                     });
                 }
-            }
-            for edge in edges {
-                if matches!(edge.callee, Callee::Unknown(_)) {
-                    if let Caller::Func(fid) = edge.caller {
-                        if member_set.contains(&fid) {
-                            taint.push(Taint {
-                                kind: "unknown_callee".to_string(),
-                                witness: edge
-                                    .callsite
-                                    .map(|id| callsites[id.0 as usize].key.clone()),
-                            });
-                        }
-                    }
+                if unknown_caller[member.0 as usize] {
+                    taint.push(Taint {
+                        kind: "unknown_caller".to_string(),
+                        witness: None,
+                    });
                 }
-                if matches!(edge.caller, Caller::Unknown(_)) {
-                    if let Callee::Func(fid) = edge.callee {
-                        if member_set.contains(&fid) {
-                            taint.push(Taint {
-                                kind: "unknown_caller".to_string(),
-                                witness: None,
-                            });
-                        }
-                    }
-                }
-            }
-            for (func, taints) in audit_taints {
-                if member_set.contains(func) {
-                    taint.extend(taints.iter().cloned());
+                if let Some(member_taints) = audit_taints.get(member) {
+                    taint.extend(member_taints.iter().cloned());
                 }
             }
             taint.sort_by_key(|t| (t.kind.clone(), t.witness.clone()));
@@ -1565,6 +1594,40 @@ fn compute_components(
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModRefPayload {
+    global: GlobalTarget,
+    access: Access,
+    via: Via,
+    witness: Option<String>,
+}
+
+impl ModRefPayload {
+    fn sort_key(&self) -> (String, String, String, String) {
+        (
+            match &self.global {
+                GlobalTarget::Name(id) => format!("name:{}", id.0),
+                GlobalTarget::Unknown(reason) => format!("unknown:{reason}"),
+            },
+            format!("{:?}", self.access),
+            format!("{:?}", self.via),
+            self.witness.clone().unwrap_or_default(),
+        )
+    }
+}
+
+impl PartialOrd for ModRefPayload {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ModRefPayload {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key().cmp(&other.sort_key())
+    }
+}
+
 fn compute_transitive_modrefs(
     func_count: usize,
     funcs: &[FuncInfo],
@@ -1572,49 +1635,153 @@ fn compute_transitive_modrefs(
     edges: &[CallEdge],
     local_modrefs: &[ModRef],
 ) -> Vec<Vec<ModRef>> {
-    let mut callees_by_func = vec![Vec::<FuncId>::new(); func_count];
+    let mut callees_by_func = vec![Vec::<usize>::new(); func_count];
     for edge in edges {
         if let (Caller::Func(caller), Callee::Func(callee)) = (&edge.caller, &edge.callee) {
-            callees_by_func[caller.0 as usize].push(*callee);
+            callees_by_func[caller.0 as usize].push(callee.0 as usize);
         }
     }
+    for callees in &mut callees_by_func {
+        callees.sort_unstable();
+        callees.dedup();
+    }
 
-    let mut local_by_func = vec![Vec::<&ModRef>::new(); func_count];
+    let (scc_members, scc_of_func) = strongly_connected_components(&callees_by_func);
+    let mut local_by_scc = vec![BTreeSet::<ModRefPayload>::new(); scc_members.len()];
     for mr in local_modrefs {
-        local_by_func[mr.func.0 as usize].push(mr);
+        local_by_scc[scc_of_func[mr.func.0 as usize]].insert(ModRefPayload {
+            global: mr.global.clone(),
+            access: mr.access,
+            via: mr.via,
+            witness: mr.witness.clone(),
+        });
+    }
+
+    let mut scc_succs = vec![Vec::<usize>::new(); scc_members.len()];
+    for (func, callees) in callees_by_func.iter().enumerate() {
+        let from = scc_of_func[func];
+        for &callee in callees {
+            let to = scc_of_func[callee];
+            if from != to {
+                scc_succs[from].push(to);
+            }
+        }
+    }
+    for succs in &mut scc_succs {
+        succs.sort_unstable();
+        succs.dedup();
+    }
+
+    let mut memo = vec![None::<BTreeSet<ModRefPayload>>; scc_members.len()];
+    for scc in 0..scc_members.len() {
+        collect_scc_payloads(scc, &local_by_scc, &scc_succs, &mut memo);
     }
 
     let mut transitive = Vec::with_capacity(func_count);
     for root_idx in 0..func_count {
         let root = FuncId(root_idx as u32);
-        let mut reachable = BTreeSet::new();
-        let mut stack = vec![root];
-        while let Some(func) = stack.pop() {
-            if !reachable.insert(func) {
-                continue;
-            }
-            for &callee in &callees_by_func[func.0 as usize] {
-                stack.push(callee);
-            }
-        }
-
-        let mut rows = Vec::new();
-        for func in reachable {
-            for mr in &local_by_func[func.0 as usize] {
-                rows.push(ModRef {
-                    func: root,
-                    global: mr.global.clone(),
-                    access: mr.access,
-                    via: mr.via,
-                    witness: mr.witness.clone(),
-                });
-            }
-        }
+        let mut rows = memo[scc_of_func[root_idx]]
+            .as_ref()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|payload| ModRef {
+                func: root,
+                global: payload.global,
+                access: payload.access,
+                via: payload.via,
+                witness: payload.witness,
+            })
+            .collect::<Vec<_>>();
         rows.sort_by_key(|mr| modref_sort_key(mr, funcs, globals));
         rows.dedup_by_key(|mr| modref_sort_key(mr, funcs, globals));
         transitive.push(rows);
     }
     transitive
+}
+
+fn collect_scc_payloads(
+    scc: usize,
+    local_by_scc: &[BTreeSet<ModRefPayload>],
+    scc_succs: &[Vec<usize>],
+    memo: &mut [Option<BTreeSet<ModRefPayload>>],
+) -> BTreeSet<ModRefPayload> {
+    if let Some(existing) = &memo[scc] {
+        return existing.clone();
+    }
+    let mut rows = local_by_scc[scc].clone();
+    for &succ in &scc_succs[scc] {
+        rows.extend(collect_scc_payloads(succ, local_by_scc, scc_succs, memo));
+    }
+    memo[scc] = Some(rows.clone());
+    rows
+}
+
+fn strongly_connected_components(edges: &[Vec<usize>]) -> (Vec<Vec<usize>>, Vec<usize>) {
+    struct Tarjan<'a> {
+        edges: &'a [Vec<usize>],
+        index: usize,
+        indices: Vec<Option<usize>>,
+        lowlink: Vec<usize>,
+        stack: Vec<usize>,
+        on_stack: Vec<bool>,
+        members: Vec<Vec<usize>>,
+        scc_of: Vec<usize>,
+    }
+
+    impl<'a> Tarjan<'a> {
+        fn new(edges: &'a [Vec<usize>]) -> Self {
+            Self {
+                edges,
+                index: 0,
+                indices: vec![None; edges.len()],
+                lowlink: vec![0; edges.len()],
+                stack: Vec::new(),
+                on_stack: vec![false; edges.len()],
+                members: Vec::new(),
+                scc_of: vec![0; edges.len()],
+            }
+        }
+
+        fn visit(&mut self, node: usize) {
+            self.indices[node] = Some(self.index);
+            self.lowlink[node] = self.index;
+            self.index += 1;
+            self.stack.push(node);
+            self.on_stack[node] = true;
+
+            for &succ in &self.edges[node] {
+                if self.indices[succ].is_none() {
+                    self.visit(succ);
+                    self.lowlink[node] = self.lowlink[node].min(self.lowlink[succ]);
+                } else if self.on_stack[succ] {
+                    self.lowlink[node] = self.lowlink[node].min(self.indices[succ].unwrap());
+                }
+            }
+
+            if self.lowlink[node] == self.indices[node].unwrap() {
+                let mut component = Vec::new();
+                while let Some(top) = self.stack.pop() {
+                    self.on_stack[top] = false;
+                    self.scc_of[top] = self.members.len();
+                    component.push(top);
+                    if top == node {
+                        break;
+                    }
+                }
+                component.sort_unstable();
+                self.members.push(component);
+            }
+        }
+    }
+
+    let mut tarjan = Tarjan::new(edges);
+    for node in 0..edges.len() {
+        if tarjan.indices[node].is_none() {
+            tarjan.visit(node);
+        }
+    }
+    (tarjan.members, tarjan.scc_of)
 }
 
 fn union(parent: &mut [usize], a: usize, b: usize) {

@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use jsonschema::JSONSchema;
@@ -17,6 +18,7 @@ pub fn export_analysis(
     input_path: &Path,
     outdir: &Path,
     validate: bool,
+    pipeline_started: Instant,
 ) -> Result<()> {
     fs::create_dir_all(outdir).with_context(|| format!("create {}", outdir.display()))?;
 
@@ -61,7 +63,8 @@ pub fn export_analysis(
         &ComponentsRecord::from_analysis(analysis),
         &mut files,
     )?;
-    write_json(outdir.join("metrics.json"), analysis.metrics(), &mut files)?;
+    let metrics = analysis.metrics().clone();
+    write_json(outdir.join("metrics.json"), &metrics, &mut files)?;
 
     let manifest = Manifest {
         schema_version: 1,
@@ -73,7 +76,7 @@ pub fn export_analysis(
         input_sha256: sha256_file(input_path)?,
         opts,
         files,
-        wall_ms: 0,
+        wall_ms: pipeline_started.elapsed().as_millis() as u64,
     };
     write_json(outdir.join("manifest.json"), &manifest, &mut Vec::new())?;
 
@@ -169,7 +172,7 @@ pub fn report(outdir: &Path) -> Result<String> {
         metrics.call_edges,
         metrics.audit_findings,
         metrics.in_rewritable_components,
-        metrics.mutable_globals_total
+        metrics.mutable_globals_total,
     ))
 }
 
@@ -439,6 +442,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use std::time::Instant;
+
     use pangs_api::{Analysis, Opts};
     use pangs_pir::Pir;
     use tempfile::TempDir;
@@ -452,10 +457,18 @@ mod tests {
         let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
         let outdir = TempDir::new().unwrap();
 
-        export_analysis(&analysis, &Opts::default(), &fixture, outdir.path(), false).unwrap();
+        export_analysis(
+            &analysis,
+            &Opts::default(),
+            &fixture,
+            outdir.path(),
+            false,
+            Instant::now(),
+        )
+        .unwrap();
         fs::write(
             outdir.path().join("metrics.json"),
-            "{\"functions\":\"bad\",\"globals\":0,\"callsites\":0,\"call_edges\":0,\"audit_findings\":0,\"mutable_globals_total\":0,\"in_rewritable_components\":0,\"partition_count\":0,\"partition_p50_size\":0,\"partition_p95_size\":0,\"partition_max_size\":0,\"oversize_fallbacks\":0,\"rounds\":0}\n",
+            "{\"functions\":\"bad\",\"globals\":0,\"callsites\":0,\"call_edges\":0,\"audit_findings\":0,\"mutable_globals_total\":0,\"in_rewritable_components\":0,\"partition_count\":0,\"partition_p50_size\":0,\"partition_p95_size\":0,\"partition_max_size\":0,\"oversize_fallbacks\":0,\"rounds\":0,\"analysis_wall_us\":0,\"pag_build_us\":0,\"solve_us\":0,\"transitive_modref_us\":0,\"components_us\":0}\n",
         )
         .unwrap();
 

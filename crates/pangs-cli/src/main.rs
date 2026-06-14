@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -110,6 +111,7 @@ fn run() -> Result<()> {
             exports,
             validate,
         } => {
+            let pipeline_started = Instant::now();
             let pir = Pir::from_path(&module)?;
             let opts = Opts {
                 stage: stage.into(),
@@ -122,7 +124,14 @@ fn run() -> Result<()> {
                 opts.stage, opts.build_mode
             );
             let analysis = Analysis::run(&pir, &opts)?;
-            pangs_clients::export_analysis(&analysis, &opts, &module, &out, validate)?;
+            pangs_clients::export_analysis(
+                &analysis,
+                &opts,
+                &module,
+                &out,
+                validate,
+                pipeline_started,
+            )?;
         }
         Command::Stats { module } => {
             let pir = Pir::from_path(&module)?;

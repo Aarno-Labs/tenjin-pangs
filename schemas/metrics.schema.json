@@ -16,7 +16,12 @@
     "partition_p95_size",
     "partition_max_size",
     "oversize_fallbacks",
-    "rounds"
+    "rounds",
+    "analysis_wall_us",
+    "pag_build_us",
+    "solve_us",
+    "transitive_modref_us",
+    "components_us"
   ],
   "$defs": {
     "counter_map": {
@@ -142,6 +147,26 @@
       "minimum": 0
     },
     "rounds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "analysis_wall_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pag_build_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "solve_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "transitive_modref_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "components_us": {
       "type": "integer",
       "minimum": 0
     },

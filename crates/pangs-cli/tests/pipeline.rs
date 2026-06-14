@@ -35,6 +35,26 @@ fn m1_6_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn m1_7_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_7")
+        .join(name)
+}
+
+fn scrub_timing_fields(mut metrics: Value) -> Value {
+    let object = metrics.as_object_mut().unwrap();
+    for key in [
+        "analysis_wall_us",
+        "pag_build_us",
+        "solve_us",
+        "transitive_modref_us",
+        "components_us",
+    ] {
+        object.remove(key);
+    }
+    metrics
+}
+
 #[test]
 fn analyze_validate_is_deterministic() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -53,12 +73,21 @@ fn analyze_validate_is_deterministic() {
         "modref.jsonl",
         "components.json",
         "audit.jsonl",
-        "metrics.json",
     ] {
         let a = fs::read(out_a.join(name)).unwrap();
         let b = fs::read(out_b.join(name)).unwrap();
         assert_eq!(a, b, "{name} should be byte-identical");
     }
+    let a = scrub_timing_fields(
+        serde_json::from_str(&fs::read_to_string(out_a.join("metrics.json")).unwrap()).unwrap(),
+    );
+    let b = scrub_timing_fields(
+        serde_json::from_str(&fs::read_to_string(out_b.join("metrics.json")).unwrap()).unwrap(),
+    );
+    assert_eq!(
+        a, b,
+        "metrics.json should be byte-identical after scrubbing timing fields"
+    );
 }
 
 #[test]
@@ -78,12 +107,21 @@ fn analyze_validate_llvm_noloc_is_deterministic() {
         "modref.jsonl",
         "components.json",
         "audit.jsonl",
-        "metrics.json",
     ] {
         let a = fs::read(out_a.join(name)).unwrap();
         let b = fs::read(out_b.join(name)).unwrap();
         assert_eq!(a, b, "{name} should be byte-identical");
     }
+    let a = scrub_timing_fields(
+        serde_json::from_str(&fs::read_to_string(out_a.join("metrics.json")).unwrap()).unwrap(),
+    );
+    let b = scrub_timing_fields(
+        serde_json::from_str(&fs::read_to_string(out_b.join("metrics.json")).unwrap()).unwrap(),
+    );
+    assert_eq!(
+        a, b,
+        "metrics.json should be byte-identical after scrubbing timing fields"
+    );
 
     let callgraph = fs::read_to_string(out_a.join("callgraph.jsonl")).unwrap();
     assert!(callgraph.contains("\"callsite\":\"driver@!noloc#0\""));
@@ -140,6 +178,62 @@ fn analyze_validate_checked_in_m1_1_fixtures() {
             );
         }
     }
+}
+
+#[test]
+fn analyze_steens_stress_fixture_is_stable_except_for_timing_fields() {
+    let fixture = m1_7_fixture("stress_chain.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out_a = tmp.path().join("a");
+    let out_b = tmp.path().join("b");
+
+    run_analyze_stage(&fixture, &out_a, "steens");
+    run_analyze_stage(&fixture, &out_b, "steens");
+
+    for name in [
+        "functions.jsonl",
+        "globals.jsonl",
+        "callgraph.jsonl",
+        "modref.jsonl",
+        "components.json",
+        "audit.jsonl",
+    ] {
+        let a = fs::read(out_a.join(name)).unwrap();
+        let b = fs::read(out_b.join(name)).unwrap();
+        assert_eq!(a, b, "{name} should be byte-identical");
+    }
+
+    let metrics_a: Value =
+        serde_json::from_str(&fs::read_to_string(out_a.join("metrics.json")).unwrap()).unwrap();
+    let metrics_b: Value =
+        serde_json::from_str(&fs::read_to_string(out_b.join("metrics.json")).unwrap()).unwrap();
+    for key in [
+        "analysis_wall_us",
+        "pag_build_us",
+        "solve_us",
+        "transitive_modref_us",
+        "components_us",
+    ] {
+        assert!(
+            metrics_a[key].as_u64().is_some(),
+            "{key} missing in metrics"
+        );
+        assert!(
+            metrics_b[key].as_u64().is_some(),
+            "{key} missing in metrics"
+        );
+    }
+    assert_eq!(
+        scrub_timing_fields(metrics_a),
+        scrub_timing_fields(metrics_b)
+    );
+
+    let manifest_a: Value =
+        serde_json::from_str(&fs::read_to_string(out_a.join("manifest.json")).unwrap()).unwrap();
+    let manifest_b: Value =
+        serde_json::from_str(&fs::read_to_string(out_b.join("manifest.json")).unwrap()).unwrap();
+    assert!(manifest_a["wall_ms"].as_u64().is_some());
+    assert!(manifest_b["wall_ms"].as_u64().is_some());
 }
 
 #[test]

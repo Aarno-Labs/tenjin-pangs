@@ -39,6 +39,12 @@ fn m1_6_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn m1_7_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_7")
+        .join(name)
+}
+
 #[test]
 fn unknown_caller_seeds_only_exported_external_and_address_taken_functions() {
     let pir = Pir {
@@ -1661,4 +1667,126 @@ fn steens_alias_rows_improve_split_component_coverage_over_conservative() {
     }));
     assert_eq!(steens.metrics().mutable_globals_total, 2);
     assert_eq!(steens.metrics().in_rewritable_components, 1);
+}
+
+#[test]
+fn transitive_modrefs_preserve_recursive_call_closure() {
+    let pir = Pir {
+        module: "m1_7_cycle".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            Func {
+                key: "main".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::CallDirect {
+                    callee: "a".to_string(),
+                    sig: sig(AbiClass::Void, vec![]),
+                    args: vec![],
+                    dest: None,
+                    loc: None,
+                }],
+            },
+            Func {
+                key: "a".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::CallDirect {
+                    callee: "b".to_string(),
+                    sig: sig(AbiClass::Void, vec![]),
+                    args: vec![],
+                    dest: None,
+                    loc: None,
+                }],
+            },
+            Func {
+                key: "b".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![
+                    Stmt::CallDirect {
+                        callee: "a".to_string(),
+                        sig: sig(AbiClass::Void, vec![]),
+                        args: vec![],
+                        dest: None,
+                        loc: None,
+                    },
+                    Stmt::GlobalRef {
+                        global: "@G".to_string(),
+                        access: Access::Ref,
+                        loc: None,
+                    },
+                ],
+            },
+        ],
+        globals: vec![Global {
+            key: "@G".to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            exported: false,
+        }],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Conservative,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let main = analysis.lookup_func("main").unwrap();
+    let a = analysis.lookup_func("a").unwrap();
+    let b = analysis.lookup_func("b").unwrap();
+    let g = analysis.lookup_global("@G").unwrap();
+
+    for func in [main, a, b] {
+        assert!(analysis.modref(func).any(|mr| {
+            mr.global == pangs_api::GlobalTarget::Name(g)
+                && mr.access == Access::Ref
+                && mr.via == pangs_api::Via::Direct
+        }));
+    }
+}
+
+#[test]
+fn steens_metrics_expose_phase_timings_on_stress_fixture() {
+    let fixture = m1_7_fixture("stress_chain.pir.json");
+    let analysis = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let metrics = analysis.metrics();
+    assert!(metrics.analysis_wall_us >= metrics.pag_build_us);
+    assert!(metrics.analysis_wall_us >= metrics.solve_us);
+    assert!(metrics.analysis_wall_us >= metrics.transitive_modref_us);
+    assert!(metrics.analysis_wall_us >= metrics.components_us);
+    assert!(metrics.partition_count > 0);
 }
