@@ -2,5 +2,45 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PANGS functions stream",
   "type": "object",
-  "required": ["key", "external", "exported", "address_taken", "vararg", "sig"]
+  "additionalProperties": false,
+  "required": [
+    "key",
+    "file",
+    "line",
+    "external",
+    "exported",
+    "address_taken",
+    "vararg",
+    "sig"
+  ],
+  "properties": {
+    "key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "file": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "line": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "external": {
+      "type": "boolean"
+    },
+    "exported": {
+      "type": "boolean"
+    },
+    "address_taken": {
+      "type": "boolean"
+    },
+    "vararg": {
+      "type": "boolean"
+    },
+    "sig": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
 }

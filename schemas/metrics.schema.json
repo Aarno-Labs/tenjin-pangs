@@ -2,5 +2,151 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PANGS metrics",
   "type": "object",
-  "required": ["functions", "globals", "callsites", "call_edges", "audit_findings", "mutable_globals_total", "in_rewritable_components"]
+  "additionalProperties": false,
+  "required": [
+    "functions",
+    "globals",
+    "callsites",
+    "call_edges",
+    "audit_findings",
+    "mutable_globals_total",
+    "in_rewritable_components",
+    "partition_count",
+    "partition_p50_size",
+    "partition_p95_size",
+    "partition_max_size",
+    "oversize_fallbacks",
+    "rounds"
+  ],
+  "$defs": {
+    "counter_map": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "lowering_stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "functions",
+        "declarations",
+        "globals",
+        "aliases",
+        "ifuncs",
+        "instruction_counts",
+        "terminator_counts",
+        "modeled_counts",
+        "skipped_counts",
+        "tainted_counts",
+        "missing_debug_locations",
+        "non_ccc_calling_conventions"
+      ],
+      "properties": {
+        "functions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "declarations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "globals": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "aliases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ifuncs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "instruction_counts": {
+          "$ref": "#/$defs/counter_map"
+        },
+        "terminator_counts": {
+          "$ref": "#/$defs/counter_map"
+        },
+        "modeled_counts": {
+          "$ref": "#/$defs/counter_map"
+        },
+        "skipped_counts": {
+          "$ref": "#/$defs/counter_map"
+        },
+        "tainted_counts": {
+          "$ref": "#/$defs/counter_map"
+        },
+        "missing_debug_locations": {
+          "$ref": "#/$defs/counter_map"
+        },
+        "non_ccc_calling_conventions": {
+          "$ref": "#/$defs/counter_map"
+        }
+      }
+    }
+  },
+  "properties": {
+    "functions": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "globals": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "callsites": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "call_edges": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "audit_findings": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "mutable_globals_total": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "in_rewritable_components": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "partition_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "partition_p50_size": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "partition_p95_size": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "partition_max_size": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "oversize_fallbacks": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rounds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "lowering": {
+      "$ref": "#/$defs/lowering_stats"
+    }
+  }
 }

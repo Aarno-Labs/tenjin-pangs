@@ -2,5 +2,41 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PANGS globals stream",
   "type": "object",
-  "required": ["key", "is_const", "never_written", "escape", "mutable"]
+  "additionalProperties": false,
+  "required": [
+    "key",
+    "file",
+    "line",
+    "is_const",
+    "never_written",
+    "escape",
+    "mutable"
+  ],
+  "properties": {
+    "key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "file": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "line": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "is_const": {
+      "type": "boolean"
+    },
+    "never_written": {
+      "type": "boolean"
+    },
+    "escape": {
+      "type": "string",
+      "enum": ["module", "external"]
+    },
+    "mutable": {
+      "type": "boolean"
+    }
+  }
 }

@@ -2,5 +2,55 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PANGS modref stream",
   "type": "object",
-  "required": ["func", "global", "access", "via"]
+  "additionalProperties": false,
+  "required": ["func", "global", "access", "via", "witness"],
+  "$defs": {
+    "global_target": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["unknown"],
+          "properties": {
+            "unknown": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    }
+  },
+  "properties": {
+    "func": {
+      "type": "string",
+      "minLength": 1
+    },
+    "global": {
+      "$ref": "#/$defs/global_target"
+    },
+    "access": {
+      "type": "string",
+      "enum": ["ref", "mod"]
+    },
+    "via": {
+      "type": "string",
+      "enum": ["direct", "aliased", "unknown"]
+    },
+    "witness": {
+      "type": ["string", "null"],
+      "minLength": 1
+    }
+  }
 }

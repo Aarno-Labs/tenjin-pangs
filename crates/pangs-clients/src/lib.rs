@@ -433,3 +433,38 @@ fn sha256_file(path: &Path) -> Result<String> {
     hasher.update(data);
     Ok(format!("{:x}", hasher.finalize()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use pangs_api::{Analysis, Opts};
+    use pangs_pir::Pir;
+    use tempfile::TempDir;
+
+    use super::{export_analysis, validate_export_dir};
+
+    #[test]
+    fn validate_export_dir_rejects_schema_mismatch() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let pir = Pir::from_path(&fixture).unwrap();
+        let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
+        let outdir = TempDir::new().unwrap();
+
+        export_analysis(&analysis, &Opts::default(), &fixture, outdir.path(), false).unwrap();
+        fs::write(
+            outdir.path().join("metrics.json"),
+            "{\"functions\":\"bad\",\"globals\":0,\"callsites\":0,\"call_edges\":0,\"audit_findings\":0,\"mutable_globals_total\":0,\"in_rewritable_components\":0,\"partition_count\":0,\"partition_p50_size\":0,\"partition_p95_size\":0,\"partition_max_size\":0,\"oversize_fallbacks\":0,\"rounds\":0}\n",
+        )
+        .unwrap();
+
+        let err = validate_export_dir(outdir.path()).unwrap_err().to_string();
+        assert!(err.contains("metrics.json"));
+        assert!(err.contains("schema validation failed"));
+    }
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+}

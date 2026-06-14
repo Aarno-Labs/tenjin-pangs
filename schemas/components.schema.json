@@ -2,5 +2,83 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PANGS components",
   "type": "object",
-  "required": ["components", "coverage"]
+  "additionalProperties": false,
+  "required": ["components", "coverage"],
+  "$defs": {
+    "taint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "witness"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "witness": {
+          "type": ["string", "null"],
+          "minLength": 1
+        }
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "frozen", "taint", "members", "mutable_globals"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "frozen": {
+          "type": "boolean"
+        },
+        "taint": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/taint"
+          }
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "mutable_globals": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mutable_globals_total", "in_rewritable_components"],
+      "properties": {
+        "mutable_globals_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "in_rewritable_components": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "properties": {
+    "components": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/component"
+      }
+    },
+    "coverage": {
+      "$ref": "#/$defs/coverage"
+    }
+  }
 }

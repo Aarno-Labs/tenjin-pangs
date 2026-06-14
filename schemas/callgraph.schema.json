@@ -2,5 +2,54 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PANGS callgraph stream",
   "type": "object",
-  "required": ["caller", "callee", "kind", "tier"]
+  "additionalProperties": false,
+  "required": ["caller", "callsite", "callee", "kind", "tier"],
+  "$defs": {
+    "endpoint": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["func"],
+          "properties": {
+            "func": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["unknown"],
+          "properties": {
+            "unknown": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    }
+  },
+  "properties": {
+    "caller": {
+      "$ref": "#/$defs/endpoint"
+    },
+    "callsite": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "callee": {
+      "$ref": "#/$defs/endpoint"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["direct", "indirect"]
+    },
+    "tier": {
+      "type": "string",
+      "enum": ["direct", "fsa", "steens", "andersen"]
+    }
+  }
 }
