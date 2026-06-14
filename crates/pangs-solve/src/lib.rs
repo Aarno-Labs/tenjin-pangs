@@ -46,6 +46,10 @@ pub struct GlobalResolution {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeResolution {
     pub reaches_function_pointer: bool,
+    #[serde(default)]
+    pub external: bool,
+    #[serde(default)]
+    pub pointee_globals: Vec<String>,
 }
 
 pub fn solve_steensgaard(pir: &Pir, pag: &Pag, build_mode: BuildMode) -> SolveResult {
@@ -370,6 +374,20 @@ impl<'a> Solver<'a> {
                 continue;
             }
             let root = self.class_of(node.id);
+            let external = self.classes[root].ext;
+            let pointee_globals = self.classes[root]
+                .pointee
+                .map(|p| {
+                    let pointee = self.find(p);
+                    let mut globals = self.classes[pointee]
+                        .global_objs
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    globals.sort();
+                    globals
+                })
+                .unwrap_or_default();
             let reaches_function_pointer = self.classes[root]
                 .pointee
                 .map(|p| {
@@ -383,6 +401,8 @@ impl<'a> Solver<'a> {
                 node.label.clone(),
                 NodeResolution {
                     reaches_function_pointer,
+                    external,
+                    pointee_globals,
                 },
             );
         }

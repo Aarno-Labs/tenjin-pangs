@@ -33,6 +33,12 @@ fn m1_5_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn m1_6_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_6")
+        .join(name)
+}
+
 #[test]
 fn unknown_caller_seeds_only_exported_external_and_address_taken_functions() {
     let pir = Pir {
@@ -1216,4 +1222,114 @@ fn steens_detects_vararg_function_pointers_through_local_values() {
         .iter()
         .any(|taint| taint.kind == "fnptr_varargs"
             && taint.witness.as_deref() == Some("driver@!noloc#0")));
+}
+
+#[test]
+fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
+    let pir = Pir::from_path(m1_6_fixture("aliased_unknown_modref.pir.json")).unwrap();
+    let conservative = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Conservative,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let steens = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let main = steens.lookup_func("main").unwrap();
+    let direct = steens.lookup_global("@Direct").unwrap();
+    let aliased = steens.lookup_global("@Aliased").unwrap();
+
+    let conservative_rows: Vec<_> = conservative
+        .modrefs()
+        .iter()
+        .map(|mr| {
+            (
+                conservative.functions()[mr.func].key.clone(),
+                match &mr.global {
+                    pangs_api::GlobalTarget::Name(id) => conservative.globals()[*id].key.clone(),
+                    pangs_api::GlobalTarget::Unknown(reason) => reason.clone(),
+                },
+                mr.access,
+                mr.via,
+                mr.witness.clone(),
+            )
+        })
+        .collect();
+    let steens_rows: Vec<_> = steens
+        .modrefs()
+        .iter()
+        .map(|mr| {
+            (
+                steens.functions()[mr.func].key.clone(),
+                match &mr.global {
+                    pangs_api::GlobalTarget::Name(id) => steens.globals()[*id].key.clone(),
+                    pangs_api::GlobalTarget::Unknown(reason) => reason.clone(),
+                },
+                mr.access,
+                mr.via,
+                mr.witness.clone(),
+            )
+        })
+        .collect();
+    for row in conservative_rows {
+        assert!(steens_rows.contains(&row));
+    }
+
+    let raw_modrefs: Vec<_> = steens.modrefs().iter().collect();
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(direct)
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Direct
+            && mr.witness.as_deref() == Some("main@m1_6.c:1:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(aliased)
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6.c:3:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(aliased)
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6.c:4:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Unknown("omega_load".to_string())
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Unknown
+            && mr.witness.as_deref() == Some("main@m1_6.c:6:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Unknown("omega_store".to_string())
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Unknown
+            && mr.witness.as_deref() == Some("main@m1_6.c:7:1#0")
+    }));
+
+    let component = steens
+        .components()
+        .iter()
+        .find(|component| component.members == vec![main])
+        .unwrap();
+    assert!(component.frozen);
+    assert!(component.taint.iter().any(|taint| {
+        taint.kind == "unknown_global" && taint.witness.as_deref() == Some("main@m1_6.c:6:1#0")
+    }));
 }

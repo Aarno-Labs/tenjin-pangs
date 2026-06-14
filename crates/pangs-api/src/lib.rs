@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
+use pangs_pag::{BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts};
 use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, Stmt};
 use pangs_solve::{solve_steensgaard, NodeResolution};
 use serde::{Deserialize, Serialize};
@@ -706,6 +706,15 @@ impl Analysis {
                         global.never_written = state.never_written;
                     }
                 }
+
+                push_pointer_modrefs_from_pag(
+                    &mut modrefs,
+                    &func_lookup,
+                    &global_lookup,
+                    &pag,
+                    &solved.nodes,
+                    &mut noloc_ord,
+                );
             }
         }
 
@@ -1284,7 +1293,7 @@ fn modref_sort_key(
     mr: &ModRef,
     funcs: &[FuncInfo],
     globals: &[GlobalInfo],
-) -> (String, String, String, String) {
+) -> (String, String, String, String, String) {
     (
         funcs[mr.func.0 as usize].key.clone(),
         match mr.global {
@@ -1292,8 +1301,74 @@ fn modref_sort_key(
             GlobalTarget::Unknown(ref reason) => reason.clone(),
         },
         format!("{:?}", mr.access),
+        format!("{:?}", mr.via),
         mr.witness.clone().unwrap_or_default(),
     )
+}
+
+fn push_pointer_modrefs_from_pag(
+    modrefs: &mut Vec<ModRef>,
+    func_lookup: &HashMap<String, FuncId>,
+    global_lookup: &HashMap<String, GlobalId>,
+    pag: &Pag,
+    nodes: &BTreeMap<String, NodeResolution>,
+    noloc_ord: &mut BTreeMap<(String, String), u32>,
+) {
+    for edge in &pag.edges {
+        let Some((owner, func, access, address_node, unknown_reason)) =
+            edge_access(edge, func_lookup)
+        else {
+            continue;
+        };
+        let Some(node) = pag.nodes.get(address_node.0 as usize) else {
+            continue;
+        };
+        let Some(resolution) = nodes.get(&node.label) else {
+            continue;
+        };
+
+        let witness = witness_key(&owner, &edge.loc, noloc_ord, "global");
+        for global_key in &resolution.pointee_globals {
+            if node.label == format!("sym:global:{global_key}") {
+                continue;
+            }
+            let Some(&gid) = global_lookup.get(global_key) else {
+                continue;
+            };
+            modrefs.push(ModRef {
+                func,
+                global: GlobalTarget::Name(gid),
+                access,
+                via: Via::Aliased,
+                witness: witness.clone(),
+            });
+        }
+
+        if resolution.external {
+            modrefs.push(ModRef {
+                func,
+                global: GlobalTarget::Unknown(unknown_reason.to_string()),
+                access,
+                via: Via::Unknown,
+                witness,
+            });
+        }
+    }
+}
+
+fn edge_access(
+    edge: &Edge,
+    func_lookup: &HashMap<String, FuncId>,
+) -> Option<(String, FuncId, Access, pangs_pag::NodeId, &'static str)> {
+    let Owner::Function(owner) = &edge.owner else {
+        return None;
+    };
+    let &func = func_lookup.get(owner)?;
+    match edge.kind {
+        EdgeKind::Load => Some((owner.clone(), func, Access::Ref, edge.src, "omega_load")),
+        EdgeKind::Store => Some((owner.clone(), func, Access::Mod, edge.dst, "omega_store")),
+        _ => None,
+    }
 }
 
 fn caller_key(caller: &Caller, funcs: &[FuncInfo]) -> String {
@@ -1356,6 +1431,14 @@ fn compute_components(
                 }
             }
             let mut taint = Vec::new();
+            for mr in modrefs {
+                if member_set.contains(&mr.func) && matches!(mr.global, GlobalTarget::Unknown(_)) {
+                    taint.push(Taint {
+                        kind: "unknown_global".to_string(),
+                        witness: mr.witness.clone(),
+                    });
+                }
+            }
             for edge in edges {
                 if matches!(edge.callee, Callee::Unknown(_)) {
                     if let Caller::Func(fid) = edge.caller {
