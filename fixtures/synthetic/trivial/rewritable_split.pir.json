@@ -1,0 +1,116 @@
+{
+  "module": "rewritable_split",
+  "source": "fixtures/synthetic/trivial/rewritable_split.c",
+  "globals": [
+    {
+      "key": "g_tainted",
+      "file": "fixtures/synthetic/trivial/rewritable_split.c",
+      "line": 1,
+      "mutable": true
+    },
+    {
+      "key": "g_rewrite",
+      "file": "fixtures/synthetic/trivial/rewritable_split.c",
+      "line": 2,
+      "mutable": true
+    }
+  ],
+  "functions": [
+    {
+      "key": "main",
+      "file": "fixtures/synthetic/trivial/rewritable_split.c",
+      "line": 4,
+      "exported": true,
+      "sig": {
+        "ret": { "class": "integer" },
+        "params": []
+      },
+      "body": [
+        {
+          "kind": "call_direct",
+          "callee": "driver",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": []
+          },
+          "loc": {
+            "file": "fixtures/synthetic/trivial/rewritable_split.c",
+            "line": 5,
+            "col": 3
+          }
+        }
+      ]
+    },
+    {
+      "key": "driver",
+      "file": "fixtures/synthetic/trivial/rewritable_split.c",
+      "line": 8,
+      "sig": {
+        "ret": { "class": "void" },
+        "params": []
+      },
+      "body": [
+        {
+          "kind": "call_indirect",
+          "operand": "fp",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": [
+              { "class": "integer" }
+            ]
+          },
+          "loc": {
+            "file": "fixtures/synthetic/trivial/rewritable_split.c",
+            "line": 9,
+            "col": 3
+          }
+        }
+      ]
+    },
+    {
+      "key": "target",
+      "file": "fixtures/synthetic/trivial/rewritable_split.c",
+      "line": 12,
+      "address_taken": true,
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [
+          { "class": "integer" }
+        ]
+      },
+      "body": [
+        {
+          "kind": "global_ref",
+          "global": "g_tainted",
+          "access": "mod",
+          "loc": {
+            "file": "fixtures/synthetic/trivial/rewritable_split.c",
+            "line": 13,
+            "col": 3
+          }
+        }
+      ]
+    },
+    {
+      "key": "worker",
+      "file": "fixtures/synthetic/trivial/rewritable_split.c",
+      "line": 17,
+      "sig": {
+        "ret": { "class": "void" },
+        "params": []
+      },
+      "body": [
+        {
+          "kind": "global_ref",
+          "global": "g_rewrite",
+          "access": "mod",
+          "loc": {
+            "file": "fixtures/synthetic/trivial/rewritable_split.c",
+            "line": 18,
+            "col": 3
+          }
+        }
+      ]
+    }
+  ]
+}

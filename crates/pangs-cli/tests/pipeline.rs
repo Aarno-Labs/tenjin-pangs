@@ -205,6 +205,89 @@ fn analyze_trivial_fixture_exports_components_and_coverage() {
     );
 }
 
+#[test]
+fn analyze_split_fixture_reports_rewritable_coverage() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/trivial/rewritable_split.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze(&fixture, &out);
+
+    let components: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("components.json")).unwrap()).unwrap();
+    let list = components["components"].as_array().unwrap();
+    assert_eq!(list.len(), 2);
+
+    let frozen = &list[0];
+    assert_eq!(frozen["id"], "c0001");
+    assert_eq!(frozen["frozen"], true);
+    assert_eq!(
+        frozen["members"].as_array().unwrap(),
+        &vec![
+            Value::String("driver".to_string()),
+            Value::String("main".to_string()),
+            Value::String("target".to_string())
+        ]
+    );
+    assert_eq!(
+        frozen["mutable_globals"].as_array().unwrap(),
+        &vec![Value::String("g_tainted".to_string())]
+    );
+    assert!(frozen["taint"].as_array().unwrap().iter().any(|taint| {
+        taint["kind"] == "unknown_callee"
+            && taint["witness"] == "driver@fixtures/synthetic/trivial/rewritable_split.c:9:3#0"
+    }));
+    assert!(frozen["taint"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|taint| { taint["kind"] == "unknown_caller" && taint["witness"].is_null() }));
+
+    let rewritable = &list[1];
+    assert_eq!(rewritable["id"], "c0002");
+    assert_eq!(rewritable["frozen"], false);
+    assert_eq!(
+        rewritable["members"].as_array().unwrap(),
+        &vec![Value::String("worker".to_string())]
+    );
+    assert_eq!(
+        rewritable["mutable_globals"].as_array().unwrap(),
+        &vec![Value::String("g_rewrite".to_string())]
+    );
+    assert_eq!(rewritable["taint"].as_array().unwrap().len(), 0);
+
+    assert_eq!(components["coverage"]["mutable_globals_total"], 2);
+    assert_eq!(components["coverage"]["in_rewritable_components"], 1);
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert_eq!(metrics["functions"], 4);
+    assert_eq!(metrics["globals"], 2);
+    assert_eq!(metrics["callsites"], 2);
+    assert_eq!(metrics["call_edges"], 5);
+    assert_eq!(metrics["mutable_globals_total"], 2);
+    assert_eq!(metrics["in_rewritable_components"], 1);
+
+    let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(modref.len(), 2);
+    assert!(modref.iter().any(|row| {
+        row["func"] == "target"
+            && row["global"]["name"] == "g_tainted"
+            && row["witness"] == "target@fixtures/synthetic/trivial/rewritable_split.c:13:3#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "worker"
+            && row["global"]["name"] == "g_rewrite"
+            && row["witness"] == "worker@fixtures/synthetic/trivial/rewritable_split.c:18:3#0"
+    }));
+}
+
 fn run_analyze(fixture: &Path, out: &Path) {
     let status = Command::new(env!("CARGO_BIN_EXE_pangs"))
         .arg("analyze")
