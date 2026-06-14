@@ -989,6 +989,67 @@ fn analyze_steens_exports_memcpy_pointer_modref_rows() {
         }));
 }
 
+#[test]
+fn analyze_steens_keeps_pointer_modref_exports_local_while_callgraph_narrows_indirect_target() {
+    let fixture = m1_6_fixture("transitive_icall_modref.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "steens");
+
+    let callgraph: Vec<Value> = fs::read_to_string(out.join("callgraph.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(callgraph.iter().any(|row| {
+        row["caller"]["func"] == "main"
+            && row["callee"]["func"] == "setup"
+            && row["tier"] == "direct"
+    }));
+    assert!(callgraph.iter().any(|row| {
+        row["caller"]["func"] == "setup"
+            && row["callee"]["func"] == "target"
+            && row["tier"] == "steens"
+            && row["callsite"] == "setup@m1_6_icall.c:12:1#0"
+    }));
+    assert!(!callgraph.iter().any(|row| {
+        row["caller"]["func"] == "setup"
+            && row["callee"]["func"] == "other"
+            && row["tier"] == "steens"
+    }));
+
+    let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(modref.iter().any(|row| {
+        row["func"] == "target"
+            && row["global"]["name"] == "@Aliased"
+            && row["access"] == "ref"
+            && row["via"] == "aliased"
+            && row["witness"] == "target@m1_6_icall.c:21:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "target"
+            && row["global"]["unknown"] == "omega_store"
+            && row["access"] == "mod"
+            && row["via"] == "unknown"
+            && row["witness"] == "target@m1_6_icall.c:23:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "other"
+            && row["global"]["name"] == "@Noise"
+            && row["access"] == "mod"
+            && row["via"] == "direct"
+            && row["witness"] == "other@m1_6_icall.c:30:1#0"
+    }));
+    assert!(!modref
+        .iter()
+        .any(|row| row["func"] == "setup" || row["func"] == "main"));
+}
+
 fn run_analyze(fixture: &Path, out: &Path) {
     run_analyze_stage(fixture, out, "conservative");
 }

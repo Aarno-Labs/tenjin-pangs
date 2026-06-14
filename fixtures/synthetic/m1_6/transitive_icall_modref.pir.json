@@ -1,0 +1,125 @@
+{
+  "module": "m1_6_transitive_icall_modref",
+  "functions": [
+    {
+      "key": "main",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "call_direct",
+          "callee": "setup",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": [],
+            "cc": "ccc"
+          },
+          "args": [],
+          "loc": { "file": "m1_6_icall.c", "line": 1, "col": 1 }
+        }
+      ]
+    },
+    {
+      "key": "setup",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "store",
+          "address": "@CB",
+          "value": "target",
+          "loc": { "file": "m1_6_icall.c", "line": 10, "col": 1 }
+        },
+        {
+          "kind": "load",
+          "dest": "%fp",
+          "address": "@CB",
+          "loc": { "file": "m1_6_icall.c", "line": 11, "col": 1 }
+        },
+        {
+          "kind": "call_indirect",
+          "operand": "%fp",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": [],
+            "cc": "ccc"
+          },
+          "args": [],
+          "loc": { "file": "m1_6_icall.c", "line": 12, "col": 1 }
+        }
+      ]
+    },
+    {
+      "key": "target",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "address_taken": true,
+      "body": [
+        {
+          "kind": "assign",
+          "dest": "%gp",
+          "sources": ["@Aliased"],
+          "loc": { "file": "m1_6_icall.c", "line": 20, "col": 1 }
+        },
+        {
+          "kind": "load",
+          "dest": "%v",
+          "address": "%gp",
+          "loc": { "file": "m1_6_icall.c", "line": 21, "col": 1 }
+        },
+        {
+          "kind": "int_to_ptr",
+          "dest": "%unk",
+          "source": "%bits",
+          "loc": { "file": "m1_6_icall.c", "line": 22, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%unk",
+          "value": "%x",
+          "loc": { "file": "m1_6_icall.c", "line": 23, "col": 1 }
+        }
+      ]
+    },
+    {
+      "key": "other",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "address_taken": true,
+      "body": [
+        {
+          "kind": "global_ref",
+          "global": "@Noise",
+          "access": "mod",
+          "loc": { "file": "m1_6_icall.c", "line": 30, "col": 1 }
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@CB",
+      "mutable": true
+    },
+    {
+      "key": "@Aliased",
+      "mutable": true
+    },
+    {
+      "key": "@Noise",
+      "mutable": true
+    }
+  ]
+}

@@ -1408,3 +1408,101 @@ fn steens_memcpy_modref_exports_aliased_direct_symbol_and_unknown_rows() {
             && taint.witness.as_deref() == Some("main@m1_6_memcpy.c:6:1#0")
     }));
 }
+
+#[test]
+fn steens_modref_closure_carries_pointer_rows_through_direct_and_indirect_calls() {
+    let fixture = m1_6_fixture("transitive_icall_modref.pir.json");
+    let analysis = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let main = analysis.lookup_func("main").unwrap();
+    let setup = analysis.lookup_func("setup").unwrap();
+    let target = analysis.lookup_func("target").unwrap();
+    let other = analysis.lookup_func("other").unwrap();
+    let aliased = analysis.lookup_global("@Aliased").unwrap();
+    let noise = analysis.lookup_global("@Noise").unwrap();
+
+    assert!(analysis.call_edges().iter().any(|edge| {
+        edge.caller == pangs_api::Caller::Func(setup)
+            && edge.callee == pangs_api::Callee::Func(target)
+            && edge.tier == pangs_api::Tier::Steens
+    }));
+    assert!(!analysis.call_edges().iter().any(|edge| {
+        edge.caller == pangs_api::Caller::Func(setup)
+            && edge.callee == pangs_api::Callee::Func(other)
+            && edge.tier == pangs_api::Tier::Steens
+    }));
+
+    let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();
+    assert!(raw_modrefs
+        .iter()
+        .all(|mr| mr.func == target || mr.func == other));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == target
+            && mr.global == pangs_api::GlobalTarget::Name(aliased)
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("target@m1_6_icall.c:21:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == target
+            && mr.global == pangs_api::GlobalTarget::Unknown("omega_store".to_string())
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Unknown
+            && mr.witness.as_deref() == Some("target@m1_6_icall.c:23:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == other
+            && mr.global == pangs_api::GlobalTarget::Name(noise)
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Direct
+            && mr.witness.as_deref() == Some("other@m1_6_icall.c:30:1#0")
+    }));
+
+    let setup_modrefs: Vec<_> = analysis.modref(setup).collect();
+    assert!(setup_modrefs.iter().any(|mr| {
+        mr.func == setup
+            && mr.global == pangs_api::GlobalTarget::Name(aliased)
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("target@m1_6_icall.c:21:1#0")
+    }));
+    assert!(setup_modrefs.iter().any(|mr| {
+        mr.func == setup
+            && mr.global == pangs_api::GlobalTarget::Unknown("omega_store".to_string())
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Unknown
+            && mr.witness.as_deref() == Some("target@m1_6_icall.c:23:1#0")
+    }));
+    assert!(!setup_modrefs.iter().any(|mr| {
+        mr.global == pangs_api::GlobalTarget::Name(noise)
+            && mr.witness.as_deref() == Some("other@m1_6_icall.c:30:1#0")
+    }));
+
+    let main_modrefs: Vec<_> = analysis.modref(main).collect();
+    assert!(main_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(aliased)
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("target@m1_6_icall.c:21:1#0")
+    }));
+    assert!(main_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Unknown("omega_store".to_string())
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Unknown
+            && mr.witness.as_deref() == Some("target@m1_6_icall.c:23:1#0")
+    }));
+    assert!(!main_modrefs.iter().any(|mr| {
+        mr.global == pangs_api::GlobalTarget::Name(noise)
+            && mr.witness.as_deref() == Some("other@m1_6_icall.c:30:1#0")
+    }));
+}
