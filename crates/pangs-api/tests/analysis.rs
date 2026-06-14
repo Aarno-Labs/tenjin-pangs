@@ -337,3 +337,200 @@ fn modref_api_closes_over_fsa_indirect_targets() {
     assert_eq!(modrefs[0].access, Access::Ref);
     assert_eq!(modrefs[0].witness.as_deref(), Some("cb@!noloc#0"));
 }
+
+#[test]
+fn direct_external_call_taints_only_the_connected_component() {
+    let pir = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            Func {
+                key: "main".to_string(),
+                sig: sig(AbiClass::Integer, vec![]),
+                file: None,
+                line: None,
+                external: false,
+                exported: true,
+                address_taken: false,
+                body: vec![Stmt::CallDirect {
+                    callee: "driver".to_string(),
+                    sig: sig(AbiClass::Void, vec![]),
+                    loc: None,
+                }],
+            },
+            Func {
+                key: "driver".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![
+                    Stmt::GlobalRef {
+                        global: "@Gext".to_string(),
+                        access: Access::Mod,
+                        loc: None,
+                    },
+                    Stmt::CallDirect {
+                        callee: "puts".to_string(),
+                        sig: sig(AbiClass::Integer, vec![Param::Integer]),
+                        loc: None,
+                    },
+                ],
+            },
+            Func {
+                key: "worker".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::GlobalRef {
+                    global: "@Glocal".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                }],
+            },
+        ],
+        globals: vec![
+            Global {
+                key: "@Gext".to_string(),
+                file: None,
+                line: None,
+                is_const: false,
+                mutable: true,
+                exported: false,
+            },
+            Global {
+                key: "@Glocal".to_string(),
+                file: None,
+                line: None,
+                is_const: false,
+                mutable: true,
+                exported: false,
+            },
+        ],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let main = analysis.lookup_func("main").unwrap();
+    let driver = analysis.lookup_func("driver").unwrap();
+    let worker = analysis.lookup_func("worker").unwrap();
+    let gext = analysis.lookup_global("@Gext").unwrap();
+    let glocal = analysis.lookup_global("@Glocal").unwrap();
+
+    assert!(analysis.call_edges().iter().any(|edge| {
+        edge.caller == pangs_api::Caller::Func(driver)
+            && edge.callee == pangs_api::Callee::Unknown("external_callee".to_string())
+    }));
+    assert!(analysis.callers(main).any(unknown_caller));
+    assert!(!analysis.callers(worker).any(unknown_caller));
+
+    let tainted_component = analysis.component(analysis.component_of(main));
+    assert_eq!(analysis.component_of(main), analysis.component_of(driver));
+    assert_ne!(analysis.component_of(main), analysis.component_of(worker));
+    assert_eq!(tainted_component.members, vec![driver, main]);
+    assert_eq!(tainted_component.mutable_globals, vec![gext]);
+    assert!(tainted_component.frozen);
+    assert!(tainted_component.taint.iter().any(|taint| {
+        taint.kind == "unknown_callee" && taint.witness.as_deref() == Some("driver@!noloc#0")
+    }));
+    assert!(tainted_component
+        .taint
+        .iter()
+        .any(|taint| taint.kind == "unknown_caller" && taint.witness.is_none()));
+
+    let rewritable_component = analysis.component(analysis.component_of(worker));
+    assert_eq!(rewritable_component.members, vec![worker]);
+    assert_eq!(rewritable_component.mutable_globals, vec![glocal]);
+    assert!(!rewritable_component.frozen);
+    assert!(rewritable_component.taint.is_empty());
+
+    let metrics = analysis.metrics();
+    assert_eq!(metrics.functions, 3);
+    assert_eq!(metrics.globals, 2);
+    assert_eq!(metrics.callsites, 2);
+    assert_eq!(metrics.call_edges, 3);
+    assert_eq!(metrics.mutable_globals_total, 2);
+    assert_eq!(metrics.in_rewritable_components, 1);
+}
+
+#[test]
+fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
+    let pir = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            Func {
+                key: "main".to_string(),
+                sig: sig(AbiClass::Integer, vec![]),
+                file: None,
+                line: None,
+                external: false,
+                exported: true,
+                address_taken: false,
+                body: vec![Stmt::CallDirect {
+                    callee: "driver".to_string(),
+                    sig: sig(AbiClass::Void, vec![]),
+                    loc: None,
+                }],
+            },
+            Func {
+                key: "driver".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::GlobalRef {
+                    global: "@G".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                }],
+            },
+        ],
+        globals: vec![Global {
+            key: "@G".to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            exported: false,
+        }],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let main = analysis.lookup_func("main").unwrap();
+    let driver = analysis.lookup_func("driver").unwrap();
+
+    let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();
+    assert_eq!(raw_modrefs.len(), 1);
+    assert_eq!(raw_modrefs[0].func, driver);
+    assert_eq!(raw_modrefs[0].witness.as_deref(), Some("driver@!noloc#0"));
+
+    let main_modrefs: Vec<_> = analysis.modref(main).collect();
+    assert_eq!(main_modrefs.len(), 1);
+    assert_eq!(main_modrefs[0].func, main);
+    assert_eq!(main_modrefs[0].witness.as_deref(), Some("driver@!noloc#0"));
+}
