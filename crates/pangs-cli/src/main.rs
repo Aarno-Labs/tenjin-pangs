@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use pangs_api::{Analysis, BuildMode, Opts, Stage};
+use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
 use pangs_pir::Pir;
 
 #[derive(Debug, Parser)]
@@ -42,9 +43,17 @@ enum Command {
         module: PathBuf,
         #[arg(long)]
         func: Option<String>,
+        #[arg(long, default_value = "library")]
+        build_mode: BuildModeArg,
+        #[arg(long)]
+        exports: Option<PathBuf>,
     },
     CheckPag {
         module: PathBuf,
+        #[arg(long, default_value = "library")]
+        build_mode: BuildModeArg,
+        #[arg(long)]
+        exports: Option<PathBuf>,
     },
     Report {
         dir: PathBuf,
@@ -128,25 +137,64 @@ fn run() -> Result<()> {
             }
             println!("{}", serde_json::to_string_pretty(&pir)?);
         }
-        Command::DumpPag { module, func } => {
-            let _pir = Pir::from_path(&module)?;
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "pag construction starts in M1.3",
-                    "func": func
-                })
-            );
+        Command::DumpPag {
+            module,
+            func,
+            build_mode,
+            exports,
+        } => {
+            let pir = Pir::from_path(&module)?;
+            let opts = PagOpts {
+                build_mode: build_mode.into(),
+                exports: read_exports(exports)?,
+            };
+            let pag = Pag::from_pir(&pir, &opts);
+            let pag = if let Some(func_key) = func {
+                pag.for_function(&func_key)
+            } else {
+                pag
+            };
+            println!("{}", serde_json::to_string_pretty(&pag)?);
         }
-        Command::CheckPag { module } => {
-            let _pir = Pir::from_path(&module)?;
-            eprintln!("check-pag: no PAG invariants enabled before M1.3");
+        Command::CheckPag {
+            module,
+            build_mode,
+            exports,
+        } => {
+            let pir = Pir::from_path(&module)?;
+            let opts = PagOpts {
+                build_mode: build_mode.into(),
+                exports: read_exports(exports)?,
+            };
+            let pag = Pag::from_pir(&pir, &opts);
+            if let Err(issues) = pag.validate() {
+                for issue in issues {
+                    eprintln!("{issue}");
+                }
+                std::process::exit(3);
+            }
+            eprintln!(
+                "check-pag: ok (nodes={}, edges={}, callsites={}, omega_seeds={})",
+                pag.nodes.len(),
+                pag.edges.len(),
+                pag.callsites.len(),
+                pag.omega_seeds.len()
+            );
         }
         Command::Report { dir } => {
             print!("{}", pangs_clients::report(&dir)?);
         }
     }
     Ok(())
+}
+
+impl From<BuildModeArg> for PagBuildMode {
+    fn from(value: BuildModeArg) -> Self {
+        match value {
+            BuildModeArg::Library => PagBuildMode::Library,
+            BuildModeArg::Executable => PagBuildMode::Executable,
+        }
+    }
 }
 
 fn read_exports(path: Option<PathBuf>) -> Result<BTreeSet<String>> {

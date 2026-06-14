@@ -11,6 +11,12 @@ fn m1_1_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn m1_3_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_3")
+        .join(name)
+}
+
 #[test]
 fn analyze_validate_is_deterministic() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -391,6 +397,55 @@ fn analyze_external_callee_fixture_freezes_only_the_connected_component() {
             && row["global"]["name"] == "g_local"
             && row["witness"] == "worker@fixtures/synthetic/trivial/external_callee_split.c:15:3#0"
     }));
+}
+
+#[test]
+fn dump_pag_emits_core_graph_and_function_filter() {
+    let fixture = m1_3_fixture("core_edges.pir.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("dump-pag")
+        .arg(&fixture)
+        .arg("--build-mode")
+        .arg("executable")
+        .arg("--func")
+        .arg("main")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let pag: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(pag["module"], "m1_3_core");
+    assert_eq!(pag["callsites"].as_array().unwrap().len(), 2);
+    assert!(pag["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|edge| edge["kind"]["kind"] == "store"));
+    assert!(pag["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|edge| edge["kind"]["kind"] == "gep"));
+    assert!(pag["omega_seeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|seed| seed["kind"] == "external_call_boundary"));
+}
+
+#[test]
+fn check_pag_accepts_core_fixture() {
+    let fixture = m1_3_fixture("core_edges.pir.json");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("check-pag")
+        .arg(&fixture)
+        .arg("--build-mode")
+        .arg("executable")
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 fn run_analyze(fixture: &Path, out: &Path) {

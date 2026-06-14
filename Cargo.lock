@@ -359,6 +359,7 @@ dependencies = [
  "clap",
  "pangs-api",
  "pangs-clients",
+ "pangs-pag",
  "pangs-pir",
  "serde_json",
  "tempfile",
@@ -379,6 +380,11 @@ dependencies = [
 [[package]]
 name = "pangs-pag"
 version = "0.1.0"
+dependencies = [
+ "pangs-pir",
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "pangs-pir"
