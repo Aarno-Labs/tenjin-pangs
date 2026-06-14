@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
-use pangs_api::{Analysis, BuildMode, Caller, EscapeStatus, Opts};
+use pangs_api::{Analysis, BuildMode, Caller, EscapeStatus, Opts, Stage};
 use pangs_pir::{AbiClass, Access, Func, Global, Param, Pir, Signature, Stmt};
 
 fn sig(ret: AbiClass, params: Vec<Param>) -> Signature {
@@ -18,6 +19,12 @@ fn unknown_caller(caller: &Caller) -> bool {
 
 fn singleton_exports(symbol: &str) -> BTreeSet<String> {
     [symbol.to_string()].into_iter().collect()
+}
+
+fn m1_4_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_4")
+        .join(name)
 }
 
 #[test]
@@ -681,4 +688,85 @@ fn explicit_exports_override_build_mode_defaults() {
     assert!(func_exported.functions()[helper].exported);
     assert!(func_exported.callers(helper).any(unknown_caller));
     assert_eq!(global_exported.escape(global), EscapeStatus::External);
+}
+
+#[test]
+fn steens_narrows_indirect_targets_below_fsa() {
+    let pir = Pir::from_path(m1_4_fixture("steens_escape_icall.pir.json")).unwrap();
+
+    let conservative = Analysis::run(&pir, &Opts::default()).unwrap();
+    let steens = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let conservative_targets = conservative
+        .call_edges()
+        .iter()
+        .filter_map(|edge| match (&edge.caller, &edge.callee) {
+            (pangs_api::Caller::Func(_), pangs_api::Callee::Func(id))
+                if edge.kind == pangs_api::CallKind::Indirect =>
+            {
+                Some(conservative.functions()[*id].key.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let steens_targets = steens
+        .call_edges()
+        .iter()
+        .filter_map(|edge| match (&edge.caller, &edge.callee) {
+            (pangs_api::Caller::Func(_), pangs_api::Callee::Func(id))
+                if edge.kind == pangs_api::CallKind::Indirect =>
+            {
+                Some(steens.functions()[*id].key.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        conservative_targets,
+        ["cb".to_string(), "other".to_string()]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(steens_targets, ["cb".to_string()].into_iter().collect());
+    assert!(steens.call_edges().iter().any(|edge| {
+        edge.kind == pangs_api::CallKind::Indirect
+            && matches!(edge.callee, pangs_api::Callee::Unknown(_))
+    }));
+    assert!(steens.metrics().partition_count > 0);
+    assert_eq!(steens.metrics().rounds, 1);
+}
+
+#[test]
+fn steens_uses_escape_bits_for_unknown_callers_and_never_written() {
+    let pir = Pir::from_path(m1_4_fixture("steens_escape_icall.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let cb = analysis.lookup_func("cb").unwrap();
+    let other = analysis.lookup_func("other").unwrap();
+    let exported_slot = analysis.lookup_global("@CB").unwrap();
+    let local = analysis.lookup_global("@Local").unwrap();
+
+    assert!(analysis.callers(cb).any(unknown_caller));
+    assert!(!analysis.callers(other).any(unknown_caller));
+    assert_eq!(analysis.escape(exported_slot), EscapeStatus::External);
+    assert_eq!(analysis.escape(local), EscapeStatus::Module);
+    assert!(!analysis.globals()[exported_slot].never_written);
+    assert!(analysis.globals()[local].never_written);
 }

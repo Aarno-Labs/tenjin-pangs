@@ -5,6 +5,8 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+pangs-pag = { path = "../pangs-pag" }
 pangs-pir = { path = "../pangs-pir" }
+pangs-solve = { path = "../pangs-solve" }
 serde.workspace = true
 thiserror.workspace = true

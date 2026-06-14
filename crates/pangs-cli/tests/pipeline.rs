@@ -17,6 +17,12 @@ fn m1_3_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn m1_4_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_4")
+        .join(name)
+}
+
 #[test]
 fn analyze_validate_is_deterministic() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -497,6 +503,59 @@ fn check_pag_accepts_checked_in_m1_1_fixtures() {
             .unwrap();
         assert!(status.success(), "{name}");
     }
+}
+
+#[test]
+fn analyze_steens_exports_narrowed_indirect_targets() {
+    let fixture = m1_4_fixture("steens_escape_icall.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&out)
+        .arg("--validate")
+        .arg("--stage")
+        .arg("steens")
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let callgraph: Vec<Value> = fs::read_to_string(out.join("callgraph.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(callgraph.iter().any(|row| {
+        row["caller"]["func"] == "setup" && row["callee"]["func"] == "cb" && row["tier"] == "steens"
+    }));
+    assert!(!callgraph
+        .iter()
+        .any(|row| { row["caller"]["func"] == "setup" && row["callee"]["func"] == "other" }));
+    assert!(callgraph.iter().any(|row| {
+        row["caller"]["func"] == "setup" && row["callee"]["unknown"] == "omega_fnptr"
+    }));
+
+    let globals: Vec<Value> = fs::read_to_string(out.join("globals.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(globals.iter().any(|row| row["key"] == "@CB"
+        && row["escape"] == "external"
+        && row["never_written"] == false));
+    assert!(globals.iter().any(|row| row["key"] == "@Local"
+        && row["escape"] == "module"
+        && row["never_written"] == true));
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert!(metrics["partition_count"].as_u64().unwrap() > 0);
+    assert_eq!(metrics["rounds"], 1);
 }
 
 fn run_analyze(fixture: &Path, out: &Path) {

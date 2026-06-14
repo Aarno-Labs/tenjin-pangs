@@ -5,3 +5,6 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+pangs-pag = { path = "../pangs-pag" }
+pangs-pir = { path = "../pangs-pir" }
+serde.workspace = true

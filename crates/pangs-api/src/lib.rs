@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
 use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, Stmt};
+use pangs_solve::solve_steensgaard;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -327,6 +329,8 @@ impl Analysis {
         let mut callsites = Vec::new();
         let mut call_edges = Vec::new();
         let mut modrefs = Vec::new();
+        let mut indirect_callsites = Vec::new();
+        let mut solver_metrics = None;
         let address_taken: Vec<_> = module
             .functions
             .iter()
@@ -376,28 +380,7 @@ impl Analysis {
                             CallKind::Indirect,
                             loc,
                         );
-                        for (target_id, target) in &address_taken {
-                            if fsa_compatible(sig, &target.sig) {
-                                call_edges.push(CallEdge {
-                                    caller: Caller::Func(caller),
-                                    callsite: Some(cs),
-                                    callee: Callee::Func(*target_id),
-                                    kind: CallKind::Indirect,
-                                    tier: match opts.stage {
-                                        Stage::Andersen => Tier::Andersen,
-                                        Stage::Steens => Tier::Steens,
-                                        Stage::Conservative => Tier::Fsa,
-                                    },
-                                });
-                            }
-                        }
-                        call_edges.push(CallEdge {
-                            caller: Caller::Func(caller),
-                            callsite: Some(cs),
-                            callee: Callee::Unknown("omega_fnptr".to_string()),
-                            kind: CallKind::Indirect,
-                            tier: Tier::Fsa,
-                        });
+                        indirect_callsites.push((cs, caller, sig.clone()));
                     }
                     Stmt::GlobalRef {
                         global,
@@ -434,15 +417,117 @@ impl Analysis {
             }
         }
 
-        for (idx, func) in module.functions.iter().enumerate() {
-            if functions[idx].address_taken || functions[idx].exported || func.external {
-                call_edges.push(CallEdge {
-                    caller: Caller::Unknown("address_escapes_to_external".to_string()),
-                    callsite: None,
-                    callee: Callee::Func(FuncId(idx as u32)),
-                    kind: CallKind::Direct,
-                    tier: Tier::Fsa,
-                });
+        match opts.stage {
+            Stage::Conservative => {
+                for (cs, caller, sig) in &indirect_callsites {
+                    for (target_id, target) in &address_taken {
+                        if fsa_compatible(sig, &target.sig) {
+                            call_edges.push(CallEdge {
+                                caller: Caller::Func(*caller),
+                                callsite: Some(*cs),
+                                callee: Callee::Func(*target_id),
+                                kind: CallKind::Indirect,
+                                tier: Tier::Fsa,
+                            });
+                        }
+                    }
+                    call_edges.push(CallEdge {
+                        caller: Caller::Func(*caller),
+                        callsite: Some(*cs),
+                        callee: Callee::Unknown("omega_fnptr".to_string()),
+                        kind: CallKind::Indirect,
+                        tier: Tier::Fsa,
+                    });
+                }
+                for (idx, func) in module.functions.iter().enumerate() {
+                    if functions[idx].address_taken || functions[idx].exported || func.external {
+                        call_edges.push(CallEdge {
+                            caller: Caller::Unknown("address_escapes_to_external".to_string()),
+                            callsite: None,
+                            callee: Callee::Func(FuncId(idx as u32)),
+                            kind: CallKind::Direct,
+                            tier: Tier::Fsa,
+                        });
+                    }
+                }
+            }
+            Stage::Steens | Stage::Andersen => {
+                let pag = Pag::from_pir(
+                    module,
+                    &PagOpts {
+                        build_mode: opts.build_mode.into(),
+                        exports: opts.exports.clone(),
+                    },
+                );
+                let solved = solve_steensgaard(module, &pag, opts.build_mode.into());
+                solver_metrics = Some(solved.metrics.clone());
+                let callsite_by_key: HashMap<_, _> = callsites
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, callsite)| (callsite.key.clone(), CallsiteId(idx as u32)))
+                    .collect();
+
+                for solved_site in &solved.indirect_calls {
+                    let Some(&cs) = callsite_by_key.get(&solved_site.callsite_key) else {
+                        continue;
+                    };
+                    let caller = callsites[cs.0 as usize].caller;
+                    for target in &solved_site.targets {
+                        if let Some(&callee_id) = func_lookup.get(target) {
+                            call_edges.push(CallEdge {
+                                caller: Caller::Func(caller),
+                                callsite: Some(cs),
+                                callee: Callee::Func(callee_id),
+                                kind: CallKind::Indirect,
+                                tier: match opts.stage {
+                                    Stage::Steens => Tier::Steens,
+                                    Stage::Andersen => Tier::Andersen,
+                                    Stage::Conservative => unreachable!(),
+                                },
+                            });
+                        }
+                    }
+                    if solved_site.unknown_callee {
+                        call_edges.push(CallEdge {
+                            caller: Caller::Func(caller),
+                            callsite: Some(cs),
+                            callee: Callee::Unknown("omega_fnptr".to_string()),
+                            kind: CallKind::Indirect,
+                            tier: match opts.stage {
+                                Stage::Steens => Tier::Steens,
+                                Stage::Andersen => Tier::Andersen,
+                                Stage::Conservative => unreachable!(),
+                            },
+                        });
+                    }
+                }
+
+                for target in &solved.unknown_callers {
+                    if let Some(&callee_id) = func_lookup.get(target) {
+                        call_edges.push(CallEdge {
+                            caller: Caller::Unknown("address_escapes_to_external".to_string()),
+                            callsite: None,
+                            callee: Callee::Func(callee_id),
+                            kind: CallKind::Direct,
+                            tier: match opts.stage {
+                                Stage::Steens => Tier::Steens,
+                                Stage::Andersen => Tier::Andersen,
+                                Stage::Conservative => unreachable!(),
+                            },
+                        });
+                    }
+                }
+
+                for global in &mut globals {
+                    if let Some(state) = solved.globals.get(&global.key) {
+                        global.escape = if state.escape_external {
+                            EscapeStatus::External
+                        } else {
+                            EscapeStatus::Module
+                        };
+                        global.never_written = state.never_written;
+                    }
+                }
             }
         }
 
@@ -480,11 +565,22 @@ impl Analysis {
             partition_p95_size: 0,
             partition_max_size: 0,
             oversize_fallbacks: 0,
-            rounds: match opts.stage {
-                Stage::Andersen => 1,
-                _ => 0,
-            },
+            rounds: 0,
             lowering: (!module.lowering.is_empty()).then(|| module.lowering.clone()),
+        };
+
+        let metrics = if let Some(solved) = solver_metrics {
+            Metrics {
+                partition_count: solved.partition_count,
+                partition_p50_size: solved.partition_p50_size,
+                partition_p95_size: solved.partition_p95_size,
+                partition_max_size: solved.partition_max_size,
+                oversize_fallbacks: solved.oversize_fallbacks,
+                rounds: solved.rounds,
+                ..metrics
+            }
+        } else {
+            metrics
         };
 
         Ok(Self {
@@ -575,6 +671,15 @@ impl Analysis {
             }
         }
         ComponentId(0)
+    }
+}
+
+impl From<BuildMode> for PagBuildMode {
+    fn from(value: BuildMode) -> Self {
+        match value {
+            BuildMode::Library => PagBuildMode::Library,
+            BuildMode::Executable => PagBuildMode::Executable,
+        }
     }
 }
 
