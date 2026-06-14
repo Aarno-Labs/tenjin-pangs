@@ -288,6 +288,111 @@ fn analyze_split_fixture_reports_rewritable_coverage() {
     }));
 }
 
+#[test]
+fn analyze_external_callee_fixture_freezes_only_the_connected_component() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/trivial/external_callee_split.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze(&fixture, &out);
+
+    let callgraph: Vec<Value> = fs::read_to_string(out.join("callgraph.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(callgraph.len(), 3);
+    assert!(callgraph.iter().any(|row| {
+        row["caller"]["func"] == "main"
+            && row["callee"]["func"] == "driver"
+            && row["tier"] == "direct"
+    }));
+    assert!(callgraph.iter().any(|row| {
+        row["caller"]["func"] == "driver"
+            && row["callsite"] == "driver@fixtures/synthetic/trivial/external_callee_split.c:10:3#0"
+            && row["callee"]["unknown"] == "external_callee"
+            && row["tier"] == "direct"
+    }));
+    assert!(callgraph.iter().any(|row| {
+        row["caller"]["unknown"] == "address_escapes_to_external" && row["callee"]["func"] == "main"
+    }));
+
+    let components: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("components.json")).unwrap()).unwrap();
+    let list = components["components"].as_array().unwrap();
+    assert_eq!(list.len(), 2);
+
+    let frozen = &list[0];
+    assert_eq!(frozen["id"], "c0001");
+    assert_eq!(frozen["frozen"], true);
+    assert_eq!(
+        frozen["members"].as_array().unwrap(),
+        &vec![
+            Value::String("driver".to_string()),
+            Value::String("main".to_string())
+        ]
+    );
+    assert_eq!(
+        frozen["mutable_globals"].as_array().unwrap(),
+        &vec![Value::String("g_external".to_string())]
+    );
+    assert!(frozen["taint"].as_array().unwrap().iter().any(|taint| {
+        taint["kind"] == "unknown_callee"
+            && taint["witness"]
+                == "driver@fixtures/synthetic/trivial/external_callee_split.c:10:3#0"
+    }));
+    assert!(frozen["taint"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|taint| { taint["kind"] == "unknown_caller" && taint["witness"].is_null() }));
+
+    let rewritable = &list[1];
+    assert_eq!(rewritable["id"], "c0002");
+    assert_eq!(rewritable["frozen"], false);
+    assert_eq!(
+        rewritable["members"].as_array().unwrap(),
+        &vec![Value::String("worker".to_string())]
+    );
+    assert_eq!(
+        rewritable["mutable_globals"].as_array().unwrap(),
+        &vec![Value::String("g_local".to_string())]
+    );
+    assert_eq!(rewritable["taint"].as_array().unwrap().len(), 0);
+
+    assert_eq!(components["coverage"]["mutable_globals_total"], 2);
+    assert_eq!(components["coverage"]["in_rewritable_components"], 1);
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert_eq!(metrics["functions"], 3);
+    assert_eq!(metrics["globals"], 2);
+    assert_eq!(metrics["callsites"], 2);
+    assert_eq!(metrics["call_edges"], 3);
+    assert_eq!(metrics["mutable_globals_total"], 2);
+    assert_eq!(metrics["in_rewritable_components"], 1);
+
+    let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(modref.len(), 2);
+    assert!(modref.iter().any(|row| {
+        row["func"] == "driver"
+            && row["global"]["name"] == "g_external"
+            && row["witness"] == "driver@fixtures/synthetic/trivial/external_callee_split.c:9:3#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "worker"
+            && row["global"]["name"] == "g_local"
+            && row["witness"] == "worker@fixtures/synthetic/trivial/external_callee_split.c:15:3#0"
+    }));
+}
+
 fn run_analyze(fixture: &Path, out: &Path) {
     let status = Command::new(env!("CARGO_BIN_EXE_pangs"))
         .arg("analyze")
