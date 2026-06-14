@@ -559,6 +559,72 @@ fn analyze_steens_exports_narrowed_indirect_targets() {
 }
 
 #[test]
+fn analyze_steens_narrows_exported_callgraph_vs_conservative() {
+    let fixture = m1_4_fixture("steens_escape_icall.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out_conservative = tmp.path().join("conservative");
+    let out_steens = tmp.path().join("steens");
+
+    let conservative = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&out_conservative)
+        .arg("--validate")
+        .arg("--stage")
+        .arg("conservative")
+        .status()
+        .unwrap();
+    assert!(conservative.success());
+
+    let steens = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&out_steens)
+        .arg("--validate")
+        .arg("--stage")
+        .arg("steens")
+        .status()
+        .unwrap();
+    assert!(steens.success());
+
+    let conservative_callgraph: Vec<Value> =
+        fs::read_to_string(out_conservative.join("callgraph.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let steens_callgraph: Vec<Value> = fs::read_to_string(out_steens.join("callgraph.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    assert!(conservative_callgraph.iter().any(|row| {
+        row["caller"]["func"] == "setup" && row["callee"]["func"] == "other" && row["tier"] == "fsa"
+    }));
+    assert!(!steens_callgraph
+        .iter()
+        .any(|row| { row["caller"]["func"] == "setup" && row["callee"]["func"] == "other" }));
+    assert!(conservative_callgraph.iter().any(|row| {
+        row["caller"]["func"] == "setup" && row["callee"]["func"] == "cb" && row["tier"] == "fsa"
+    }));
+    assert!(steens_callgraph.iter().any(|row| {
+        row["caller"]["func"] == "setup" && row["callee"]["func"] == "cb" && row["tier"] == "steens"
+    }));
+    assert!(conservative_callgraph.iter().any(|row| {
+        row["caller"]["func"] == "setup" && row["callee"]["unknown"] == "omega_fnptr"
+    }));
+    assert!(steens_callgraph.iter().any(|row| {
+        row["caller"]["func"] == "setup" && row["callee"]["unknown"] == "omega_fnptr"
+    }));
+    assert!(steens_callgraph.len() < conservative_callgraph.len());
+}
+
+#[test]
 fn analyze_steens_improves_rewritable_coverage_over_conservative() {
     let fixture = m1_4_fixture("address_taken_local_only.pir.json");
     let tmp = TempDir::new().unwrap();
