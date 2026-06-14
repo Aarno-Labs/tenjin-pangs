@@ -37,6 +37,7 @@ fn unknown_caller_seeds_only_exported_external_and_address_taken_functions() {
             Func {
                 key: "helper".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -47,6 +48,7 @@ fn unknown_caller_seeds_only_exported_external_and_address_taken_functions() {
             Func {
                 key: "cb".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -57,6 +59,7 @@ fn unknown_caller_seeds_only_exported_external_and_address_taken_functions() {
             Func {
                 key: "pub_fn".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -67,6 +70,7 @@ fn unknown_caller_seeds_only_exported_external_and_address_taken_functions() {
             Func {
                 key: "ext_decl".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: true,
@@ -110,6 +114,7 @@ fn indirect_call_component_taint_uses_callsite_witness_and_matches_external_targ
             Func {
                 key: "driver".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -126,6 +131,7 @@ fn indirect_call_component_taint_uses_callsite_witness_and_matches_external_targ
             Func {
                 key: "ext_cb".to_string(),
                 sig: target_sig,
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: true,
@@ -176,6 +182,7 @@ fn direct_global_modref_marks_never_written_and_preserves_direct_witness() {
         functions: vec![Func {
             key: "writer".to_string(),
             sig: sig(AbiClass::Void, vec![]),
+            param_names: vec![],
             file: None,
             line: None,
             external: false,
@@ -234,6 +241,7 @@ fn modref_api_closes_over_direct_calls_but_export_rows_stay_local() {
             Func {
                 key: "entry".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -250,6 +258,7 @@ fn modref_api_closes_over_direct_calls_but_export_rows_stay_local() {
             Func {
                 key: "leaf".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -303,6 +312,7 @@ fn modref_api_closes_over_fsa_indirect_targets() {
             Func {
                 key: "driver".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -319,6 +329,7 @@ fn modref_api_closes_over_fsa_indirect_targets() {
             Func {
                 key: "cb".to_string(),
                 sig: target_sig,
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -367,6 +378,7 @@ fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
             Func {
                 key: "main".to_string(),
                 sig: sig(AbiClass::Integer, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -383,6 +395,7 @@ fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
             Func {
                 key: "driver".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -438,6 +451,7 @@ fn direct_external_call_taints_only_the_connected_component() {
             Func {
                 key: "main".to_string(),
                 sig: sig(AbiClass::Integer, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -454,6 +468,7 @@ fn direct_external_call_taints_only_the_connected_component() {
             Func {
                 key: "driver".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -477,6 +492,7 @@ fn direct_external_call_taints_only_the_connected_component() {
             Func {
                 key: "worker".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -570,6 +586,7 @@ fn build_mode_changes_default_export_and_escape_behavior() {
             Func {
                 key: "main".to_string(),
                 sig: sig(AbiClass::Integer, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -580,6 +597,7 @@ fn build_mode_changes_default_export_and_escape_behavior() {
             Func {
                 key: "helper".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
                 file: None,
                 line: None,
                 external: false,
@@ -645,6 +663,7 @@ fn explicit_exports_override_build_mode_defaults() {
         functions: vec![Func {
             key: "helper".to_string(),
             sig: sig(AbiClass::Void, vec![]),
+            param_names: vec![],
             file: None,
             line: None,
             external: false,
@@ -908,6 +927,33 @@ fn steens_store_through_unknown_pointer_escapes_the_stored_target() {
 
     assert_eq!(analysis.escape(esc), EscapeStatus::External);
     assert_eq!(analysis.escape(local), EscapeStatus::Module);
+    assert!(!analysis.globals()[esc].never_written);
+    assert!(analysis.globals()[local].never_written);
+}
+
+#[test]
+fn steens_escaped_function_parameter_binding_escapes_stored_targets() {
+    let pir = Pir::from_path(m1_4_fixture("escaped_fn_param_escape.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let cb = analysis.lookup_func("cb").unwrap();
+    let slot = analysis.lookup_global("@CB").unwrap();
+    let esc = analysis.lookup_global("@Esc").unwrap();
+    let local = analysis.lookup_global("@Local").unwrap();
+
+    assert!(analysis.callers(cb).any(unknown_caller));
+    assert_eq!(analysis.escape(slot), EscapeStatus::External);
+    assert_eq!(analysis.escape(esc), EscapeStatus::External);
+    assert_eq!(analysis.escape(local), EscapeStatus::Module);
+    assert!(!analysis.globals()[slot].never_written);
     assert!(!analysis.globals()[esc].never_written);
     assert!(analysis.globals()[local].never_written);
 }

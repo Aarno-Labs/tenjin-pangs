@@ -1,0 +1,54 @@
+{
+  "module": "m1_4.escaped_fn_param_escape",
+  "functions": [
+    {
+      "key": "setup",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "store",
+          "address": "@CB",
+          "value": "cb"
+        }
+      ]
+    },
+    {
+      "key": "cb",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [{ "class": "integer" }],
+        "cc": "ccc"
+      },
+      "param_names": ["%p"],
+      "address_taken": true,
+      "body": [
+        {
+          "kind": "store",
+          "address": "%p",
+          "value": "@Esc"
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@CB",
+      "exported": true,
+      "mutable": true
+    },
+    {
+      "key": "@Esc",
+      "exported": false,
+      "mutable": true
+    },
+    {
+      "key": "@Local",
+      "exported": false,
+      "mutable": true
+    }
+  ]
+}

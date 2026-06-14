@@ -140,6 +140,7 @@ fn lowers_call_args_and_results_from_ll() {
     let pir = Pir::from_path(m1_1_fixture("call_shapes.ll")).unwrap();
     let driver = pir.functions.iter().find(|f| f.key == "driver").unwrap();
 
+    assert_eq!(driver.param_names, vec!["%driver::x".to_string()]);
     assert!(driver.body.iter().any(|stmt| matches!(
         stmt,
         Stmt::CallDirect {

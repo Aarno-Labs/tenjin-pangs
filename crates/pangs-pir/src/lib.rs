@@ -64,6 +64,8 @@ impl Pir {
 pub struct Func {
     pub key: String,
     pub sig: Signature,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub param_names: Vec<String>,
     #[serde(default)]
     pub file: Option<String>,
     #[serde(default)]

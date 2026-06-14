@@ -709,4 +709,19 @@ mod tests {
         assert!(!result.globals["@Local"].escape_external);
         assert!(result.globals["@Local"].never_written);
     }
+
+    #[test]
+    fn escaped_function_parameter_binding_marks_param_value_unknown_origin() {
+        let pir = Pir::from_path(fixture("escaped_fn_param_escape.pir.json")).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let result = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert!(result.unknown_callers.contains("cb"));
+        assert!(result.globals["@CB"].escape_external);
+        assert!(!result.globals["@CB"].never_written);
+        assert!(result.globals["@Esc"].escape_external);
+        assert!(!result.globals["@Esc"].never_written);
+        assert!(!result.globals["@Local"].escape_external);
+        assert!(result.globals["@Local"].never_written);
+    }
 }

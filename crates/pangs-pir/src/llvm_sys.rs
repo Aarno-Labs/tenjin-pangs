@@ -277,6 +277,7 @@ unsafe fn lower_function(
     let key = value_name(function);
     let mut body = Vec::new();
     let mut fctx = FunctionCtx::new(key.clone());
+    let param_names = function_param_names(function, &mut fctx);
     lower_personality_function(ctx, function, lowering);
 
     let mut block = LLVMGetFirstBasicBlock(function);
@@ -299,6 +300,7 @@ unsafe fn lower_function(
     Func {
         key: key.clone(),
         sig: function_signature(ctx, function, lowering),
+        param_names,
         file: None,
         line: None,
         external: false,
@@ -323,6 +325,7 @@ unsafe fn lower_decl(
     Func {
         key: key.clone(),
         sig: function_signature(ctx, function, lowering),
+        param_names: Vec::new(),
         file: None,
         line: None,
         external: true,
@@ -334,6 +337,15 @@ unsafe fn lower_decl(
         address_taken: address_taken.contains(&key),
         body: Vec::new(),
     }
+}
+
+unsafe fn function_param_names(function: LLVMValueRef, fctx: &mut FunctionCtx) -> Vec<String> {
+    let count = LLVMCountParams(function);
+    let mut out = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        out.push(fctx.local_key(LLVMGetParam(function, index)));
+    }
+    out
 }
 
 unsafe fn lower_instruction(

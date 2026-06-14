@@ -781,7 +781,7 @@ impl<'a> Builder<'a> {
                 );
             }
             for param_index in 0..func.sig.params.len() {
-                self.add_node(
+                let param = self.add_node(
                     NodeKey::Param(index, param_index),
                     format!("param:{}:{}", func.key, param_index),
                     NodeKind::Param {
@@ -789,6 +789,16 @@ impl<'a> Builder<'a> {
                         index: param_index as u32,
                     },
                 );
+                if let Some(name) = func.param_names.get(param_index) {
+                    let value = self.value_node(index, Scope::Function(func.key.clone()), name);
+                    self.add_edge(
+                        EdgeKind::Assign,
+                        param,
+                        value,
+                        Owner::Function(func.key.clone()),
+                        None,
+                    );
+                }
             }
             self.add_node(
                 NodeKey::Return(index),

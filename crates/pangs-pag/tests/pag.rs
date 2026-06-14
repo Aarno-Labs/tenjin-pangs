@@ -15,6 +15,12 @@ fn m1_1_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn m1_4_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_4")
+        .join(name)
+}
+
 #[test]
 fn builds_core_nodes_edges_callsites_and_seeds() {
     let pir = Pir::from_path(fixture("core_edges.pir.json")).unwrap();
@@ -219,4 +225,26 @@ fn builds_checked_in_m1_1_fixture_suite() {
         assert_eq!(pag.metrics().nodes, pag.nodes.len(), "{name}");
         assert_eq!(pag.metrics().edges, pag.edges.len(), "{name}");
     }
+}
+
+#[test]
+fn binds_named_function_parameters_into_the_body_graph() {
+    let pir = Pir::from_path(m1_4_fixture("escaped_fn_param_escape.pir.json")).unwrap();
+    let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+    let param = pag
+        .nodes
+        .iter()
+        .find(|node| node.label == "param:cb:0")
+        .unwrap()
+        .id;
+    let value = pag
+        .nodes
+        .iter()
+        .find(|node| node.label == "val:cb:%p")
+        .unwrap()
+        .id;
+    assert!(pag.edges.iter().any(|edge| {
+        matches!(edge.kind, pangs_pag::EdgeKind::Assign) && edge.src == param && edge.dst == value
+    }));
 }
