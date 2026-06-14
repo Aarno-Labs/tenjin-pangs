@@ -416,6 +416,18 @@ fn dump_pag_emits_core_graph_and_function_filter() {
 
     let pag: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(pag["module"], "m1_3_core");
+    assert_eq!(
+        pag["metrics"]["nodes"],
+        pag["nodes"].as_array().unwrap().len()
+    );
+    assert_eq!(
+        pag["metrics"]["edges"],
+        pag["edges"].as_array().unwrap().len()
+    );
+    assert_eq!(
+        pag["metrics"]["callsites"],
+        pag["callsites"].as_array().unwrap().len()
+    );
     assert_eq!(pag["callsites"].as_array().unwrap().len(), 3);
     assert!(pag["callsites"].as_array().unwrap().iter().any(|callsite| {
         callsite["callee"] == "id_i32"
@@ -451,6 +463,40 @@ fn check_pag_accepts_core_fixture() {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+#[test]
+fn check_pag_accepts_checked_in_m1_1_fixtures() {
+    for name in [
+        "address_taken.ll",
+        "aggregate_eh.ll",
+        "abi_rows.ll",
+        "addrspacecast.ll",
+        "aliases.ll",
+        "arithmetic.ll",
+        "call_shapes.ll",
+        "gep_offsets.ll",
+        "global_init.ll",
+        "global_init_select.ll",
+        "ifunc.ll",
+        "inline_asm.ll",
+        "invoke.ll",
+        "no_debug.ll",
+        "resume.ll",
+        "unknown_intrinsics.ll",
+        "value_flow.ll",
+        "volatile_atomic.ll",
+    ] {
+        let fixture = m1_1_fixture(name);
+        let status = Command::new(env!("CARGO_BIN_EXE_pangs"))
+            .arg("check-pag")
+            .arg(&fixture)
+            .arg("--build-mode")
+            .arg("executable")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{name}");
+    }
 }
 
 fn run_analyze(fixture: &Path, out: &Path) {

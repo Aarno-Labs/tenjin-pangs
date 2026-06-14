@@ -25,6 +25,8 @@ pub struct Pag {
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
+    pub metrics: PagMetrics,
+    #[serde(default)]
     pub nodes: Vec<Node>,
     #[serde(default)]
     pub edges: Vec<Edge>,
@@ -37,6 +39,10 @@ pub struct Pag {
 impl Pag {
     pub fn from_pir(pir: &Pir, opts: &PagOpts) -> Self {
         Builder::new(pir, opts).build()
+    }
+
+    pub fn metrics(&self) -> &PagMetrics {
+        &self.metrics
     }
 
     pub fn for_function(&self, func: &str) -> Self {
@@ -142,7 +148,7 @@ impl Pag {
                 node.id = NodeId(index as u32);
                 node
             })
-            .collect();
+            .collect::<Vec<_>>();
         let edges = edges
             .into_iter()
             .enumerate()
@@ -152,7 +158,7 @@ impl Pag {
                 edge.dst = node_map[&edge.dst];
                 edge
             })
-            .collect();
+            .collect::<Vec<_>>();
         let callsites = callsites
             .into_iter()
             .enumerate()
@@ -163,7 +169,7 @@ impl Pag {
                 callsite.result = callsite.result.map(|id| node_map[&id]);
                 callsite
             })
-            .collect();
+            .collect::<Vec<_>>();
         let omega_seeds = omega_seeds
             .into_iter()
             .map(|mut seed| {
@@ -173,11 +179,12 @@ impl Pag {
                 };
                 seed
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         Self {
             module: self.module.clone(),
             source: self.source.clone(),
+            metrics: PagMetrics::compute(&nodes, &edges, &callsites, &omega_seeds),
             nodes,
             edges,
             callsites,
@@ -187,6 +194,28 @@ impl Pag {
 
     pub fn validate(&self) -> Result<(), Vec<ValidationIssue>> {
         let mut issues = Vec::new();
+        let expected_metrics =
+            PagMetrics::compute(&self.nodes, &self.edges, &self.callsites, &self.omega_seeds);
+
+        if self.metrics.nodes != expected_metrics.nodes
+            || self.metrics.edges != expected_metrics.edges
+            || self.metrics.callsites != expected_metrics.callsites
+            || self.metrics.omega_seeds != expected_metrics.omega_seeds
+            || self.metrics.value_nodes != expected_metrics.value_nodes
+            || self.metrics.object_nodes != expected_metrics.object_nodes
+            || self.metrics.param_nodes != expected_metrics.param_nodes
+            || self.metrics.return_nodes != expected_metrics.return_nodes
+            || self.metrics.addr_of_edges != expected_metrics.addr_of_edges
+            || self.metrics.assign_edges != expected_metrics.assign_edges
+            || self.metrics.load_edges != expected_metrics.load_edges
+            || self.metrics.store_edges != expected_metrics.store_edges
+            || self.metrics.gep_edges != expected_metrics.gep_edges
+            || self.metrics.memcpy_edges != expected_metrics.memcpy_edges
+            || self.metrics.direct_calls != expected_metrics.direct_calls
+            || self.metrics.indirect_calls != expected_metrics.indirect_calls
+        {
+            issues.push(ValidationIssue::MetricsMismatch);
+        }
 
         for (index, node) in self.nodes.iter().enumerate() {
             if node.id.0 as usize != index {
@@ -363,6 +392,72 @@ pub struct EdgeId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CallsiteId(pub u32);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PagMetrics {
+    pub nodes: usize,
+    pub value_nodes: usize,
+    pub object_nodes: usize,
+    pub param_nodes: usize,
+    pub return_nodes: usize,
+    pub edges: usize,
+    pub addr_of_edges: usize,
+    pub assign_edges: usize,
+    pub load_edges: usize,
+    pub store_edges: usize,
+    pub gep_edges: usize,
+    pub memcpy_edges: usize,
+    pub callsites: usize,
+    pub direct_calls: usize,
+    pub indirect_calls: usize,
+    pub omega_seeds: usize,
+}
+
+impl PagMetrics {
+    fn compute(
+        nodes: &[Node],
+        edges: &[Edge],
+        callsites: &[Callsite],
+        omega_seeds: &[OmegaSeed],
+    ) -> Self {
+        let mut metrics = Self {
+            nodes: nodes.len(),
+            edges: edges.len(),
+            callsites: callsites.len(),
+            omega_seeds: omega_seeds.len(),
+            ..Self::default()
+        };
+
+        for node in nodes {
+            match node.kind {
+                NodeKind::Value { .. } => metrics.value_nodes += 1,
+                NodeKind::Object { .. } => metrics.object_nodes += 1,
+                NodeKind::Param { .. } => metrics.param_nodes += 1,
+                NodeKind::Return { .. } => metrics.return_nodes += 1,
+            }
+        }
+
+        for edge in edges {
+            match edge.kind {
+                EdgeKind::AddrOf => metrics.addr_of_edges += 1,
+                EdgeKind::Assign => metrics.assign_edges += 1,
+                EdgeKind::Load => metrics.load_edges += 1,
+                EdgeKind::Store => metrics.store_edges += 1,
+                EdgeKind::Gep { .. } => metrics.gep_edges += 1,
+                EdgeKind::Memcpy { .. } => metrics.memcpy_edges += 1,
+            }
+        }
+
+        for callsite in callsites {
+            match callsite.kind {
+                CallKind::Direct => metrics.direct_calls += 1,
+                CallKind::Indirect => metrics.indirect_calls += 1,
+            }
+        }
+
+        metrics
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -570,6 +665,8 @@ pub enum ValidationIssue {
         callsite: CallsiteId,
         detail: String,
     },
+    #[error("pag metrics do not match the graph contents")]
+    MetricsMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -717,9 +814,13 @@ impl<'a> Builder<'a> {
             self.lower_stmt(Owner::GlobalInit, usize::MAX, stmt_index, stmt);
         }
 
+        let metrics =
+            PagMetrics::compute(&self.nodes, &self.edges, &self.callsites, &self.omega_seeds);
+
         Pag {
             module: self.pir.module.clone(),
             source: self.pir.source.clone(),
+            metrics,
             nodes: self.nodes,
             edges: self.edges,
             callsites: self.callsites,

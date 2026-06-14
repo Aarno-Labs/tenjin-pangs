@@ -9,6 +9,12 @@ fn fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn m1_1_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_1")
+        .join(name)
+}
+
 #[test]
 fn builds_core_nodes_edges_callsites_and_seeds() {
     let pir = Pir::from_path(fixture("core_edges.pir.json")).unwrap();
@@ -21,6 +27,16 @@ fn builds_core_nodes_edges_callsites_and_seeds() {
     );
 
     pag.validate().unwrap();
+    assert_eq!(pag.metrics().nodes, pag.nodes.len());
+    assert_eq!(pag.metrics().edges, pag.edges.len());
+    assert_eq!(pag.metrics().callsites, pag.callsites.len());
+    assert_eq!(pag.metrics().omega_seeds, pag.omega_seeds.len());
+    assert_eq!(pag.metrics().direct_calls, 2);
+    assert_eq!(pag.metrics().indirect_calls, 1);
+    assert_eq!(pag.metrics().store_edges, 2);
+    assert_eq!(pag.metrics().load_edges, 1);
+    assert_eq!(pag.metrics().gep_edges, 1);
+    assert_eq!(pag.metrics().object_nodes, 6);
 
     assert!(pag
         .nodes
@@ -167,4 +183,40 @@ fn validate_rejects_bad_addr_of_shape() {
             ..
         }
     )));
+}
+
+#[test]
+fn builds_checked_in_m1_1_fixture_suite() {
+    for name in [
+        "address_taken.ll",
+        "aggregate_eh.ll",
+        "abi_rows.ll",
+        "addrspacecast.ll",
+        "aliases.ll",
+        "arithmetic.ll",
+        "call_shapes.ll",
+        "gep_offsets.ll",
+        "global_init.ll",
+        "global_init_select.ll",
+        "ifunc.ll",
+        "inline_asm.ll",
+        "invoke.ll",
+        "no_debug.ll",
+        "resume.ll",
+        "unknown_intrinsics.ll",
+        "value_flow.ll",
+        "volatile_atomic.ll",
+    ] {
+        let pir = Pir::from_path(m1_1_fixture(name)).unwrap();
+        let pag = Pag::from_pir(
+            &pir,
+            &PagOpts {
+                build_mode: BuildMode::Executable,
+                ..PagOpts::default()
+            },
+        );
+        pag.validate().unwrap();
+        assert_eq!(pag.metrics().nodes, pag.nodes.len(), "{name}");
+        assert_eq!(pag.metrics().edges, pag.edges.len(), "{name}");
+    }
 }
