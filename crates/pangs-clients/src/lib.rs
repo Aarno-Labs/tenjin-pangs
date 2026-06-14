@@ -1,12 +1,14 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use jsonschema::JSONSchema;
 use pangs_api::{
     Analysis, CallEdge, Callee, Caller, ComponentInfo, FuncId, GlobalId, GlobalTarget, ModRef, Opts,
 };
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub fn export_analysis(
@@ -94,24 +96,64 @@ pub fn validate_export_dir(outdir: &Path) -> Result<()> {
     ];
     for name in json_files {
         let path = outdir.join(name);
+        let schema_json = load_schema_for_artifact(name)?;
+        let schema_json = Box::leak(Box::new(schema_json));
+        let schema = JSONSchema::compile(schema_json)
+            .with_context(|| format!("compile schema for {name}"))?;
         if name.ends_with(".jsonl") {
             let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
             for (line_no, line) in BufReader::new(file).lines().enumerate() {
                 let line = line?;
                 if !line.trim().is_empty() {
-                    serde_json::from_str::<serde_json::Value>(&line).with_context(|| {
+                    let value = serde_json::from_str::<Value>(&line).with_context(|| {
                         format!("parse {} line {}", path.display(), line_no + 1)
                     })?;
+                    validate_value_against_schema(
+                        &schema,
+                        &value,
+                        &format!("{} line {}", path.display(), line_no + 1),
+                    )?;
                 }
             }
         } else {
             let text =
                 fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-            serde_json::from_str::<serde_json::Value>(&text)
+            let value = serde_json::from_str::<Value>(&text)
                 .with_context(|| format!("parse {}", path.display()))?;
+            validate_value_against_schema(&schema, &value, &path.display().to_string())?;
         }
     }
     Ok(())
+}
+
+fn load_schema_for_artifact(name: &str) -> Result<Value> {
+    let schema_name = name.replace(".jsonl", ".schema.json");
+    let schema_name = if schema_name == "components.json" || schema_name == "metrics.json" {
+        schema_name.replace(".json", ".schema.json")
+    } else if schema_name == "manifest.json" {
+        "manifest.schema.json".to_string()
+    } else {
+        schema_name
+    };
+    let path = schema_dir().join(schema_name);
+    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str::<Value>(&text).with_context(|| format!("parse {}", path.display()))
+}
+
+fn validate_value_against_schema(schema: &JSONSchema, value: &Value, label: &str) -> Result<()> {
+    schema.validate(value).map_err(|errors| {
+        let details = errors
+            .map(|error| format!("{} at {}", error, error.instance_path))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::anyhow!("schema validation failed for {label}: {details}")
+    })
+}
+
+fn schema_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../schemas")
+        .to_path_buf()
 }
 
 pub fn report(outdir: &Path) -> Result<String> {
