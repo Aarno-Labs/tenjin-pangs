@@ -208,3 +208,132 @@ fn direct_global_modref_marks_never_written_and_preserves_direct_witness() {
         .iter()
         .any(|mr| mr.access == Access::Ref && mr.witness.as_deref() == Some("writer@!noloc#1")));
 }
+
+#[test]
+fn modref_api_closes_over_direct_calls_but_export_rows_stay_local() {
+    let pir = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            Func {
+                key: "entry".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::CallDirect {
+                    callee: "leaf".to_string(),
+                    sig: sig(AbiClass::Void, vec![]),
+                    loc: None,
+                }],
+            },
+            Func {
+                key: "leaf".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::GlobalRef {
+                    global: "@G".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                }],
+            },
+        ],
+        globals: vec![Global {
+            key: "@G".to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            exported: false,
+        }],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
+    let entry = analysis.lookup_func("entry").unwrap();
+    let leaf = analysis.lookup_func("leaf").unwrap();
+    let global = analysis.lookup_global("@G").unwrap();
+
+    let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();
+    assert_eq!(raw_modrefs.len(), 1);
+    assert_eq!(raw_modrefs[0].func, leaf);
+
+    let entry_modrefs: Vec<_> = analysis.modref(entry).collect();
+    assert_eq!(entry_modrefs.len(), 1);
+    assert_eq!(entry_modrefs[0].func, entry);
+    assert!(matches!(
+        entry_modrefs[0].global,
+        pangs_api::GlobalTarget::Name(id) if id == global
+    ));
+    assert_eq!(entry_modrefs[0].witness.as_deref(), Some("leaf@!noloc#0"));
+}
+
+#[test]
+fn modref_api_closes_over_fsa_indirect_targets() {
+    let target_sig = sig(AbiClass::Void, vec![Param::Integer]);
+    let pir = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            Func {
+                key: "driver".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::CallIndirect {
+                    operand: "%fp".to_string(),
+                    sig: target_sig.clone(),
+                    loc: None,
+                }],
+            },
+            Func {
+                key: "cb".to_string(),
+                sig: target_sig,
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: true,
+                body: vec![Stmt::GlobalRef {
+                    global: "@G".to_string(),
+                    access: Access::Ref,
+                    loc: None,
+                }],
+            },
+        ],
+        globals: vec![Global {
+            key: "@G".to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            exported: false,
+        }],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
+    let driver = analysis.lookup_func("driver").unwrap();
+    let global = analysis.lookup_global("@G").unwrap();
+
+    let modrefs: Vec<_> = analysis.modref(driver).collect();
+    assert_eq!(modrefs.len(), 1);
+    assert_eq!(modrefs[0].func, driver);
+    assert!(matches!(
+        modrefs[0].global,
+        pangs_api::GlobalTarget::Name(id) if id == global
+    ));
+    assert_eq!(modrefs[0].access, Access::Ref);
+    assert_eq!(modrefs[0].witness.as_deref(), Some("cb@!noloc#0"));
+}

@@ -265,6 +265,8 @@ pub struct Analysis {
     callsites: Table<CallsiteId, CallsiteInfo>,
     call_edges: Vec<CallEdge>,
     modrefs: Vec<ModRef>,
+    #[serde(skip)]
+    transitive_modrefs: Vec<Vec<ModRef>>,
     components: Vec<ComponentInfo>,
     findings: Vec<Finding>,
     metrics: Metrics,
@@ -449,6 +451,13 @@ impl Analysis {
         modrefs.sort_by_key(|mr| modref_sort_key(mr, &functions, &globals));
         modrefs.dedup_by_key(|mr| modref_sort_key(mr, &functions, &globals));
 
+        let transitive_modrefs = compute_transitive_modrefs(
+            functions.len(),
+            &functions,
+            &globals,
+            &call_edges,
+            &modrefs,
+        );
         let components =
             compute_components(&functions, &globals, &callsites, &call_edges, &modrefs);
         let mutable_globals_total = globals.iter().filter(|g| g.mutable).count();
@@ -484,6 +493,7 @@ impl Analysis {
             callsites: Table::new(callsites),
             call_edges,
             modrefs,
+            transitive_modrefs,
             components,
             findings: Vec::new(),
             metrics,
@@ -555,7 +565,7 @@ impl Analysis {
     }
 
     pub fn modref(&self, func: FuncId) -> impl Iterator<Item = &ModRef> {
-        self.modrefs.iter().filter(move |mr| mr.func == func)
+        self.transitive_modrefs[func.0 as usize].iter()
     }
 
     pub fn component_of(&self, func: FuncId) -> ComponentId {
@@ -767,6 +777,58 @@ fn compute_components(
             }
         })
         .collect()
+}
+
+fn compute_transitive_modrefs(
+    func_count: usize,
+    funcs: &[FuncInfo],
+    globals: &[GlobalInfo],
+    edges: &[CallEdge],
+    local_modrefs: &[ModRef],
+) -> Vec<Vec<ModRef>> {
+    let mut callees_by_func = vec![Vec::<FuncId>::new(); func_count];
+    for edge in edges {
+        if let (Caller::Func(caller), Callee::Func(callee)) = (&edge.caller, &edge.callee) {
+            callees_by_func[caller.0 as usize].push(*callee);
+        }
+    }
+
+    let mut local_by_func = vec![Vec::<&ModRef>::new(); func_count];
+    for mr in local_modrefs {
+        local_by_func[mr.func.0 as usize].push(mr);
+    }
+
+    let mut transitive = Vec::with_capacity(func_count);
+    for root_idx in 0..func_count {
+        let root = FuncId(root_idx as u32);
+        let mut reachable = BTreeSet::new();
+        let mut stack = vec![root];
+        while let Some(func) = stack.pop() {
+            if !reachable.insert(func) {
+                continue;
+            }
+            for &callee in &callees_by_func[func.0 as usize] {
+                stack.push(callee);
+            }
+        }
+
+        let mut rows = Vec::new();
+        for func in reachable {
+            for mr in &local_by_func[func.0 as usize] {
+                rows.push(ModRef {
+                    func: root,
+                    global: mr.global.clone(),
+                    access: mr.access,
+                    via: mr.via,
+                    witness: mr.witness.clone(),
+                });
+            }
+        }
+        rows.sort_by_key(|mr| modref_sort_key(mr, funcs, globals));
+        rows.dedup_by_key(|mr| modref_sort_key(mr, funcs, globals));
+        transitive.push(rows);
+    }
+    transitive
 }
 
 fn union(parent: &mut [usize], a: usize, b: usize) {
