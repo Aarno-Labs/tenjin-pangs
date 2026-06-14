@@ -770,3 +770,45 @@ fn steens_uses_escape_bits_for_unknown_callers_and_never_written() {
     assert!(!analysis.globals()[exported_slot].never_written);
     assert!(analysis.globals()[local].never_written);
 }
+
+#[test]
+fn steens_ptrtoint_marks_only_the_pointee_global_as_external() {
+    let pir = Pir::from_path(m1_4_fixture("ptrtoint_escape.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let global = analysis.lookup_global("@G").unwrap();
+    assert_eq!(analysis.escape(global), EscapeStatus::External);
+    assert!(!analysis.globals()[global].never_written);
+    assert!(analysis.call_edges().is_empty());
+}
+
+#[test]
+fn steens_inttoptr_keeps_unknown_indirect_callee_without_concrete_targets() {
+    let pir = Pir::from_path(m1_4_fixture("inttoptr_unknown_call.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert!(!analysis.call_edges().iter().any(|edge| {
+        edge.kind == pangs_api::CallKind::Indirect
+            && matches!(edge.callee, pangs_api::Callee::Func(_))
+    }));
+    assert!(analysis.call_edges().iter().any(|edge| {
+        edge.kind == pangs_api::CallKind::Indirect
+            && matches!(edge.callee, pangs_api::Callee::Unknown(_))
+    }));
+}

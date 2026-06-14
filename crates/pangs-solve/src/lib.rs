@@ -623,4 +623,31 @@ mod tests {
         assert!(result.globals["@Local"].never_written);
         assert!(result.metrics.partition_count > 0);
     }
+
+    #[test]
+    fn ptrtoint_marks_the_pointee_class_escaped() {
+        let pir = Pir::from_path(fixture("ptrtoint_escape.pir.json")).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let result = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert!(result.indirect_calls.is_empty());
+        assert!(result.unknown_callers.is_empty());
+        assert!(result.globals["@G"].escape_external);
+        assert!(!result.globals["@G"].never_written);
+    }
+
+    #[test]
+    fn inttoptr_keeps_only_unknown_indirect_call_targets() {
+        let pir = Pir::from_path(fixture("inttoptr_unknown_call.pir.json")).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let result = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert_eq!(result.indirect_calls.len(), 1);
+        assert_eq!(result.indirect_calls[0].callsite_key, "driver@!noloc#0");
+        assert!(result.indirect_calls[0].targets.is_empty());
+        assert!(result.indirect_calls[0].unknown_callee);
+        assert!(!result.unknown_callers.contains("cb"));
+        assert!(!result.globals["@G"].escape_external);
+        assert!(result.globals["@G"].never_written);
+    }
 }
