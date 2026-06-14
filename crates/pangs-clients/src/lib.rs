@@ -121,10 +121,11 @@ pub fn report(outdir: &Path) -> Result<String> {
             .with_context(|| format!("read {}", metrics_path.display()))?,
     )?;
     Ok(format!(
-        "functions: {}\nglobals: {}\ncall edges: {}\nmutable globals rewritable: {}/{}\n",
+        "functions: {}\nglobals: {}\ncall edges: {}\naudit findings: {}\nmutable globals rewritable: {}/{}\n",
         metrics.functions,
         metrics.globals,
         metrics.call_edges,
+        metrics.audit_findings,
         metrics.in_rewritable_components,
         metrics.mutable_globals_total
     ))

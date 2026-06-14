@@ -2,5 +2,5 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PANGS metrics",
   "type": "object",
-  "required": ["functions", "globals", "callsites", "call_edges", "mutable_globals_total", "in_rewritable_components"]
+  "required": ["functions", "globals", "callsites", "call_edges", "audit_findings", "mutable_globals_total", "in_rewritable_components"]
 }

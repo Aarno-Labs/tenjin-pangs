@@ -196,6 +196,7 @@ pub struct Metrics {
     pub globals: usize,
     pub callsites: usize,
     pub call_edges: usize,
+    pub audit_findings: usize,
     pub mutable_globals_total: usize,
     pub in_rewritable_components: usize,
     pub partition_count: usize,
@@ -329,6 +330,8 @@ impl Analysis {
         let mut callsites = Vec::new();
         let mut call_edges = Vec::new();
         let mut modrefs = Vec::new();
+        let mut findings = Vec::new();
+        let mut audit_taints = BTreeMap::<FuncId, Vec<Taint>>::new();
         let mut indirect_callsites = Vec::new();
         let mut solver_metrics = None;
         let address_taken: Vec<_> = module
@@ -352,6 +355,17 @@ impl Analysis {
                             &func.key,
                             CallKind::Direct,
                             loc,
+                        );
+                        let callsite_key = callsites[cs.0 as usize].key.clone();
+                        detect_direct_call_audits(
+                            &mut findings,
+                            &mut audit_taints,
+                            module,
+                            caller,
+                            callee,
+                            stmt,
+                            loc,
+                            &callsite_key,
                         );
                         if let Some(&callee_id) = func_lookup.get(callee) {
                             call_edges.push(CallEdge {
@@ -380,7 +394,36 @@ impl Analysis {
                             CallKind::Indirect,
                             loc,
                         );
+                        let callsite_key = callsites[cs.0 as usize].key.clone();
+                        detect_indirect_call_audits(
+                            &mut findings,
+                            &mut audit_taints,
+                            module,
+                            caller,
+                            stmt,
+                            sig,
+                            loc,
+                            &callsite_key,
+                        );
                         indirect_callsites.push((cs, caller, sig.clone()));
+                    }
+                    Stmt::Unknown {
+                        reason,
+                        operands,
+                        results,
+                        loc,
+                        ..
+                    } if reason.starts_with("inline_asm") => {
+                        let witness = witness_key(&func.key, loc, &mut noloc_ord, "audit");
+                        push_audit_finding(
+                            &mut findings,
+                            &mut audit_taints,
+                            caller,
+                            "inline_asm",
+                            loc,
+                            audit_affected_values(func.key.as_str(), operands, results),
+                            witness,
+                        );
                     }
                     Stmt::GlobalRef {
                         global,
@@ -543,8 +586,23 @@ impl Analysis {
             &call_edges,
             &modrefs,
         );
-        let components =
-            compute_components(&functions, &globals, &callsites, &call_edges, &modrefs);
+        findings.sort_by_key(|finding| {
+            (
+                finding.kind.clone(),
+                finding.file.clone(),
+                finding.line.unwrap_or(0),
+                finding.affected.join("|"),
+            )
+        });
+
+        let components = compute_components(
+            &functions,
+            &globals,
+            &callsites,
+            &call_edges,
+            &modrefs,
+            &audit_taints,
+        );
         let mutable_globals_total = globals.iter().filter(|g| g.mutable).count();
         let in_rewritable_components = components
             .iter()
@@ -558,6 +616,7 @@ impl Analysis {
             globals: globals.len(),
             callsites: callsites.len(),
             call_edges: call_edges.len(),
+            audit_findings: findings.len(),
             mutable_globals_total,
             in_rewritable_components,
             partition_count: 0,
@@ -591,7 +650,7 @@ impl Analysis {
             modrefs,
             transitive_modrefs,
             components,
-            findings: Vec::new(),
+            findings,
             metrics,
             func_lookup,
             global_lookup,
@@ -772,6 +831,145 @@ fn edge_sort_key(
     )
 }
 
+fn detect_direct_call_audits(
+    findings: &mut Vec<Finding>,
+    audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
+    module: &Pir,
+    caller: FuncId,
+    callee: &str,
+    stmt: &Stmt,
+    loc: &Option<pangs_pir::Loc>,
+    callsite_key: &str,
+) {
+    if let Some(kind) = direct_boundary_kind(callee) {
+        push_audit_finding(
+            findings,
+            audit_taints,
+            caller,
+            kind,
+            loc,
+            vec![format!("callsite:{callsite_key}")],
+            Some(callsite_key.to_string()),
+        );
+    }
+    if let Stmt::CallDirect { sig, args, .. } = stmt {
+        detect_vararg_fnptr_audit(
+            findings,
+            audit_taints,
+            module,
+            caller,
+            sig,
+            args,
+            loc,
+            callsite_key,
+        );
+    }
+}
+
+fn detect_indirect_call_audits(
+    findings: &mut Vec<Finding>,
+    audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
+    module: &Pir,
+    caller: FuncId,
+    stmt: &Stmt,
+    sig: &pangs_pir::Signature,
+    loc: &Option<pangs_pir::Loc>,
+    callsite_key: &str,
+) {
+    if let Stmt::CallIndirect { args, .. } = stmt {
+        detect_vararg_fnptr_audit(
+            findings,
+            audit_taints,
+            module,
+            caller,
+            sig,
+            args,
+            loc,
+            callsite_key,
+        );
+    }
+}
+
+fn detect_vararg_fnptr_audit(
+    findings: &mut Vec<Finding>,
+    audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
+    module: &Pir,
+    caller: FuncId,
+    sig: &pangs_pir::Signature,
+    args: &[String],
+    loc: &Option<pangs_pir::Loc>,
+    callsite_key: &str,
+) {
+    if !sig.vararg {
+        return;
+    }
+    let fixed = sig.params.len();
+    let mut affected = args
+        .iter()
+        .skip(fixed)
+        .filter(|arg| module.functions.iter().any(|func| func.key == **arg))
+        .map(|arg| format!("function:{arg}"))
+        .collect::<Vec<_>>();
+    affected.sort();
+    affected.dedup();
+    if affected.is_empty() {
+        return;
+    }
+    push_audit_finding(
+        findings,
+        audit_taints,
+        caller,
+        "fnptr_varargs",
+        loc,
+        affected,
+        Some(callsite_key.to_string()),
+    );
+}
+
+fn direct_boundary_kind(callee: &str) -> Option<&'static str> {
+    match callee {
+        "dlopen" | "dlsym" => Some("dlopen_dlsym"),
+        "setjmp" | "longjmp" => Some("setjmp_longjmp"),
+        _ => None,
+    }
+}
+
+fn audit_affected_values(func: &str, operands: &[String], results: &[String]) -> Vec<String> {
+    let mut affected = operands
+        .iter()
+        .map(|operand| format!("value:{operand}"))
+        .chain(results.iter().map(|result| format!("value:{result}")))
+        .collect::<Vec<_>>();
+    if affected.is_empty() {
+        affected.push(format!("function:{func}"));
+    }
+    affected.sort();
+    affected.dedup();
+    affected
+}
+
+fn push_audit_finding(
+    findings: &mut Vec<Finding>,
+    audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
+    caller: FuncId,
+    kind: &str,
+    loc: &Option<pangs_pir::Loc>,
+    affected: Vec<String>,
+    witness: Option<String>,
+) {
+    findings.push(Finding {
+        kind: kind.to_string(),
+        file: loc.as_ref().map(|loc| loc.file.clone()),
+        line: loc.as_ref().map(|loc| loc.line),
+        affected,
+        effect: "omega_taint".to_string(),
+    });
+    audit_taints.entry(caller).or_default().push(Taint {
+        kind: kind.to_string(),
+        witness,
+    });
+}
+
 fn modref_sort_key(
     mr: &ModRef,
     funcs: &[FuncInfo],
@@ -808,6 +1006,7 @@ fn compute_components(
     callsites: &[CallsiteInfo],
     edges: &[CallEdge],
     modrefs: &[ModRef],
+    audit_taints: &BTreeMap<FuncId, Vec<Taint>>,
 ) -> Vec<ComponentInfo> {
     let mut parent: Vec<usize> = (0..funcs.len()).collect();
     for edge in edges {
@@ -869,6 +1068,11 @@ fn compute_components(
                             });
                         }
                     }
+                }
+            }
+            for (func, taints) in audit_taints {
+                if member_set.contains(func) {
+                    taint.extend(taints.iter().cloned());
                 }
             }
             taint.sort_by_key(|t| (t.kind.clone(), t.witness.clone()));

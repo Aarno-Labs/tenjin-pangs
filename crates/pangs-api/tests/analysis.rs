@@ -27,6 +27,12 @@ fn m1_4_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn m1_5_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_5")
+        .join(name)
+}
+
 #[test]
 fn unknown_caller_seeds_only_exported_external_and_address_taken_functions() {
     let pir = Pir {
@@ -987,4 +993,76 @@ fn steens_unfreezes_address_taken_but_unescaped_components() {
             .frozen
     );
     assert!(!steens.component(steens.component_of(cb_steens)).frozen);
+}
+
+#[test]
+fn audit_inline_asm_freezes_an_otherwise_local_component() {
+    let pir = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![Func {
+            key: "asm_only".to_string(),
+            sig: sig(AbiClass::Void, vec![]),
+            param_names: vec![],
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: false,
+            body: vec![Stmt::Unknown {
+                op: "call".to_string(),
+                operands: vec![],
+                results: vec![],
+                reason: "inline_asm".to_string(),
+                loc: None,
+            }],
+        }],
+        globals: vec![],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
+    assert_eq!(analysis.audit_findings().len(), 1);
+    assert_eq!(analysis.audit_findings()[0].kind, "inline_asm");
+    assert_eq!(
+        analysis.audit_findings()[0].affected,
+        vec!["function:asm_only"]
+    );
+    assert_eq!(analysis.metrics().audit_findings, 1);
+    let component =
+        analysis.component(analysis.component_of(analysis.lookup_func("asm_only").unwrap()));
+    assert!(component.frozen);
+    assert!(component
+        .taint
+        .iter()
+        .any(|taint| taint.kind == "inline_asm"
+            && taint.witness.as_deref() == Some("asm_only@!noloc#0")));
+}
+
+#[test]
+fn audit_surface_fixture_reports_varargs_and_boundary_findings() {
+    let pir = Pir::from_path(m1_5_fixture("audit_surface.pir.json")).unwrap();
+    let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
+
+    let kinds = analysis
+        .audit_findings()
+        .iter()
+        .map(|finding| finding.kind.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            "dlopen_dlsym",
+            "dlopen_dlsym",
+            "fnptr_varargs",
+            "inline_asm",
+            "setjmp_longjmp",
+            "setjmp_longjmp"
+        ]
+    );
+    assert!(analysis.audit_findings().iter().any(|finding| {
+        finding.kind == "fnptr_varargs" && finding.affected == vec!["function:cb".to_string()]
+    }));
+    assert_eq!(analysis.metrics().audit_findings, 6);
 }

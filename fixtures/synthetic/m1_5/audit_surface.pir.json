@@ -1,0 +1,165 @@
+{
+  "module": "m1_5_audit",
+  "functions": [
+    {
+      "key": "accept_vararg",
+      "sig": {
+        "ret": {
+          "class": "void"
+        },
+        "params": [
+          {
+            "class": "integer"
+          }
+        ],
+        "vararg": true,
+        "cc": "ccc"
+      },
+      "external": true
+    },
+    {
+      "key": "dlopen",
+      "sig": {
+        "ret": {
+          "class": "integer"
+        },
+        "params": [],
+        "cc": "ccc"
+      },
+      "external": true
+    },
+    {
+      "key": "dlsym",
+      "sig": {
+        "ret": {
+          "class": "integer"
+        },
+        "params": [],
+        "cc": "ccc"
+      },
+      "external": true
+    },
+    {
+      "key": "setjmp",
+      "sig": {
+        "ret": {
+          "class": "integer"
+        },
+        "params": [],
+        "cc": "ccc"
+      },
+      "external": true
+    },
+    {
+      "key": "longjmp",
+      "sig": {
+        "ret": {
+          "class": "void"
+        },
+        "params": [],
+        "cc": "ccc"
+      },
+      "external": true
+    },
+    {
+      "key": "cb",
+      "sig": {
+        "ret": {
+          "class": "void"
+        },
+        "params": [],
+        "cc": "ccc"
+      },
+      "address_taken": true,
+      "body": []
+    },
+    {
+      "key": "driver",
+      "sig": {
+        "ret": {
+          "class": "void"
+        },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "unknown",
+          "op": "call",
+          "operands": [
+            "%fp"
+          ],
+          "results": [
+            "%rv"
+          ],
+          "reason": "inline_asm"
+        },
+        {
+          "kind": "call_direct",
+          "callee": "accept_vararg",
+          "sig": {
+            "ret": {
+              "class": "void"
+            },
+            "params": [
+              {
+                "class": "integer"
+              }
+            ],
+            "vararg": true,
+            "cc": "ccc"
+          },
+          "args": [
+            "%tag",
+            "cb"
+          ]
+        },
+        {
+          "kind": "call_direct",
+          "callee": "dlopen",
+          "sig": {
+            "ret": {
+              "class": "integer"
+            },
+            "params": [],
+            "cc": "ccc"
+          }
+        },
+        {
+          "kind": "call_direct",
+          "callee": "dlsym",
+          "sig": {
+            "ret": {
+              "class": "integer"
+            },
+            "params": [],
+            "cc": "ccc"
+          }
+        },
+        {
+          "kind": "call_direct",
+          "callee": "setjmp",
+          "sig": {
+            "ret": {
+              "class": "integer"
+            },
+            "params": [],
+            "cc": "ccc"
+          }
+        },
+        {
+          "kind": "call_direct",
+          "callee": "longjmp",
+          "sig": {
+            "ret": {
+              "class": "void"
+            },
+            "params": [],
+            "cc": "ccc"
+          }
+        }
+      ]
+    }
+  ],
+  "globals": []
+}

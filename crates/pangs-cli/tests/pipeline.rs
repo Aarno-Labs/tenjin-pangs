@@ -23,6 +23,12 @@ fn m1_4_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn m1_5_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_5")
+        .join(name)
+}
+
 #[test]
 fn analyze_validate_is_deterministic() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -666,6 +672,74 @@ fn analyze_steens_improves_rewritable_coverage_over_conservative() {
     let steens_callgraph = fs::read_to_string(out_steens.join("callgraph.jsonl")).unwrap();
     assert!(conservative_callgraph.contains("\"unknown\":\"address_escapes_to_external\""));
     assert!(!steens_callgraph.contains("\"unknown\":\"address_escapes_to_external\""));
+}
+
+#[test]
+fn analyze_inline_asm_exports_audit_and_freezes_the_component() {
+    let fixture = m1_1_fixture("inline_asm.ll");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze(&fixture, &out);
+
+    let audit: Vec<Value> = fs::read_to_string(out.join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0]["kind"], "inline_asm");
+    assert_eq!(audit[0]["effect"], "omega_taint");
+
+    let components: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("components.json")).unwrap()).unwrap();
+    assert_eq!(components["components"][0]["frozen"], Value::Bool(true));
+    assert!(components["components"][0]["taint"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|taint| { taint["kind"] == "inline_asm" && taint["witness"] == "asm_call@!noloc#0" }));
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert_eq!(metrics["audit_findings"], 1);
+}
+
+#[test]
+fn analyze_audit_surface_exports_boundary_and_vararg_findings() {
+    let fixture = m1_5_fixture("audit_surface.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze(&fixture, &out);
+
+    let audit: Vec<Value> = fs::read_to_string(out.join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(audit.len(), 6);
+    assert!(audit.iter().any(|row| row["kind"] == "fnptr_varargs"));
+    assert!(
+        audit
+            .iter()
+            .filter(|row| row["kind"] == "dlopen_dlsym")
+            .count()
+            == 2
+    );
+    assert!(
+        audit
+            .iter()
+            .filter(|row| row["kind"] == "setjmp_longjmp")
+            .count()
+            == 2
+    );
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert_eq!(metrics["audit_findings"], 6);
 }
 
 fn run_analyze(fixture: &Path, out: &Path) {
