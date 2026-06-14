@@ -1607,3 +1607,58 @@ fn steens_alias_rows_increase_rewritable_coverage_over_conservative() {
     assert_eq!(steens.metrics().mutable_globals_total, 1);
     assert_eq!(steens.metrics().in_rewritable_components, 1);
 }
+
+#[test]
+fn steens_alias_rows_improve_split_component_coverage_over_conservative() {
+    let fixture = m1_6_fixture("split_coverage_gain.pir.json");
+    let conservative = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Conservative,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let steens = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let driver_cons = conservative.lookup_func("driver").unwrap();
+    let worker_cons = conservative.lookup_func("worker").unwrap();
+    let driver_steens = steens.lookup_func("driver").unwrap();
+    let worker_steens = steens.lookup_func("worker").unwrap();
+    let rewrite_steens = steens.lookup_global("@Rewrite").unwrap();
+
+    let cons_driver_component = conservative.component(conservative.component_of(driver_cons));
+    assert!(cons_driver_component.frozen);
+    let cons_worker_component = conservative.component(conservative.component_of(worker_cons));
+    assert!(!cons_worker_component.frozen);
+    assert!(cons_worker_component.mutable_globals.is_empty());
+    assert_eq!(conservative.metrics().mutable_globals_total, 2);
+    assert_eq!(conservative.metrics().in_rewritable_components, 0);
+
+    let steens_driver_component = steens.component(steens.component_of(driver_steens));
+    assert!(steens_driver_component.frozen);
+    let steens_worker_component = steens.component(steens.component_of(worker_steens));
+    assert!(!steens_worker_component.frozen);
+    assert_eq!(
+        steens_worker_component.mutable_globals,
+        vec![rewrite_steens]
+    );
+    assert!(steens.modrefs().iter().any(|mr| {
+        mr.func == worker_steens
+            && mr.global == pangs_api::GlobalTarget::Name(rewrite_steens)
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("worker@m1_6_split.c:11:1#0")
+    }));
+    assert_eq!(steens.metrics().mutable_globals_total, 2);
+    assert_eq!(steens.metrics().in_rewritable_components, 1);
+}
