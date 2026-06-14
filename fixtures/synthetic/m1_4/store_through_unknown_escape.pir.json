@@ -1,0 +1,42 @@
+{
+  "module": "m1_4.store_through_unknown_escape",
+  "functions": [
+    {
+      "key": "driver",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "int_to_ptr",
+          "dest": "%p",
+          "source": "%raw"
+        },
+        {
+          "kind": "assign",
+          "dest": "%q",
+          "sources": ["@Esc"]
+        },
+        {
+          "kind": "store",
+          "address": "%p",
+          "value": "%q"
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@Esc",
+      "exported": false,
+      "mutable": true
+    },
+    {
+      "key": "@Local",
+      "exported": false,
+      "mutable": true
+    }
+  ]
+}

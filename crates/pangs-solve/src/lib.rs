@@ -695,4 +695,18 @@ mod tests {
         assert!(!result.globals["@Local"].escape_external);
         assert!(result.globals["@Local"].never_written);
     }
+
+    #[test]
+    fn store_through_unknown_pointer_escapes_stored_targets() {
+        let pir = Pir::from_path(fixture("store_through_unknown_escape.pir.json")).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let result = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert!(result.indirect_calls.is_empty());
+        assert!(result.unknown_callers.is_empty());
+        assert!(result.globals["@Esc"].escape_external);
+        assert!(!result.globals["@Esc"].never_written);
+        assert!(!result.globals["@Local"].escape_external);
+        assert!(result.globals["@Local"].never_written);
+    }
 }

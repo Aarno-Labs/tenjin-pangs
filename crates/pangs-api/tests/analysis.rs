@@ -889,3 +889,25 @@ fn steens_escaped_function_return_marks_return_pointee_escaped() {
     assert!(!analysis.globals()[ret].never_written);
     assert!(analysis.globals()[local].never_written);
 }
+
+#[test]
+fn steens_store_through_unknown_pointer_escapes_the_stored_target() {
+    let pir = Pir::from_path(m1_4_fixture("store_through_unknown_escape.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let esc = analysis.lookup_global("@Esc").unwrap();
+    let local = analysis.lookup_global("@Local").unwrap();
+
+    assert_eq!(analysis.escape(esc), EscapeStatus::External);
+    assert_eq!(analysis.escape(local), EscapeStatus::Module);
+    assert!(!analysis.globals()[esc].never_written);
+    assert!(analysis.globals()[local].never_written);
+}
