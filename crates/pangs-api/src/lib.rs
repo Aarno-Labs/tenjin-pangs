@@ -329,7 +329,7 @@ impl Analysis {
             .functions
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.address_taken && !f.external)
+            .filter(|(_, f)| f.address_taken)
             .map(|(idx, f)| (FuncId(idx as u32), f))
             .collect();
 
@@ -433,8 +433,7 @@ impl Analysis {
         }
 
         for (idx, func) in module.functions.iter().enumerate() {
-            if functions[idx].exported || (opts.build_mode == BuildMode::Library && !func.external)
-            {
+            if functions[idx].address_taken || functions[idx].exported || func.external {
                 call_edges.push(CallEdge {
                     caller: Caller::Unknown("address_escapes_to_external".to_string()),
                     callsite: None,
@@ -450,7 +449,8 @@ impl Analysis {
         modrefs.sort_by_key(|mr| modref_sort_key(mr, &functions, &globals));
         modrefs.dedup_by_key(|mr| modref_sort_key(mr, &functions, &globals));
 
-        let components = compute_components(&functions, &globals, &call_edges, &modrefs);
+        let components =
+            compute_components(&functions, &globals, &callsites, &call_edges, &modrefs);
         let mutable_globals_total = globals.iter().filter(|g| g.mutable).count();
         let in_rewritable_components = components
             .iter()
@@ -518,6 +518,10 @@ impl Analysis {
 
     pub fn component(&self, id: ComponentId) -> &ComponentInfo {
         &self.components[id.0 as usize]
+    }
+
+    pub fn escape(&self, id: GlobalId) -> EscapeStatus {
+        self.globals[id].escape
     }
 
     pub fn audit_findings(&self) -> &[Finding] {
@@ -686,6 +690,7 @@ fn callee_key(callee: &Callee, funcs: &[FuncInfo]) -> String {
 fn compute_components(
     funcs: &[FuncInfo],
     globals: &[GlobalInfo],
+    callsites: &[CallsiteInfo],
     edges: &[CallEdge],
     modrefs: &[ModRef],
 ) -> Vec<ComponentInfo> {
@@ -733,7 +738,9 @@ fn compute_components(
                         if member_set.contains(&fid) {
                             taint.push(Taint {
                                 kind: "unknown_callee".to_string(),
-                                witness: None,
+                                witness: edge
+                                    .callsite
+                                    .map(|id| callsites[id.0 as usize].key.clone()),
                             });
                         }
                     }
