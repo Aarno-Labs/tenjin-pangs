@@ -1315,58 +1315,78 @@ fn push_pointer_modrefs_from_pag(
     noloc_ord: &mut BTreeMap<(String, String), u32>,
 ) {
     for edge in &pag.edges {
-        let Some((owner, func, access, address_node, unknown_reason)) =
-            edge_access(edge, func_lookup)
-        else {
+        let Some((owner, func, accesses)) = edge_accesses(edge, func_lookup) else {
             continue;
         };
-        let Some(node) = pag.nodes.get(address_node.0 as usize) else {
-            continue;
-        };
-        let Some(resolution) = nodes.get(&node.label) else {
-            continue;
-        };
-
         let witness = witness_key(&owner, &edge.loc, noloc_ord, "global");
-        for global_key in &resolution.pointee_globals {
-            if node.label == format!("sym:global:{global_key}") {
-                continue;
-            }
-            let Some(&gid) = global_lookup.get(global_key) else {
+        for (access, address_node, unknown_reason, suppress_direct_symbol) in accesses {
+            let Some(node) = pag.nodes.get(address_node.0 as usize) else {
                 continue;
             };
-            modrefs.push(ModRef {
-                func,
-                global: GlobalTarget::Name(gid),
-                access,
-                via: Via::Aliased,
-                witness: witness.clone(),
-            });
-        }
+            let Some(resolution) = nodes.get(&node.label) else {
+                continue;
+            };
 
-        if resolution.external {
-            modrefs.push(ModRef {
-                func,
-                global: GlobalTarget::Unknown(unknown_reason.to_string()),
-                access,
-                via: Via::Unknown,
-                witness,
-            });
+            for global_key in &resolution.pointee_globals {
+                if suppress_direct_symbol && node.label == format!("sym:global:{global_key}") {
+                    continue;
+                }
+                let Some(&gid) = global_lookup.get(global_key) else {
+                    continue;
+                };
+                modrefs.push(ModRef {
+                    func,
+                    global: GlobalTarget::Name(gid),
+                    access,
+                    via: Via::Aliased,
+                    witness: witness.clone(),
+                });
+            }
+
+            if resolution.external {
+                modrefs.push(ModRef {
+                    func,
+                    global: GlobalTarget::Unknown(unknown_reason.to_string()),
+                    access,
+                    via: Via::Unknown,
+                    witness: witness.clone(),
+                });
+            }
         }
     }
 }
 
-fn edge_access(
+fn edge_accesses(
     edge: &Edge,
     func_lookup: &HashMap<String, FuncId>,
-) -> Option<(String, FuncId, Access, pangs_pag::NodeId, &'static str)> {
+) -> Option<(
+    String,
+    FuncId,
+    Vec<(Access, pangs_pag::NodeId, &'static str, bool)>,
+)> {
     let Owner::Function(owner) = &edge.owner else {
         return None;
     };
     let &func = func_lookup.get(owner)?;
     match edge.kind {
-        EdgeKind::Load => Some((owner.clone(), func, Access::Ref, edge.src, "omega_load")),
-        EdgeKind::Store => Some((owner.clone(), func, Access::Mod, edge.dst, "omega_store")),
+        EdgeKind::Load => Some((
+            owner.clone(),
+            func,
+            vec![(Access::Ref, edge.src, "omega_load", true)],
+        )),
+        EdgeKind::Store => Some((
+            owner.clone(),
+            func,
+            vec![(Access::Mod, edge.dst, "omega_store", true)],
+        )),
+        EdgeKind::Memcpy { .. } => Some((
+            owner.clone(),
+            func,
+            vec![
+                (Access::Ref, edge.src, "omega_load", false),
+                (Access::Mod, edge.dst, "omega_store", false),
+            ],
+        )),
         _ => None,
     }
 }

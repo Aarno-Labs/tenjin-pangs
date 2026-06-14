@@ -1,0 +1,78 @@
+{
+  "module": "m1_6_memcpy_modref",
+  "functions": [
+    {
+      "key": "main",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "assign",
+          "dest": "%dstp",
+          "sources": ["@DstAliased"],
+          "loc": { "file": "m1_6_memcpy.c", "line": 1, "col": 1 }
+        },
+        {
+          "kind": "assign",
+          "dest": "%srcp",
+          "sources": ["@SrcAliased"],
+          "loc": { "file": "m1_6_memcpy.c", "line": 2, "col": 1 }
+        },
+        {
+          "kind": "memcpy",
+          "dst": "%dstp",
+          "src": "%srcp",
+          "bytes": 8,
+          "loc": { "file": "m1_6_memcpy.c", "line": 3, "col": 1 }
+        },
+        {
+          "kind": "int_to_ptr",
+          "dest": "%unkdst",
+          "source": "%bits0",
+          "loc": { "file": "m1_6_memcpy.c", "line": 4, "col": 1 }
+        },
+        {
+          "kind": "int_to_ptr",
+          "dest": "%unksrc",
+          "source": "%bits1",
+          "loc": { "file": "m1_6_memcpy.c", "line": 5, "col": 1 }
+        },
+        {
+          "kind": "memcpy",
+          "dst": "%unkdst",
+          "src": "%unksrc",
+          "bytes": 8,
+          "loc": { "file": "m1_6_memcpy.c", "line": 6, "col": 1 }
+        },
+        {
+          "kind": "memcpy",
+          "dst": "@DirectDst",
+          "src": "@DirectSrc",
+          "bytes": 8,
+          "loc": { "file": "m1_6_memcpy.c", "line": 7, "col": 1 }
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@DstAliased",
+      "mutable": true
+    },
+    {
+      "key": "@SrcAliased",
+      "mutable": true
+    },
+    {
+      "key": "@DirectDst",
+      "mutable": true
+    },
+    {
+      "key": "@DirectSrc",
+      "mutable": true
+    }
+  ]
+}

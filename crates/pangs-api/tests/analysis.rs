@@ -1333,3 +1333,78 @@ fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
         taint.kind == "unknown_global" && taint.witness.as_deref() == Some("main@m1_6.c:6:1#0")
     }));
 }
+
+#[test]
+fn steens_memcpy_modref_exports_aliased_direct_symbol_and_unknown_rows() {
+    let fixture = m1_6_fixture("memcpy_modref.pir.json");
+    let analysis = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let main = analysis.lookup_func("main").unwrap();
+    let dst_aliased = analysis.lookup_global("@DstAliased").unwrap();
+    let src_aliased = analysis.lookup_global("@SrcAliased").unwrap();
+    let direct_dst = analysis.lookup_global("@DirectDst").unwrap();
+    let direct_src = analysis.lookup_global("@DirectSrc").unwrap();
+    let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();
+
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(src_aliased)
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:3:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(dst_aliased)
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:3:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(direct_src)
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:7:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(direct_dst)
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:7:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Unknown("omega_load".to_string())
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Unknown
+            && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:6:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Unknown("omega_store".to_string())
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Unknown
+            && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:6:1#0")
+    }));
+
+    let component = analysis
+        .components()
+        .iter()
+        .find(|component| component.members == vec![main])
+        .unwrap();
+    assert!(component.frozen);
+    assert!(component.taint.iter().any(|taint| {
+        taint.kind == "unknown_global"
+            && taint.witness.as_deref() == Some("main@m1_6_memcpy.c:6:1#0")
+    }));
+}

@@ -917,6 +917,78 @@ fn analyze_steens_exports_pointer_aware_modref_and_freezes_unknown_global_compon
         }));
 }
 
+#[test]
+fn analyze_steens_exports_memcpy_pointer_modref_rows() {
+    let fixture = m1_6_fixture("memcpy_modref.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "steens");
+
+    let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["name"] == "@SrcAliased"
+            && row["access"] == "ref"
+            && row["via"] == "aliased"
+            && row["witness"] == "main@m1_6_memcpy.c:3:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["name"] == "@DstAliased"
+            && row["access"] == "mod"
+            && row["via"] == "aliased"
+            && row["witness"] == "main@m1_6_memcpy.c:3:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["name"] == "@DirectSrc"
+            && row["access"] == "ref"
+            && row["via"] == "aliased"
+            && row["witness"] == "main@m1_6_memcpy.c:7:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["name"] == "@DirectDst"
+            && row["access"] == "mod"
+            && row["via"] == "aliased"
+            && row["witness"] == "main@m1_6_memcpy.c:7:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["unknown"] == "omega_load"
+            && row["access"] == "ref"
+            && row["via"] == "unknown"
+            && row["witness"] == "main@m1_6_memcpy.c:6:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["unknown"] == "omega_store"
+            && row["access"] == "mod"
+            && row["via"] == "unknown"
+            && row["witness"] == "main@m1_6_memcpy.c:6:1#0"
+    }));
+
+    let components: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("components.json")).unwrap()).unwrap();
+    assert!(components["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|component| {
+            component["members"] == serde_json::json!(["main"])
+                && component["frozen"] == true
+                && component["taint"].as_array().unwrap().iter().any(|taint| {
+                    taint["kind"] == "unknown_global"
+                        && taint["witness"] == "main@m1_6_memcpy.c:6:1#0"
+                })
+        }));
+}
+
 fn run_analyze(fixture: &Path, out: &Path) {
     run_analyze_stage(fixture, out, "conservative");
 }
