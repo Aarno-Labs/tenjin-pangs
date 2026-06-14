@@ -223,6 +223,13 @@ enum DeferredAudit {
         result: String,
         loc: Option<pangs_pir::Loc>,
     },
+    VarargFnPtr {
+        caller: FuncId,
+        owner: String,
+        values: Vec<String>,
+        loc: Option<pangs_pir::Loc>,
+        witness: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -420,6 +427,17 @@ impl Analysis {
                             loc,
                             &callsite_key,
                         );
+                        if let Stmt::CallDirect { sig, .. } = stmt {
+                            record_vararg_deferred_audit(
+                                &mut deferred_audits,
+                                caller,
+                                &func.key,
+                                stmt,
+                                sig,
+                                loc,
+                                &callsite_key,
+                            );
+                        }
                         if let Some(&callee_id) = func_lookup.get(callee) {
                             call_edges.push(CallEdge {
                                 caller: Caller::Func(caller),
@@ -453,6 +471,15 @@ impl Analysis {
                             &mut audit_taints,
                             module,
                             caller,
+                            stmt,
+                            sig,
+                            loc,
+                            &callsite_key,
+                        );
+                        record_vararg_deferred_audit(
+                            &mut deferred_audits,
+                            caller,
+                            &func.key,
                             stmt,
                             sig,
                             loc,
@@ -702,6 +729,14 @@ impl Analysis {
                 finding.affected.join("|"),
             )
         });
+        findings.dedup_by_key(|finding| {
+            (
+                finding.kind.clone(),
+                finding.file.clone(),
+                finding.line.unwrap_or(0),
+                finding.affected.join("|"),
+            )
+        });
 
         let components = compute_components(
             &functions,
@@ -893,6 +928,36 @@ fn emit_deferred_steens_audits(
                         &loc,
                         vec![format!("value:{result}")],
                         Some(audit_witness(&owner, &loc)),
+                    );
+                }
+            }
+            DeferredAudit::VarargFnPtr {
+                caller,
+                owner,
+                values,
+                loc,
+                witness,
+            } => {
+                let affected = values
+                    .into_iter()
+                    .filter(|value| {
+                        let label = pag_value_label(module, &owner, value);
+                        node_summaries
+                            .get(&label)
+                            .map(|node| node.reaches_function_pointer)
+                            .unwrap_or(false)
+                    })
+                    .map(|value| format!("value:{value}"))
+                    .collect::<Vec<_>>();
+                if !affected.is_empty() {
+                    push_audit_finding(
+                        findings,
+                        audit_taints,
+                        caller,
+                        "fnptr_varargs",
+                        &loc,
+                        affected,
+                        Some(witness),
                     );
                 }
             }
@@ -1131,6 +1196,39 @@ fn detect_memory_aggregate_audits(
     affected.dedup();
     let witness = witness_key(owner, loc, noloc_ord, "audit");
     push_audit_finding(findings, audit_taints, caller, kind, loc, affected, witness);
+}
+
+fn record_vararg_deferred_audit(
+    deferred: &mut Vec<DeferredAudit>,
+    caller: FuncId,
+    owner: &str,
+    stmt: &Stmt,
+    sig: &pangs_pir::Signature,
+    loc: &Option<pangs_pir::Loc>,
+    callsite_key: &str,
+) {
+    if !sig.vararg {
+        return;
+    }
+    let args = match stmt {
+        Stmt::CallDirect { args, .. } | Stmt::CallIndirect { args, .. } => args,
+        _ => return,
+    };
+    let values = args
+        .iter()
+        .skip(sig.params.len())
+        .cloned()
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    deferred.push(DeferredAudit::VarargFnPtr {
+        caller,
+        owner: owner.to_string(),
+        values,
+        loc: loc.clone(),
+        witness: callsite_key.to_string(),
+    });
 }
 
 fn direct_boundary_kind(callee: &str) -> Option<&'static str> {

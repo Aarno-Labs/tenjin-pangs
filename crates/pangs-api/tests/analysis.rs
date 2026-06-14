@@ -1188,3 +1188,32 @@ fn audit_memops_on_fnptr_aggregates_are_reported_but_scalar_fnptr_memops_are_not
         .any(|finding| finding.kind == "memcpy_fnptr_aggregate"
             || finding.kind == "memset_fnptr_aggregate"));
 }
+
+#[test]
+fn steens_detects_vararg_function_pointers_through_local_values() {
+    let pir = Pir::from_path(m1_5_fixture("vararg_fnptr_flow.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let cb = analysis.lookup_func("cb").unwrap();
+    assert!(analysis.callers(cb).any(unknown_caller));
+    assert!(analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "fnptr_varargs"
+            && finding.affected == vec!["value:%fp".to_string()]));
+    let driver = analysis.lookup_func("driver").unwrap();
+    let component = analysis.component(analysis.component_of(driver));
+    assert!(component
+        .taint
+        .iter()
+        .any(|taint| taint.kind == "fnptr_varargs"
+            && taint.witness.as_deref() == Some("driver@!noloc#0")));
+}

@@ -265,6 +265,9 @@ impl<'a> Solver<'a> {
                 (OmegaSeedKind::ExternalCallBoundary, SeedTarget::Callsite(id)) => {
                     self.apply_external_call(id.0 as usize);
                 }
+                (OmegaSeedKind::VarargCallBoundary, SeedTarget::Callsite(id)) => {
+                    self.apply_vararg_call(id.0 as usize);
+                }
                 _ => {}
             }
         }
@@ -515,6 +518,25 @@ impl<'a> Solver<'a> {
         }
     }
 
+    fn apply_vararg_call(&mut self, site_index: usize) {
+        let callsite = self.callsites_by_index[site_index];
+        let fixed = callsite.sig.params.len();
+        let extra_args = callsite
+            .args
+            .iter()
+            .skip(fixed)
+            .copied()
+            .collect::<Vec<_>>();
+        for arg in extra_args {
+            let class = self.class_of(arg);
+            let root = self.find(class);
+            let Some(pointee) = self.classes[root].pointee else {
+                continue;
+            };
+            self.set_esc(pointee);
+        }
+    }
+
     fn function_object_class(&mut self, key: &str) -> Option<usize> {
         let id = *self.function_object_nodes.get(key)?;
         Some(self.class_of(id))
@@ -630,6 +652,12 @@ mod tests {
     fn fixture(name: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/synthetic/m1_4")
+            .join(name)
+    }
+
+    fn fixture_m1_5(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/m1_5")
             .join(name)
     }
 
@@ -757,5 +785,14 @@ mod tests {
         assert!(!result.globals["@Esc"].never_written);
         assert!(!result.globals["@Local"].escape_external);
         assert!(result.globals["@Local"].never_written);
+    }
+
+    #[test]
+    fn vararg_boundary_escapes_function_pointer_actuals() {
+        let pir = Pir::from_path(fixture_m1_5("vararg_fnptr_flow.pir.json")).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let result = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert!(result.unknown_callers.contains("cb"));
     }
 }

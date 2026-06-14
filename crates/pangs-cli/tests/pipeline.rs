@@ -812,6 +812,41 @@ fn analyze_exports_memop_findings_for_fnptr_aggregates() {
     assert_eq!(metrics["audit_findings"], 2);
 }
 
+#[test]
+fn analyze_steens_exports_vararg_function_pointer_audits_from_local_values() {
+    let fixture = m1_5_fixture("vararg_fnptr_flow.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "steens");
+
+    let audit: Vec<Value> = fs::read_to_string(out.join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(audit.iter().any(|row| {
+        row["kind"] == "fnptr_varargs" && row["affected"] == serde_json::json!(["value:%fp"])
+    }));
+
+    let callgraph = fs::read_to_string(out.join("callgraph.jsonl")).unwrap();
+    assert!(callgraph.contains("\"unknown\":\"address_escapes_to_external\""));
+
+    let components: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("components.json")).unwrap()).unwrap();
+    assert!(components["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |component| component["members"] == serde_json::json!(["driver", "sink"])
+                && component["taint"].as_array().unwrap().iter().any(|taint| {
+                    taint["kind"] == "fnptr_varargs" && taint["witness"] == "driver@!noloc#0"
+                })
+        ));
+}
+
 fn run_analyze(fixture: &Path, out: &Path) {
     run_analyze_stage(fixture, out, "conservative");
 }
