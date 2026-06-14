@@ -1,0 +1,44 @@
+{
+  "module": "m1_5_fnptr_aggregate_memops",
+  "functions": [
+    {
+      "key": "driver",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "alloca",
+          "dest": "%agg",
+          "ty": "{ void ()*, i32 }"
+        },
+        {
+          "kind": "assign",
+          "dest": "%agg_copy",
+          "sources": ["%agg"]
+        },
+        {
+          "kind": "gep",
+          "dest": "%agg_field",
+          "base": "%agg_copy",
+          "byte_off": 0
+        },
+        {
+          "kind": "memcpy",
+          "dst": "%agg_copy",
+          "src": "%agg",
+          "bytes": 16
+        },
+        {
+          "kind": "memset",
+          "dst": "%agg_field",
+          "value": "%zero",
+          "bytes": 8
+        }
+      ]
+    }
+  ],
+  "globals": []
+}

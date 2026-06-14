@@ -1115,3 +1115,76 @@ fn steens_only_audits_int_punning_when_it_reaches_function_pointers() {
         .any(|taint| taint.kind == "fnptr_inttoptr"
             && taint.witness.as_deref() == Some("driver@!noloc#0")));
 }
+
+#[test]
+fn audit_memops_on_fnptr_aggregates_are_reported_but_scalar_fnptr_memops_are_not() {
+    let pir = Pir::from_path(m1_5_fixture("fnptr_aggregate_memops.pir.json")).unwrap();
+    let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
+    let kinds = analysis
+        .audit_findings()
+        .iter()
+        .map(|finding| finding.kind.as_str())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"memcpy_fnptr_aggregate"));
+    assert!(kinds.contains(&"memset_fnptr_aggregate"));
+    assert!(analysis.audit_findings().iter().any(|finding| {
+        finding.kind == "memcpy_fnptr_aggregate"
+            && finding
+                .affected
+                .iter()
+                .any(|value| value == "value:%agg" || value == "value:%agg_copy")
+    }));
+    let component =
+        analysis.component(analysis.component_of(analysis.lookup_func("driver").unwrap()));
+    assert!(component
+        .taint
+        .iter()
+        .any(|taint| taint.kind == "memcpy_fnptr_aggregate"));
+    assert!(component
+        .taint
+        .iter()
+        .any(|taint| taint.kind == "memset_fnptr_aggregate"));
+
+    let scalar = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![Func {
+            key: "driver".to_string(),
+            sig: sig(AbiClass::Void, vec![]),
+            param_names: vec![],
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: false,
+            body: vec![
+                Stmt::Alloca {
+                    dest: "%slot".to_string(),
+                    ty: "void ()*".to_string(),
+                    loc: None,
+                },
+                Stmt::Memcpy {
+                    dst: "%slot".to_string(),
+                    src: "%slot".to_string(),
+                    bytes: Some(8),
+                    loc: None,
+                },
+                Stmt::Memset {
+                    dst: "%slot".to_string(),
+                    value: "%zero".to_string(),
+                    bytes: Some(8),
+                    loc: None,
+                },
+            ],
+        }],
+        globals: vec![],
+        global_init: vec![],
+    };
+    let scalar_analysis = Analysis::run(&scalar, &Opts::default()).unwrap();
+    assert!(!scalar_analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "memcpy_fnptr_aggregate"
+            || finding.kind == "memset_fnptr_aggregate"));
+}

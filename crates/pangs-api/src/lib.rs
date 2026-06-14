@@ -225,6 +225,38 @@ enum DeferredAudit {
     },
 }
 
+#[derive(Debug, Default)]
+struct AggregateFnPtrState {
+    flagged: BTreeSet<String>,
+}
+
+impl AggregateFnPtrState {
+    fn note(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Alloca { dest, ty, .. } => {
+                if is_fnptr_aggregate_type(ty) {
+                    self.flagged.insert(dest.clone());
+                }
+            }
+            Stmt::Assign { dest, sources, .. } => {
+                if sources.iter().any(|source| self.flagged.contains(source)) {
+                    self.flagged.insert(dest.clone());
+                }
+            }
+            Stmt::Gep { dest, base, .. } => {
+                if self.flagged.contains(base) {
+                    self.flagged.insert(dest.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn contains(&self, value: &str) -> bool {
+        self.flagged.contains(value)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table<I, T> {
     rows: Vec<T>,
@@ -362,8 +394,12 @@ impl Analysis {
         let mut noloc_ord: BTreeMap<(String, String), u32> = BTreeMap::new();
         for (func_idx, func) in module.functions.iter().enumerate() {
             let caller = FuncId(func_idx as u32);
+            let mut aggregate_fnptrs = AggregateFnPtrState::default();
             for stmt in &func.body {
                 match stmt {
+                    Stmt::Alloca { .. } | Stmt::Assign { .. } | Stmt::Gep { .. } => {
+                        aggregate_fnptrs.note(stmt);
+                    }
                     Stmt::CallDirect { callee, loc, .. } => {
                         let cs = push_callsite(
                             &mut callsites,
@@ -440,6 +476,38 @@ impl Analysis {
                             loc,
                             audit_affected_values(func.key.as_str(), operands, results),
                             witness,
+                        );
+                    }
+                    Stmt::Memcpy { dst, src, loc, .. } => {
+                        detect_memory_aggregate_audits(
+                            &mut findings,
+                            &mut audit_taints,
+                            &mut noloc_ord,
+                            caller,
+                            &func.key,
+                            "memcpy_fnptr_aggregate",
+                            loc,
+                            [dst.as_str(), src.as_str()]
+                                .into_iter()
+                                .filter(|value| aggregate_fnptrs.contains(value))
+                                .map(ToOwned::to_owned)
+                                .collect(),
+                        );
+                    }
+                    Stmt::Memset { dst, loc, .. } => {
+                        detect_memory_aggregate_audits(
+                            &mut findings,
+                            &mut audit_taints,
+                            &mut noloc_ord,
+                            caller,
+                            &func.key,
+                            "memset_fnptr_aggregate",
+                            loc,
+                            if aggregate_fnptrs.contains(dst) {
+                                vec![dst.clone()]
+                            } else {
+                                Vec::new()
+                            },
                         );
                     }
                     Stmt::PtrToInt { source, loc, .. } => {
@@ -1042,6 +1110,29 @@ fn detect_vararg_fnptr_audit(
     );
 }
 
+fn detect_memory_aggregate_audits(
+    findings: &mut Vec<Finding>,
+    audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
+    noloc_ord: &mut BTreeMap<(String, String), u32>,
+    caller: FuncId,
+    owner: &str,
+    kind: &str,
+    loc: &Option<pangs_pir::Loc>,
+    values: Vec<String>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    let mut affected = values
+        .into_iter()
+        .map(|value| format!("value:{value}"))
+        .collect::<Vec<_>>();
+    affected.sort();
+    affected.dedup();
+    let witness = witness_key(owner, loc, noloc_ord, "audit");
+    push_audit_finding(findings, audit_taints, caller, kind, loc, affected, witness);
+}
+
 fn direct_boundary_kind(callee: &str) -> Option<&'static str> {
     match callee {
         "dlopen" | "dlsym" => Some("dlopen_dlsym"),
@@ -1062,6 +1153,11 @@ fn audit_affected_values(func: &str, operands: &[String], results: &[String]) ->
     affected.sort();
     affected.dedup();
     affected
+}
+
+fn is_fnptr_aggregate_type(ty: &str) -> bool {
+    let aggregate = ty.contains('{') || ty.contains('[');
+    aggregate && ty.contains(")*")
 }
 
 fn push_audit_finding(

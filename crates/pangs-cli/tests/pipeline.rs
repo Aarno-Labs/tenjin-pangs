@@ -772,6 +772,46 @@ fn analyze_steens_exports_fnptr_int_punning_audits_but_not_non_fn_ptrtoint() {
     assert!(!plain_audit.contains("fnptr_inttoptr"));
 }
 
+#[test]
+fn analyze_exports_memop_findings_for_fnptr_aggregates() {
+    let fixture = m1_5_fixture("fnptr_aggregate_memops.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze(&fixture, &out);
+
+    let audit: Vec<Value> = fs::read_to_string(out.join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(audit
+        .iter()
+        .any(|row| row["kind"] == "memcpy_fnptr_aggregate"));
+    assert!(audit
+        .iter()
+        .any(|row| row["kind"] == "memset_fnptr_aggregate"));
+
+    let components: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("components.json")).unwrap()).unwrap();
+    assert_eq!(components["components"][0]["frozen"], Value::Bool(true));
+    assert!(components["components"][0]["taint"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|taint| taint["kind"] == "memcpy_fnptr_aggregate"));
+    assert!(components["components"][0]["taint"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|taint| taint["kind"] == "memset_fnptr_aggregate"));
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert_eq!(metrics["audit_findings"], 2);
+}
+
 fn run_analyze(fixture: &Path, out: &Path) {
     run_analyze_stage(fixture, out, "conservative");
 }
