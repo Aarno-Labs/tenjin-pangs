@@ -1559,3 +1559,51 @@ fn steens_memset_modref_exports_direct_aliased_and_unknown_store_rows() {
             && taint.witness.as_deref() == Some("main@m1_6_memset.c:4:1#0")
     }));
 }
+
+#[test]
+fn steens_alias_rows_increase_rewritable_coverage_over_conservative() {
+    let fixture = m1_6_fixture("aliased_coverage_gain.pir.json");
+    let conservative = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Conservative,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let steens = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let worker_cons = conservative.lookup_func("worker").unwrap();
+    let worker_steens = steens.lookup_func("worker").unwrap();
+    let g_steens = steens.lookup_global("@G").unwrap();
+
+    assert!(conservative.modrefs().is_empty());
+    let cons_component = conservative.component(conservative.component_of(worker_cons));
+    assert!(!cons_component.frozen);
+    assert!(cons_component.mutable_globals.is_empty());
+    assert_eq!(conservative.metrics().mutable_globals_total, 1);
+    assert_eq!(conservative.metrics().in_rewritable_components, 0);
+
+    let steens_rows: Vec<_> = steens.modrefs().iter().collect();
+    assert!(steens_rows.iter().any(|mr| {
+        mr.func == worker_steens
+            && mr.global == pangs_api::GlobalTarget::Name(g_steens)
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("worker@m1_6_cover.c:2:1#0")
+    }));
+    let steens_component = steens.component(steens.component_of(worker_steens));
+    assert!(!steens_component.frozen);
+    assert_eq!(steens_component.mutable_globals, vec![g_steens]);
+    assert_eq!(steens.metrics().mutable_globals_total, 1);
+    assert_eq!(steens.metrics().in_rewritable_components, 1);
+}

@@ -1,0 +1,33 @@
+{
+  "module": "m1_6_aliased_coverage_gain",
+  "functions": [
+    {
+      "key": "worker",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "assign",
+          "dest": "%gp",
+          "sources": ["@G"],
+          "loc": { "file": "m1_6_cover.c", "line": 1, "col": 1 }
+        },
+        {
+          "kind": "load",
+          "dest": "%v",
+          "address": "%gp",
+          "loc": { "file": "m1_6_cover.c", "line": 2, "col": 1 }
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@G",
+      "mutable": true
+    }
+  ]
+}

@@ -1102,6 +1102,68 @@ fn analyze_steens_exports_memset_pointer_modref_rows() {
         }));
 }
 
+#[test]
+fn analyze_steens_alias_rows_improve_rewritable_coverage_over_conservative() {
+    let fixture = m1_6_fixture("aliased_coverage_gain.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out_cons = tmp.path().join("cons");
+    let out_steens = tmp.path().join("steens");
+
+    run_analyze_stage(&fixture, &out_cons, "conservative");
+    run_analyze_stage(&fixture, &out_steens, "steens");
+
+    let cons_modref = fs::read_to_string(out_cons.join("modref.jsonl")).unwrap();
+    assert!(cons_modref.trim().is_empty());
+
+    let cons_components: Value =
+        serde_json::from_str(&fs::read_to_string(out_cons.join("components.json")).unwrap())
+            .unwrap();
+    assert!(cons_components["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|component| {
+            component["members"] == serde_json::json!(["worker"])
+                && component["frozen"] == false
+                && component["mutable_globals"] == serde_json::json!([])
+        }));
+    let cons_metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out_cons.join("metrics.json")).unwrap()).unwrap();
+    assert_eq!(cons_metrics["mutable_globals_total"], 1);
+    assert_eq!(cons_metrics["in_rewritable_components"], 0);
+
+    let steens_modref: Vec<Value> = fs::read_to_string(out_steens.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(steens_modref.iter().any(|row| {
+        row["func"] == "worker"
+            && row["global"]["name"] == "@G"
+            && row["access"] == "ref"
+            && row["via"] == "aliased"
+            && row["witness"] == "worker@m1_6_cover.c:2:1#0"
+    }));
+
+    let steens_components: Value =
+        serde_json::from_str(&fs::read_to_string(out_steens.join("components.json")).unwrap())
+            .unwrap();
+    assert!(steens_components["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|component| {
+            component["members"] == serde_json::json!(["worker"])
+                && component["frozen"] == false
+                && component["mutable_globals"] == serde_json::json!(["@G"])
+        }));
+    let steens_metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out_steens.join("metrics.json")).unwrap())
+            .unwrap();
+    assert_eq!(steens_metrics["mutable_globals_total"], 1);
+    assert_eq!(steens_metrics["in_rewritable_components"], 1);
+}
+
 fn run_analyze(fixture: &Path, out: &Path) {
     run_analyze_stage(fixture, out, "conservative");
 }
