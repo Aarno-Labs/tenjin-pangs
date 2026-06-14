@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use pangs_api::{Analysis, BuildMode, Caller, EscapeStatus, Opts};
 use pangs_pir::{AbiClass, Access, Func, Global, Param, Pir, Signature, Stmt};
 
@@ -12,6 +14,10 @@ fn sig(ret: AbiClass, params: Vec<Param>) -> Signature {
 
 fn unknown_caller(caller: &Caller) -> bool {
     matches!(caller, Caller::Unknown(reason) if reason == "address_escapes_to_external")
+}
+
+fn singleton_exports(symbol: &str) -> BTreeSet<String> {
+    [symbol.to_string()].into_iter().collect()
 }
 
 #[test]
@@ -339,6 +345,75 @@ fn modref_api_closes_over_fsa_indirect_targets() {
 }
 
 #[test]
+fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
+    let pir = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            Func {
+                key: "main".to_string(),
+                sig: sig(AbiClass::Integer, vec![]),
+                file: None,
+                line: None,
+                external: false,
+                exported: true,
+                address_taken: false,
+                body: vec![Stmt::CallDirect {
+                    callee: "driver".to_string(),
+                    sig: sig(AbiClass::Void, vec![]),
+                    loc: None,
+                }],
+            },
+            Func {
+                key: "driver".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::GlobalRef {
+                    global: "@G".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                }],
+            },
+        ],
+        globals: vec![Global {
+            key: "@G".to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            exported: false,
+        }],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let main = analysis.lookup_func("main").unwrap();
+    let driver = analysis.lookup_func("driver").unwrap();
+
+    let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();
+    assert_eq!(raw_modrefs.len(), 1);
+    assert_eq!(raw_modrefs[0].func, driver);
+    assert_eq!(raw_modrefs[0].witness.as_deref(), Some("driver@!noloc#0"));
+
+    let main_modrefs: Vec<_> = analysis.modref(main).collect();
+    assert_eq!(main_modrefs.len(), 1);
+    assert_eq!(main_modrefs[0].func, main);
+    assert_eq!(main_modrefs[0].witness.as_deref(), Some("driver@!noloc#0"));
+}
+
+#[test]
 fn direct_external_call_taints_only_the_connected_component() {
     let pir = Pir {
         module: "m".to_string(),
@@ -467,7 +542,7 @@ fn direct_external_call_taints_only_the_connected_component() {
 }
 
 #[test]
-fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
+fn build_mode_changes_default_export_and_escape_behavior() {
     let pir = Pir {
         module: "m".to_string(),
         source: None,
@@ -479,29 +554,85 @@ fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
                 file: None,
                 line: None,
                 external: false,
-                exported: true,
+                exported: false,
                 address_taken: false,
-                body: vec![Stmt::CallDirect {
-                    callee: "driver".to_string(),
-                    sig: sig(AbiClass::Void, vec![]),
-                    loc: None,
-                }],
+                body: vec![],
             },
             Func {
-                key: "driver".to_string(),
+                key: "helper".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
                 file: None,
                 line: None,
                 external: false,
-                exported: false,
+                exported: true,
                 address_taken: false,
-                body: vec![Stmt::GlobalRef {
-                    global: "@G".to_string(),
-                    access: Access::Mod,
-                    loc: None,
-                }],
+                body: vec![],
             },
         ],
+        globals: vec![Global {
+            key: "@Pub".to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            exported: true,
+        }],
+        global_init: vec![],
+    };
+
+    let library = Analysis::run(
+        &pir,
+        &Opts {
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let executable = Analysis::run(
+        &pir,
+        &Opts {
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let lib_main = library.lookup_func("main").unwrap();
+    let lib_helper = library.lookup_func("helper").unwrap();
+    let exe_main = executable.lookup_func("main").unwrap();
+    let exe_helper = executable.lookup_func("helper").unwrap();
+    let lib_global = library.lookup_global("@Pub").unwrap();
+    let exe_global = executable.lookup_global("@Pub").unwrap();
+
+    assert!(!library.functions()[lib_main].exported);
+    assert!(library.functions()[lib_helper].exported);
+    assert!(!library.callers(lib_main).any(unknown_caller));
+    assert!(library.callers(lib_helper).any(unknown_caller));
+    assert_eq!(library.escape(lib_global), EscapeStatus::External);
+
+    assert!(executable.functions()[exe_main].exported);
+    assert!(!executable.functions()[exe_helper].exported);
+    assert!(executable.callers(exe_main).any(unknown_caller));
+    assert!(!executable.callers(exe_helper).any(unknown_caller));
+    assert_eq!(executable.escape(exe_global), EscapeStatus::Module);
+}
+
+#[test]
+fn explicit_exports_override_build_mode_defaults() {
+    let pir = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![Func {
+            key: "helper".to_string(),
+            sig: sig(AbiClass::Void, vec![]),
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: false,
+            body: vec![],
+        }],
         globals: vec![Global {
             key: "@G".to_string(),
             file: None,
@@ -513,24 +644,29 @@ fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
         global_init: vec![],
     };
 
-    let analysis = Analysis::run(
+    let func_exported = Analysis::run(
         &pir,
         &Opts {
             build_mode: BuildMode::Executable,
+            exports: singleton_exports("helper"),
             ..Opts::default()
         },
     )
     .unwrap();
-    let main = analysis.lookup_func("main").unwrap();
-    let driver = analysis.lookup_func("driver").unwrap();
+    let global_exported = Analysis::run(
+        &pir,
+        &Opts {
+            build_mode: BuildMode::Executable,
+            exports: singleton_exports("@G"),
+            ..Opts::default()
+        },
+    )
+    .unwrap();
 
-    let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();
-    assert_eq!(raw_modrefs.len(), 1);
-    assert_eq!(raw_modrefs[0].func, driver);
-    assert_eq!(raw_modrefs[0].witness.as_deref(), Some("driver@!noloc#0"));
+    let helper = func_exported.lookup_func("helper").unwrap();
+    let global = global_exported.lookup_global("@G").unwrap();
 
-    let main_modrefs: Vec<_> = analysis.modref(main).collect();
-    assert_eq!(main_modrefs.len(), 1);
-    assert_eq!(main_modrefs[0].func, main);
-    assert_eq!(main_modrefs[0].witness.as_deref(), Some("driver@!noloc#0"));
+    assert!(func_exported.functions()[helper].exported);
+    assert!(func_exported.callers(helper).any(unknown_caller));
+    assert_eq!(global_exported.escape(global), EscapeStatus::External);
 }
