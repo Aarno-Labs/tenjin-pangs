@@ -812,3 +812,80 @@ fn steens_inttoptr_keeps_unknown_indirect_callee_without_concrete_targets() {
             && matches!(edge.callee, pangs_api::Callee::Unknown(_))
     }));
 }
+
+#[test]
+fn steens_external_call_escapes_only_passed_pointer_targets() {
+    let pir = Pir::from_path(m1_4_fixture("external_call_arg_escape.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let esc = analysis.lookup_global("@Esc").unwrap();
+    let local = analysis.lookup_global("@Local").unwrap();
+    let ext_decl = analysis.lookup_func("ext_decl").unwrap();
+
+    assert!(analysis.callers(ext_decl).any(unknown_caller));
+    assert_eq!(analysis.escape(esc), EscapeStatus::External);
+    assert_eq!(analysis.escape(local), EscapeStatus::Module);
+    assert!(!analysis.globals()[esc].never_written);
+    assert!(analysis.globals()[local].never_written);
+}
+
+#[test]
+fn steens_unknown_operand_and_result_seed_escape_and_unknown_icall() {
+    let pir = Pir::from_path(m1_4_fixture("unknown_op_escape.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let esc = analysis.lookup_global("@Esc").unwrap();
+    let local = analysis.lookup_global("@Local").unwrap();
+
+    assert!(analysis.call_edges().iter().any(|edge| {
+        edge.kind == pangs_api::CallKind::Indirect
+            && matches!(edge.callee, pangs_api::Callee::Unknown(_))
+    }));
+    assert_eq!(analysis.escape(esc), EscapeStatus::External);
+    assert_eq!(analysis.escape(local), EscapeStatus::Module);
+    assert!(!analysis.globals()[esc].never_written);
+    assert!(analysis.globals()[local].never_written);
+}
+
+#[test]
+fn steens_escaped_function_return_marks_return_pointee_escaped() {
+    let pir = Pir::from_path(m1_4_fixture("escaped_fn_return_escape.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let cb = analysis.lookup_func("cb").unwrap();
+    let slot = analysis.lookup_global("@CB").unwrap();
+    let ret = analysis.lookup_global("@Ret").unwrap();
+    let local = analysis.lookup_global("@Local").unwrap();
+
+    assert!(analysis.callers(cb).any(unknown_caller));
+    assert_eq!(analysis.escape(slot), EscapeStatus::External);
+    assert_eq!(analysis.escape(ret), EscapeStatus::External);
+    assert_eq!(analysis.escape(local), EscapeStatus::Module);
+    assert!(!analysis.globals()[slot].never_written);
+    assert!(!analysis.globals()[ret].never_written);
+    assert!(analysis.globals()[local].never_written);
+}

@@ -650,4 +650,49 @@ mod tests {
         assert!(!result.globals["@G"].escape_external);
         assert!(result.globals["@G"].never_written);
     }
+
+    #[test]
+    fn external_call_marks_pointer_argument_targets_escaped() {
+        let pir = Pir::from_path(fixture("external_call_arg_escape.pir.json")).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let result = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert!(result.indirect_calls.is_empty());
+        assert!(result.unknown_callers.contains("ext_decl"));
+        assert!(result.globals["@Esc"].escape_external);
+        assert!(!result.globals["@Esc"].never_written);
+        assert!(!result.globals["@Local"].escape_external);
+        assert!(result.globals["@Local"].never_written);
+    }
+
+    #[test]
+    fn unknown_operand_and_result_seed_escape_and_unknown_call() {
+        let pir = Pir::from_path(fixture("unknown_op_escape.pir.json")).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let result = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert_eq!(result.indirect_calls.len(), 1);
+        assert_eq!(result.indirect_calls[0].callsite_key, "driver@!noloc#0");
+        assert!(result.indirect_calls[0].targets.is_empty());
+        assert!(result.indirect_calls[0].unknown_callee);
+        assert!(result.globals["@Esc"].escape_external);
+        assert!(!result.globals["@Esc"].never_written);
+        assert!(!result.globals["@Local"].escape_external);
+        assert!(result.globals["@Local"].never_written);
+    }
+
+    #[test]
+    fn escaped_function_return_marks_return_pointee_escaped() {
+        let pir = Pir::from_path(fixture("escaped_fn_return_escape.pir.json")).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let result = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert!(result.unknown_callers.contains("cb"));
+        assert!(result.globals["@CB"].escape_external);
+        assert!(!result.globals["@CB"].never_written);
+        assert!(result.globals["@Ret"].escape_external);
+        assert!(!result.globals["@Ret"].never_written);
+        assert!(!result.globals["@Local"].escape_external);
+        assert!(result.globals["@Local"].never_written);
+    }
 }

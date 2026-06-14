@@ -1,0 +1,49 @@
+{
+  "module": "m1_4.unknown_op_escape",
+  "functions": [
+    {
+      "key": "driver",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "assign",
+          "dest": "%p",
+          "sources": ["@Esc"]
+        },
+        {
+          "kind": "unknown",
+          "op": "mystery",
+          "operands": ["%p"],
+          "results": ["%q"],
+          "reason": "unknown_pointer_intrinsic"
+        },
+        {
+          "kind": "call_indirect",
+          "operand": "%q",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": [],
+            "cc": "ccc"
+          },
+          "args": []
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@Esc",
+      "exported": false,
+      "mutable": true
+    },
+    {
+      "key": "@Local",
+      "exported": false,
+      "mutable": true
+    }
+  ]
+}

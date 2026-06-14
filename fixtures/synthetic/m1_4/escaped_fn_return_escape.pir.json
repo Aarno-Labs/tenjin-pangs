@@ -1,0 +1,57 @@
+{
+  "module": "m1_4.escaped_fn_return_escape",
+  "functions": [
+    {
+      "key": "setup",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "store",
+          "address": "@CB",
+          "value": "cb"
+        }
+      ]
+    },
+    {
+      "key": "cb",
+      "sig": {
+        "ret": { "class": "integer" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "address_taken": true,
+      "body": [
+        {
+          "kind": "assign",
+          "dest": "%r",
+          "sources": ["@Ret"]
+        },
+        {
+          "kind": "return",
+          "value": "%r"
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@CB",
+      "exported": true,
+      "mutable": true
+    },
+    {
+      "key": "@Ret",
+      "exported": false,
+      "mutable": true
+    },
+    {
+      "key": "@Local",
+      "exported": false,
+      "mutable": true
+    }
+  ]
+}
