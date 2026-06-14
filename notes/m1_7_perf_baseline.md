@@ -13,41 +13,48 @@ Command shape:
 - `target/release/pangs analyze <module> -o <out> --stage steens --build-mode executable --validate`
 
 Observed on June 14, 2026 after the first M1.7 timing + closure pass, measured in
-release mode:
+release mode. The numbers below are the current post-optimization baseline.
 
 1. `exe-jq-O0.bc`
-   - single-run `pipeline wall`: `490 ms`
-   - `metrics.analysis_wall_us`: `206224`
-   - `pag_build_us`: `68793`
-   - `solve_us`: `51462`
-   - `transitive_modref_us`: `34200`
-   - `components_us`: `662`
-   - hyperfine mean: `519.2 ms ± 6.7 ms`
+   - single-run `pipeline wall`: `537 ms`
+   - `metrics.analysis_wall_us`: `207877`
+   - `pag_build_us`: `74206`
+   - `solve_us`: `62388`
+   - `transitive_modref_us`: `9723`
+   - `components_us`: `964`
+   - hyperfine mean: `575.8 ms ± 25.2 ms`
+   - transitive mod/ref delta vs previous release baseline: `34200 us -> 9723 us`
 
 2. `exe-lua-O0.bc`
-   - single-run `pipeline wall`: `419 ms`
-   - `metrics.analysis_wall_us`: `219268`
-   - `pag_build_us`: `37446`
-   - `solve_us`: `35089`
-   - `transitive_modref_us`: `117233`
-   - `components_us`: `801`
-   - hyperfine mean: `435.1 ms ± 3.3 ms`
+   - single-run `pipeline wall`: `397 ms`
+   - `metrics.analysis_wall_us`: `160851`
+   - `pag_build_us`: `43358`
+   - `solve_us`: `43673`
+   - `transitive_modref_us`: `29078`
+   - `components_us`: `1167`
+   - hyperfine mean: `391.5 ms ± 9.1 ms`
+   - transitive mod/ref delta vs previous release baseline: `117233 us -> 29078 us`
 
 3. `exe-gifsicle-O0.bc`
-   - single-run `pipeline wall`: `289 ms`
-   - `metrics.analysis_wall_us`: `140280`
-   - `pag_build_us`: `27194`
-   - `solve_us`: `44399`
-   - `transitive_modref_us`: `46612`
-   - `components_us`: `466`
-   - hyperfine mean: `316.4 ms ± 8.9 ms`
+   - single-run `pipeline wall`: `303 ms`
+   - `metrics.analysis_wall_us`: `146427`
+   - `pag_build_us`: `34055`
+   - `solve_us`: `78012`
+   - `transitive_modref_us`: `11627`
+   - `components_us`: `671`
+   - hyperfine mean: `311.3 ms ± 4.1 ms`
+   - transitive mod/ref delta vs previous release baseline: `46612 us -> 11627 us`
 
 Interpretation:
-- `components` is negligible.
-- `transitive_modref` is still a major cost on `lua`.
-- `solve` and `transitive_modref` are comparable on `gifsicle`; neither should be
-  ignored.
-- `jq` is more balanced across PAG build, solve, and transitive closure.
+- the SCC/payload-interning rewrite substantially reduced `transitive_modref_us` on all
+  three modules
+- `components` is still negligible
+- `solve` is now the dominant internal phase on `gifsicle`
+- `lua` is no longer overwhelmingly closure-bound, though `transitive_modref` remains
+  material
+- `jq` remains more balanced, and the outer wall measurements were noisy enough that it
+  should be rerun on a quieter machine before drawing stronger conclusions from its
+  hyperfine mean
 - `analysis_wall_us` is lower than end-to-end `pipeline wall` and hyperfine because it
   excludes some CLI/process/export overhead; the outer wall is recorded in
   `manifest.json.wall_ms` and surfaced via `pangs report`.

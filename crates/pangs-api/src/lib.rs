@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
@@ -1602,29 +1603,42 @@ struct ModRefPayload {
     witness: Option<String>,
 }
 
-impl ModRefPayload {
-    fn sort_key(&self) -> (String, String, String, String) {
-        (
-            match &self.global {
-                GlobalTarget::Name(id) => format!("name:{}", id.0),
-                GlobalTarget::Unknown(reason) => format!("unknown:{reason}"),
-            },
-            format!("{:?}", self.access),
-            format!("{:?}", self.via),
-            self.witness.clone().unwrap_or_default(),
-        )
-    }
-}
-
 impl PartialOrd for ModRefPayload {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for ModRefPayload {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.sort_key().cmp(&other.sort_key())
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.global.cmp(&other.global) {
+            Ordering::Equal => {}
+            order => return order,
+        }
+        match access_rank(self.access).cmp(&access_rank(other.access)) {
+            Ordering::Equal => {}
+            order => return order,
+        }
+        match via_rank(self.via).cmp(&via_rank(other.via)) {
+            Ordering::Equal => {}
+            order => return order,
+        }
+        self.witness.cmp(&other.witness)
+    }
+}
+
+fn access_rank(access: Access) -> u8 {
+    match access {
+        Access::Ref => 0,
+        Access::Mod => 1,
+    }
+}
+
+fn via_rank(via: Via) -> u8 {
+    match via {
+        Via::Direct => 0,
+        Via::Aliased => 1,
+        Via::Unknown => 2,
     }
 }
 
@@ -1647,14 +1661,29 @@ fn compute_transitive_modrefs(
     }
 
     let (scc_members, scc_of_func) = strongly_connected_components(&callees_by_func);
-    let mut local_by_scc = vec![BTreeSet::<ModRefPayload>::new(); scc_members.len()];
+    let mut payload_ids = BTreeMap::<ModRefPayload, usize>::new();
+    let mut payloads = Vec::<ModRefPayload>::new();
+    let mut local_by_scc = vec![Vec::<usize>::new(); scc_members.len()];
     for mr in local_modrefs {
-        local_by_scc[scc_of_func[mr.func.0 as usize]].insert(ModRefPayload {
+        let payload = ModRefPayload {
             global: mr.global.clone(),
             access: mr.access,
             via: mr.via,
             witness: mr.witness.clone(),
-        });
+        };
+        let id = if let Some(&id) = payload_ids.get(&payload) {
+            id
+        } else {
+            let id = payloads.len();
+            payload_ids.insert(payload.clone(), id);
+            payloads.push(payload);
+            id
+        };
+        local_by_scc[scc_of_func[mr.func.0 as usize]].push(id);
+    }
+    for rows in &mut local_by_scc {
+        rows.sort_unstable();
+        rows.dedup();
     }
 
     let mut scc_succs = vec![Vec::<usize>::new(); scc_members.len()];
@@ -1672,9 +1701,9 @@ fn compute_transitive_modrefs(
         succs.dedup();
     }
 
-    let mut memo = vec![None::<BTreeSet<ModRefPayload>>; scc_members.len()];
+    let mut memo = vec![None::<Vec<usize>>; scc_members.len()];
     for scc in 0..scc_members.len() {
-        collect_scc_payloads(scc, &local_by_scc, &scc_succs, &mut memo);
+        collect_scc_payload_ids(scc, &local_by_scc, &scc_succs, &mut memo);
     }
 
     let mut transitive = Vec::with_capacity(func_count);
@@ -1684,37 +1713,66 @@ fn compute_transitive_modrefs(
             .as_ref()
             .unwrap()
             .iter()
-            .cloned()
-            .map(|payload| ModRef {
-                func: root,
-                global: payload.global,
-                access: payload.access,
-                via: payload.via,
-                witness: payload.witness,
+            .map(|&payload_id| {
+                let payload = &payloads[payload_id];
+                ModRef {
+                    func: root,
+                    global: payload.global.clone(),
+                    access: payload.access,
+                    via: payload.via,
+                    witness: payload.witness.clone(),
+                }
             })
             .collect::<Vec<_>>();
         rows.sort_by_key(|mr| modref_sort_key(mr, funcs, globals));
-        rows.dedup_by_key(|mr| modref_sort_key(mr, funcs, globals));
         transitive.push(rows);
     }
     transitive
 }
 
-fn collect_scc_payloads(
+fn collect_scc_payload_ids(
     scc: usize,
-    local_by_scc: &[BTreeSet<ModRefPayload>],
+    local_by_scc: &[Vec<usize>],
     scc_succs: &[Vec<usize>],
-    memo: &mut [Option<BTreeSet<ModRefPayload>>],
-) -> BTreeSet<ModRefPayload> {
+    memo: &mut [Option<Vec<usize>>],
+) -> Vec<usize> {
     if let Some(existing) = &memo[scc] {
         return existing.clone();
     }
     let mut rows = local_by_scc[scc].clone();
     for &succ in &scc_succs[scc] {
-        rows.extend(collect_scc_payloads(succ, local_by_scc, scc_succs, memo));
+        let succ_rows = collect_scc_payload_ids(succ, local_by_scc, scc_succs, memo);
+        rows = merge_sorted_unique(rows, succ_rows);
     }
+    rows.dedup();
     memo[scc] = Some(rows.clone());
     rows
+}
+
+fn merge_sorted_unique(left: Vec<usize>, right: Vec<usize>) -> Vec<usize> {
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let mut i = 0;
+    let mut j = 0;
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            Ordering::Less => {
+                merged.push(left[i]);
+                i += 1;
+            }
+            Ordering::Greater => {
+                merged.push(right[j]);
+                j += 1;
+            }
+            Ordering::Equal => {
+                merged.push(left[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    merged.extend_from_slice(&left[i..]);
+    merged.extend_from_slice(&right[j..]);
+    merged
 }
 
 fn strongly_connected_components(edges: &[Vec<usize>]) -> (Vec<Vec<usize>>, Vec<usize>) {
