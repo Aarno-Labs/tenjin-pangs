@@ -12,49 +12,53 @@ Environment:
 Command shape:
 - `target/release/pangs analyze <module> -o <out> --stage steens --build-mode executable --validate`
 
-Observed on June 14, 2026 after the first M1.7 timing + closure pass, measured in
-release mode. The numbers below are the current post-optimization baseline.
+Observed on June 14, 2026 after the M1.7 timing pass, the API closure optimization,
+and the solver identity/storage optimization, measured in release mode. The numbers
+below are the current post-optimization baseline.
 
 1. `exe-jq-O0.bc`
-   - single-run `pipeline wall`: `537 ms`
-   - `metrics.analysis_wall_us`: `207877`
-   - `pag_build_us`: `74206`
-   - `solve_us`: `62388`
-   - `transitive_modref_us`: `9723`
-   - `components_us`: `964`
-   - hyperfine mean: `575.8 ms ± 25.2 ms`
-   - transitive mod/ref delta vs previous release baseline: `34200 us -> 9723 us`
+   - single-run `pipeline wall`: `470 ms`
+   - `metrics.analysis_wall_us`: `182861`
+   - `pag_build_us`: `64411`
+   - `solve_us`: `58019`
+   - `transitive_modref_us`: `7494`
+   - `components_us`: `623`
+   - hyperfine mean: `491.3 ms ± 8.2 ms`
+   - transitive mod/ref delta vs previous release baseline: `34200 us -> 7494 us`
+   - solve delta vs previous release baseline: `51462 us -> 58019 us`
 
 2. `exe-lua-O0.bc`
-   - single-run `pipeline wall`: `397 ms`
-   - `metrics.analysis_wall_us`: `160851`
-   - `pag_build_us`: `43358`
-   - `solve_us`: `43673`
-   - `transitive_modref_us`: `29078`
-   - `components_us`: `1167`
-   - hyperfine mean: `391.5 ms ± 9.1 ms`
-   - transitive mod/ref delta vs previous release baseline: `117233 us -> 29078 us`
+   - single-run `pipeline wall`: `314 ms`
+   - `metrics.analysis_wall_us`: `123198`
+   - `pag_build_us`: `37499`
+   - `solve_us`: `35461`
+   - `transitive_modref_us`: `20132`
+   - `components_us`: `799`
+   - hyperfine mean: `341.4 ms ± 5.3 ms`
+   - transitive mod/ref delta vs previous release baseline: `117233 us -> 20132 us`
+   - solve delta vs previous release baseline: `35089 us -> 35461 us`
 
 3. `exe-gifsicle-O0.bc`
-   - single-run `pipeline wall`: `303 ms`
-   - `metrics.analysis_wall_us`: `146427`
-   - `pag_build_us`: `34055`
-   - `solve_us`: `78012`
-   - `transitive_modref_us`: `11627`
-   - `components_us`: `671`
-   - hyperfine mean: `311.3 ms ± 4.1 ms`
-   - transitive mod/ref delta vs previous release baseline: `46612 us -> 11627 us`
+   - single-run `pipeline wall`: `260 ms`
+   - `metrics.analysis_wall_us`: `109241`
+   - `pag_build_us`: `28220`
+   - `solve_us`: `48519`
+   - `transitive_modref_us`: `10957`
+   - `components_us`: `433`
+   - hyperfine mean: `275.7 ms ± 1.3 ms`
+   - transitive mod/ref delta vs previous release baseline: `46612 us -> 10957 us`
+   - solve delta vs previous release baseline: `44399 us -> 48519 us`
 
 Interpretation:
-- the SCC/payload-interning rewrite substantially reduced `transitive_modref_us` on all
-  three modules
+- the closure rewrite substantially reduced `transitive_modref_us` on all three modules
+- the solver ID-based refactor reduced end-to-end wall time on all three modules, even
+  though `solve_us` itself only improved materially on `gifsicle`
 - `components` is still negligible
-- `solve` is now the dominant internal phase on `gifsicle`
-- `lua` is no longer overwhelmingly closure-bound, though `transitive_modref` remains
-  material
-- `jq` remains more balanced, and the outer wall measurements were noisy enough that it
-  should be rerun on a quieter machine before drawing stronger conclusions from its
-  hyperfine mean
+- `solve` remains the dominant internal phase on `gifsicle`
+- `lua` is no longer closure-dominated; its remaining cost is split across PAG build,
+  solve, and transitive closure
+- `jq` is still more balanced, but its end-to-end wall improved enough that the
+  optimization should be kept despite the smaller internal solver win
 - `analysis_wall_us` is lower than end-to-end `pipeline wall` and hyperfine because it
   excludes some CLI/process/export overhead; the outer wall is recorded in
   `manifest.json.wall_ms` and surfaced via `pangs report`.

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use pangs_pag::{BuildMode, CallKind, NodeId, NodeKind, OmegaSeedKind, Pag, SeedTarget};
 use pangs_pir::{fsa_compatible, Pir, Signature};
@@ -73,9 +73,9 @@ struct ClassData {
     pointee: Option<usize>,
     ext: bool,
     esc: bool,
-    icall_sites: BTreeSet<usize>,
-    fn_objs: BTreeSet<String>,
-    global_objs: BTreeSet<String>,
+    icall_sites: HashSet<usize>,
+    fn_objs: HashSet<usize>,
+    global_objs: HashSet<usize>,
 }
 
 struct Solver<'a> {
@@ -83,36 +83,55 @@ struct Solver<'a> {
     pag: &'a Pag,
     build_mode: BuildMode,
     classes: Vec<ClassData>,
-    function_meta: BTreeMap<String, FunctionMeta>,
-    function_object_nodes: BTreeMap<String, NodeId>,
-    global_object_nodes: BTreeMap<String, NodeId>,
+    function_meta: Vec<FunctionMeta>,
+    function_name_to_index: HashMap<String, usize>,
+    function_keys: Vec<String>,
+    function_object_nodes: Vec<Option<NodeId>>,
+    global_keys: Vec<String>,
+    global_object_nodes: Vec<Option<NodeId>>,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
     worklist: VecDeque<usize>,
-    seen_pairs: BTreeSet<(usize, String)>,
-    external_applied: BTreeSet<usize>,
-    escaped_fn_applied: BTreeSet<String>,
+    seen_pairs: HashSet<(usize, usize)>,
+    external_applied: HashSet<usize>,
+    escaped_fn_applied: HashSet<usize>,
 }
 
 impl<'a> Solver<'a> {
     fn new(pir: &'a Pir, pag: &'a Pag, build_mode: BuildMode) -> Self {
-        let mut function_meta: BTreeMap<String, FunctionMeta> = pir
+        let function_keys = pir
             .functions
             .iter()
-            .map(|func| {
-                (
-                    func.key.clone(),
-                    FunctionMeta {
-                        sig: func.sig.clone(),
-                        address_taken: func.address_taken,
-                        external: func.external,
-                        param_nodes: Vec::new(),
-                        ret_node: None,
-                    },
-                )
+            .map(|func| func.key.clone())
+            .collect::<Vec<_>>();
+        let function_name_to_index = function_keys
+            .iter()
+            .enumerate()
+            .map(|(idx, key)| (key.clone(), idx))
+            .collect::<HashMap<_, _>>();
+        let mut function_meta = pir
+            .functions
+            .iter()
+            .map(|func| FunctionMeta {
+                sig: func.sig.clone(),
+                address_taken: func.address_taken,
+                external: func.external,
+                param_nodes: Vec::new(),
+                ret_node: None,
             })
-            .collect();
-        let mut function_object_nodes = BTreeMap::new();
-        let mut global_object_nodes = BTreeMap::new();
+            .collect::<Vec<_>>();
+        let mut function_object_nodes = vec![None; function_keys.len()];
+
+        let global_keys = pir
+            .globals
+            .iter()
+            .map(|global| global.key.clone())
+            .collect::<Vec<_>>();
+        let global_name_to_index = global_keys
+            .iter()
+            .enumerate()
+            .map(|(idx, key)| (key.clone(), idx))
+            .collect::<HashMap<_, _>>();
+        let mut global_object_nodes = vec![None; global_keys.len()];
 
         let mut classes = Vec::with_capacity(pag.nodes.len());
         for (index, node) in pag.nodes.iter().enumerate() {
@@ -125,17 +144,22 @@ impl<'a> Solver<'a> {
             match &node.kind {
                 NodeKind::Object { object, key, .. } => match object {
                     pangs_pag::ObjectKind::Function => {
-                        data.fn_objs.insert(key.clone());
-                        function_object_nodes.insert(key.clone(), node.id);
+                        if let Some(&func_index) = function_name_to_index.get(key) {
+                            data.fn_objs.insert(func_index);
+                            function_object_nodes[func_index] = Some(node.id);
+                        }
                     }
                     pangs_pag::ObjectKind::Global => {
-                        data.global_objs.insert(key.clone());
-                        global_object_nodes.insert(key.clone(), node.id);
+                        if let Some(&global_index) = global_name_to_index.get(key) {
+                            data.global_objs.insert(global_index);
+                            global_object_nodes[global_index] = Some(node.id);
+                        }
                     }
                     pangs_pag::ObjectKind::Alloca => {}
                 },
                 NodeKind::Param { func, index } => {
-                    if let Some(meta) = function_meta.get_mut(func) {
+                    if let Some(&func_index) = function_name_to_index.get(func) {
+                        let meta = &mut function_meta[func_index];
                         if meta.param_nodes.len() <= *index as usize {
                             meta.param_nodes
                                 .resize(*index as usize + 1, NodeId(u32::MAX));
@@ -144,8 +168,8 @@ impl<'a> Solver<'a> {
                     }
                 }
                 NodeKind::Return { func } => {
-                    if let Some(meta) = function_meta.get_mut(func) {
-                        meta.ret_node = Some(node.id);
+                    if let Some(&func_index) = function_name_to_index.get(func) {
+                        function_meta[func_index].ret_node = Some(node.id);
                     }
                 }
                 NodeKind::Value { .. } => {}
@@ -161,13 +185,16 @@ impl<'a> Solver<'a> {
             build_mode,
             classes,
             function_meta,
+            function_name_to_index,
+            function_keys,
             function_object_nodes,
+            global_keys,
             global_object_nodes,
             callsites_by_index,
             worklist: VecDeque::new(),
-            seen_pairs: BTreeSet::new(),
-            external_applied: BTreeSet::new(),
-            escaped_fn_applied: BTreeSet::new(),
+            seen_pairs: HashSet::new(),
+            external_applied: HashSet::new(),
+            escaped_fn_applied: HashSet::new(),
         }
     }
 
@@ -281,10 +308,11 @@ impl<'a> Solver<'a> {
         if self.build_mode != BuildMode::Executable {
             return;
         }
-        let Some(main) = self.function_meta.get("main").cloned() else {
+        let Some(&main_index) = self.function_name_to_index.get("main") else {
             return;
         };
-        for param in main.param_nodes.iter().skip(1).copied() {
+        let params = self.function_meta[main_index].param_nodes.clone();
+        for param in params.iter().skip(1).copied() {
             if param.0 != u32::MAX {
                 let class = self.class_of(param);
                 self.set_ext(class);
@@ -307,15 +335,15 @@ impl<'a> Solver<'a> {
             let mut targets = self.classes[root]
                 .fn_objs
                 .iter()
-                .filter_map(|key| {
-                    let meta = self.function_meta.get(key)?;
+                .filter_map(|&func_index| {
+                    let meta = &self.function_meta[func_index];
                     if !meta.address_taken {
                         return None;
                     }
                     if !fsa_compatible(&callsite.sig, &meta.sig) {
                         return None;
                     }
-                    Some(key.clone())
+                    Some(self.function_keys[func_index].clone())
                 })
                 .collect::<Vec<_>>();
             targets.sort();
@@ -327,14 +355,13 @@ impl<'a> Solver<'a> {
         }
 
         let mut unknown_callers = BTreeSet::new();
-        let function_keys = self.function_meta.keys().cloned().collect::<Vec<_>>();
-        for key in function_keys {
-            let Some(class) = self.function_object_class(&key) else {
+        for func_index in 0..self.function_meta.len() {
+            let Some(class) = self.function_object_class(func_index) else {
                 continue;
             };
             let root = self.find(class);
             if self.classes[root].esc {
-                unknown_callers.insert(key);
+                unknown_callers.insert(self.function_keys[func_index].clone());
             }
         }
 
@@ -349,8 +376,8 @@ impl<'a> Solver<'a> {
         }
 
         let mut globals = BTreeMap::new();
-        for global in &self.pir.globals {
-            let Some(class) = self.global_object_class(&global.key) else {
+        for (global_index, global) in self.pir.globals.iter().enumerate() {
+            let Some(class) = self.global_object_class(global_index) else {
                 continue;
             };
             let root = self.find(class);
@@ -382,7 +409,7 @@ impl<'a> Solver<'a> {
                     let mut globals = self.classes[pointee]
                         .global_objs
                         .iter()
-                        .cloned()
+                        .map(|&global_index| self.global_keys[global_index].clone())
                         .collect::<Vec<_>>();
                     globals.sort();
                     globals
@@ -449,24 +476,25 @@ impl<'a> Solver<'a> {
             let escaped = self.classes[root]
                 .fn_objs
                 .iter()
-                .cloned()
+                .copied()
                 .collect::<Vec<_>>();
-            for func in escaped {
-                if !self.escaped_fn_applied.insert(func.clone()) {
+            for func_index in escaped {
+                if !self.escaped_fn_applied.insert(func_index) {
                     continue;
                 }
-                if let Some(meta) = self.function_meta.get(&func).cloned() {
-                    for param in meta.param_nodes {
-                        if param.0 != u32::MAX {
-                            let class = self.class_of(param);
-                            self.set_ext(class);
-                        }
+                let meta = &self.function_meta[func_index];
+                let params = meta.param_nodes.clone();
+                let ret_node = meta.ret_node;
+                for param in params {
+                    if param.0 != u32::MAX {
+                        let class = self.class_of(param);
+                        self.set_ext(class);
                     }
-                    if let Some(ret) = meta.ret_node {
-                        let class = self.class_of(ret);
-                        let pointee = self.pointee_of(class);
-                        self.set_esc(pointee);
-                    }
+                }
+                if let Some(ret) = ret_node {
+                    let class = self.class_of(ret);
+                    let pointee = self.pointee_of(class);
+                    self.set_esc(pointee);
                 }
             }
         }
@@ -479,34 +507,36 @@ impl<'a> Solver<'a> {
         let funcs = self.classes[root]
             .fn_objs
             .iter()
-            .cloned()
+            .copied()
             .collect::<Vec<_>>();
         for site_index in site_ids {
             if ext {
                 self.apply_external_call(site_index);
             }
-            for func in &funcs {
-                if !self.seen_pairs.insert((site_index, func.clone())) {
+            for &func_index in &funcs {
+                if !self.seen_pairs.insert((site_index, func_index)) {
                     continue;
                 }
                 let callsite = self.callsites_by_index[site_index];
-                let Some(meta) = self.function_meta.get(func).cloned() else {
-                    continue;
-                };
+                let meta = &self.function_meta[func_index];
                 if !fsa_compatible(&callsite.sig, &meta.sig) {
                     continue;
                 }
-                self.bind_indirect_call(site_index, func, &meta);
+                self.bind_indirect_call(site_index, func_index);
             }
         }
     }
 
-    fn bind_indirect_call(&mut self, site_index: usize, func: &str, meta: &FunctionMeta) {
+    fn bind_indirect_call(&mut self, site_index: usize, func_index: usize) {
         let callsite = self.callsites_by_index[site_index];
-        if meta.external {
+        let (external, param_nodes, ret_node) = {
+            let meta = &self.function_meta[func_index];
+            (meta.external, meta.param_nodes.clone(), meta.ret_node)
+        };
+        if external {
             self.apply_external_call(site_index);
         }
-        for (arg, param) in callsite.args.iter().zip(meta.param_nodes.iter()) {
+        for (arg, param) in callsite.args.iter().zip(param_nodes.iter()) {
             if param.0 == u32::MAX {
                 continue;
             }
@@ -514,12 +544,11 @@ impl<'a> Solver<'a> {
             let param = self.class_of(*param);
             self.join(arg, param);
         }
-        if let (Some(result), Some(ret)) = (callsite.result, meta.ret_node) {
+        if let (Some(result), Some(ret)) = (callsite.result, ret_node) {
             let result = self.class_of(result);
             let ret = self.class_of(ret);
             self.join(result, ret);
         }
-        let _ = func;
     }
 
     fn apply_external_call(&mut self, site_index: usize) {
@@ -557,13 +586,19 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn function_object_class(&mut self, key: &str) -> Option<usize> {
-        let id = *self.function_object_nodes.get(key)?;
+    fn function_object_class(&mut self, func_index: usize) -> Option<usize> {
+        let id = self
+            .function_object_nodes
+            .get(func_index)
+            .and_then(|id| *id)?;
         Some(self.class_of(id))
     }
 
-    fn global_object_class(&mut self, key: &str) -> Option<usize> {
-        let id = *self.global_object_nodes.get(key)?;
+    fn global_object_class(&mut self, global_index: usize) -> Option<usize> {
+        let id = self
+            .global_object_nodes
+            .get(global_index)
+            .and_then(|id| *id)?;
         Some(self.class_of(id))
     }
 
