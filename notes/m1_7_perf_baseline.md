@@ -13,52 +13,53 @@ Command shape:
 - `target/release/pangs analyze <module> -o <out> --stage steens --build-mode executable --validate`
 
 Observed on June 14, 2026 after the M1.7 timing pass, the API closure optimization,
-and the solver identity/storage optimization, measured in release mode. The numbers
-below are the current post-optimization baseline.
+the solver identity/storage optimization, and the deduplicated solver worklist,
+measured in release mode. The numbers below are the current post-optimization
+baseline.
 
 1. `exe-jq-O0.bc`
-   - single-run `pipeline wall`: `470 ms`
-   - `metrics.analysis_wall_us`: `182861`
-   - `pag_build_us`: `64411`
-   - `solve_us`: `58019`
-   - `transitive_modref_us`: `7494`
-   - `components_us`: `623`
-   - hyperfine mean: `491.3 ms ± 8.2 ms`
+   - single-run `pipeline wall`: `497 ms`
+   - `metrics.analysis_wall_us`: `189458`
+   - `pag_build_us`: `76302`
+   - `solve_us`: `51444`
+   - `transitive_modref_us`: `7654`
+   - `components_us`: `666`
+   - hyperfine mean: `490.3 ms ± 7.3 ms`
    - transitive mod/ref delta vs previous release baseline: `34200 us -> 7494 us`
-   - solve delta vs previous release baseline: `51462 us -> 58019 us`
+   - solve delta vs previous release baseline: `51462 us -> 51444 us`
 
 2. `exe-lua-O0.bc`
-   - single-run `pipeline wall`: `314 ms`
-   - `metrics.analysis_wall_us`: `123198`
-   - `pag_build_us`: `37499`
-   - `solve_us`: `35461`
-   - `transitive_modref_us`: `20132`
-   - `components_us`: `799`
-   - hyperfine mean: `341.4 ms ± 5.3 ms`
+   - single-run `pipeline wall`: `307 ms`
+   - `metrics.analysis_wall_us`: `114493`
+   - `pag_build_us`: `36535`
+   - `solve_us`: `27265`
+   - `transitive_modref_us`: `21669`
+   - `components_us`: `708`
+   - hyperfine mean: `332.3 ms ± 0.9 ms`
    - transitive mod/ref delta vs previous release baseline: `117233 us -> 20132 us`
-   - solve delta vs previous release baseline: `35089 us -> 35461 us`
+   - solve delta vs previous release baseline: `35089 us -> 27265 us`
 
 3. `exe-gifsicle-O0.bc`
-   - single-run `pipeline wall`: `260 ms`
-   - `metrics.analysis_wall_us`: `109241`
-   - `pag_build_us`: `28220`
-   - `solve_us`: `48519`
-   - `transitive_modref_us`: `10957`
-   - `components_us`: `433`
-   - hyperfine mean: `275.7 ms ± 1.3 ms`
+   - single-run `pipeline wall`: `237 ms`
+   - `metrics.analysis_wall_us`: `86460`
+   - `pag_build_us`: `27616`
+   - `solve_us`: `23168`
+   - `transitive_modref_us`: `11660`
+   - `components_us`: `461`
+   - hyperfine mean: `258.1 ms ± 5.7 ms`
    - transitive mod/ref delta vs previous release baseline: `46612 us -> 10957 us`
-   - solve delta vs previous release baseline: `44399 us -> 48519 us`
+   - solve delta vs previous release baseline: `44399 us -> 23168 us`
 
 Interpretation:
 - the closure rewrite substantially reduced `transitive_modref_us` on all three modules
-- the solver ID-based refactor reduced end-to-end wall time on all three modules, even
-  though `solve_us` itself only improved materially on `gifsicle`
+- the solver ID-based refactor plus worklist dedup reduced end-to-end wall time on all
+  three modules
 - `components` is still negligible
-- `solve` remains the dominant internal phase on `gifsicle`
+- `solve` is no longer overwhelmingly dominant on `gifsicle`, though it remains one of
+  the two largest internal buckets
 - `lua` is no longer closure-dominated; its remaining cost is split across PAG build,
   solve, and transitive closure
-- `jq` is still more balanced, but its end-to-end wall improved enough that the
-  optimization should be kept despite the smaller internal solver win
+- `jq` is still more balanced and saw little solver-phase movement from the last pass
 - `analysis_wall_us` is lower than end-to-end `pipeline wall` and hyperfine because it
   excludes some CLI/process/export overhead; the outer wall is recorded in
   `manifest.json.wall_ms` and surfaced via `pangs report`.

@@ -91,6 +91,7 @@ struct Solver<'a> {
     global_object_nodes: Vec<Option<NodeId>>,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
     worklist: VecDeque<usize>,
+    queued: Vec<bool>,
     seen_pairs: HashSet<(usize, usize)>,
     external_applied: HashSet<usize>,
     escaped_fn_applied: HashSet<usize>,
@@ -178,6 +179,7 @@ impl<'a> Solver<'a> {
         }
 
         let callsites_by_index = pag.callsites.iter().collect();
+        let queued = vec![false; classes.len()];
 
         Self {
             pir,
@@ -192,6 +194,7 @@ impl<'a> Solver<'a> {
             global_object_nodes,
             callsites_by_index,
             worklist: VecDeque::new(),
+            queued,
             seen_pairs: HashSet::new(),
             external_applied: HashSet::new(),
             escaped_fn_applied: HashSet::new(),
@@ -205,6 +208,7 @@ impl<'a> Solver<'a> {
         self.seed_main_entry_params();
 
         while let Some(class) = self.worklist.pop_front() {
+            self.queued[class] = false;
             let root = self.find(class);
             self.process_class(root);
         }
@@ -617,6 +621,7 @@ impl<'a> Solver<'a> {
             size: 1,
             ..ClassData::default()
         });
+        self.queued.push(false);
         self.classes[root].pointee = Some(id);
         self.enqueue(root);
         id
@@ -674,6 +679,10 @@ impl<'a> Solver<'a> {
     }
 
     fn enqueue(&mut self, class: usize) {
+        if self.queued[class] {
+            return;
+        }
+        self.queued[class] = true;
         self.worklist.push_back(class);
     }
 
