@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{Analysis, AnalysisError, Callee, Caller, CallKind, Opts, Stage};
+use crate::{Analysis, AnalysisError, CallKind, Callee, Caller, Opts, Stage};
 
 /// One stage's facts, keyed by stable string keys so they compare across stages.
 struct StageFacts {
@@ -89,7 +89,10 @@ impl DifferentialReport {
 }
 
 /// Run all three stages on `module` and check the narrowing/monotonicity ledger.
-pub fn run_differential(module: &pangs_pir::Pir, base: &Opts) -> Result<DifferentialReport, AnalysisError> {
+pub fn run_differential(
+    module: &pangs_pir::Pir,
+    base: &Opts,
+) -> Result<DifferentialReport, AnalysisError> {
     let facts = |stage: Stage| -> Result<StageFacts, AnalysisError> {
         let opts = Opts {
             stage,
@@ -104,18 +107,65 @@ pub fn run_differential(module: &pangs_pir::Pir, base: &Opts) -> Result<Differen
     let mut report = DifferentialReport::default();
 
     // Indirect-call targets narrow: andersen ⊆ steens ⊆ conservative, per callsite.
-    check_targets(&mut report, "steens", &steens.icall_targets, "conservative", &cons.icall_targets);
-    check_targets(&mut report, "andersen", &ander.icall_targets, "steens", &steens.icall_targets);
+    check_targets(
+        &mut report,
+        "steens",
+        &steens.icall_targets,
+        "conservative",
+        &cons.icall_targets,
+    );
+    check_targets(
+        &mut report,
+        "andersen",
+        &ander.icall_targets,
+        "steens",
+        &steens.icall_targets,
+    );
 
     // No new Ω/unknown facts as precision rises.
-    check_subset(&mut report, "icall_unknown", "andersen", &ander.icall_unknown, "steens", &steens.icall_unknown);
-    check_subset(&mut report, "icall_unknown", "steens", &steens.icall_unknown, "conservative", &cons.icall_unknown);
-    check_subset(&mut report, "unknown_callers", "andersen", &ander.unknown_callers, "steens", &steens.unknown_callers);
-    check_subset(&mut report, "unknown_callers", "steens", &steens.unknown_callers, "conservative", &cons.unknown_callers);
+    check_subset(
+        &mut report,
+        "icall_unknown",
+        "andersen",
+        &ander.icall_unknown,
+        "steens",
+        &steens.icall_unknown,
+    );
+    check_subset(
+        &mut report,
+        "icall_unknown",
+        "steens",
+        &steens.icall_unknown,
+        "conservative",
+        &cons.icall_unknown,
+    );
+    check_subset(
+        &mut report,
+        "unknown_callers",
+        "andersen",
+        &ander.unknown_callers,
+        "steens",
+        &steens.unknown_callers,
+    );
+    check_subset(
+        &mut report,
+        "unknown_callers",
+        "steens",
+        &steens.unknown_callers,
+        "conservative",
+        &cons.unknown_callers,
+    );
 
     // steens → andersen share the pointer-aware mod/ref machinery; Andersen only refines
     // pts, so it can never *reveal* new aliased taint — coverage must be monotone here.
-    check_subset(&mut report, "rewritable_globals", "steens", &steens.rewritable_globals, "andersen", &ander.rewritable_globals);
+    check_subset(
+        &mut report,
+        "rewritable_globals",
+        "steens",
+        &steens.rewritable_globals,
+        "andersen",
+        &ander.rewritable_globals,
+    );
     if steens.in_rewritable_components > ander.in_rewritable_components {
         report.violations.push(format!(
             "in_rewritable_components dropped steens→andersen: steens={}, andersen={}",

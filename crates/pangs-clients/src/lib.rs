@@ -582,8 +582,7 @@ impl TraceReport {
 /// conceded it cannot bound that site, so no observed target there is a violation).
 pub fn check_traces(dir: &Path, trace: &Path) -> Result<TraceReport> {
     let callgraph = dir.join("callgraph.jsonl");
-    let file = File::open(&callgraph)
-        .with_context(|| format!("open {}", callgraph.display()))?;
+    let file = File::open(&callgraph).with_context(|| format!("open {}", callgraph.display()))?;
 
     // caller -> callsite_key -> (allowed targets, permissive?)
     use std::collections::{BTreeMap, BTreeSet};
@@ -630,8 +629,7 @@ pub fn check_traces(dir: &Path, trace: &Path) -> Result<TraceReport> {
         })
         .collect();
 
-    let trace_file = File::open(trace)
-        .with_context(|| format!("open {}", trace.display()))?;
+    let trace_file = File::open(trace).with_context(|| format!("open {}", trace.display()))?;
     let mut report = TraceReport::default();
     for line in BufReader::new(trace_file).lines() {
         let line = line?;

@@ -41,6 +41,12 @@ fn m1_7_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn m2_2_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m2_2")
+        .join(name)
+}
+
 fn scrub_timing_fields(mut metrics: Value) -> Value {
     let object = metrics.as_object_mut().unwrap();
     for key in [
@@ -77,10 +83,7 @@ fn two_distinct_loc_icalls_both_appear_in_callgraph() {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        let indirect: Vec<&Value> = edges
-            .iter()
-            .filter(|e| e["kind"] == "indirect")
-            .collect();
+        let indirect: Vec<&Value> = edges.iter().filter(|e| e["kind"] == "indirect").collect();
         let callees: Vec<&str> = indirect
             .iter()
             .filter_map(|e| e["callee"]["func"].as_str())
@@ -98,9 +101,43 @@ fn two_distinct_loc_icalls_both_appear_in_callgraph() {
             .iter()
             .filter_map(|e| e["callsite"].as_str())
             .collect();
-        assert!(keys.iter().any(|k| k.ends_with("#0")), "missing #0: {keys:?}");
-        assert!(keys.iter().any(|k| k.ends_with("#1")), "missing #1: {keys:?}");
+        assert!(
+            keys.iter().any(|k| k.ends_with("#0")),
+            "missing #0: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.ends_with("#1")),
+            "missing #1: {keys:?}"
+        );
     }
+}
+
+#[test]
+fn analyze_exports_m2_2_simple_icall_provenance() {
+    let fixture = m2_2_fixture("simple_local_assign.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "andersen");
+
+    let callgraph: Vec<Value> = fs::read_to_string(out.join("callgraph.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let indirect = callgraph
+        .iter()
+        .filter(|row| row["kind"] == "indirect")
+        .collect::<Vec<_>>();
+    assert_eq!(indirect.len(), 1, "{indirect:#?}");
+    assert_eq!(indirect[0]["callee"]["func"], "cb");
+    assert_eq!(indirect[0]["tier"], "simple");
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert_eq!(metrics["icalls_simple"], 1);
+    assert_eq!(metrics["icalls_andersen"], 0);
+    assert_eq!(metrics["icalls_unknown"], 0);
 }
 
 #[test]
@@ -1435,13 +1472,18 @@ fn differential_ledger_holds_on_synthetic_suite() {
             checked += 1;
         }
     }
-    assert!(checked >= 10, "expected ≥10 PIR fixtures, checked {checked}");
+    assert!(
+        checked >= 10,
+        "expected ≥10 PIR fixtures, checked {checked}"
+    );
 }
 
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
 
 fn workspace_path(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel)
 }
 
 /// M1.8 dynamic icall validation, end to end: compile a synthetic executable, instrument
@@ -1464,7 +1506,14 @@ fn dynamic_icall_trace_validates_against_andersen() {
 
     // 1. compile to bitcode
     assert!(Command::new(CLANG_14)
-        .args(["-O0", "-g", "-emit-llvm", "-Xclang", "-disable-O0-optnone", "-c"])
+        .args([
+            "-O0",
+            "-g",
+            "-emit-llvm",
+            "-Xclang",
+            "-disable-O0-optnone",
+            "-c"
+        ])
         .arg(&src)
         .arg("-o")
         .arg(&bc)
@@ -1547,7 +1596,14 @@ fn dynamic_multi_icall_trace_validates_both_sites() {
     let trace = tmp.path().join("trace.txt");
 
     assert!(Command::new(CLANG_14)
-        .args(["-O0", "-g", "-emit-llvm", "-Xclang", "-disable-O0-optnone", "-c"])
+        .args([
+            "-O0",
+            "-g",
+            "-emit-llvm",
+            "-Xclang",
+            "-disable-O0-optnone",
+            "-c"
+        ])
         .arg(&src)
         .arg("-o")
         .arg(&bc)
@@ -1566,7 +1622,10 @@ fn dynamic_multi_icall_trace_validates_both_sites() {
 
     // Both icall edges must be present in the analysis (the regression).
     let callgraph = fs::read_to_string(out.join("callgraph.jsonl")).unwrap();
-    assert!(callgraph.contains("\"func\":\"alpha\""), "alpha edge missing");
+    assert!(
+        callgraph.contains("\"func\":\"alpha\""),
+        "alpha edge missing"
+    );
     assert!(callgraph.contains("\"func\":\"beta\""), "beta edge missing");
 
     assert!(Command::new(env!("CARGO_BIN_EXE_pangs"))
@@ -1595,8 +1654,14 @@ fn dynamic_multi_icall_trace_validates_both_sites() {
     // The runtime resolves the externally-visible targets, so the trace carries the real
     // symbol names — confirming both sites were actually observed and validated.
     let trace_text = fs::read_to_string(&trace).unwrap();
-    assert!(trace_text.contains("\talpha"), "alpha not observed:\n{trace_text}");
-    assert!(trace_text.contains("\tbeta"), "beta not observed:\n{trace_text}");
+    assert!(
+        trace_text.contains("\talpha"),
+        "alpha not observed:\n{trace_text}"
+    );
+    assert!(
+        trace_text.contains("\tbeta"),
+        "beta not observed:\n{trace_text}"
+    );
 
     let check = Command::new(env!("CARGO_BIN_EXE_pangs"))
         .arg("check-traces")

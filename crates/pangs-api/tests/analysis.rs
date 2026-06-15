@@ -45,6 +45,27 @@ fn m1_7_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn m2_2_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m2_2")
+        .join(name)
+}
+
+fn assert_single_simple_target(analysis: &Analysis, target: &str) {
+    let target_id = analysis.lookup_func(target).unwrap();
+    let concrete_edges = analysis
+        .call_edges()
+        .iter()
+        .filter(|edge| edge.kind == pangs_api::CallKind::Indirect)
+        .collect::<Vec<_>>();
+    assert_eq!(concrete_edges.len(), 1, "{concrete_edges:#?}");
+    assert_eq!(concrete_edges[0].callee, pangs_api::Callee::Func(target_id));
+    assert_eq!(concrete_edges[0].tier, pangs_api::Tier::Simple);
+    assert_eq!(analysis.metrics().icalls_simple, 1);
+    assert_eq!(analysis.metrics().icalls_andersen, 0);
+    assert_eq!(analysis.metrics().icalls_unknown, 0);
+}
+
 #[test]
 fn unknown_caller_seeds_only_exported_external_and_address_taken_functions() {
     let pir = Pir {
@@ -119,6 +140,88 @@ fn unknown_caller_seeds_only_exported_external_and_address_taken_functions() {
     assert!(analysis.callers(cb).any(unknown_caller));
     assert!(analysis.callers(pub_fn).any(unknown_caller));
     assert!(analysis.callers(ext_decl).any(unknown_caller));
+}
+
+#[test]
+fn m2_2_simple_local_assign_icall_takes_exact_precedence() {
+    let pir = Pir::from_path(m2_2_fixture("simple_local_assign.pir.json")).unwrap();
+
+    let conservative = Analysis::run(&pir, &Opts::default()).unwrap();
+    let conservative_targets = conservative
+        .call_edges()
+        .iter()
+        .filter_map(|edge| match edge.callee {
+            pangs_api::Callee::Func(id) if edge.kind == pangs_api::CallKind::Indirect => {
+                Some(conservative.functions()[id].key.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        conservative_targets,
+        ["cb".to_string(), "other".to_string()]
+            .into_iter()
+            .collect()
+    );
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_single_simple_target(&analysis, "cb");
+}
+
+#[test]
+fn m2_2_simple_never_address_taken_global_slot_resolves_exactly() {
+    let pir = Pir::from_path(m2_2_fixture("simple_global_slot.pir.json")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_single_simple_target(&analysis, "cb");
+}
+
+#[test]
+fn m2_2_simple_param_actual_resolves_through_internal_direct_call() {
+    let pir = Pir::from_path(m2_2_fixture("simple_param_actual.pir.json")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_single_simple_target(&analysis, "cb");
+}
+
+#[test]
+fn m2_2_simple_return_value_resolves_through_internal_direct_call() {
+    let pir = Pir::from_path(m2_2_fixture("simple_return_value.pir.json")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_single_simple_target(&analysis, "cb");
 }
 
 #[test]

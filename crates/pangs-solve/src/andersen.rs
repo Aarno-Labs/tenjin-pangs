@@ -380,11 +380,7 @@ impl<'a> Refiner<'a> {
 
     /// Recompute each in-scope site's targets = FSA ∩ {address-taken functions in
     /// pts(operand)} from the solved points-to.
-    fn recompute_targets(
-        &self,
-        sites: &[usize],
-        pts: &Solve,
-    ) -> HashMap<usize, Vec<usize>> {
+    fn recompute_targets(&self, sites: &[usize], pts: &Solve) -> HashMap<usize, Vec<usize>> {
         let mut map = HashMap::new();
         for &site in sites {
             let cs = &self.pag.callsites[site];
@@ -427,13 +423,23 @@ impl<'a> Refiner<'a> {
             if in_scope.contains(&idx) {
                 let mut targets: Vec<String> = final_map
                     .get(&idx)
-                    .map(|fs| fs.iter().map(|&i| self.pir.functions[i].key.clone()).collect())
+                    .map(|fs| {
+                        fs.iter()
+                            .map(|&i| self.pir.functions[i].key.clone())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 targets.sort();
                 // M2.0 subset tripwire: a more-exact tier may only narrow. Andersen's
                 // per-site targets must be ⊆ the Steensgaard envelope it refined.
                 if let Some(steens) = steens {
-                    crate::debug_assert_narrows(&cs.key, "andersen", &targets, "steens", &steens.targets);
+                    crate::debug_assert_narrows(
+                        &cs.key,
+                        "andersen",
+                        &targets,
+                        "steens",
+                        &steens.targets,
+                    );
                 }
                 out.push(IndirectCallResolution {
                     callsite_key: cs.key.clone(),
@@ -476,7 +482,9 @@ impl<'a> Refiner<'a> {
 }
 
 fn maps_equal(a: &HashMap<usize, Vec<usize>>, b: &HashMap<usize, Vec<usize>>) -> bool {
-    a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).map(|w| w == v).unwrap_or(false))
+    a.len() == b.len()
+        && a.iter()
+            .all(|(k, v)| b.get(k).map(|w| w == v).unwrap_or(false))
 }
 
 /// One stateless inclusion solve over a fixed constraint set.
@@ -625,7 +633,11 @@ impl Solve {
 
         while let Some(n) = self.worklist.pop() {
             self.queued.remove(&n);
-            let objs: Vec<Cell> = self.pts.get(&n).map(|s| s.iter().copied().collect()).unwrap_or_default();
+            let objs: Vec<Cell> = self
+                .pts
+                .get(&n)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
 
             // n as a load base: p = *n  ⇒  pts(o) ⊆ pts(p)  for o ∈ pts(n)
             if let Some(ps) = self.loads.get(&n).cloned() {
@@ -661,8 +673,16 @@ impl Solve {
                     .filter(|&(d, s)| d == n || s == n)
                     .collect();
                 for (d, s) in relevant {
-                    let dobjs: Vec<Cell> = self.pts.get(&d).map(|s| s.iter().copied().collect()).unwrap_or_default();
-                    let sobjs: Vec<Cell> = self.pts.get(&s).map(|s| s.iter().copied().collect()).unwrap_or_default();
+                    let dobjs: Vec<Cell> = self
+                        .pts
+                        .get(&d)
+                        .map(|s| s.iter().copied().collect())
+                        .unwrap_or_default();
+                    let sobjs: Vec<Cell> = self
+                        .pts
+                        .get(&s)
+                        .map(|s| s.iter().copied().collect())
+                        .unwrap_or_default();
                     for &od in &dobjs {
                         for &os in &sobjs {
                             self.add_copy(os, od);
@@ -829,7 +849,11 @@ mod tests {
             .unwrap();
         assert_eq!(andersen_a.targets, vec!["g".to_string()]);
         // The drop only happens because the loop ran a second round.
-        assert!(andersen.metrics.rounds >= 2, "rounds={}", andersen.metrics.rounds);
+        assert!(
+            andersen.metrics.rounds >= 2,
+            "rounds={}",
+            andersen.metrics.rounds
+        );
     }
 
     #[test]
@@ -878,7 +902,10 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 10, "expected to check ≥10 fixtures, got {checked}");
+        assert!(
+            checked >= 10,
+            "expected to check ≥10 fixtures, got {checked}"
+        );
     }
 
     #[test]
@@ -894,7 +921,13 @@ mod tests {
         let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
         assert_eq!(steens.indirect_calls.len(), 2);
         for r in &steens.indirect_calls {
-            assert_eq!(r.targets.len(), 1, "steens dropped {}: {:?}", r.callsite_key, r.targets);
+            assert_eq!(
+                r.targets.len(),
+                1,
+                "steens dropped {}: {:?}",
+                r.callsite_key,
+                r.targets
+            );
             // Soundness: a resolved site must never be empty-without-unknown_callee.
             assert!(!(r.targets.is_empty() && !r.unknown_callee));
         }
@@ -909,7 +942,13 @@ mod tests {
         let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
         assert_eq!(andersen.indirect_calls.len(), 2);
         for r in &andersen.indirect_calls {
-            assert_eq!(r.targets.len(), 1, "andersen dropped {}: {:?}", r.callsite_key, r.targets);
+            assert_eq!(
+                r.targets.len(),
+                1,
+                "andersen dropped {}: {:?}",
+                r.callsite_key,
+                r.targets
+            );
         }
     }
 

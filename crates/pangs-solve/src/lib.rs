@@ -15,7 +15,7 @@ pub use andersen::solve_andersen;
 /// M2.2/M2.4). In release it is a no-op (we never widen silently — the coarser answer is
 /// already sound).
 #[track_caller]
-pub(crate) fn debug_assert_narrows(
+pub fn debug_assert_narrows(
     site: &str,
     refined_tier: &str,
     refined: &[String],
@@ -826,7 +826,13 @@ mod tests {
     #[test]
     fn narrowing_tripwire_is_silent_when_refined_is_a_subset() {
         // M2.0: a more-exact tier narrowing within the envelope must not fire.
-        debug_assert_narrows("site", "andersen", &["f".into()], "steens", &["f".into(), "g".into()]);
+        debug_assert_narrows(
+            "site",
+            "andersen",
+            &["f".into()],
+            "steens",
+            &["f".into(), "g".into()],
+        );
         debug_assert_narrows("site", "simple", &[], "steens", &["f".into()]);
     }
 

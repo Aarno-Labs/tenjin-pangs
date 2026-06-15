@@ -49,7 +49,7 @@
     },
     "tier": {
       "type": "string",
-      "enum": ["direct", "fsa", "steens", "andersen"]
+      "enum": ["direct", "fsa", "steens", "andersen", "simple"]
     }
   }
 }

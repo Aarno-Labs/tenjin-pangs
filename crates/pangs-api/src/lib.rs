@@ -4,12 +4,14 @@ use std::time::Instant;
 
 use pangs_pag::{BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts};
 use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, Stmt};
-use pangs_solve::{solve_andersen, solve_steensgaard, NodeResolution};
+use pangs_solve::{debug_assert_narrows, solve_andersen, solve_steensgaard, NodeResolution};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod differential;
+mod simple;
 pub use differential::{run_differential, DifferentialReport};
+use simple::{resolve_simple_icalls, SimpleIcallQuery, SimpleIcallResolution};
 
 #[derive(Debug, Error)]
 pub enum AnalysisError {
@@ -414,6 +416,7 @@ impl Analysis {
         let mut audit_taints = BTreeMap::<FuncId, Vec<Taint>>::new();
         let mut deferred_audits = Vec::<DeferredAudit>::new();
         let mut indirect_callsites = Vec::new();
+        let mut simple_icall_queries = Vec::new();
         let mut solver_metrics = None;
         let mut pag_build_us = 0;
         let mut solve_us = 0;
@@ -429,7 +432,7 @@ impl Analysis {
         for (func_idx, func) in module.functions.iter().enumerate() {
             let caller = FuncId(func_idx as u32);
             let mut aggregate_fnptrs = AggregateFnPtrState::default();
-            for stmt in &func.body {
+            for (stmt_idx, stmt) in func.body.iter().enumerate() {
                 match stmt {
                     Stmt::Alloca { .. } | Stmt::Assign { .. } | Stmt::Gep { .. } => {
                         aggregate_fnptrs.note(stmt);
@@ -483,7 +486,9 @@ impl Analysis {
                             });
                         }
                     }
-                    Stmt::CallIndirect { sig, loc, .. } => {
+                    Stmt::CallIndirect {
+                        operand, sig, loc, ..
+                    } => {
                         let cs = push_callsite(
                             &mut callsites,
                             &mut noloc_ord,
@@ -513,6 +518,14 @@ impl Analysis {
                             &callsite_key,
                         );
                         indirect_callsites.push((cs, caller, sig.clone()));
+                        simple_icall_queries.push(SimpleIcallQuery {
+                            callsite: cs,
+                            callsite_key,
+                            func_index: func_idx,
+                            stmt_index: stmt_idx,
+                            operand: operand.clone(),
+                            sig: sig.clone(),
+                        });
                     }
                     Stmt::Unknown {
                         reason,
@@ -614,6 +627,11 @@ impl Analysis {
                 }
             }
         }
+        let simple_icalls = resolve_simple_icalls(module, &simple_icall_queries);
+        let simple_queries: BTreeMap<CallsiteId, &SimpleIcallQuery> = simple_icall_queries
+            .iter()
+            .map(|query| (query.callsite, query))
+            .collect();
 
         match opts.stage {
             Stage::Conservative => {
@@ -680,6 +698,7 @@ impl Analysis {
                     .enumerate()
                     .map(|(idx, callsite)| (callsite.key.clone(), CallsiteId(idx as u32)))
                     .collect();
+                let mut simple_emitted = BTreeSet::new();
 
                 for solved_site in &solved.indirect_calls {
                     // Every solver-resolved indirect callsite MUST map back to a callsite
@@ -701,6 +720,22 @@ impl Analysis {
                         continue;
                     };
                     let caller = callsites[cs.0 as usize].caller;
+                    if let Some(simple) = simple_icalls.get(&cs) {
+                        if let Some(query) = simple_queries.get(&cs) {
+                            emit_simple_call_edges(
+                                &mut call_edges,
+                                module,
+                                &func_lookup,
+                                &address_taken,
+                                caller,
+                                cs,
+                                query,
+                                simple,
+                            );
+                            simple_emitted.insert(cs);
+                            continue;
+                        }
+                    }
                     // Oversize/uninteresting partitions keep the Steensgaard answer even
                     // under `--stage andersen`, so they are tagged `steens`.
                     let site_tier = match opts.stage {
@@ -728,6 +763,23 @@ impl Analysis {
                             kind: CallKind::Indirect,
                             tier: site_tier,
                         });
+                    }
+                }
+                for (cs, simple) in &simple_icalls {
+                    if simple_emitted.contains(cs) {
+                        continue;
+                    }
+                    if let Some(query) = simple_queries.get(cs) {
+                        emit_simple_call_edges(
+                            &mut call_edges,
+                            module,
+                            &func_lookup,
+                            &address_taken,
+                            callsites[cs.0 as usize].caller,
+                            *cs,
+                            query,
+                            simple,
+                        );
                     }
                 }
 
@@ -1095,6 +1147,61 @@ fn audit_witness(owner: &str, loc: &Option<pangs_pir::Loc>) -> String {
     match loc {
         Some(loc) => format!("{owner}@{}:{}:{}#0", loc.file, loc.line, loc.col),
         None => format!("{owner}@!noloc#0"),
+    }
+}
+
+fn emit_simple_call_edges(
+    call_edges: &mut Vec<CallEdge>,
+    module: &Pir,
+    func_lookup: &HashMap<String, FuncId>,
+    address_taken: &[(FuncId, &pangs_pir::Func)],
+    caller: FuncId,
+    callsite: CallsiteId,
+    query: &SimpleIcallQuery,
+    simple: &SimpleIcallResolution,
+) {
+    let mut fsa_envelope = address_taken
+        .iter()
+        .filter(|(_, func)| fsa_compatible(&query.sig, &func.sig))
+        .map(|(_, func)| func.key.clone())
+        .collect::<Vec<_>>();
+    fsa_envelope.sort();
+    fsa_envelope.dedup();
+    debug_assert_narrows(
+        &query.callsite_key,
+        "simple",
+        &simple.targets,
+        "fsa",
+        &fsa_envelope,
+    );
+    debug_assert!(
+        !simple.sites.is_empty(),
+        "simple resolver produced targets without reaching sites for {}",
+        query.callsite_key
+    );
+
+    for target in &simple.targets {
+        let Some(&callee_id) = func_lookup.get(target) else {
+            debug_assert!(
+                false,
+                "simple resolver returned non-module target {target:?} for {}",
+                query.callsite_key
+            );
+            continue;
+        };
+        let Some(func) = module.functions.iter().find(|func| func.key == *target) else {
+            continue;
+        };
+        if !fsa_compatible(&query.sig, &func.sig) {
+            continue;
+        }
+        call_edges.push(CallEdge {
+            caller: Caller::Func(caller),
+            callsite: Some(callsite),
+            callee: Callee::Func(callee_id),
+            kind: CallKind::Indirect,
+            tier: Tier::Simple,
+        });
     }
 }
 

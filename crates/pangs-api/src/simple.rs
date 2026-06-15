@@ -1,0 +1,770 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use pangs_pir::{fsa_compatible, Pir, Signature, Stmt};
+
+use crate::CallsiteId;
+
+const DEFAULT_CONTEXT_DEPTH: usize = 8;
+
+#[derive(Debug, Clone)]
+pub(crate) struct SimpleIcallQuery {
+    pub callsite: CallsiteId,
+    pub callsite_key: String,
+    pub func_index: usize,
+    pub stmt_index: usize,
+    pub operand: String,
+    pub sig: Signature,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SimpleIcallResolution {
+    pub targets: Vec<String>,
+    pub sites: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ValueResolution {
+    targets: BTreeSet<String>,
+    sites: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkResult {
+    Simple,
+    Complex,
+}
+
+pub(crate) fn resolve_simple_icalls(
+    module: &Pir,
+    queries: &[SimpleIcallQuery],
+) -> BTreeMap<CallsiteId, SimpleIcallResolution> {
+    let mut resolver = SimpleResolver::new(module);
+    let mut out = BTreeMap::new();
+    for query in queries {
+        if let Some(resolution) = resolver.resolve_query(query) {
+            out.insert(query.callsite, resolution);
+        }
+    }
+    out
+}
+
+struct SimpleResolver<'a> {
+    module: &'a Pir,
+    functions: HashMap<&'a str, usize>,
+    globals: HashSet<&'a str>,
+    definitions: Vec<HashMap<&'a str, usize>>,
+}
+
+impl<'a> SimpleResolver<'a> {
+    fn new(module: &'a Pir) -> Self {
+        let functions = module
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(index, func)| (func.key.as_str(), index))
+            .collect();
+        let globals = module
+            .globals
+            .iter()
+            .map(|global| global.key.as_str())
+            .collect();
+        let definitions = module
+            .functions
+            .iter()
+            .map(|func| {
+                let mut defs = HashMap::new();
+                for (index, stmt) in func.body.iter().enumerate() {
+                    if let Some(dest) = stmt_dest(stmt) {
+                        defs.insert(dest, index);
+                    }
+                }
+                defs
+            })
+            .collect();
+        Self {
+            module,
+            functions,
+            globals,
+            definitions,
+        }
+    }
+
+    fn resolve_query(&mut self, query: &SimpleIcallQuery) -> Option<SimpleIcallResolution> {
+        let mut value = ValueResolution::default();
+        let mut visiting = HashSet::new();
+        if self.resolve_value(
+            query.func_index,
+            query.stmt_index,
+            &query.operand,
+            0,
+            &mut visiting,
+            &mut value,
+        ) == WalkResult::Complex
+        {
+            return None;
+        }
+        if value.targets.is_empty() {
+            return None;
+        }
+        let mut targets = value.targets.into_iter().collect::<Vec<_>>();
+        targets.retain(|target| {
+            self.functions
+                .get(target.as_str())
+                .and_then(|&index| self.module.functions.get(index))
+                .map(|func| fsa_compatible(&query.sig, &func.sig))
+                .unwrap_or(false)
+        });
+        targets.sort();
+        targets.dedup();
+        if targets.is_empty() {
+            return None;
+        }
+        if targets
+            .iter()
+            .any(|target| self.function_has_unsafe_escape(target))
+        {
+            return None;
+        }
+        Some(SimpleIcallResolution {
+            targets,
+            sites: value.sites.into_iter().collect(),
+        })
+    }
+
+    fn resolve_value(
+        &mut self,
+        func_index: usize,
+        before_stmt: usize,
+        value: &str,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+        out: &mut ValueResolution,
+    ) -> WalkResult {
+        if depth > DEFAULT_CONTEXT_DEPTH {
+            return WalkResult::Complex;
+        }
+        if let Some(&target_index) = self.functions.get(value) {
+            let target = &self.module.functions[target_index];
+            out.targets.insert(target.key.clone());
+            out.sites.insert(format!(
+                "function:{}@{}",
+                target.key,
+                self.owner_key(func_index)
+            ));
+            return WalkResult::Simple;
+        }
+        if self.globals.contains(value) {
+            return self.resolve_global(value, depth, visiting, out);
+        }
+        if !visiting.insert((func_index, value.to_string(), depth)) {
+            return WalkResult::Simple;
+        }
+        let result = self.resolve_value_inner(func_index, before_stmt, value, depth, visiting, out);
+        visiting.remove(&(func_index, value.to_string(), depth));
+        result
+    }
+
+    fn resolve_value_inner(
+        &mut self,
+        func_index: usize,
+        before_stmt: usize,
+        value: &str,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+        out: &mut ValueResolution,
+    ) -> WalkResult {
+        if let Some(param_index) = self.param_index(func_index, value) {
+            return self.resolve_param_actuals(func_index, param_index, depth + 1, visiting, out);
+        }
+        let Some(&stmt_index) = self.definitions[func_index].get(value) else {
+            return WalkResult::Complex;
+        };
+        if stmt_index >= before_stmt {
+            return WalkResult::Complex;
+        }
+        match &self.module.functions[func_index].body[stmt_index] {
+            Stmt::Assign { sources, .. } => {
+                self.resolve_all_sources(func_index, stmt_index, sources, depth, visiting, out)
+            }
+            Stmt::Gep { base, .. } => {
+                self.resolve_value(func_index, stmt_index, base, depth, visiting, out)
+            }
+            Stmt::Load { address, .. } if self.globals.contains(address.as_str()) => {
+                self.resolve_global(address, depth, visiting, out)
+            }
+            Stmt::CallDirect { callee, .. } => {
+                self.resolve_return_values(callee, depth + 1, visiting, out)
+            }
+            Stmt::Alloca { .. }
+            | Stmt::Load { .. }
+            | Stmt::PtrToInt { .. }
+            | Stmt::IntToPtr { .. }
+            | Stmt::Memcpy { .. }
+            | Stmt::Memset { .. }
+            | Stmt::Unknown { .. }
+            | Stmt::CallIndirect { .. } => WalkResult::Complex,
+            Stmt::Store { .. } | Stmt::Return { .. } | Stmt::GlobalRef { .. } => {
+                WalkResult::Complex
+            }
+        }
+    }
+
+    fn resolve_all_sources(
+        &mut self,
+        func_index: usize,
+        before_stmt: usize,
+        sources: &[String],
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+        out: &mut ValueResolution,
+    ) -> WalkResult {
+        if sources.is_empty() {
+            return WalkResult::Complex;
+        }
+        for source in sources {
+            if self.resolve_value(func_index, before_stmt, source, depth, visiting, out)
+                == WalkResult::Complex
+            {
+                return WalkResult::Complex;
+            }
+        }
+        WalkResult::Simple
+    }
+
+    fn resolve_return_values(
+        &mut self,
+        callee: &str,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+        out: &mut ValueResolution,
+    ) -> WalkResult {
+        if depth > DEFAULT_CONTEXT_DEPTH {
+            return WalkResult::Complex;
+        }
+        let Some(&callee_index) = self.functions.get(callee) else {
+            return WalkResult::Complex;
+        };
+        let callee_func = &self.module.functions[callee_index];
+        if callee_func.external {
+            return WalkResult::Complex;
+        }
+        let mut saw_return = false;
+        for (stmt_index, stmt) in callee_func.body.iter().enumerate() {
+            if let Stmt::Return {
+                value: Some(value), ..
+            } = stmt
+            {
+                saw_return = true;
+                if self.resolve_value(callee_index, stmt_index, value, depth, visiting, out)
+                    == WalkResult::Complex
+                {
+                    return WalkResult::Complex;
+                }
+            }
+        }
+        if saw_return {
+            WalkResult::Simple
+        } else {
+            WalkResult::Complex
+        }
+    }
+
+    fn resolve_param_actuals(
+        &mut self,
+        callee_index: usize,
+        param_index: usize,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+        out: &mut ValueResolution,
+    ) -> WalkResult {
+        if depth > DEFAULT_CONTEXT_DEPTH {
+            return WalkResult::Complex;
+        }
+        let callee = self.module.functions[callee_index].key.clone();
+        let mut saw_call = false;
+        for caller_index in 0..self.module.functions.len() {
+            let body_len = self.module.functions[caller_index].body.len();
+            for stmt_index in 0..body_len {
+                let Stmt::CallDirect {
+                    callee: called,
+                    args,
+                    ..
+                } = &self.module.functions[caller_index].body[stmt_index]
+                else {
+                    continue;
+                };
+                if called != &callee {
+                    continue;
+                }
+                let Some(actual) = args.get(param_index).cloned() else {
+                    return WalkResult::Complex;
+                };
+                saw_call = true;
+                if self.resolve_value(caller_index, stmt_index, &actual, depth, visiting, out)
+                    == WalkResult::Complex
+                {
+                    return WalkResult::Complex;
+                }
+            }
+        }
+        if saw_call {
+            WalkResult::Simple
+        } else {
+            WalkResult::Complex
+        }
+    }
+
+    fn resolve_global(
+        &mut self,
+        global: &str,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+        out: &mut ValueResolution,
+    ) -> WalkResult {
+        if depth > DEFAULT_CONTEXT_DEPTH || !self.global_is_never_address_taken(global) {
+            return WalkResult::Complex;
+        }
+        let mut saw_store = false;
+        for func_index in 0..self.module.functions.len() {
+            let body_len = self.module.functions[func_index].body.len();
+            for stmt_index in 0..body_len {
+                let Stmt::Store { address, value, .. } =
+                    &self.module.functions[func_index].body[stmt_index]
+                else {
+                    continue;
+                };
+                if address != global {
+                    continue;
+                }
+                saw_store = true;
+                let value = value.clone();
+                if self.resolve_value(func_index, stmt_index, &value, depth, visiting, out)
+                    == WalkResult::Complex
+                {
+                    return WalkResult::Complex;
+                }
+            }
+        }
+        for (stmt_index, stmt) in self.module.global_init.iter().enumerate() {
+            let Stmt::Store { address, value, .. } = stmt else {
+                continue;
+            };
+            if address != global {
+                continue;
+            }
+            saw_store = true;
+            if self.resolve_global_init_value(stmt_index, value, depth, visiting, out)
+                == WalkResult::Complex
+            {
+                return WalkResult::Complex;
+            }
+        }
+        if saw_store {
+            WalkResult::Simple
+        } else {
+            WalkResult::Complex
+        }
+    }
+
+    fn resolve_global_init_value(
+        &mut self,
+        before_stmt: usize,
+        value: &str,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+        out: &mut ValueResolution,
+    ) -> WalkResult {
+        if let Some(&target_index) = self.functions.get(value) {
+            let target = &self.module.functions[target_index];
+            out.targets.insert(target.key.clone());
+            out.sites
+                .insert(format!("function:{}@global_init", target.key));
+            return WalkResult::Simple;
+        }
+        if self.globals.contains(value) {
+            return self.resolve_global(value, depth + 1, visiting, out);
+        }
+        for stmt_index in (0..before_stmt).rev() {
+            let Some(dest) = stmt_dest(&self.module.global_init[stmt_index]) else {
+                continue;
+            };
+            if dest != value {
+                continue;
+            }
+            return match &self.module.global_init[stmt_index] {
+                Stmt::Assign { sources, .. } => {
+                    self.resolve_all_global_init_sources(stmt_index, sources, depth, visiting, out)
+                }
+                Stmt::Gep { base, .. } => {
+                    self.resolve_global_init_value(stmt_index, base, depth, visiting, out)
+                }
+                _ => WalkResult::Complex,
+            };
+        }
+        WalkResult::Complex
+    }
+
+    fn resolve_all_global_init_sources(
+        &mut self,
+        before_stmt: usize,
+        sources: &[String],
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+        out: &mut ValueResolution,
+    ) -> WalkResult {
+        if sources.is_empty() {
+            return WalkResult::Complex;
+        }
+        for source in sources {
+            if self.resolve_global_init_value(before_stmt, source, depth, visiting, out)
+                == WalkResult::Complex
+            {
+                return WalkResult::Complex;
+            }
+        }
+        WalkResult::Simple
+    }
+
+    fn global_is_never_address_taken(&self, global: &str) -> bool {
+        if self
+            .module
+            .globals
+            .iter()
+            .find(|candidate| candidate.key == global)
+            .map(|candidate| candidate.exported)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        self.module.functions.iter().all(|func| {
+            func.body
+                .iter()
+                .all(|stmt| global_use_is_safe(stmt, global))
+        }) && self
+            .module
+            .global_init
+            .iter()
+            .all(|stmt| global_use_is_safe(stmt, global))
+    }
+
+    fn function_has_unsafe_escape(&self, target: &str) -> bool {
+        let mut visiting = HashSet::new();
+        for (func_index, func) in self.module.functions.iter().enumerate() {
+            for stmt in &func.body {
+                if self.function_symbol_use_escapes(func_index, stmt, target, 0, &mut visiting) {
+                    return true;
+                }
+            }
+        }
+        self.module.global_init.iter().any(|stmt| {
+            function_use_is_unsafe(stmt, target, |global| {
+                self.global_is_never_address_taken(global)
+            })
+        })
+    }
+
+    fn function_symbol_use_escapes(
+        &self,
+        func_index: usize,
+        stmt: &Stmt,
+        target: &str,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+    ) -> bool {
+        match stmt {
+            Stmt::Assign { dest, sources, .. } if sources.iter().any(|source| source == target) => {
+                self.local_value_escapes(func_index, dest, depth, visiting)
+            }
+            Stmt::Store { address, value, .. } if value == target => {
+                !self.global_is_never_address_taken(address)
+            }
+            Stmt::CallDirect {
+                callee, sig, args, ..
+            } => {
+                if callee == target {
+                    return true;
+                }
+                args.iter().enumerate().any(|(index, arg)| {
+                    arg == target
+                        && self.call_arg_escapes(callee, sig.vararg, index, target, depth, visiting)
+                })
+            }
+            Stmt::CallIndirect { operand, args, .. } => {
+                operand != target && args.iter().any(|arg| arg == target)
+            }
+            Stmt::Return { value, .. } if value.as_deref() == Some(target) => {
+                self.return_value_escapes(func_index, target, depth, visiting)
+            }
+            Stmt::Load { address, .. } => address == target,
+            Stmt::Gep { base, .. } => base == target,
+            Stmt::PtrToInt { source, .. } => source == target,
+            Stmt::IntToPtr { source, .. } => source == target,
+            Stmt::Memcpy { dst, src, .. } => dst == target || src == target,
+            Stmt::Memset { dst, value, .. } => dst == target || value == target,
+            Stmt::Unknown {
+                operands, results, ..
+            } => {
+                operands.iter().any(|operand| operand == target)
+                    || results.iter().any(|result| result == target)
+            }
+            Stmt::Alloca { .. }
+            | Stmt::Assign { .. }
+            | Stmt::Store { .. }
+            | Stmt::Return { .. }
+            | Stmt::GlobalRef { .. } => false,
+        }
+    }
+
+    fn local_value_escapes(
+        &self,
+        func_index: usize,
+        value: &str,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+    ) -> bool {
+        if depth > DEFAULT_CONTEXT_DEPTH {
+            return true;
+        }
+        if !visiting.insert((func_index, value.to_string(), depth)) {
+            return false;
+        }
+        let escapes = self.module.functions[func_index]
+            .body
+            .iter()
+            .any(|stmt| self.local_value_use_escapes(func_index, stmt, value, depth, visiting));
+        visiting.remove(&(func_index, value.to_string(), depth));
+        escapes
+    }
+
+    fn local_value_use_escapes(
+        &self,
+        func_index: usize,
+        stmt: &Stmt,
+        value: &str,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+    ) -> bool {
+        match stmt {
+            Stmt::Assign { dest, sources, .. } if sources.iter().any(|source| source == value) => {
+                self.local_value_escapes(func_index, dest, depth, visiting)
+            }
+            Stmt::Gep { dest, base, .. } if base == value => {
+                self.local_value_escapes(func_index, dest, depth, visiting)
+            }
+            Stmt::Store {
+                address,
+                value: stored,
+                ..
+            } if stored == value => !self.global_is_never_address_taken(address),
+            Stmt::CallDirect {
+                callee, sig, args, ..
+            } => args.iter().enumerate().any(|(index, arg)| {
+                arg == value
+                    && self.call_arg_escapes(callee, sig.vararg, index, value, depth, visiting)
+            }),
+            Stmt::Return {
+                value: Some(ret), ..
+            } if ret == value => self.return_value_escapes(func_index, value, depth, visiting),
+            Stmt::CallIndirect { operand, args, .. } => {
+                operand != value && args.iter().any(|arg| arg == value)
+            }
+            Stmt::Load { address, .. } => address == value,
+            Stmt::Store { address, .. } => address == value,
+            Stmt::PtrToInt { source, .. } => source == value,
+            Stmt::IntToPtr { source, .. } => source == value,
+            Stmt::Memcpy { dst, src, .. } => dst == value || src == value,
+            Stmt::Memset {
+                dst, value: fill, ..
+            } => dst == value || fill == value,
+            Stmt::Unknown {
+                operands, results, ..
+            } => {
+                operands.iter().any(|operand| operand == value)
+                    || results.iter().any(|result| result == value)
+            }
+            Stmt::Alloca { .. }
+            | Stmt::Assign { .. }
+            | Stmt::Gep { .. }
+            | Stmt::Return { .. }
+            | Stmt::GlobalRef { .. } => false,
+        }
+    }
+
+    fn call_arg_escapes(
+        &self,
+        callee: &str,
+        vararg: bool,
+        arg_index: usize,
+        _value: &str,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+    ) -> bool {
+        if vararg {
+            return true;
+        }
+        let Some(&callee_index) = self.functions.get(callee) else {
+            return true;
+        };
+        let callee_func = &self.module.functions[callee_index];
+        if callee_func.external {
+            return true;
+        }
+        let Some(param) = callee_func.param_names.get(arg_index) else {
+            return true;
+        };
+        self.local_value_escapes(callee_index, param, depth + 1, visiting)
+    }
+
+    fn return_value_escapes(
+        &self,
+        func_index: usize,
+        value: &str,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+    ) -> bool {
+        let func = &self.module.functions[func_index];
+        if func.external || func.exported || func.address_taken {
+            return true;
+        }
+        let mut saw_caller = false;
+        for caller_index in 0..self.module.functions.len() {
+            for stmt in &self.module.functions[caller_index].body {
+                let Stmt::CallDirect {
+                    callee,
+                    dest: Some(dest),
+                    ..
+                } = stmt
+                else {
+                    continue;
+                };
+                if callee != &func.key {
+                    continue;
+                }
+                saw_caller = true;
+                if self.local_value_escapes(caller_index, dest, depth + 1, visiting) {
+                    return true;
+                }
+            }
+        }
+        !saw_caller && !value.is_empty()
+    }
+
+    fn param_index(&self, func_index: usize, value: &str) -> Option<usize> {
+        self.module.functions[func_index]
+            .param_names
+            .iter()
+            .position(|param| param == value)
+    }
+
+    fn owner_key(&self, func_index: usize) -> &str {
+        self.module
+            .functions
+            .get(func_index)
+            .map(|func| func.key.as_str())
+            .unwrap_or("global_init")
+    }
+}
+
+fn stmt_dest(stmt: &Stmt) -> Option<&str> {
+    match stmt {
+        Stmt::Alloca { dest, .. }
+        | Stmt::Assign { dest, .. }
+        | Stmt::Load { dest, .. }
+        | Stmt::Gep { dest, .. }
+        | Stmt::PtrToInt { dest, .. }
+        | Stmt::IntToPtr { dest, .. } => Some(dest),
+        Stmt::CallDirect { dest, .. } | Stmt::CallIndirect { dest, .. } => dest.as_deref(),
+        Stmt::Unknown { results, .. } => results.first().map(String::as_str),
+        Stmt::Store { .. }
+        | Stmt::Memcpy { .. }
+        | Stmt::Memset { .. }
+        | Stmt::Return { .. }
+        | Stmt::GlobalRef { .. } => None,
+    }
+}
+
+fn global_use_is_safe(stmt: &Stmt, global: &str) -> bool {
+    match stmt {
+        Stmt::Load { address, .. } => address == global,
+        Stmt::Store { address, value, .. } => address == global && value != global,
+        Stmt::GlobalRef { .. } => true,
+        Stmt::Assign { dest, sources, .. } => {
+            dest != global && !sources.iter().any(|source| source == global)
+        }
+        Stmt::Gep { dest, base, .. } => dest != global && base != global,
+        Stmt::PtrToInt { dest, source, .. } | Stmt::IntToPtr { dest, source, .. } => {
+            dest != global && source != global
+        }
+        Stmt::Memcpy { dst, src, .. } => dst != global && src != global,
+        Stmt::Memset { dst, value, .. } => dst != global && value != global,
+        Stmt::Unknown {
+            operands, results, ..
+        } => {
+            !operands.iter().any(|operand| operand == global)
+                && !results.iter().any(|result| result == global)
+        }
+        Stmt::Return { value, .. } => value.as_deref() != Some(global),
+        Stmt::CallDirect {
+            callee, args, dest, ..
+        } => {
+            callee != global
+                && dest.as_deref() != Some(global)
+                && !args.iter().any(|arg| arg == global)
+        }
+        Stmt::CallIndirect {
+            operand,
+            args,
+            dest,
+            ..
+        } => {
+            operand != global
+                && dest.as_deref() != Some(global)
+                && !args.iter().any(|arg| arg == global)
+        }
+        Stmt::Alloca { dest, .. } => dest != global,
+    }
+}
+
+fn function_use_is_unsafe<F>(stmt: &Stmt, target: &str, mut global_is_safe_slot: F) -> bool
+where
+    F: FnMut(&str) -> bool,
+{
+    match stmt {
+        Stmt::Assign { .. } => false,
+        Stmt::Store { address, value, .. } if value == target => {
+            !global_is_safe_slot(address.as_str())
+        }
+        Stmt::Store { .. } => false,
+        Stmt::CallIndirect {
+            operand,
+            args,
+            dest,
+            ..
+        } => {
+            args.iter().any(|arg| arg == target)
+                || (operand != target && dest.as_deref() == Some(target))
+        }
+        Stmt::Load { address, .. } => address == target,
+        Stmt::Gep { base, .. } => base == target,
+        Stmt::PtrToInt { source, .. } => source == target,
+        Stmt::IntToPtr { source, .. } => source == target,
+        Stmt::Memcpy { dst, src, .. } => dst == target || src == target,
+        Stmt::Memset { dst, value, .. } => dst == target || value == target,
+        Stmt::Unknown {
+            operands, results, ..
+        } => {
+            operands.iter().any(|operand| operand == target)
+                || results.iter().any(|result| result == target)
+        }
+        Stmt::Return { value, .. } => value.as_deref() == Some(target),
+        Stmt::CallDirect {
+            callee, args, dest, ..
+        } => {
+            callee == target
+                || dest.as_deref() == Some(target)
+                || args.iter().any(|arg| arg == target)
+        }
+        Stmt::Alloca { dest, .. } => dest == target,
+        Stmt::GlobalRef { .. } => false,
+    }
+}
