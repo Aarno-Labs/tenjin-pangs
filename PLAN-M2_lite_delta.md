@@ -143,7 +143,7 @@ it is (a) an **exact resolver for dispatch-table icalls** (targets = InitVal of 
 object, fed through the same `exact_overrides` seam as B2, tagged `simple`), and (b) the
 input to the stationarity verdict. Acceptance fixtures and the ≤2-min-on-PHP budget stand.
 
-### M2.5 — Exact-precedence wiring + stationarity verdict *(re-shaped: 1–2 days, was 2–3)*
+### M2.5 — Exact-precedence wiring + stationarity verdict *(re-shaped: 1–2 days, was 2–3)* — **IMPLEMENTED**
 The full plan's two certificate checks split under lite:
 
 1. **Icall settlement at Steensgaard (CORAL Eq.1) — CUT.** Its purpose is to certify that
@@ -161,6 +161,24 @@ The full plan's two certificate checks split under lite:
 - **Acceptance:** coverage-metric delta on Vim/PHP (the step where M2 pays); flat
   per-provenance attribution table (M2.0) published; subset assertions green; the
   stationarity hand-audit completed.
+
+**Implementation status:**
+- B1/B2 exact-precedence is wired through `Tier::Simple` call edges with the existing
+  FSA subset tripwire. B1 InitVal exact dispatch-table resolution is applied after the
+  pointer-aware mod/ref pass computes stationarity, so the exact edge is only emitted for
+  globals certified stationary by solved mod/ref facts.
+- Stationarity verdicts are now materialized per global as
+  `StationarityVerdict { complete_initval, stationary, reason, runtime_writers }`.
+  Reasons distinguish `stationary`, `conservative_stage`, `incomplete_initval`,
+  `exported_global`, `runtime_writer`, and `unknown_runtime_writer`.
+- `stationarity.jsonl` is exported and schema-validated, giving the mandatory hand-audit a
+  normal artifact with writer witnesses instead of only aggregate metrics. The human
+  `pangs report` also prints flat icall provenance counts, confined functions, complete
+  InitVal globals, and stationary globals.
+- Synthetic coverage exercises the successful stationary table case, runtime writer
+  rejection, unknown-runtime-writer rejection, and incomplete/poisoned InitVal fallback.
+  Full workspace tests pass with LLVM 14. The real-corpus coverage delta and 20-verdict
+  hand audit remain M2.7 validation work, not implementation blockers.
 
 ### M2.6 — typed heap clones — **removed**
 `DESIGN_lite.md` §2A'/§3 cut typed heap clones from the design (not deferred). Heap
@@ -186,9 +204,11 @@ M2 step. Delete the row from the schedule.
   (`simple_icalls`, `confined_functions`, `globals_with_complete_initval`,
   `stationary_globals`). No cascade/certificate fields.
 - `manifest.json` `opts` records the B2 context-depth cap and whether B3 is enabled.
-- No new top-level JSONL stream is required for M2.0/M2.1; B1 `InitVal` and B2
-  `DefUseReachingSites` are internal pre-analysis tables, surfaced only as provenance tags
-  and metrics (a debug `pangs dump-initval` may be added for the M2.5 audit, optional).
+- `stationarity.jsonl` records one stationarity verdict per global for the M2.5 audit:
+  global key, InitVal completeness, stationary boolean, rejection reason, and runtime
+  writer witnesses. B1 `InitVal` slots and B2 `DefUseReachingSites` otherwise remain
+  internal pre-analysis tables, surfaced through provenance tags, metrics, and this
+  stationarity verdict stream.
 
 ## 3. Effort & risk deltas (vs `PLAN-M2.md` §3)
 

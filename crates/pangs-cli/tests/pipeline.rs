@@ -227,6 +227,17 @@ fn analyze_exports_m2_4_initval_dispatch_table_resolution() {
     assert!(globals.iter().any(|row| {
         row["key"] == "@Table" && row["mutable"] == true && row["stationary"] == true
     }));
+    let stationarity: Vec<Value> = fs::read_to_string(out.join("stationarity.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(stationarity.len(), 1, "{stationarity:#?}");
+    assert_eq!(stationarity[0]["global"], "@Table");
+    assert_eq!(stationarity[0]["complete_initval"], true);
+    assert_eq!(stationarity[0]["stationary"], true);
+    assert_eq!(stationarity[0]["reason"], "stationary");
+    assert_eq!(stationarity[0]["runtime_writers"], serde_json::json!([]));
 
     let components: Value =
         serde_json::from_str(&fs::read_to_string(out.join("components.json")).unwrap()).unwrap();
@@ -246,6 +257,35 @@ fn analyze_exports_m2_4_initval_dispatch_table_resolution() {
 }
 
 #[test]
+fn analyze_exports_m2_5_stationarity_unknown_writer_evidence() {
+    let fixture = m2_4_fixture("initval_unknown_runtime_mod_blocks_stationarity.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "andersen");
+
+    let stationarity: Vec<Value> = fs::read_to_string(out.join("stationarity.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(stationarity.len(), 1, "{stationarity:#?}");
+    assert_eq!(stationarity[0]["global"], "@Table");
+    assert_eq!(stationarity[0]["complete_initval"], true);
+    assert_eq!(stationarity[0]["stationary"], false);
+    assert_eq!(stationarity[0]["reason"], "unknown_runtime_writer");
+    assert!(stationarity[0]["runtime_writers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|writer| {
+            writer["func"] == "driver"
+                && writer["global"]["unknown"] == "omega_store"
+                && writer["access"] == "mod"
+        }));
+}
+
+#[test]
 fn analyze_validate_is_deterministic() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/synthetic/trivial/module.pir.json");
@@ -261,6 +301,7 @@ fn analyze_validate_is_deterministic() {
         "globals.jsonl",
         "callgraph.jsonl",
         "modref.jsonl",
+        "stationarity.jsonl",
         "components.json",
         "audit.jsonl",
     ] {
@@ -295,6 +336,7 @@ fn analyze_validate_llvm_noloc_is_deterministic() {
         "globals.jsonl",
         "callgraph.jsonl",
         "modref.jsonl",
+        "stationarity.jsonl",
         "components.json",
         "audit.jsonl",
     ] {
@@ -356,6 +398,7 @@ fn analyze_validate_checked_in_m1_1_fixtures() {
             "globals.jsonl",
             "callgraph.jsonl",
             "modref.jsonl",
+            "stationarity.jsonl",
             "components.json",
             "audit.jsonl",
             "metrics.json",
@@ -385,6 +428,7 @@ fn analyze_steens_stress_fixture_is_stable_except_for_timing_fields() {
         "globals.jsonl",
         "callgraph.jsonl",
         "modref.jsonl",
+        "stationarity.jsonl",
         "components.json",
         "audit.jsonl",
     ] {

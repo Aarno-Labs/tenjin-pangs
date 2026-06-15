@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use pangs_api::{Analysis, BuildMode, Caller, EscapeStatus, Opts, Stage};
+use pangs_api::{Analysis, BuildMode, Caller, EscapeStatus, Opts, Stage, StationarityReason};
 use pangs_pir::{AbiClass, Access, Func, Global, Param, Pir, Signature, Stmt};
 
 fn sig(ret: AbiClass, params: Vec<Param>) -> Signature {
@@ -375,6 +375,15 @@ fn m2_4_initval_stationary_dispatch_table_resolves_exactly() {
     let table = analysis.lookup_global("@Table").unwrap();
     assert!(analysis.globals()[table].mutable);
     assert!(analysis.globals()[table].stationary);
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == table)
+        .unwrap();
+    assert!(verdict.complete_initval);
+    assert!(verdict.stationary);
+    assert_eq!(verdict.reason, StationarityReason::Stationary);
+    assert!(verdict.runtime_writers.is_empty());
     let driver = analysis.lookup_func("driver").unwrap();
     let component = analysis.component(analysis.component_of(driver));
     assert!(
@@ -426,6 +435,15 @@ fn m2_4_alias_write_blocks_initval_stationarity() {
     let table = analysis.lookup_global("@Table").unwrap();
     assert!(analysis.globals()[table].mutable);
     assert!(!analysis.globals()[table].stationary);
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == table)
+        .unwrap();
+    assert!(verdict.complete_initval);
+    assert!(!verdict.stationary);
+    assert_eq!(verdict.reason, StationarityReason::RuntimeWriter);
+    assert!(!verdict.runtime_writers.is_empty());
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
     assert_eq!(analysis.metrics().stationary_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);
@@ -449,6 +467,13 @@ fn m2_4_unknown_initializer_poisons_initval() {
 
     let table = analysis.lookup_global("@Table").unwrap();
     assert!(!analysis.globals()[table].stationary);
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == table)
+        .unwrap();
+    assert!(!verdict.complete_initval);
+    assert_eq!(verdict.reason, StationarityReason::IncompleteInitval);
     assert_eq!(analysis.metrics().globals_with_complete_initval, 0);
     assert_eq!(analysis.metrics().stationary_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);
@@ -496,6 +521,17 @@ fn m2_4_unknown_runtime_mod_blocks_stationarity() {
     let table = analysis.lookup_global("@Table").unwrap();
     assert!(analysis.globals()[table].mutable);
     assert!(!analysis.globals()[table].stationary);
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == table)
+        .unwrap();
+    assert!(verdict.complete_initval);
+    assert_eq!(verdict.reason, StationarityReason::UnknownRuntimeWriter);
+    assert!(verdict
+        .runtime_writers
+        .iter()
+        .any(|writer| matches!(writer.global, pangs_api::GlobalTarget::Unknown(_))));
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
     assert_eq!(analysis.metrics().stationary_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);

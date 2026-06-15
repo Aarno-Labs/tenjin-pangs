@@ -209,6 +209,35 @@ pub struct Finding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StationarityVerdict {
+    pub global: GlobalId,
+    pub complete_initval: bool,
+    pub stationary: bool,
+    pub reason: StationarityReason,
+    pub runtime_writers: Vec<StationarityWriter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StationarityReason {
+    Stationary,
+    ConservativeStage,
+    IncompleteInitval,
+    ExportedGlobal,
+    RuntimeWriter,
+    UnknownRuntimeWriter,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StationarityWriter {
+    pub func: Option<FuncId>,
+    pub global: GlobalTarget,
+    pub access: Access,
+    pub via: Via,
+    pub witness: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metrics {
     pub functions: usize,
     pub globals: usize,
@@ -357,6 +386,7 @@ pub struct Analysis {
     callsites: Table<CallsiteId, CallsiteInfo>,
     call_edges: Vec<CallEdge>,
     modrefs: Vec<ModRef>,
+    stationarity: Vec<StationarityVerdict>,
     #[serde(skip)]
     transitive_modrefs: Vec<Vec<ModRef>>,
     components: Vec<ComponentInfo>,
@@ -863,10 +893,10 @@ impl Analysis {
         modrefs.sort_by_key(|mr| modref_sort_key(mr, &functions, &globals));
         modrefs.dedup_by_key(|mr| modref_sort_key(mr, &functions, &globals));
 
-        let stationary_globals = if opts.stage == Stage::Conservative {
-            BTreeSet::new()
+        let (stationary_globals, stationarity) = if opts.stage == Stage::Conservative {
+            conservative_stationarity_verdicts(module, &global_lookup)
         } else {
-            stationary_globals_from_modrefs(
+            stationarity_verdicts_from_modrefs(
                 module,
                 &initval_report.complete_globals,
                 &global_lookup,
@@ -1020,6 +1050,7 @@ impl Analysis {
             callsites: Table::new(callsites),
             call_edges,
             modrefs,
+            stationarity,
             transitive_modrefs,
             components,
             findings,
@@ -1047,6 +1078,10 @@ impl Analysis {
 
     pub fn modrefs(&self) -> &[ModRef] {
         &self.modrefs
+    }
+
+    pub fn stationarity_verdicts(&self) -> &[StationarityVerdict] {
+        &self.stationarity
     }
 
     pub fn components(&self) -> &[ComponentInfo] {
@@ -1266,14 +1301,37 @@ fn emit_simple_call_edges(
     }
 }
 
-fn stationary_globals_from_modrefs(
+fn conservative_stationarity_verdicts(
+    module: &Pir,
+    global_lookup: &HashMap<String, GlobalId>,
+) -> (BTreeSet<String>, Vec<StationarityVerdict>) {
+    let verdicts = module
+        .globals
+        .iter()
+        .filter_map(|global| {
+            global_lookup
+                .get(&global.key)
+                .copied()
+                .map(|gid| StationarityVerdict {
+                    global: gid,
+                    complete_initval: false,
+                    stationary: false,
+                    reason: StationarityReason::ConservativeStage,
+                    runtime_writers: Vec::new(),
+                })
+        })
+        .collect();
+    (BTreeSet::new(), verdicts)
+}
+
+fn stationarity_verdicts_from_modrefs(
     module: &Pir,
     complete_globals: &BTreeSet<String>,
     global_lookup: &HashMap<String, GlobalId>,
     modrefs: &[ModRef],
-) -> BTreeSet<String> {
-    let mut runtime_written = BTreeSet::<String>::new();
-    let mut unknown_write = false;
+) -> (BTreeSet<String>, Vec<StationarityVerdict>) {
+    let mut runtime_writers = BTreeMap::<String, Vec<StationarityWriter>>::new();
+    let mut unknown_writers = Vec::<StationarityWriter>::new();
     for mr in modrefs {
         if mr.access != Access::Mod {
             continue;
@@ -1283,20 +1341,78 @@ fn stationary_globals_from_modrefs(
                 let Some(global) = module.globals.get(gid.0 as usize) else {
                     continue;
                 };
-                runtime_written.insert(global.key.clone());
+                runtime_writers
+                    .entry(global.key.clone())
+                    .or_default()
+                    .push(stationarity_writer_from_modref(mr));
             }
-            GlobalTarget::Unknown(_) => unknown_write = true,
+            GlobalTarget::Unknown(_) => unknown_writers.push(stationarity_writer_from_modref(mr)),
         }
     }
-    module
-        .globals
-        .iter()
-        .filter(|global| complete_globals.contains(&global.key))
-        .filter(|global| !global.exported)
-        .filter(|global| global_lookup.contains_key(&global.key))
-        .filter(|global| !unknown_write && !runtime_written.contains(&global.key))
-        .map(|global| global.key.clone())
-        .collect()
+    for writers in runtime_writers.values_mut() {
+        writers.sort_by_key(stationarity_writer_sort_key);
+        writers.dedup_by_key(|writer| stationarity_writer_sort_key(writer));
+    }
+    unknown_writers.sort_by_key(stationarity_writer_sort_key);
+    unknown_writers.dedup_by_key(|writer| stationarity_writer_sort_key(writer));
+
+    let mut stationary_globals = BTreeSet::new();
+    let mut verdicts = Vec::new();
+    for global in &module.globals {
+        let Some(&gid) = global_lookup.get(&global.key) else {
+            continue;
+        };
+        let complete_initval = complete_globals.contains(&global.key);
+        let mut writers = Vec::new();
+        let reason = if !complete_initval {
+            StationarityReason::IncompleteInitval
+        } else if global.exported {
+            StationarityReason::ExportedGlobal
+        } else if !unknown_writers.is_empty() {
+            writers.extend(unknown_writers.iter().cloned());
+            StationarityReason::UnknownRuntimeWriter
+        } else if let Some(known_writers) = runtime_writers.get(&global.key) {
+            writers.extend(known_writers.iter().cloned());
+            StationarityReason::RuntimeWriter
+        } else {
+            stationary_globals.insert(global.key.clone());
+            StationarityReason::Stationary
+        };
+        verdicts.push(StationarityVerdict {
+            global: gid,
+            complete_initval,
+            stationary: reason == StationarityReason::Stationary,
+            reason,
+            runtime_writers: writers,
+        });
+    }
+    verdicts.sort_by_key(|verdict| module.globals[verdict.global.0 as usize].key.clone());
+    (stationary_globals, verdicts)
+}
+
+fn stationarity_writer_from_modref(mr: &ModRef) -> StationarityWriter {
+    StationarityWriter {
+        func: Some(mr.func),
+        global: mr.global.clone(),
+        access: mr.access,
+        via: mr.via,
+        witness: mr.witness.clone(),
+    }
+}
+
+fn stationarity_writer_sort_key(
+    writer: &StationarityWriter,
+) -> (Option<u32>, String, String, String, String) {
+    (
+        writer.func.map(|id| id.0),
+        match &writer.global {
+            GlobalTarget::Name(id) => format!("name:{}", id.0),
+            GlobalTarget::Unknown(reason) => format!("unknown:{reason}"),
+        },
+        format!("{:?}", writer.access),
+        format!("{:?}", writer.via),
+        writer.witness.clone().unwrap_or_default(),
+    )
 }
 
 fn apply_initval_exact_call_edges(

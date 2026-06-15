@@ -6,7 +6,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use jsonschema::JSONSchema;
 use pangs_api::{
-    Analysis, CallEdge, Callee, Caller, ComponentInfo, FuncId, GlobalId, GlobalTarget, ModRef, Opts,
+    Analysis, CallEdge, Callee, Caller, ComponentInfo, FuncId, GlobalId, GlobalTarget, ModRef,
+    Opts, StationarityVerdict, StationarityWriter,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -54,6 +55,14 @@ pub fn export_analysis(
         &mut files,
     )?;
     write_jsonl(
+        outdir.join("stationarity.jsonl"),
+        analysis
+            .stationarity_verdicts()
+            .iter()
+            .map(|verdict| StationarityRecord::from_verdict(verdict, analysis)),
+        &mut files,
+    )?;
+    write_jsonl(
         outdir.join("audit.jsonl"),
         analysis.audit_findings().iter(),
         &mut files,
@@ -95,6 +104,7 @@ pub fn validate_export_dir(outdir: &Path) -> Result<()> {
         "globals.jsonl",
         "callgraph.jsonl",
         "modref.jsonl",
+        "stationarity.jsonl",
         "audit.jsonl",
     ];
     for name in json_files {
@@ -172,10 +182,18 @@ pub fn report(outdir: &Path) -> Result<String> {
     )?;
     let wall_ms = manifest["wall_ms"].as_u64().unwrap_or(0);
     Ok(format!(
-        "functions: {}\nglobals: {}\ncall edges: {}\naudit findings: {}\nmutable globals rewritable: {}/{}\npipeline wall: {} ms\nanalysis wall: {} us\npag build: {} us\nsolve: {} us\ntransitive modref: {} us\ncomponents: {} us\n",
+        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\nconfined functions: {}\ninitval complete globals: {}\nstationary globals: {}\naudit findings: {}\nmutable globals rewritable: {}/{}\npipeline wall: {} ms\nanalysis wall: {} us\npag build: {} us\nsolve: {} us\ntransitive modref: {} us\ncomponents: {} us\n",
         metrics.functions,
         metrics.globals,
         metrics.call_edges,
+        metrics.icalls_simple,
+        metrics.icalls_andersen,
+        metrics.icalls_steens,
+        metrics.icalls_fsa,
+        metrics.icalls_unknown,
+        metrics.confined_functions,
+        metrics.globals_with_complete_initval,
+        metrics.stationary_globals,
         metrics.audit_findings,
         metrics.in_rewritable_components,
         metrics.mutable_globals_total,
@@ -336,6 +354,59 @@ impl ModRefRecord {
 enum GlobalRecordTarget {
     Name { name: String },
     Unknown { unknown: String },
+}
+
+#[derive(Serialize)]
+struct StationarityRecord {
+    global: String,
+    complete_initval: bool,
+    stationary: bool,
+    reason: pangs_api::StationarityReason,
+    runtime_writers: Vec<StationarityWriterRecord>,
+}
+
+impl StationarityRecord {
+    fn from_verdict(verdict: &StationarityVerdict, analysis: &Analysis) -> Self {
+        Self {
+            global: global_key(analysis, verdict.global),
+            complete_initval: verdict.complete_initval,
+            stationary: verdict.stationary,
+            reason: verdict.reason,
+            runtime_writers: verdict
+                .runtime_writers
+                .iter()
+                .map(|writer| StationarityWriterRecord::from_writer(writer, analysis))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct StationarityWriterRecord {
+    func: Option<String>,
+    global: GlobalRecordTarget,
+    access: pangs_pir::Access,
+    via: pangs_api::Via,
+    witness: Option<String>,
+}
+
+impl StationarityWriterRecord {
+    fn from_writer(writer: &StationarityWriter, analysis: &Analysis) -> Self {
+        Self {
+            func: writer.func.map(|id| func_key(analysis, id)),
+            global: match &writer.global {
+                GlobalTarget::Name(id) => GlobalRecordTarget::Name {
+                    name: global_key(analysis, *id),
+                },
+                GlobalTarget::Unknown(reason) => GlobalRecordTarget::Unknown {
+                    unknown: reason.clone(),
+                },
+            },
+            access: writer.access,
+            via: writer.via,
+            witness: writer.witness.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -551,6 +622,10 @@ mod tests {
         assert!(text.contains("solve: "));
         assert!(text.contains("transitive modref: "));
         assert!(text.contains("components: "));
+        assert!(text.contains("icalls by tier: "));
+        assert!(text.contains("confined functions: "));
+        assert!(text.contains("initval complete globals: "));
+        assert!(text.contains("stationary globals: "));
     }
 
     fn workspace_root() -> PathBuf {

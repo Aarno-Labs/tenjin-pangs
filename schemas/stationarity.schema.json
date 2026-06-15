@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PANGS stationarity stream",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "global",
+    "complete_initval",
+    "stationary",
+    "reason",
+    "runtime_writers"
+  ],
+  "$defs": {
+    "global_target": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["unknown"],
+          "properties": {
+            "unknown": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "writer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["func", "global", "access", "via", "witness"],
+      "properties": {
+        "func": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "global": {
+          "$ref": "#/$defs/global_target"
+        },
+        "access": {
+          "type": "string",
+          "enum": ["mod", "ref"]
+        },
+        "via": {
+          "type": "string",
+          "enum": ["direct", "aliased", "unknown"]
+        },
+        "witness": {
+          "type": ["string", "null"],
+          "minLength": 1
+        }
+      }
+    }
+  },
+  "properties": {
+    "global": {
+      "type": "string",
+      "minLength": 1
+    },
+    "complete_initval": {
+      "type": "boolean"
+    },
+    "stationary": {
+      "type": "boolean"
+    },
+    "reason": {
+      "type": "string",
+      "enum": [
+        "stationary",
+        "conservative_stage",
+        "incomplete_initval",
+        "exported_global",
+        "runtime_writer",
+        "unknown_runtime_writer"
+      ]
+    },
+    "runtime_writers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/writer"
+      }
+    }
+  }
+}
