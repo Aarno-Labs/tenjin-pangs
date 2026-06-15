@@ -79,18 +79,26 @@ three pre-existing soundness gaps in the lowering/solver — exactly the point o
    missing functions whose address is taken only via `select`/`phi`/etc.
    (`world` in a `?:`). Fixed in `crates/pangs-pir/src/llvm_sys.rs`
    (`collect_inst_address_taken` now scans all operands of other instructions).
-3. **Steensgaard over-merge on function-pointer-through-memory — OPEN (triaged: bug).**
-   With ≥2 global function pointers, or a global-fnptr store combined with a
-   select-into-local, steens (and the Andersen partition it seeds) drops one icall site's
-   targets to empty (a false-negative). Minimal repro lives in
-   `.m1_8_tmp`-style PIR bisection; isolated single-icall and pure-select fixtures resolve
-   correctly. This is in the Steensgaard unification / PAG memory-indirection handling,
-   not in the M1.4b Andersen additions, and is out of M1.8's scope to fix. **Follow-up:
-   file against M1.4/M1.3.** Until fixed, `check-traces` will (correctly) flag a violation
-   on programs that exercise it — the harness is doing its job.
+3. **Indirect-call edge dropped on multi-icall functions — FIXED.** Originally triaged
+   (incorrectly) as a Steensgaard over-merge on function-pointers-through-memory. The
+   solver was in fact correct; the real cause was a **callsite-key ordinal mismatch**
+   between `pangs-pag::add_callsite` (one per-function counter → `…:9:5#1`) and the API
+   export's `push_callsite` (per-distinct-loc counter → `…:9:5#0`). Any function with ≥2
+   calls at distinct source lines had its second-and-later resolved icall targets dropped
+   at the export join `callsite_by_key.get(key)` (silent `else { continue }`) — empty edge
+   set, no `unknown_callee`. The "through-memory" framing was a coincidence of the repro
+   fixtures, and the loc-dependence (noloc copies resolved fine) was the decisive clue.
+   Fixed in `crates/pangs-api/src/lib.rs` (`push_callsite` now uses the same per-caller
+   ordinal as pag), with a hard export-layer invariant (every solved icall must map to a
+   callsite) as the backstop. Regression: `fixtures/synthetic/m1_4b/two_global_fnptrs.pir.json`
+   + `pipeline.rs::two_distinct_loc_icalls_both_appear_in_callgraph`, and the dynamic
+   harness `pipeline.rs::dynamic_multi_icall_trace_validates_both_sites`. Full write-up in
+   `ju_steens_overmerge_bug.md`.
+   - *Still separate:* the const-array `memcpy` shape (`fn table[2]={f,g}; table[0]();`) is
+     a distinct M1.1/M1.3 coverage question, not this bug.
 
 ## 5. Caveat on full-scale corpus
 
-Per `PLAN-M1.md` §1, full-scale program validation (Vim/PHP) is deferred. Finding #3 means
-real-corpus icall coverage is currently understated; the differential ledger and trace
-harness are the tools to quantify it once #3 is fixed.
+Per `PLAN-M1.md` §1, full-scale program validation (Vim/PHP) is deferred. With finding #3
+now fixed, real-corpus icall coverage on multi-icall functions is no longer understated;
+the differential ledger and trace harness remain the tools to quantify coverage at scale.

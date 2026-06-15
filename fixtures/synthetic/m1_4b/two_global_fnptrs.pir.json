@@ -1,0 +1,36 @@
+{
+  "module": "m1_4b.two_global_fnptrs",
+  "comment": "Regression for the callsite-key ordinal mismatch (ju_steens_overmerge_bug.md): two indirect calls at DISTINCT source locations in one function. The solver keys them with a per-function ordinal (#0, #1) while the export layer used to key them per-distinct-loc (#0, #0); the mismatch silently dropped the second site's resolved targets from callgraph.jsonl. The distinct locs are load-bearing — a noloc variant does not reproduce.",
+  "functions": [
+    {
+      "key": "caller",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "store", "address": "@ga", "value": "@alpha", "loc": { "file": "fixtures/synthetic/m1_4b/two_global_fnptrs.c", "line": 6, "col": 8 } },
+        { "kind": "load", "dest": "%t0", "address": "@ga", "loc": { "file": "fixtures/synthetic/m1_4b/two_global_fnptrs.c", "line": 7, "col": 5 } },
+        {
+          "kind": "call_indirect",
+          "operand": "%t0",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": [],
+          "loc": { "file": "fixtures/synthetic/m1_4b/two_global_fnptrs.c", "line": 7, "col": 5 }
+        },
+        { "kind": "store", "address": "@gb", "value": "@beta", "loc": { "file": "fixtures/synthetic/m1_4b/two_global_fnptrs.c", "line": 8, "col": 8 } },
+        { "kind": "load", "dest": "%t1", "address": "@gb", "loc": { "file": "fixtures/synthetic/m1_4b/two_global_fnptrs.c", "line": 9, "col": 5 } },
+        {
+          "kind": "call_indirect",
+          "operand": "%t1",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": [],
+          "loc": { "file": "fixtures/synthetic/m1_4b/two_global_fnptrs.c", "line": 9, "col": 5 }
+        }
+      ]
+    },
+    { "key": "alpha", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "address_taken": true, "body": [] },
+    { "key": "beta", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "address_taken": true, "body": [] }
+  ],
+  "globals": [
+    { "key": "ga", "mutable": true, "exported": false },
+    { "key": "gb", "mutable": true, "exported": false }
+  ]
+}

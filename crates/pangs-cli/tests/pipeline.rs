@@ -55,6 +55,54 @@ fn scrub_timing_fields(mut metrics: Value) -> Value {
     metrics
 }
 
+/// Regression for the callsite-key ordinal mismatch (ju_steens_overmerge_bug.md).
+/// A function with two indirect calls at *distinct* source locations used to lose the
+/// second site's resolved targets from `callgraph.jsonl`: the solver keyed callsites with
+/// a per-function ordinal (`…:7:5#0`, `…:9:5#1`) while the export layer keyed them
+/// per-distinct-loc (`…:7:5#0`, `…:9:5#0`), so the export-time `callsite_by_key` lookup
+/// missed the second site and silently dropped its edge — a soundness false negative.
+/// Both indirect edges must now appear on both `steens` and `andersen`.
+#[test]
+fn two_distinct_loc_icalls_both_appear_in_callgraph() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_4b/two_global_fnptrs.pir.json");
+
+    for stage in ["steens", "andersen"] {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join(stage);
+        run_analyze_stage(&fixture, &out, stage);
+
+        let edges: Vec<Value> = fs::read_to_string(out.join("callgraph.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let indirect: Vec<&Value> = edges
+            .iter()
+            .filter(|e| e["kind"] == "indirect")
+            .collect();
+        let callees: Vec<&str> = indirect
+            .iter()
+            .filter_map(|e| e["callee"]["func"].as_str())
+            .collect();
+        assert!(
+            callees.contains(&"alpha"),
+            "{stage}: first icall site (alpha) missing: {indirect:?}"
+        );
+        assert!(
+            callees.contains(&"beta"),
+            "{stage}: second icall site (beta) dropped — callsite-key ordinal drift: {indirect:?}"
+        );
+        // The two sites have distinct keys ending in #0 and #1 (per-function ordinals).
+        let keys: Vec<&str> = indirect
+            .iter()
+            .filter_map(|e| e["callsite"].as_str())
+            .collect();
+        assert!(keys.iter().any(|k| k.ends_with("#0")), "missing #0: {keys:?}");
+        assert!(keys.iter().any(|k| k.ends_with("#1")), "missing #1: {keys:?}");
+    }
+}
+
 #[test]
 fn analyze_validate_is_deterministic() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1464,6 +1512,92 @@ fn dynamic_icall_trace_validates_against_andersen() {
         .success());
 
     // 6. validate the trace against the analysis (exit 0 == every pair in the edge set)
+    let check = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("check-traces")
+        .arg(&out)
+        .arg(&trace)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "check-traces failed:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+/// M1.8 dynamic validation on a *multi-icall* executable — the end-to-end counterpart of
+/// `two_distinct_loc_icalls_both_appear_in_callgraph`. Two indirect calls at distinct
+/// source lines must each produce a resolved, validated (caller, idx, target) trace pair.
+/// Guards the callsite-key ordinal fix (ju_steens_overmerge_bug.md) through real bitcode:
+/// before the fix the second site (`beta`) was dropped from the analysis edge set, so a
+/// resolved `beta` trace pair would make `check-traces` exit 3.
+#[test]
+fn dynamic_multi_icall_trace_validates_both_sites() {
+    assert!(
+        Path::new(CLANG_14).exists(),
+        "LLVM-14 clang is required for the M1.8 dynamic trace test"
+    );
+    let tmp = TempDir::new().unwrap();
+    let src = workspace_path("fixtures/synthetic/m1_8/two_icall_exec.c");
+    let runtime = workspace_path("scripts/pangs_trace_runtime.c");
+    let bc = tmp.path().join("exec.bc");
+    let inst = tmp.path().join("exec_inst.bc");
+    let exe = tmp.path().join("exec_inst");
+    let out = tmp.path().join("out");
+    let trace = tmp.path().join("trace.txt");
+
+    assert!(Command::new(CLANG_14)
+        .args(["-O0", "-g", "-emit-llvm", "-Xclang", "-disable-O0-optnone", "-c"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&bc)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .args(["analyze"])
+        .arg(&bc)
+        .arg("-o")
+        .arg(&out)
+        .args(["--build-mode", "executable"])
+        .status()
+        .unwrap()
+        .success());
+
+    // Both icall edges must be present in the analysis (the regression).
+    let callgraph = fs::read_to_string(out.join("callgraph.jsonl")).unwrap();
+    assert!(callgraph.contains("\"func\":\"alpha\""), "alpha edge missing");
+    assert!(callgraph.contains("\"func\":\"beta\""), "beta edge missing");
+
+    assert!(Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("instrument")
+        .arg(&bc)
+        .arg("-o")
+        .arg(&inst)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new(CLANG_14)
+        .args(["-O0"])
+        .arg(&inst)
+        .arg(&runtime)
+        .args(["-rdynamic", "-ldl", "-o"])
+        .arg(&exe)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new(&exe)
+        .env("PANGS_TRACE", &trace)
+        .status()
+        .unwrap()
+        .success());
+
+    // The runtime resolves the externally-visible targets, so the trace carries the real
+    // symbol names — confirming both sites were actually observed and validated.
+    let trace_text = fs::read_to_string(&trace).unwrap();
+    assert!(trace_text.contains("\talpha"), "alpha not observed:\n{trace_text}");
+    assert!(trace_text.contains("\tbeta"), "beta not observed:\n{trace_text}");
+
     let check = Command::new(env!("CARGO_BIN_EXE_pangs"))
         .arg("check-traces")
         .arg(&out)

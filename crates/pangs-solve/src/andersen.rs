@@ -794,6 +794,38 @@ mod tests {
     }
 
     #[test]
+    fn two_global_fnptrs_through_memory_resolve_both_sites() {
+        // Regression for the Steensgaard over-merge bug (ju_steens_overmerge_bug.md):
+        // two distinct global function pointers stored and loaded through memory in the
+        // same function form a cyclic pointee structure. The `join` recursion used to
+        // re-parent the destination root and orphan the merged pointee link, dropping the
+        // *second* icall site to empty targets with no `unknown_callee` — a silent false
+        // negative. Both sites must now resolve to their single target on both stages.
+        let (pir, pag) = load("two_global_fnptrs.pir.json");
+
+        let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert_eq!(steens.indirect_calls.len(), 2);
+        for r in &steens.indirect_calls {
+            assert_eq!(r.targets.len(), 1, "steens dropped {}: {:?}", r.callsite_key, r.targets);
+            // Soundness: a resolved site must never be empty-without-unknown_callee.
+            assert!(!(r.targets.is_empty() && !r.unknown_callee));
+        }
+        let steens_targets: Vec<&str> = steens
+            .indirect_calls
+            .iter()
+            .flat_map(|r| r.targets.iter().map(|t| t.as_str()))
+            .collect();
+        assert!(steens_targets.contains(&"alpha"));
+        assert!(steens_targets.contains(&"beta"));
+
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
+        assert_eq!(andersen.indirect_calls.len(), 2);
+        for r in &andersen.indirect_calls {
+            assert_eq!(r.targets.len(), 1, "andersen dropped {}: {:?}", r.callsite_key, r.targets);
+        }
+    }
+
+    #[test]
     fn oversize_budget_falls_back_to_steensgaard() {
         let (pir, pag) = load("field_sensitive_fnptr.pir.json");
         // A zero budget forces every partition oversize → Steensgaard answer, tagged fallback.

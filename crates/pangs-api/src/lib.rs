@@ -668,7 +668,22 @@ impl Analysis {
                     .collect();
 
                 for solved_site in &solved.indirect_calls {
+                    // Every solver-resolved indirect callsite MUST map back to a callsite
+                    // in this export's table — they are built from the same module body in
+                    // the same order. A miss means the callsite-key schemes have drifted
+                    // apart again (as they once did: per-function vs per-loc ordinals),
+                    // which silently drops this site's resolved targets — a soundness false
+                    // negative. Make that loud in debug; never widen silently in release.
                     let Some(&cs) = callsite_by_key.get(&solved_site.callsite_key) else {
+                        debug_assert!(
+                            false,
+                            "solved indirect callsite {} (targets={:?}, unknown_callee={}) \
+                             has no matching callsite key in the export table — \
+                             callsite-key scheme drift, see ju_steens_overmerge_bug.md",
+                            solved_site.callsite_key,
+                            solved_site.targets,
+                            solved_site.unknown_callee,
+                        );
                         continue;
                     };
                     let caller = callsites[cs.0 as usize].caller;
@@ -1066,12 +1081,15 @@ fn push_callsite(
     loc: &Option<pangs_pir::Loc>,
 ) -> CallsiteId {
     let id = CallsiteId(callsites.len() as u32);
+    // The callsite-key ordinal MUST match pag's `add_callsite` scheme: a single
+    // per-caller counter incremented for every call in body order, regardless of whether
+    // the call has a source location. Keying the ordinal per-distinct-loc (as this used
+    // to) silently diverges from pag whenever a function has ≥2 calls at different lines —
+    // the solver emits `…:9:5#1` while this table held `…:9:5#0`, so the export-time
+    // `callsite_by_key` lookup misses and that icall's resolved targets are dropped
+    // (a soundness false negative). See ju_steens_overmerge_bug.md.
+    let ord = next_noloc(noloc_ord, caller, "call");
     let (key, loc_info, synthetic) = if let Some(loc) = loc {
-        let ord = next_noloc(
-            noloc_ord,
-            caller,
-            &format!("call@{}:{}:{}", loc.file, loc.line, loc.col),
-        );
         (
             format!("{}@{}:{}:{}#{}", caller, loc.file, loc.line, loc.col, ord),
             Some(LocInfo {
@@ -1082,7 +1100,6 @@ fn push_callsite(
             false,
         )
     } else {
-        let ord = next_noloc(noloc_ord, caller, "call");
         (format!("{}@!noloc#{}", caller, ord), None, true)
     };
     callsites.push(CallsiteInfo {
