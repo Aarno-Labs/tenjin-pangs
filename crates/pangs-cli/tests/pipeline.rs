@@ -1354,3 +1354,125 @@ fn run_analyze_stage(fixture: &Path, out: &Path, stage: &str) {
         .unwrap();
     assert!(status.success());
 }
+
+/// M1.8 differential ledger: every synthetic PIR fixture must satisfy the cross-stage
+/// narrowing/monotonicity relations (`pangs differential` exits 0). A non-zero exit is a
+/// soundness regression, not a precision difference.
+#[test]
+fn differential_ledger_holds_on_synthetic_suite() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/synthetic");
+    let mut checked = 0;
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.to_string_lossy().ends_with(".pir.json") {
+                continue;
+            }
+            let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+                .arg("differential")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "differential failed on {}:\n{}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 10, "expected ≥10 PIR fixtures, checked {checked}");
+}
+
+const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
+
+fn workspace_path(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
+}
+
+/// M1.8 dynamic icall validation, end to end: compile a synthetic executable, instrument
+/// its indirect calls, link the trace runtime, run it, and assert `check-traces` confirms
+/// every observed (caller, idx, target) pair is in the andersen edge set.
+#[test]
+fn dynamic_icall_trace_validates_against_andersen() {
+    assert!(
+        Path::new(CLANG_14).exists(),
+        "LLVM-14 clang is required for the M1.8 dynamic trace test"
+    );
+    let tmp = TempDir::new().unwrap();
+    let src = workspace_path("fixtures/synthetic/m1_8/icall_exec.c");
+    let runtime = workspace_path("scripts/pangs_trace_runtime.c");
+    let bc = tmp.path().join("exec.bc");
+    let inst = tmp.path().join("exec_inst.bc");
+    let exe = tmp.path().join("exec_inst");
+    let out = tmp.path().join("out");
+    let trace = tmp.path().join("trace.txt");
+
+    // 1. compile to bitcode
+    assert!(Command::new(CLANG_14)
+        .args(["-O0", "-g", "-emit-llvm", "-Xclang", "-disable-O0-optnone", "-c"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&bc)
+        .status()
+        .unwrap()
+        .success());
+
+    // 2. analyze (default andersen)
+    assert!(Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .args(["analyze"])
+        .arg(&bc)
+        .arg("-o")
+        .arg(&out)
+        .args(["--build-mode", "executable"])
+        .status()
+        .unwrap()
+        .success());
+
+    // 3. instrument
+    assert!(Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("instrument")
+        .arg(&bc)
+        .arg("-o")
+        .arg(&inst)
+        .status()
+        .unwrap()
+        .success());
+
+    // 4. link instrumented module + trace runtime
+    assert!(Command::new(CLANG_14)
+        .args(["-O0"])
+        .arg(&inst)
+        .arg(&runtime)
+        .args(["-rdynamic", "-ldl", "-o"])
+        .arg(&exe)
+        .status()
+        .unwrap()
+        .success());
+
+    // 5. run with the trace sink
+    assert!(Command::new(&exe)
+        .env("PANGS_TRACE", &trace)
+        .status()
+        .unwrap()
+        .success());
+
+    // 6. validate the trace against the analysis (exit 0 == every pair in the edge set)
+    let check = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("check-traces")
+        .arg(&out)
+        .arg(&trace)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "check-traces failed:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}

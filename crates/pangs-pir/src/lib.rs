@@ -7,6 +7,13 @@ use thiserror::Error;
 
 mod llvm_sys;
 
+/// Instrument every indirect call in an LLVM `.bc`/`.ll` module with a runtime trace hook
+/// and write the result to `output` (M1.8 dynamic icall validation). Returns the number of
+/// instrumented sites.
+pub fn instrument_icalls(input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<usize, PirError> {
+    llvm_sys::instrument_icalls(input.as_ref(), output.as_ref())
+}
+
 #[derive(Debug, Error)]
 pub enum PirError {
     #[error("failed to read PIR input {path}: {source}")]

@@ -1360,7 +1360,13 @@ unsafe fn collect_inst_address_taken(
             collect_value_func_refs(ctx, LLVMGetOperand(inst, 0), out);
             collect_value_func_refs(ctx, LLVMGetOperand(inst, 1), out);
         }
-        _ => {}
+        // Any other instruction (select, phi, gep, insertvalue, ret, …) that names a
+        // function constant as an operand takes that function's address.
+        _ => {
+            for index in 0..LLVMGetNumOperands(inst) {
+                collect_value_func_refs(ctx, LLVMGetOperand(inst, index as u32), out);
+            }
+        }
     }
 }
 
@@ -2271,4 +2277,119 @@ fn push_unknown(
         loc,
     });
     lowering.bump_modeled("unknown");
+}
+
+// ---------------------------------------------------------------------------------------
+// M1.8 dynamic icall trace instrumentation.
+//
+// Inserts, before every *indirect* call, a call to the runtime hook
+//   void __pangs_trace_icall(const char *caller, int32_t idx, void *target)
+// where `idx` is the static index of this indirect call among the indirect calls of its
+// function, in instruction order. `check-traces` maps (caller, idx) to the analysis's
+// i-th indirect callsite for that caller — both sides count in the same order — so no
+// callsite-key string has to be re-derived here (the named M1.8 correspondence risk).
+
+use llvm_sys::bit_writer::LLVMWriteBitcodeToFile;
+
+pub fn instrument_icalls(input: &Path, output: &Path) -> Result<usize, PirError> {
+    let parsed = ParsedModule::from_path(input)?;
+    let count = unsafe { instrument_module(parsed.module) };
+    let out_str = output.display().to_string();
+    let c_out = CString::new(out_str.clone()).map_err(|_| PirError::Llvm {
+        path: out_str.clone(),
+        message: "path contains interior NUL".to_string(),
+    })?;
+    let rc = unsafe { LLVMWriteBitcodeToFile(parsed.module, c_out.as_ptr()) };
+    if rc != 0 {
+        return Err(PirError::Llvm {
+            path: out_str,
+            message: "failed to write instrumented bitcode".to_string(),
+        });
+    }
+    Ok(count)
+}
+
+unsafe fn instrument_module(module: LLVMModuleRef) -> usize {
+    let context = LLVMGetModuleContext(module);
+    let i8_ty = LLVMInt8TypeInContext(context);
+    let i8_ptr = LLVMPointerType(i8_ty, 0);
+    let i32_ty = LLVMInt32TypeInContext(context);
+    let void_ty = LLVMVoidTypeInContext(context);
+    let mut params = [i8_ptr, i32_ty, i8_ptr];
+    let hook_ty = LLVMFunctionType(void_ty, params.as_mut_ptr(), params.len() as u32, 0);
+
+    let hook_name = CString::new("__pangs_trace_icall").unwrap();
+    let mut hook = LLVMGetNamedFunction(module, hook_name.as_ptr());
+    if hook.is_null() {
+        hook = LLVMAddFunction(module, hook_name.as_ptr(), hook_ty);
+    }
+
+    let builder = LLVMCreateBuilderInContext(context);
+    let mut total = 0usize;
+
+    let mut function = LLVMGetFirstFunction(module);
+    while !function.is_null() {
+        if LLVMCountBasicBlocks(function) != 0 {
+            let caller = value_name(function);
+            let mut idx: u64 = 0;
+            let mut block = LLVMGetFirstBasicBlock(function);
+            while !block.is_null() {
+                let mut inst = LLVMGetFirstInstruction(block);
+                while !inst.is_null() {
+                    if is_indirect_call(inst) {
+                        emit_trace(builder, hook, hook_ty, i8_ptr, i32_ty, inst, &caller, idx);
+                        idx += 1;
+                        total += 1;
+                    }
+                    inst = LLVMGetNextInstruction(inst);
+                }
+                block = LLVMGetNextBasicBlock(block);
+            }
+        }
+        function = LLVMGetNextFunction(function);
+    }
+
+    LLVMDisposeBuilder(builder);
+    total
+}
+
+unsafe fn is_indirect_call(inst: LLVMValueRef) -> bool {
+    match LLVMGetInstructionOpcode(inst) {
+        LLVMOpcode::LLVMCall | LLVMOpcode::LLVMInvoke | LLVMOpcode::LLVMCallBr => {
+            let called = LLVMGetCalledValue(inst);
+            // Indirect iff the callee is neither inline asm nor a direct function symbol.
+            LLVMIsAInlineAsm(called).is_null() && LLVMIsAFunction(called).is_null()
+        }
+        _ => false,
+    }
+}
+
+unsafe fn emit_trace(
+    builder: LLVMBuilderRef,
+    hook: LLVMValueRef,
+    hook_ty: LLVMTypeRef,
+    i8_ptr: LLVMTypeRef,
+    i32_ty: LLVMTypeRef,
+    inst: LLVMValueRef,
+    caller: &str,
+    idx: u64,
+) {
+    LLVMPositionBuilderBefore(builder, inst);
+    let caller_c = CString::new(caller).unwrap_or_else(|_| CString::new("?").unwrap());
+    let name = CString::new("pangs_caller").unwrap();
+    let caller_ptr = LLVMBuildGlobalStringPtr(builder, caller_c.as_ptr(), name.as_ptr());
+    let idx_const = LLVMConstInt(i32_ty, idx, 0);
+    let called = LLVMGetCalledValue(inst);
+    let cast_name = CString::new("pangs_tgt").unwrap();
+    let target_ptr = LLVMBuildPointerCast(builder, called, i8_ptr, cast_name.as_ptr());
+    let mut args = [caller_ptr, idx_const, target_ptr];
+    let empty = CString::new("").unwrap();
+    LLVMBuildCall2(
+        builder,
+        hook_ty,
+        hook,
+        args.as_mut_ptr(),
+        args.len() as u32,
+        empty.as_ptr(),
+    );
 }

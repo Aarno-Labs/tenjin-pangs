@@ -1,0 +1,27 @@
+{
+  "module": "m1_4b.local_fnptr_indirection",
+  "functions": [
+    {
+      "key": "caller",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%local", "ty": "void ()*" },
+        { "kind": "store", "address": "%local", "value": "f" },
+        { "kind": "load", "dest": "%tmp", "address": "%local" },
+        {
+          "kind": "call_indirect",
+          "operand": "%tmp",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "f",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": []
+}

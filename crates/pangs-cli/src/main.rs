@@ -23,7 +23,9 @@ enum Command {
         module: PathBuf,
         #[arg(short, long)]
         out: PathBuf,
-        #[arg(long, default_value = "conservative")]
+        // Andersen is the M1 shipping answer (M1.4b); `conservative` and `steens` remain
+        // runnable regression floors.
+        #[arg(long, default_value = "andersen")]
         stage: StageArg,
         #[arg(long, default_value = "library")]
         build_mode: BuildModeArg,
@@ -58,6 +60,25 @@ enum Command {
     },
     Report {
         dir: PathBuf,
+    },
+    /// Run conservative→steens→andersen and check the narrowing/monotonicity ledger.
+    Differential {
+        module: PathBuf,
+        #[arg(long, default_value = "library")]
+        build_mode: BuildModeArg,
+        #[arg(long)]
+        exports: Option<PathBuf>,
+    },
+    /// Instrument every indirect call in a module, writing an instrumented `.bc`.
+    Instrument {
+        module: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
+    },
+    /// Validate a dynamic icall trace against an analysis export directory.
+    CheckTraces {
+        dir: PathBuf,
+        trace: PathBuf,
     },
 }
 
@@ -192,6 +213,48 @@ fn run() -> Result<()> {
         }
         Command::Report { dir } => {
             print!("{}", pangs_clients::report(&dir)?);
+        }
+        Command::Differential {
+            module,
+            build_mode,
+            exports,
+        } => {
+            let pir = Pir::from_path(&module)?;
+            let opts = Opts {
+                build_mode: build_mode.into(),
+                exports: read_exports(exports)?,
+                ..Opts::default()
+            };
+            let report = pangs_api::run_differential(&pir, &opts)?;
+            for note in &report.notes {
+                eprintln!("differential note: {note}");
+            }
+            if report.is_clean() {
+                eprintln!("differential: ok (andersen ⊆ steens ⊆ conservative; coverage sound)");
+            } else {
+                for violation in &report.violations {
+                    eprintln!("differential: {violation}");
+                }
+                std::process::exit(3);
+            }
+        }
+        Command::Instrument { module, out } => {
+            let count = pangs_pir::instrument_icalls(&module, &out)?;
+            eprintln!("instrument: {count} indirect call(s) → {}", out.display());
+        }
+        Command::CheckTraces { dir, trace } => {
+            let report = pangs_clients::check_traces(&dir, &trace)?;
+            eprintln!(
+                "check-traces: {} checked, {} unresolved",
+                report.checked, report.unresolved
+            );
+            if !report.is_clean() {
+                for violation in &report.violations {
+                    eprintln!("check-traces: {violation}");
+                }
+                std::process::exit(3);
+            }
+            eprintln!("check-traces: ok (all observed pairs in analysis edge set)");
         }
     }
     Ok(())

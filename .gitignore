@@ -5,3 +5,4 @@ ju_*
 libcurl-*-*/
 target/
 pdfs/
+.m1_8_tmp

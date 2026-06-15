@@ -1,0 +1,15 @@
+{
+  "functions": 4,
+  "globals": 0,
+  "callsites": 3,
+  "call_edges": 2,
+  "audit_findings": 0,
+  "mutable_globals_total": 0,
+  "in_rewritable_components": 0,
+  "partition_count": 13,
+  "partition_p50_size": 1,
+  "partition_p95_size": 4,
+  "partition_max_size": 5,
+  "oversize_fallbacks": 0,
+  "rounds": 3
+}

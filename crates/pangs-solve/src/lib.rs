@@ -4,6 +4,9 @@ use pangs_pag::{BuildMode, CallKind, NodeId, NodeKind, OmegaSeedKind, Pag, SeedT
 use pangs_pir::{fsa_compatible, Pir, Signature};
 use serde::{Deserialize, Serialize};
 
+mod andersen;
+pub use andersen::solve_andersen;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SolveMetrics {
     pub partition_count: usize,
@@ -35,6 +38,12 @@ pub struct IndirectCallResolution {
     pub targets: Vec<String>,
     #[serde(default)]
     pub unknown_callee: bool,
+    /// When true, this site's targets were *not* refined by Andersen (the owning
+    /// partition was uninteresting or exceeded the oversize budget) and carry the
+    /// Steensgaard answer; the API tags such edges `tier: steens` even under
+    /// `--stage andersen`.
+    #[serde(default)]
+    pub fallback: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -53,7 +62,47 @@ pub struct NodeResolution {
 }
 
 pub fn solve_steensgaard(pir: &Pir, pag: &Pag, build_mode: BuildMode) -> SolveResult {
-    Solver::new(pir, pag, build_mode).solve()
+    let mut solver = Solver::new(pir, pag, build_mode);
+    solver.run();
+    solver.finish()
+}
+
+/// Run Steensgaard and also export the final union-find class structure, which the
+/// Andersen pass (`andersen::solve_andersen`) consumes as Kahlon partitions plus the
+/// round-0 escape/pointee facts. The two are produced from one solve so the partition
+/// scoping and the round-0 call graph stay consistent.
+pub fn solve_steensgaard_with_classes(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: BuildMode,
+) -> (SolveResult, SteensClasses) {
+    let mut solver = Solver::new(pir, pag, build_mode);
+    solver.run();
+    let classes = solver.export_classes();
+    let result = solver.finish();
+    (result, classes)
+}
+
+/// Snapshot of the Steensgaard union-find after solving: for every PAG node, its class
+/// root, and for every class root, its pointee class and Ω bits. Class roots are indices
+/// into a universe that includes synthetic pointee classes beyond `pag.nodes.len()`.
+#[derive(Debug, Clone, Default)]
+pub struct SteensClasses {
+    /// `node_class[node_id] = class root` for the `pag.nodes.len()` base nodes.
+    pub node_class: Vec<usize>,
+    /// `pointee[root] = Some(pointee root)` when the class points somewhere.
+    pub pointee: Vec<Option<usize>>,
+    /// `ext[root]` — class members may point to external/escaped memory (PIP `p ⊒ Ω`).
+    pub ext: Vec<bool>,
+    /// `esc[root]` — class members are reachable by external code (PIP `Ω ⊒ {x}`).
+    pub esc: Vec<bool>,
+}
+
+impl SteensClasses {
+    /// Class root of a PAG node.
+    pub fn class_of(&self, node: NodeId) -> usize {
+        self.node_class[node.0 as usize]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +250,7 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn solve(mut self) -> SolveResult {
+    fn run(&mut self) {
         self.apply_edge_rules();
         self.register_indirect_calls();
         self.apply_seeds();
@@ -212,8 +261,34 @@ impl<'a> Solver<'a> {
             let root = self.find(class);
             self.process_class(root);
         }
+    }
 
-        self.finish()
+    /// Snapshot the solved union-find for the Andersen pass. Must be called after
+    /// `run()` and before `finish()` (which consumes `self`).
+    fn export_classes(&mut self) -> SteensClasses {
+        let n_nodes = self.pag.nodes.len();
+        let total = self.classes.len();
+        let mut node_class = vec![0usize; n_nodes];
+        for i in 0..n_nodes {
+            node_class[i] = self.find(i);
+        }
+        let mut pointee = vec![None; total];
+        let mut ext = vec![false; total];
+        let mut esc = vec![false; total];
+        for i in 0..total {
+            let root = self.find(i);
+            if root == i {
+                pointee[i] = self.classes[i].pointee.map(|p| self.find(p));
+                ext[i] = self.classes[i].ext;
+                esc[i] = self.classes[i].esc;
+            }
+        }
+        SteensClasses {
+            node_class,
+            pointee,
+            ext,
+            esc,
+        }
     }
 
     fn apply_edge_rules(&mut self) {
@@ -355,6 +430,7 @@ impl<'a> Solver<'a> {
                 callsite_key: callsite.key.clone(),
                 targets,
                 unknown_callee: self.classes[root].ext,
+                fallback: false,
             });
         }
 

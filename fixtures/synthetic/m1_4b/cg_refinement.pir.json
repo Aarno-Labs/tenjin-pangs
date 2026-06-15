@@ -1,0 +1,71 @@
+{
+  "module": "m1_4b.cg_refinement",
+  "functions": [
+    {
+      "key": "setup",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%s", "ty": "struct.S" },
+        { "kind": "gep", "dest": "%p0", "base": "%s", "byte_off": 0 },
+        { "kind": "store", "address": "%p0", "value": "dispatchA" },
+        { "kind": "gep", "dest": "%p1", "base": "%s", "byte_off": 8 },
+        { "kind": "store", "address": "%p1", "value": "dispatchB" },
+        { "kind": "gep", "dest": "%q0", "base": "%s", "byte_off": 0 },
+        { "kind": "load", "dest": "%fp", "address": "%q0" },
+        {
+          "kind": "call_indirect",
+          "operand": "%fp",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": [{ "class": "integer" }],
+            "cc": "ccc"
+          },
+          "args": ["g"]
+        }
+      ]
+    },
+    {
+      "key": "dispatchA",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [{ "class": "integer" }],
+        "cc": "ccc"
+      },
+      "param_names": ["cb"],
+      "address_taken": true,
+      "body": [
+        {
+          "kind": "call_indirect",
+          "operand": "cb",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "dispatchB",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [{ "class": "integer" }],
+        "cc": "ccc"
+      },
+      "param_names": ["cb"],
+      "address_taken": true,
+      "body": [
+        {
+          "kind": "call_indirect",
+          "operand": "cb",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "g",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": []
+}

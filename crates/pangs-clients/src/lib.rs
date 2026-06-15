@@ -460,7 +460,43 @@ mod tests {
     use pangs_pir::Pir;
     use tempfile::TempDir;
 
-    use super::{export_analysis, report, validate_export_dir};
+    use super::{check_traces, export_analysis, report, validate_export_dir};
+
+    #[test]
+    fn check_traces_flags_a_target_outside_the_edge_set() {
+        let dir = TempDir::new().unwrap();
+        // One indirect callsite resolved to {target}; no unknown edge → not permissive.
+        fs::write(
+            dir.path().join("callgraph.jsonl"),
+            "{\"caller\":{\"func\":\"main\"},\"callsite\":\"main@!noloc#0\",\"callee\":{\"func\":\"target\"},\"kind\":\"indirect\",\"tier\":\"andersen\"}\n",
+        )
+        .unwrap();
+        let trace = dir.path().join("trace.txt");
+
+        // Observed target in the set → clean.
+        fs::write(&trace, "main\t0\ttarget\n").unwrap();
+        assert!(check_traces(dir.path(), &trace).unwrap().is_clean());
+
+        // Observed target NOT in the set → violation (the soundness catch).
+        fs::write(&trace, "main\t0\trogue\n").unwrap();
+        let report = check_traces(dir.path(), &trace).unwrap();
+        assert!(!report.is_clean());
+        assert!(report.violations[0].contains("rogue"));
+    }
+
+    #[test]
+    fn check_traces_permits_targets_at_unknown_sites() {
+        let dir = TempDir::new().unwrap();
+        // Site carries an unknown (Ω) callee edge → permissive: any observed target is ok.
+        fs::write(
+            dir.path().join("callgraph.jsonl"),
+            "{\"caller\":{\"func\":\"main\"},\"callsite\":\"main@!noloc#0\",\"callee\":{\"unknown\":\"omega_fnptr\"},\"kind\":\"indirect\",\"tier\":\"andersen\"}\n",
+        )
+        .unwrap();
+        let trace = dir.path().join("trace.txt");
+        fs::write(&trace, "main\t0\tanything\n").unwrap();
+        assert!(check_traces(dir.path(), &trace).unwrap().is_clean());
+    }
 
     #[test]
     fn validate_export_dir_rejects_schema_mismatch() {
@@ -518,4 +554,127 @@ mod tests {
     fn workspace_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
+}
+
+/// Result of validating a dynamic icall trace against an export directory.
+#[derive(Debug, Default)]
+pub struct TraceReport {
+    /// (caller, idx, target) pairs that are not in the analysis's edge set.
+    pub violations: Vec<String>,
+    pub checked: usize,
+    /// Trace rows whose target could not be resolved to a symbol (dladdr "?").
+    pub unresolved: usize,
+}
+
+impl TraceReport {
+    pub fn is_clean(&self) -> bool {
+        self.violations.is_empty()
+    }
+}
+
+/// M1.8 dynamic icall validation: assert every observed `(caller, idx, target)` in a trace
+/// file is permitted by the analysis's indirect-call edge set in `dir/callgraph.jsonl`.
+///
+/// `idx` is the static index of an indirect call among its function's indirect calls (in
+/// instruction order). The analysis's indirect callsites for a caller, ordered by their
+/// key ordinal, are in the same order — so trace `idx` selects the matching callsite. A
+/// callsite that already carries an unknown (Ω) callee edge is permissive (the analysis
+/// conceded it cannot bound that site, so no observed target there is a violation).
+pub fn check_traces(dir: &Path, trace: &Path) -> Result<TraceReport> {
+    let callgraph = dir.join("callgraph.jsonl");
+    let file = File::open(&callgraph)
+        .with_context(|| format!("open {}", callgraph.display()))?;
+
+    // caller -> callsite_key -> (allowed targets, permissive?)
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut sites: BTreeMap<String, BTreeMap<String, (BTreeSet<String>, bool)>> = BTreeMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(&line)?;
+        if row.get("kind").and_then(Value::as_str) != Some("indirect") {
+            continue;
+        }
+        let Some(caller) = row["caller"].get("func").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(callsite) = row.get("callsite").and_then(Value::as_str) else {
+            continue;
+        };
+        let entry = sites
+            .entry(caller.to_string())
+            .or_default()
+            .entry(callsite.to_string())
+            .or_insert_with(|| (BTreeSet::new(), false));
+        match (&row["callee"]).get("func").and_then(Value::as_str) {
+            Some(func) => {
+                entry.0.insert(func.to_string());
+            }
+            None => {
+                // unknown/Ω callee → permissive site
+                entry.1 = true;
+            }
+        }
+    }
+
+    // For each caller, order its indirect callsite keys by their ordinal (the trailing
+    // `#<n>` segment), giving the same index the runtime counts.
+    let ordered: BTreeMap<String, Vec<String>> = sites
+        .iter()
+        .map(|(caller, by_key)| {
+            let mut keys: Vec<String> = by_key.keys().cloned().collect();
+            keys.sort_by_key(|k| key_ordinal(k));
+            (caller.clone(), keys)
+        })
+        .collect();
+
+    let trace_file = File::open(trace)
+        .with_context(|| format!("open {}", trace.display()))?;
+    let mut report = TraceReport::default();
+    for line in BufReader::new(trace_file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let caller = cols.next().unwrap_or("").to_string();
+        let idx: usize = cols.next().unwrap_or("").parse().unwrap_or(usize::MAX);
+        let target = cols.next().unwrap_or("").to_string();
+        report.checked += 1;
+        if target == "?" {
+            report.unresolved += 1;
+            continue;
+        }
+        let Some(keys) = ordered.get(&caller) else {
+            report.violations.push(format!(
+                "{caller}#{idx}: caller has no indirect callsites in the analysis, observed target {target}"
+            ));
+            continue;
+        };
+        let Some(key) = keys.get(idx) else {
+            report.violations.push(format!(
+                "{caller}#{idx}: observed indirect call index out of range (analysis has {} sites), target {target}",
+                keys.len()
+            ));
+            continue;
+        };
+        let (allowed, permissive) = &sites[&caller][key];
+        if *permissive || allowed.contains(&target) {
+            continue;
+        }
+        report.violations.push(format!(
+            "{key}: observed target {target} not in analysis edge set {{{}}}",
+            allowed.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    Ok(report)
+}
+
+/// Parse the trailing `#<n>` ordinal of a callsite key; keys without one sort last.
+fn key_ordinal(key: &str) -> u64 {
+    key.rsplit_once('#')
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or(u64::MAX)
 }

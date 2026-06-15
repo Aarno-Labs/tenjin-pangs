@@ -4,9 +4,12 @@ use std::time::Instant;
 
 use pangs_pag::{BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts};
 use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, Stmt};
-use pangs_solve::{solve_steensgaard, NodeResolution};
+use pangs_solve::{solve_andersen, solve_steensgaard, NodeResolution};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod differential;
+pub use differential::{run_differential, DifferentialReport};
 
 #[derive(Debug, Error)]
 pub enum AnalysisError {
@@ -643,7 +646,12 @@ impl Analysis {
                 );
                 pag_build_us = pag_started.elapsed().as_micros() as u64;
                 let solve_started = Instant::now();
-                let solved = solve_steensgaard(module, &pag, opts.build_mode.into());
+                let solved = match opts.stage {
+                    Stage::Andersen => {
+                        solve_andersen(module, &pag, opts.build_mode.into(), opts.partition_budget)
+                    }
+                    _ => solve_steensgaard(module, &pag, opts.build_mode.into()),
+                };
                 solve_us = solve_started.elapsed().as_micros() as u64;
                 solver_metrics = Some(solved.metrics.clone());
                 emit_deferred_steens_audits(
@@ -664,6 +672,14 @@ impl Analysis {
                         continue;
                     };
                     let caller = callsites[cs.0 as usize].caller;
+                    // Oversize/uninteresting partitions keep the Steensgaard answer even
+                    // under `--stage andersen`, so they are tagged `steens`.
+                    let site_tier = match opts.stage {
+                        Stage::Steens => Tier::Steens,
+                        Stage::Andersen if solved_site.fallback => Tier::Steens,
+                        Stage::Andersen => Tier::Andersen,
+                        Stage::Conservative => unreachable!(),
+                    };
                     for target in &solved_site.targets {
                         if let Some(&callee_id) = func_lookup.get(target) {
                             call_edges.push(CallEdge {
@@ -671,11 +687,7 @@ impl Analysis {
                                 callsite: Some(cs),
                                 callee: Callee::Func(callee_id),
                                 kind: CallKind::Indirect,
-                                tier: match opts.stage {
-                                    Stage::Steens => Tier::Steens,
-                                    Stage::Andersen => Tier::Andersen,
-                                    Stage::Conservative => unreachable!(),
-                                },
+                                tier: site_tier,
                             });
                         }
                     }
@@ -685,11 +697,7 @@ impl Analysis {
                             callsite: Some(cs),
                             callee: Callee::Unknown("omega_fnptr".to_string()),
                             kind: CallKind::Indirect,
-                            tier: match opts.stage {
-                                Stage::Steens => Tier::Steens,
-                                Stage::Andersen => Tier::Andersen,
-                                Stage::Conservative => unreachable!(),
-                            },
+                            tier: site_tier,
                         });
                     }
                 }

@@ -1194,7 +1194,11 @@ impl<'a> Builder<'a> {
     }
 
     fn operand_node(&mut self, func_index: usize, scope: Scope, operand: &str) -> NodeId {
-        if let Some(index) = self.globals.get(operand).copied() {
+        // Symbol operands lowered from LLVM carry an `@` sigil (`@hello`) while object keys
+        // are the bare symbol (`hello`); hand-written fixtures may use either form. Try the
+        // operand verbatim first, then with a leading `@` stripped, so both resolve.
+        let symbol = self.resolve_symbol(operand);
+        if let Some(index) = self.globals.get(symbol).copied() {
             let value = self.add_node(
                 NodeKey::SymbolValue(SymbolKind::Global, index),
                 format!("sym:global:{}", operand),
@@ -1205,7 +1209,7 @@ impl<'a> Builder<'a> {
             self.ensure_symbol_addr_of(ObjectKind::Global, index, SymbolKind::Global, index, value);
             return value;
         }
-        if let Some(index) = self.functions.get(operand).copied() {
+        if let Some(index) = self.functions.get(symbol).copied() {
             let value = self.add_node(
                 NodeKey::SymbolValue(SymbolKind::Function, index),
                 format!("sym:function:{}", operand),
@@ -1223,6 +1227,15 @@ impl<'a> Builder<'a> {
             return value;
         }
         self.value_node(func_index, scope, operand)
+    }
+
+    /// Resolve a symbol operand to its object-map key: the operand verbatim if a global or
+    /// function already uses it as a key, else with a leading `@` stripped.
+    fn resolve_symbol<'b>(&self, operand: &'b str) -> &'b str {
+        if self.globals.contains_key(operand) || self.functions.contains_key(operand) {
+            return operand;
+        }
+        operand.strip_prefix('@').unwrap_or(operand)
     }
 
     fn ensure_symbol_addr_of(

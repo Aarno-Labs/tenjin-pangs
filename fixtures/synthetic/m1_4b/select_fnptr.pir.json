@@ -1,0 +1,24 @@
+{
+  "module": "m1_4b.select_fnptr",
+  "functions": [
+    {
+      "key": "caller",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%local", "ty": "void ()*" },
+        { "kind": "assign", "dest": "%cond", "sources": ["f", "g"] },
+        { "kind": "store", "address": "%local", "value": "%cond" },
+        { "kind": "load", "dest": "%tmp", "address": "%local" },
+        {
+          "kind": "call_indirect",
+          "operand": "%tmp",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    { "key": "f", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "address_taken": true, "body": [] },
+    { "key": "g", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "address_taken": true, "body": [] }
+  ],
+  "globals": []
+}
