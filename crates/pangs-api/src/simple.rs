@@ -535,15 +535,10 @@ impl<'a> SimpleResolver<'a> {
                 .unwrap_or_else(|| self.global_is_never_address_taken(address)),
             Stmt::CallDirect {
                 callee, sig, args, ..
-            } => {
-                if callee == target {
-                    return true;
-                }
-                args.iter().enumerate().any(|(index, arg)| {
-                    arg == target
-                        && self.call_arg_escapes(callee, sig.vararg, index, target, depth, visiting)
-                })
-            }
+            } => args.iter().enumerate().any(|(index, arg)| {
+                arg == target
+                    && self.call_arg_escapes(callee, sig.vararg, index, target, depth, visiting)
+            }),
             Stmt::CallIndirect { operand, args, .. } => {
                 operand != target && args.iter().any(|arg| arg == target)
             }
