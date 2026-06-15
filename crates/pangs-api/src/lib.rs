@@ -226,6 +226,7 @@ pub struct Metrics {
     pub icalls_steens: usize,
     pub icalls_fsa: usize,
     pub icalls_unknown: usize,
+    pub confined_functions: usize,
     pub analysis_wall_us: u64,
     pub pag_build_us: u64,
     pub solve_us: u64,
@@ -627,7 +628,9 @@ impl Analysis {
                 }
             }
         }
-        let simple_icalls = resolve_simple_icalls(module, &simple_icall_queries);
+        let simple_report = resolve_simple_icalls(module, &simple_icall_queries);
+        let simple_icalls = &simple_report.resolutions;
+        let confined_functions = &simple_report.confined_functions;
         let simple_queries: BTreeMap<CallsiteId, &SimpleIcallQuery> = simple_icall_queries
             .iter()
             .map(|query| (query.callsite, query))
@@ -745,6 +748,9 @@ impl Analysis {
                         Stage::Conservative => unreachable!(),
                     };
                     for target in &solved_site.targets {
+                        if confined_functions.contains(target) {
+                            continue;
+                        }
                         if let Some(&callee_id) = func_lookup.get(target) {
                             call_edges.push(CallEdge {
                                 caller: Caller::Func(caller),
@@ -765,7 +771,7 @@ impl Analysis {
                         });
                     }
                 }
-                for (cs, simple) in &simple_icalls {
+                for (cs, simple) in simple_icalls {
                     if simple_emitted.contains(cs) {
                         continue;
                     }
@@ -918,6 +924,7 @@ impl Analysis {
             icalls_steens,
             icalls_fsa,
             icalls_unknown,
+            confined_functions: confined_functions.len(),
             audit_findings: findings.len(),
             mutable_globals_total,
             in_rewritable_components,

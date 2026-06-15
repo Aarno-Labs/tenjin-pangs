@@ -23,6 +23,12 @@ pub(crate) struct SimpleIcallResolution {
 }
 
 #[derive(Debug, Clone, Default)]
+pub(crate) struct SimpleIcallReport {
+    pub resolutions: BTreeMap<CallsiteId, SimpleIcallResolution>,
+    pub confined_functions: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct ValueResolution {
     targets: BTreeSet<String>,
     sites: BTreeSet<String>,
@@ -37,15 +43,40 @@ enum WalkResult {
 pub(crate) fn resolve_simple_icalls(
     module: &Pir,
     queries: &[SimpleIcallQuery],
-) -> BTreeMap<CallsiteId, SimpleIcallResolution> {
+) -> SimpleIcallReport {
     let mut resolver = SimpleResolver::new(module);
-    let mut out = BTreeMap::new();
+    let mut resolutions = BTreeMap::new();
+    let mut reached_sites: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for query in queries {
         if let Some(resolution) = resolver.resolve_query(query) {
-            out.insert(query.callsite, resolution);
+            for target in &resolution.targets {
+                let prefix = format!("function:{target}@");
+                reached_sites.entry(target.clone()).or_default().extend(
+                    resolution
+                        .sites
+                        .iter()
+                        .filter(|site| site.starts_with(&prefix))
+                        .cloned(),
+                );
+            }
+            resolutions.insert(query.callsite, resolution);
         }
     }
-    out
+    let address_taken_sites = resolver.address_taken_sites();
+    let confined_functions = module
+        .functions
+        .iter()
+        .filter(|func| func.address_taken)
+        .filter_map(|func| {
+            let sites = address_taken_sites.get(&func.key)?;
+            let reached = reached_sites.get(&func.key)?;
+            sites.is_subset(reached).then(|| func.key.clone())
+        })
+        .collect();
+    SimpleIcallReport {
+        resolutions,
+        confined_functions,
+    }
 }
 
 struct SimpleResolver<'a> {
@@ -706,6 +737,34 @@ impl<'a> SimpleResolver<'a> {
         !saw_caller && !value.is_empty()
     }
 
+    fn address_taken_sites(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut sites = BTreeMap::<String, BTreeSet<String>>::new();
+        for (func_index, func) in self.module.functions.iter().enumerate() {
+            for stmt in &func.body {
+                for target in function_symbol_value_operands(stmt) {
+                    if self.functions.contains_key(target) {
+                        sites.entry(target.to_string()).or_default().insert(format!(
+                            "function:{}@{}",
+                            target,
+                            self.owner_key(func_index)
+                        ));
+                    }
+                }
+            }
+        }
+        for stmt in &self.module.global_init {
+            for target in function_symbol_value_operands(stmt) {
+                if self.functions.contains_key(target) {
+                    sites
+                        .entry(target.to_string())
+                        .or_default()
+                        .insert(format!("function:{target}@global_init"));
+                }
+            }
+        }
+        sites
+    }
+
     fn function_place(&self, func_index: usize, before_stmt: usize, value: &str) -> Option<SubObj> {
         if self.globals.contains(value) {
             return Some(SubObj {
@@ -906,6 +965,33 @@ fn stmt_operands(stmt: &Stmt) -> Vec<&str> {
         Stmt::CallDirect { callee, args, .. } => std::iter::once(callee.as_str())
             .chain(args.iter().map(String::as_str))
             .collect(),
+        Stmt::CallIndirect { operand, args, .. } => std::iter::once(operand.as_str())
+            .chain(args.iter().map(String::as_str))
+            .collect(),
+    }
+}
+
+fn function_symbol_value_operands(stmt: &Stmt) -> Vec<&str> {
+    match stmt {
+        Stmt::Alloca { .. } | Stmt::GlobalRef { .. } => Vec::new(),
+        Stmt::Assign { sources, .. } => sources.iter().map(String::as_str).collect(),
+        Stmt::Load { address, .. } => vec![address.as_str()],
+        Stmt::Store { address, value, .. } => vec![address.as_str(), value.as_str()],
+        Stmt::Gep { base, .. } => vec![base.as_str()],
+        Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => {
+            vec![source.as_str()]
+        }
+        Stmt::Memcpy { dst, src, .. } => vec![dst.as_str(), src.as_str()],
+        Stmt::Memset { dst, value, .. } => vec![dst.as_str(), value.as_str()],
+        Stmt::Unknown {
+            operands, results, ..
+        } => operands
+            .iter()
+            .chain(results.iter())
+            .map(String::as_str)
+            .collect(),
+        Stmt::Return { value, .. } => value.as_deref().into_iter().collect(),
+        Stmt::CallDirect { args, .. } => args.iter().map(String::as_str).collect(),
         Stmt::CallIndirect { operand, args, .. } => std::iter::once(operand.as_str())
             .chain(args.iter().map(String::as_str))
             .collect(),

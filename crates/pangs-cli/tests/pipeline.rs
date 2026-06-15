@@ -47,6 +47,12 @@ fn m2_2_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn m2_3_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m2_3")
+        .join(name)
+}
+
 fn scrub_timing_fields(mut metrics: Value) -> Value {
     let object = metrics.as_object_mut().unwrap();
     for key in [
@@ -138,6 +144,44 @@ fn analyze_exports_m2_2_simple_icall_provenance() {
     assert_eq!(metrics["icalls_simple"], 1);
     assert_eq!(metrics["icalls_andersen"], 0);
     assert_eq!(metrics["icalls_unknown"], 0);
+}
+
+#[test]
+fn analyze_exports_m2_3_confined_subtraction() {
+    let fixture = m2_3_fixture("confined_subtraction.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "andersen");
+
+    let callgraph: Vec<Value> = fs::read_to_string(out.join("callgraph.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(callgraph.iter().any(|row| {
+        row["kind"] == "indirect"
+            && row["callsite"] == "driver@!noloc#0"
+            && row["callee"]["func"] == "cb"
+            && row["tier"] == "simple"
+    }));
+    assert!(callgraph.iter().any(|row| {
+        row["kind"] == "indirect"
+            && row["callsite"] == "driver@!noloc#1"
+            && row["callee"]["func"] == "other"
+            && row["tier"] == "andersen"
+    }));
+    assert!(!callgraph.iter().any(|row| {
+        row["kind"] == "indirect"
+            && row["callsite"] == "driver@!noloc#1"
+            && row["callee"]["func"] == "cb"
+    }));
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert_eq!(metrics["confined_functions"], 1);
+    assert_eq!(metrics["icalls_simple"], 1);
+    assert_eq!(metrics["icalls_andersen"], 1);
 }
 
 #[test]

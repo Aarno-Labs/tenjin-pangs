@@ -51,6 +51,12 @@ fn m2_2_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn m2_3_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m2_3")
+        .join(name)
+}
+
 fn assert_single_simple_target(analysis: &Analysis, target: &str) {
     let target_id = analysis.lookup_func(target).unwrap();
     let concrete_edges = analysis
@@ -292,6 +298,53 @@ fn m2_2_simple_return_value_resolves_through_internal_direct_call() {
     .unwrap();
 
     assert_single_simple_target(&analysis, "cb");
+}
+
+#[test]
+fn m2_3_confined_function_is_subtracted_from_complex_icall_site() {
+    let pir = Pir::from_path(m2_3_fixture("confined_subtraction.pir.json")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.metrics().icalls_simple, 1);
+    assert_eq!(analysis.metrics().icalls_andersen, 1);
+    assert_eq!(analysis.metrics().confined_functions, 1);
+
+    let cb = analysis.lookup_func("cb").unwrap();
+    let other = analysis.lookup_func("other").unwrap();
+    let mut simple_cb = false;
+    let mut complex_other = false;
+    for edge in analysis.call_edges() {
+        if edge.kind != pangs_api::CallKind::Indirect {
+            continue;
+        }
+        if edge.callsite == Some(pangs_api::CallsiteId(0))
+            && edge.callee == pangs_api::Callee::Func(cb)
+            && edge.tier == pangs_api::Tier::Simple
+        {
+            simple_cb = true;
+        }
+        if edge.callsite == Some(pangs_api::CallsiteId(1))
+            && edge.callee == pangs_api::Callee::Func(other)
+            && edge.tier == pangs_api::Tier::Andersen
+        {
+            complex_other = true;
+        }
+        assert!(
+            !(edge.callsite == Some(pangs_api::CallsiteId(1))
+                && edge.callee == pangs_api::Callee::Func(cb)),
+            "confined cb leaked into the complex icall target set: {edge:#?}"
+        );
+    }
+    assert!(simple_cb);
+    assert!(complex_other);
 }
 
 #[test]
