@@ -1,0 +1,62 @@
+{
+  "module": "m2_4.initval_unknown_runtime_mod_blocks_stationarity",
+  "functions": [
+    {
+      "key": "driver",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        { "kind": "unknown", "op": "opaque_ptr", "operands": [], "results": ["%opaque"], "reason": "test_unknown_runtime_mod" },
+        { "kind": "int_to_ptr", "dest": "%unknown_ptr", "source": "%opaque" },
+        { "kind": "store", "address": "%unknown_ptr", "value": "target" },
+        { "kind": "gep", "dest": "%slot", "base": "@Table", "byte_off": 8 },
+        { "kind": "load", "dest": "%fp", "address": "%slot" },
+        {
+          "kind": "call_indirect",
+          "operand": "%fp",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": [],
+            "cc": "ccc"
+          },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "target",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "address_taken": true,
+      "body": []
+    },
+    {
+      "key": "other",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": [
+    {
+      "key": "@Table",
+      "exported": false,
+      "mutable": true
+    }
+  ],
+  "global_init": [
+    { "kind": "store", "address": "@Table", "value": "target" },
+    { "kind": "gep", "dest": "@__global_init::slot1", "base": "@Table", "byte_off": 8 },
+    { "kind": "store", "address": "@__global_init::slot1", "value": "other" }
+  ]
+}

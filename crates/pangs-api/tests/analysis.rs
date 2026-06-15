@@ -435,6 +435,76 @@ fn m2_4_alias_write_blocks_initval_stationarity() {
 }
 
 #[test]
+fn m2_4_unknown_initializer_poisons_initval() {
+    let pir = Pir::from_path(m2_4_fixture("initval_unknown_initializer_poisons.pir.json")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let table = analysis.lookup_global("@Table").unwrap();
+    assert!(!analysis.globals()[table].stationary);
+    assert_eq!(analysis.metrics().globals_with_complete_initval, 0);
+    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().icalls_simple, 0);
+}
+
+#[test]
+fn m2_4_dynamic_initializer_gep_poisons_initval() {
+    let pir = Pir::from_path(m2_4_fixture(
+        "initval_dynamic_initializer_gep_poisons.pir.json",
+    ))
+    .unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let table = analysis.lookup_global("@Table").unwrap();
+    assert!(!analysis.globals()[table].stationary);
+    assert_eq!(analysis.metrics().globals_with_complete_initval, 0);
+    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().icalls_simple, 0);
+}
+
+#[test]
+fn m2_4_unknown_runtime_mod_blocks_stationarity() {
+    let pir = Pir::from_path(m2_4_fixture(
+        "initval_unknown_runtime_mod_blocks_stationarity.pir.json",
+    ))
+    .unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let table = analysis.lookup_global("@Table").unwrap();
+    assert!(analysis.globals()[table].mutable);
+    assert!(!analysis.globals()[table].stationary);
+    assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
+    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().icalls_simple, 0);
+    assert!(analysis.modrefs().iter().any(|mr| {
+        mr.access == Access::Mod && matches!(mr.global, pangs_api::GlobalTarget::Unknown(_))
+    }));
+}
+
+#[test]
 fn indirect_call_component_taint_uses_callsite_witness_and_matches_external_targets() {
     let target_sig = sig(AbiClass::Void, vec![Param::Integer]);
     let pir = Pir {

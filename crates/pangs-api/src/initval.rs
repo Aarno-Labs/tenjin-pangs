@@ -111,6 +111,17 @@ impl<'a> InitValResolver<'a> {
                 | Stmt::Memset { .. }
                 | Stmt::CallDirect { .. }
                 | Stmt::CallIndirect { .. } => self.poison_mentioned_globals(stmt),
+                Stmt::Gep {
+                    base,
+                    byte_off: None,
+                    ..
+                } => {
+                    if let Some(place) = self.global_init_place(stmt_index, base) {
+                        self.poisoned_globals.insert(place.root);
+                    } else {
+                        self.poison_mentioned_globals(stmt);
+                    }
+                }
                 _ => {}
             }
         }
