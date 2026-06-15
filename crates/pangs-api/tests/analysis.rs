@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use pangs_api::{Analysis, BuildMode, Caller, EscapeStatus, Opts, Stage, StationarityReason};
+use pangs_api::{
+    run_m2_ablation, Analysis, BuildMode, Caller, EscapeStatus, M2AblationMode, Opts, Stage,
+    StationarityReason,
+};
 use pangs_pir::{AbiClass, Access, Func, Global, Param, Pir, Signature, Stmt};
 
 fn sig(ret: AbiClass, params: Vec<Param>) -> Signature {
@@ -538,6 +541,56 @@ fn m2_4_unknown_runtime_mod_blocks_stationarity() {
     assert!(analysis.modrefs().iter().any(|mr| {
         mr.access == Access::Mod && matches!(mr.global, pangs_api::GlobalTarget::Unknown(_))
     }));
+}
+
+#[test]
+fn m2_7_ablation_toggles_isolate_b2_and_b1_effects() {
+    let b2_pir = Pir::from_path(m2_2_fixture("simple_local_assign.pir.json")).unwrap();
+    let b2_report = run_m2_ablation(
+        &b2_pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let b2_only = b2_report
+        .variants
+        .iter()
+        .find(|variant| variant.mode == M2AblationMode::B2Only)
+        .unwrap();
+    let b1_only = b2_report
+        .variants
+        .iter()
+        .find(|variant| variant.mode == M2AblationMode::B1Only)
+        .unwrap();
+    assert_eq!(b2_only.icalls_simple, 1);
+    assert_eq!(b1_only.icalls_simple, 0);
+
+    let b1_pir = Pir::from_path(m2_4_fixture("initval_dispatch_table.pir.json")).unwrap();
+    let b1_report = run_m2_ablation(
+        &b1_pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let baseline = b1_report
+        .variants
+        .iter()
+        .find(|variant| variant.mode == M2AblationMode::M1Baseline)
+        .unwrap();
+    let b1_only = b1_report
+        .variants
+        .iter()
+        .find(|variant| variant.mode == M2AblationMode::B1Only)
+        .unwrap();
+    assert_eq!(baseline.globals_with_complete_initval, 0);
+    assert_eq!(baseline.stationary_globals, 0);
+    assert_eq!(b1_only.globals_with_complete_initval, 1);
+    assert_eq!(b1_only.stationary_globals, 1);
+    assert_eq!(b1_only.icalls_simple, 1);
 }
 
 #[test]

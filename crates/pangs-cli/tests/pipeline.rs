@@ -286,6 +286,40 @@ fn analyze_exports_m2_5_stationarity_unknown_writer_evidence() {
 }
 
 #[test]
+fn m2_ablation_reports_preanalysis_variants() {
+    let fixture = m2_2_fixture("simple_local_assign.pir.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("m2-ablation")
+        .arg(&fixture)
+        .arg("--stage")
+        .arg("andersen")
+        .arg("--build-mode")
+        .arg("executable")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "m2-ablation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let variants = report["variants"].as_array().unwrap();
+    assert_eq!(variants.len(), 4, "{variants:#?}");
+    assert!(variants
+        .iter()
+        .any(|variant| { variant["mode"] == "m1_baseline" && variant["icalls_simple"] == 0 }));
+    assert!(variants
+        .iter()
+        .any(|variant| { variant["mode"] == "b2_only" && variant["icalls_simple"] == 1 }));
+    assert!(variants
+        .iter()
+        .any(|variant| { variant["mode"] == "b1_only" && variant["icalls_simple"] == 0 }));
+    assert!(variants
+        .iter()
+        .any(|variant| { variant["mode"] == "both" && variant["icalls_simple"] == 1 }));
+}
+
+#[test]
 fn analyze_validate_is_deterministic() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/synthetic/trivial/module.pir.json");

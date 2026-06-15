@@ -69,6 +69,16 @@ enum Command {
         #[arg(long)]
         exports: Option<PathBuf>,
     },
+    /// Run the M2.7 pre-analysis ablation: M1 baseline, B2 only, B1 only, and both.
+    M2Ablation {
+        module: PathBuf,
+        #[arg(long, default_value = "andersen")]
+        stage: StageArg,
+        #[arg(long, default_value = "library")]
+        build_mode: BuildModeArg,
+        #[arg(long)]
+        exports: Option<PathBuf>,
+    },
     /// Instrument every indirect call in a module, writing an instrumented `.bc`.
     Instrument {
         module: PathBuf,
@@ -237,6 +247,22 @@ fn run() -> Result<()> {
                 }
                 std::process::exit(3);
             }
+        }
+        Command::M2Ablation {
+            module,
+            stage,
+            build_mode,
+            exports,
+        } => {
+            let pir = Pir::from_path(&module)?;
+            let opts = Opts {
+                stage: stage.into(),
+                build_mode: build_mode.into(),
+                exports: read_exports(exports)?,
+                ..Opts::default()
+            };
+            let report = pangs_api::run_m2_ablation(&pir, &opts)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Instrument { module, out } => {
             let count = pangs_pir::instrument_icalls(&module, &out)?;

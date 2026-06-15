@@ -187,13 +187,28 @@ objects stay plain allocation-site objects. If the M3 decision gates (`DESIGN_li
 *additive* object-domain change behind the frozen PAG — but that is an M3 decision, not an
 M2 step. Delete the row from the schedule.
 
-### M2.7 — Validation & freeze — unchanged structure, two trims
+### M2.7 — Validation & freeze — unchanged structure, two trims — **IMPLEMENTED**
 - **Keep:** re-run M1.8 dynamic icall validation (every observed pair ∈ edge set — now a
   hard bar, since B1/B2 resolution is *exact*); KELP-style ablation {B2 only, B1 only,
   both} on the corpus using the M2.0 provenance counts; freeze the M2 metrics dashboard.
 - **Trim:** the cclyzer++ differential is **advisory/optional** (consistent with M1's
   advisory-only cclyzer policy), not a gate. Drop the typed-clone object-count histogram
   (no clones).
+
+**Implementation status:**
+- `Opts` now records the frozen M2 controls: `enable_b1_initval`, `enable_b2_simple`,
+  `enable_b3_confined`, and `b2_context_depth`. Defaults keep normal analysis behavior
+  unchanged (`true/true/true`, depth 8).
+- `pangs m2-ablation <module>` runs four variants through the normal analysis pipeline:
+  `m1_baseline` (B1/B2/B3 off), `b2_only`, `b1_only`, and `both`. Each row reports the
+  flat icall provenance counts, confined functions, complete InitVal globals, stationary
+  globals, localization coverage, call edges, and analysis wall time.
+- Synthetic tests cover the ablation switches and CLI JSON output. The existing M1.8
+  dynamic icall tests remain in the full suite and validate observed indirect calls
+  against Andersen exports after B1/B2 exact precedence.
+- Large real-corpus ablations should be run as longer release jobs. A release CLI build
+  succeeds; an interactive `jq` O1 ablation did not finish within the short turn budget
+  and was terminated cleanly, so no generated corpus results were checked in.
 
 ## 2. Contract/schema deltas
 
@@ -203,7 +218,8 @@ M2 step. Delete the row from the schedule.
   (`icalls_simple`, `icalls_andersen`, `icalls_fsa`, …) and B1/B2 coverage stats
   (`simple_icalls`, `confined_functions`, `globals_with_complete_initval`,
   `stationary_globals`). No cascade/certificate fields.
-- `manifest.json` `opts` records the B2 context-depth cap and whether B3 is enabled.
+- `manifest.json` `opts` records the M2 controls: B1 enabled, B2 enabled, B3 enabled,
+  and the B2 context-depth cap.
 - `stationarity.jsonl` records one stationarity verdict per global for the M2.5 audit:
   global key, InitVal completeness, stationary boolean, rejection reason, and runtime
   writer witnesses. B1 `InitVal` slots and B2 `DefUseReachingSites` otherwise remain

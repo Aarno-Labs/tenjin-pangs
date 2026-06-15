@@ -4,7 +4,7 @@ use pangs_pir::{fsa_compatible, Pir, Signature, Stmt};
 
 use crate::CallsiteId;
 
-const DEFAULT_CONTEXT_DEPTH: usize = 8;
+pub(crate) const DEFAULT_CONTEXT_DEPTH: usize = 8;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SimpleIcallQuery {
@@ -43,8 +43,9 @@ enum WalkResult {
 pub(crate) fn resolve_simple_icalls(
     module: &Pir,
     queries: &[SimpleIcallQuery],
+    context_depth: usize,
 ) -> SimpleIcallReport {
-    let mut resolver = SimpleResolver::new(module);
+    let mut resolver = SimpleResolver::new(module, context_depth);
     let mut resolutions = BTreeMap::new();
     let mut reached_sites: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for query in queries {
@@ -81,6 +82,7 @@ pub(crate) fn resolve_simple_icalls(
 
 struct SimpleResolver<'a> {
     module: &'a Pir,
+    context_depth: usize,
     functions: HashMap<&'a str, usize>,
     globals: HashSet<&'a str>,
     definitions: Vec<HashMap<&'a str, usize>>,
@@ -93,7 +95,7 @@ struct SubObj {
 }
 
 impl<'a> SimpleResolver<'a> {
-    fn new(module: &'a Pir) -> Self {
+    fn new(module: &'a Pir, context_depth: usize) -> Self {
         let functions = module
             .functions
             .iter()
@@ -120,6 +122,7 @@ impl<'a> SimpleResolver<'a> {
             .collect();
         Self {
             module,
+            context_depth,
             functions,
             globals,
             definitions,
@@ -177,7 +180,7 @@ impl<'a> SimpleResolver<'a> {
         visiting: &mut HashSet<(usize, String, usize)>,
         out: &mut ValueResolution,
     ) -> WalkResult {
-        if depth > DEFAULT_CONTEXT_DEPTH {
+        if depth > self.context_depth {
             return WalkResult::Complex;
         }
         if let Some(&target_index) = self.functions.get(value) {
@@ -278,7 +281,7 @@ impl<'a> SimpleResolver<'a> {
         visiting: &mut HashSet<(usize, String, usize)>,
         out: &mut ValueResolution,
     ) -> WalkResult {
-        if depth > DEFAULT_CONTEXT_DEPTH {
+        if depth > self.context_depth {
             return WalkResult::Complex;
         }
         let Some(&callee_index) = self.functions.get(callee) else {
@@ -317,7 +320,7 @@ impl<'a> SimpleResolver<'a> {
         visiting: &mut HashSet<(usize, String, usize)>,
         out: &mut ValueResolution,
     ) -> WalkResult {
-        if depth > DEFAULT_CONTEXT_DEPTH {
+        if depth > self.context_depth {
             return WalkResult::Complex;
         }
         let callee = self.module.functions[callee_index].key.clone();
@@ -379,7 +382,7 @@ impl<'a> SimpleResolver<'a> {
         visiting: &mut HashSet<(usize, String, usize)>,
         out: &mut ValueResolution,
     ) -> WalkResult {
-        if depth > DEFAULT_CONTEXT_DEPTH || !self.global_place_is_simple(place) {
+        if depth > self.context_depth || !self.global_place_is_simple(place) {
             return WalkResult::Complex;
         }
         let mut saw_store = false;
@@ -603,7 +606,7 @@ impl<'a> SimpleResolver<'a> {
         depth: usize,
         visiting: &mut HashSet<(usize, String, usize)>,
     ) -> bool {
-        if depth > DEFAULT_CONTEXT_DEPTH {
+        if depth > self.context_depth {
             return true;
         }
         if !visiting.insert((func_index, value.to_string(), depth)) {

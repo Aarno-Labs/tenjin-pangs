@@ -36,7 +36,16 @@
     "opts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["stage", "build_mode", "exports", "partition_budget"],
+      "required": [
+        "stage",
+        "build_mode",
+        "exports",
+        "partition_budget",
+        "enable_b1_initval",
+        "enable_b2_simple",
+        "enable_b3_confined",
+        "b2_context_depth"
+      ],
       "properties": {
         "stage": {
           "type": "string",
@@ -55,6 +64,19 @@
           }
         },
         "partition_budget": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "enable_b1_initval": {
+          "type": "boolean"
+        },
+        "enable_b2_simple": {
+          "type": "boolean"
+        },
+        "enable_b3_confined": {
+          "type": "boolean"
+        },
+        "b2_context_depth": {
           "type": "integer",
           "minimum": 0
         }

@@ -15,7 +15,9 @@ mod initval;
 mod simple;
 pub use differential::{run_differential, DifferentialReport};
 use initval::resolve_initval_icalls;
-use simple::{resolve_simple_icalls, SimpleIcallQuery, SimpleIcallResolution};
+use simple::{
+    resolve_simple_icalls, SimpleIcallQuery, SimpleIcallResolution, DEFAULT_CONTEXT_DEPTH,
+};
 
 #[derive(Debug, Error)]
 pub enum AnalysisError {
@@ -43,6 +45,10 @@ pub struct Opts {
     pub build_mode: BuildMode,
     pub exports: BTreeSet<String>,
     pub partition_budget: u64,
+    pub enable_b1_initval: bool,
+    pub enable_b2_simple: bool,
+    pub enable_b3_confined: bool,
+    pub b2_context_depth: usize,
 }
 
 impl Default for Opts {
@@ -52,6 +58,10 @@ impl Default for Opts {
             build_mode: BuildMode::Library,
             exports: BTreeSet::new(),
             partition_budget: 1_000_000,
+            enable_b1_initval: true,
+            enable_b2_simple: true,
+            enable_b3_confined: true,
+            b2_context_depth: DEFAULT_CONTEXT_DEPTH,
         }
     }
 }
@@ -270,6 +280,37 @@ pub struct Metrics {
     pub components_us: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lowering: Option<LoweringStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct M2AblationReport {
+    pub variants: Vec<M2AblationVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct M2AblationVariant {
+    pub mode: M2AblationMode,
+    pub icalls_simple: usize,
+    pub icalls_andersen: usize,
+    pub icalls_steens: usize,
+    pub icalls_fsa: usize,
+    pub icalls_unknown: usize,
+    pub confined_functions: usize,
+    pub globals_with_complete_initval: usize,
+    pub stationary_globals: usize,
+    pub mutable_globals_total: usize,
+    pub in_rewritable_components: usize,
+    pub call_edges: usize,
+    pub analysis_wall_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum M2AblationMode {
+    M1Baseline,
+    B2Only,
+    B1Only,
+    Both,
 }
 
 #[derive(Debug)]
@@ -666,9 +707,19 @@ impl Analysis {
                 }
             }
         }
-        let simple_report = resolve_simple_icalls(module, &simple_icall_queries);
-        let initval_report =
-            resolve_initval_icalls(module, &simple_icall_queries, &BTreeSet::new());
+        let mut simple_report = if opts.enable_b2_simple {
+            resolve_simple_icalls(module, &simple_icall_queries, opts.b2_context_depth)
+        } else {
+            Default::default()
+        };
+        if !opts.enable_b3_confined {
+            simple_report.confined_functions.clear();
+        }
+        let initval_report = if opts.enable_b1_initval {
+            resolve_initval_icalls(module, &simple_icall_queries, &BTreeSet::new())
+        } else {
+            Default::default()
+        };
         let simple_icalls = &simple_report.resolutions;
         let confined_functions = &simple_report.confined_functions;
         let simple_queries: BTreeMap<CallsiteId, &SimpleIcallQuery> = simple_icall_queries
@@ -903,8 +954,11 @@ impl Analysis {
                 &modrefs,
             )
         };
-        let initval_report =
-            resolve_initval_icalls(module, &simple_icall_queries, &stationary_globals);
+        let initval_report = if opts.enable_b1_initval {
+            resolve_initval_icalls(module, &simple_icall_queries, &stationary_globals)
+        } else {
+            Default::default()
+        };
         for global in &mut globals {
             global.stationary = initval_report.stationary_globals.contains(&global.key);
         }
@@ -1137,6 +1191,47 @@ impl Analysis {
             }
         }
         ComponentId(0)
+    }
+}
+
+pub fn run_m2_ablation(module: &Pir, base: &Opts) -> Result<M2AblationReport, AnalysisError> {
+    let variants = [
+        (M2AblationMode::M1Baseline, false, false, false),
+        (M2AblationMode::B2Only, false, true, true),
+        (M2AblationMode::B1Only, true, false, false),
+        (M2AblationMode::Both, true, true, true),
+    ];
+    let mut rows = Vec::new();
+    for (mode, enable_b1_initval, enable_b2_simple, enable_b3_confined) in variants {
+        let opts = Opts {
+            enable_b1_initval,
+            enable_b2_simple,
+            enable_b3_confined,
+            ..base.clone()
+        };
+        let analysis = Analysis::run(module, &opts)?;
+        rows.push(M2AblationVariant::from_metrics(mode, analysis.metrics()));
+    }
+    Ok(M2AblationReport { variants: rows })
+}
+
+impl M2AblationVariant {
+    fn from_metrics(mode: M2AblationMode, metrics: &Metrics) -> Self {
+        Self {
+            mode,
+            icalls_simple: metrics.icalls_simple,
+            icalls_andersen: metrics.icalls_andersen,
+            icalls_steens: metrics.icalls_steens,
+            icalls_fsa: metrics.icalls_fsa,
+            icalls_unknown: metrics.icalls_unknown,
+            confined_functions: metrics.confined_functions,
+            globals_with_complete_initval: metrics.globals_with_complete_initval,
+            stationary_globals: metrics.stationary_globals,
+            mutable_globals_total: metrics.mutable_globals_total,
+            in_rewritable_components: metrics.in_rewritable_components,
+            call_edges: metrics.call_edges,
+            analysis_wall_us: metrics.analysis_wall_us,
+        }
     }
 }
 
