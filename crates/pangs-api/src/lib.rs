@@ -90,6 +90,7 @@ pub struct GlobalInfo {
     pub line: Option<u32>,
     pub is_const: bool,
     pub mutable: bool,
+    pub stationary: bool,
     pub never_written: bool,
     pub escape: EscapeStatus,
 }
@@ -407,6 +408,7 @@ impl Analysis {
                 line: global.line,
                 is_const: global.is_const,
                 mutable: global.mutable && !global.is_const,
+                stationary: false,
                 never_written: true,
                 escape: if exported {
                     EscapeStatus::External
@@ -892,6 +894,10 @@ impl Analysis {
             )
         });
 
+        for global in &mut globals {
+            global.stationary = initval_report.stationary_globals.contains(&global.key);
+        }
+
         let components_started = Instant::now();
         let components = compute_components(
             &functions,
@@ -902,7 +908,10 @@ impl Analysis {
             &audit_taints,
         );
         let components_us = components_started.elapsed().as_micros() as u64;
-        let mutable_globals_total = globals.iter().filter(|g| g.mutable).count();
+        let mutable_globals_total = globals
+            .iter()
+            .filter(|g| g.mutable && !g.stationary)
+            .count();
         let in_rewritable_components = components
             .iter()
             .filter(|c| !c.frozen)
@@ -1771,7 +1780,8 @@ fn compute_components(
             for member in &members {
                 for mr in &modrefs_by_func[member.0 as usize] {
                     if let GlobalTarget::Name(gid) = mr.global {
-                        if globals[gid.0 as usize].mutable {
+                        let global = &globals[gid.0 as usize];
+                        if global.mutable && !global.stationary {
                             mutable_globals.insert(gid);
                         }
                     }

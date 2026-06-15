@@ -13,6 +13,7 @@
         { "kind": "store", "address": "%local", "value": "@Table" },
         { "kind": "gep", "dest": "%slot", "base": "@Table", "byte_off": 8 },
         { "kind": "load", "dest": "%fp", "address": "%slot" },
+        { "kind": "global_ref", "global": "@Table", "access": "ref" },
         {
           "kind": "call_indirect",
           "operand": "%fp",
@@ -49,9 +50,8 @@
   "globals": [
     {
       "key": "@Table",
-      "is_const": true,
       "exported": false,
-      "mutable": false
+      "mutable": true
     }
   ],
   "global_init": [

@@ -216,6 +216,33 @@ fn analyze_exports_m2_4_initval_dispatch_table_resolution() {
     assert_eq!(metrics["icalls_simple"], 1);
     assert_eq!(metrics["globals_with_complete_initval"], 1);
     assert_eq!(metrics["stationary_globals"], 1);
+    assert_eq!(metrics["mutable_globals_total"], 0);
+    assert_eq!(metrics["in_rewritable_components"], 0);
+
+    let globals: Vec<Value> = fs::read_to_string(out.join("globals.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(globals.iter().any(|row| {
+        row["key"] == "@Table" && row["mutable"] == true && row["stationary"] == true
+    }));
+
+    let components: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("components.json")).unwrap()).unwrap();
+    assert_eq!(components["coverage"]["mutable_globals_total"], 0);
+    assert_eq!(components["coverage"]["in_rewritable_components"], 0);
+    assert!(components["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|component| {
+            component["mutable_globals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|global| global != "@Table")
+        }));
 }
 
 #[test]

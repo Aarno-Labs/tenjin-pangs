@@ -369,6 +369,18 @@ fn m2_4_initval_stationary_dispatch_table_resolves_exactly() {
     assert_single_simple_target(&analysis, "other");
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
     assert_eq!(analysis.metrics().stationary_globals, 1);
+    assert_eq!(analysis.metrics().mutable_globals_total, 0);
+    assert_eq!(analysis.metrics().in_rewritable_components, 0);
+
+    let table = analysis.lookup_global("@Table").unwrap();
+    assert!(analysis.globals()[table].mutable);
+    assert!(analysis.globals()[table].stationary);
+    let driver = analysis.lookup_func("driver").unwrap();
+    let component = analysis.component(analysis.component_of(driver));
+    assert!(
+        component.mutable_globals.is_empty(),
+        "stationary table should leave localization payload: {component:#?}"
+    );
 }
 
 #[test]

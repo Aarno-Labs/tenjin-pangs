@@ -243,6 +243,7 @@ struct GlobalRecord<'a> {
     never_written: bool,
     escape: pangs_api::EscapeStatus,
     mutable: bool,
+    stationary: bool,
 }
 
 impl<'a> From<&'a pangs_api::GlobalInfo> for GlobalRecord<'a> {
@@ -255,6 +256,7 @@ impl<'a> From<&'a pangs_api::GlobalInfo> for GlobalRecord<'a> {
             never_written: info.never_written,
             escape: info.escape,
             mutable: info.mutable,
+            stationary: info.stationary,
         }
     }
 }

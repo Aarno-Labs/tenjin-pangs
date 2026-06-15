@@ -10,7 +10,8 @@
     "is_const",
     "never_written",
     "escape",
-    "mutable"
+    "mutable",
+    "stationary"
   ],
   "properties": {
     "key": {
@@ -36,6 +37,9 @@
       "enum": ["module", "external"]
     },
     "mutable": {
+      "type": "boolean"
+    },
+    "stationary": {
       "type": "boolean"
     }
   }
