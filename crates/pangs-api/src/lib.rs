@@ -637,14 +637,9 @@ impl Analysis {
             }
         }
         let simple_report = resolve_simple_icalls(module, &simple_icall_queries);
-        let initval_report = resolve_initval_icalls(module, &simple_icall_queries);
-        let mut exact_icalls = simple_report.resolutions.clone();
-        for (callsite, resolution) in &initval_report.resolutions {
-            exact_icalls
-                .entry(*callsite)
-                .or_insert_with(|| resolution.clone());
-        }
-        let simple_icalls = &exact_icalls;
+        let initval_report =
+            resolve_initval_icalls(module, &simple_icall_queries, &BTreeSet::new());
+        let simple_icalls = &simple_report.resolutions;
         let confined_functions = &simple_report.confined_functions;
         let simple_queries: BTreeMap<CallsiteId, &SimpleIcallQuery> = simple_icall_queries
             .iter()
@@ -868,6 +863,32 @@ impl Analysis {
         modrefs.sort_by_key(|mr| modref_sort_key(mr, &functions, &globals));
         modrefs.dedup_by_key(|mr| modref_sort_key(mr, &functions, &globals));
 
+        let stationary_globals = if opts.stage == Stage::Conservative {
+            BTreeSet::new()
+        } else {
+            stationary_globals_from_modrefs(
+                module,
+                &initval_report.complete_globals,
+                &global_lookup,
+                &modrefs,
+            )
+        };
+        let initval_report =
+            resolve_initval_icalls(module, &simple_icall_queries, &stationary_globals);
+        for global in &mut globals {
+            global.stationary = initval_report.stationary_globals.contains(&global.key);
+        }
+        apply_initval_exact_call_edges(
+            &mut call_edges,
+            module,
+            &func_lookup,
+            &address_taken,
+            &callsites,
+            &simple_queries,
+            simple_icalls,
+            &initval_report.resolutions,
+        );
+
         let transitive_started = Instant::now();
         let transitive_modrefs = compute_transitive_modrefs(
             functions.len(),
@@ -893,10 +914,6 @@ impl Analysis {
                 finding.affected.join("|"),
             )
         });
-
-        for global in &mut globals {
-            global.stationary = initval_report.stationary_globals.contains(&global.key);
-        }
 
         let components_started = Instant::now();
         let components = compute_components(
@@ -1246,6 +1263,73 @@ fn emit_simple_call_edges(
             kind: CallKind::Indirect,
             tier: Tier::Simple,
         });
+    }
+}
+
+fn stationary_globals_from_modrefs(
+    module: &Pir,
+    complete_globals: &BTreeSet<String>,
+    global_lookup: &HashMap<String, GlobalId>,
+    modrefs: &[ModRef],
+) -> BTreeSet<String> {
+    let mut runtime_written = BTreeSet::<String>::new();
+    let mut unknown_write = false;
+    for mr in modrefs {
+        if mr.access != Access::Mod {
+            continue;
+        }
+        match &mr.global {
+            GlobalTarget::Name(gid) => {
+                let Some(global) = module.globals.get(gid.0 as usize) else {
+                    continue;
+                };
+                runtime_written.insert(global.key.clone());
+            }
+            GlobalTarget::Unknown(_) => unknown_write = true,
+        }
+    }
+    module
+        .globals
+        .iter()
+        .filter(|global| complete_globals.contains(&global.key))
+        .filter(|global| !global.exported)
+        .filter(|global| global_lookup.contains_key(&global.key))
+        .filter(|global| !unknown_write && !runtime_written.contains(&global.key))
+        .map(|global| global.key.clone())
+        .collect()
+}
+
+fn apply_initval_exact_call_edges(
+    call_edges: &mut Vec<CallEdge>,
+    module: &Pir,
+    func_lookup: &HashMap<String, FuncId>,
+    address_taken: &[(FuncId, &pangs_pir::Func)],
+    callsites: &[CallsiteInfo],
+    simple_queries: &BTreeMap<CallsiteId, &SimpleIcallQuery>,
+    b2_resolutions: &BTreeMap<CallsiteId, SimpleIcallResolution>,
+    initval_resolutions: &BTreeMap<CallsiteId, SimpleIcallResolution>,
+) {
+    for (cs, resolution) in initval_resolutions {
+        if b2_resolutions.contains_key(cs) {
+            continue;
+        }
+        let Some(query) = simple_queries.get(cs) else {
+            continue;
+        };
+        let Some(callsite) = callsites.get(cs.0 as usize) else {
+            continue;
+        };
+        call_edges.retain(|edge| !(edge.kind == CallKind::Indirect && edge.callsite == Some(*cs)));
+        emit_simple_call_edges(
+            call_edges,
+            module,
+            func_lookup,
+            address_taken,
+            callsite.caller,
+            *cs,
+            query,
+            resolution,
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use pangs_pir::{Access, Pir, Stmt};
+use pangs_pir::{Pir, Stmt};
 
 use crate::simple::{SimpleIcallQuery, SimpleIcallResolution};
 use crate::CallsiteId;
@@ -24,22 +24,24 @@ struct SlotValue {
     sites: BTreeSet<String>,
 }
 
-pub(crate) fn resolve_initval_icalls(module: &Pir, queries: &[SimpleIcallQuery]) -> InitValReport {
+pub(crate) fn resolve_initval_icalls(
+    module: &Pir,
+    queries: &[SimpleIcallQuery],
+    stationary_globals: &BTreeSet<String>,
+) -> InitValReport {
     let mut resolver = InitValResolver::new(module);
     resolver.build_init_slots();
-    resolver.find_runtime_writes();
     let complete_globals = resolver.complete_globals();
-    let stationary_globals = resolver.stationary_globals(&complete_globals);
     let mut resolutions = BTreeMap::new();
     for query in queries {
-        if let Some(resolution) = resolver.resolve_query(query, &stationary_globals) {
+        if let Some(resolution) = resolver.resolve_query(query, stationary_globals) {
             resolutions.insert(query.callsite, resolution);
         }
     }
     InitValReport {
         resolutions,
         complete_globals,
-        stationary_globals,
+        stationary_globals: stationary_globals.clone(),
     }
 }
 
@@ -50,7 +52,6 @@ struct InitValResolver<'a> {
     definitions: Vec<HashMap<&'a str, usize>>,
     init_slots: BTreeMap<SubObj, SlotValue>,
     poisoned_globals: BTreeSet<String>,
-    runtime_written_globals: BTreeSet<String>,
 }
 
 impl<'a> InitValResolver<'a> {
@@ -86,7 +87,6 @@ impl<'a> InitValResolver<'a> {
             definitions,
             init_slots: BTreeMap::new(),
             poisoned_globals: BTreeSet::new(),
-            runtime_written_globals: BTreeSet::new(),
         }
     }
 
@@ -116,57 +116,11 @@ impl<'a> InitValResolver<'a> {
         }
     }
 
-    fn find_runtime_writes(&mut self) {
-        for (func_index, func) in self.module.functions.iter().enumerate() {
-            for (stmt_index, stmt) in func.body.iter().enumerate() {
-                match stmt {
-                    Stmt::Store { address, .. } => {
-                        if let Some(place) = self.function_place(func_index, stmt_index, address) {
-                            self.runtime_written_globals.insert(place.root);
-                        } else if self.globals.contains(address.as_str()) {
-                            self.runtime_written_globals.insert(address.clone());
-                        }
-                    }
-                    Stmt::GlobalRef {
-                        global,
-                        access: Access::Mod,
-                        ..
-                    } => {
-                        self.runtime_written_globals.insert(global.clone());
-                    }
-                    Stmt::Unknown { .. }
-                    | Stmt::Memcpy { .. }
-                    | Stmt::Memset { .. }
-                    | Stmt::CallIndirect { .. } => self.mark_mentioned_global_writes(stmt),
-                    Stmt::CallDirect { callee, args, .. } if self.is_external(callee) => {
-                        for arg in args {
-                            if let Some(place) = self.function_place(func_index, stmt_index, arg) {
-                                self.runtime_written_globals.insert(place.root);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
     fn complete_globals(&self) -> BTreeSet<String> {
         self.init_slots
             .keys()
             .map(|place| place.root.clone())
             .filter(|global| !self.poisoned_globals.contains(global))
-            .collect()
-    }
-
-    fn stationary_globals(&self, complete_globals: &BTreeSet<String>) -> BTreeSet<String> {
-        self.module
-            .globals
-            .iter()
-            .filter(|global| complete_globals.contains(&global.key))
-            .filter(|global| !global.exported)
-            .filter(|global| !self.runtime_written_globals.contains(&global.key))
-            .map(|global| global.key.clone())
             .collect()
     }
 
@@ -369,26 +323,12 @@ impl<'a> InitValResolver<'a> {
         self.poisoned_globals.extend(globals);
     }
 
-    fn mark_mentioned_global_writes(&mut self, stmt: &Stmt) {
-        let globals = self.mentioned_globals(stmt);
-        self.runtime_written_globals.extend(globals);
-    }
-
     fn mentioned_globals(&self, stmt: &Stmt) -> BTreeSet<String> {
         stmt_operands(stmt)
             .into_iter()
             .filter(|operand| self.globals.contains(*operand))
             .map(str::to_string)
             .collect()
-    }
-
-    fn is_external(&self, callee: &str) -> bool {
-        self.module
-            .functions
-            .iter()
-            .find(|func| func.key == callee)
-            .map(|func| func.external)
-            .unwrap_or(true)
     }
 }
 

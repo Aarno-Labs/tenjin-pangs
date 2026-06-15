@@ -538,7 +538,10 @@ impl<'a> Refiner<'a> {
             };
             let mut globals: Vec<String> = set
                 .iter()
-                .filter_map(|cell| self.global_of_cell.get(cell))
+                .filter_map(|cell| {
+                    let root = pts.field_base.get(cell).unwrap_or(cell);
+                    self.global_of_cell.get(root)
+                })
                 .map(|&idx| self.pir.globals[idx].key.clone())
                 .collect();
             globals.sort();

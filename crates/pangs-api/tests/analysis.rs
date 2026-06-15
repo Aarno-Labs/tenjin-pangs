@@ -408,6 +408,33 @@ fn m2_4_runtime_write_blocks_initval_exact_dispatch_resolution() {
 }
 
 #[test]
+fn m2_4_alias_write_blocks_initval_stationarity() {
+    let pir = Pir::from_path(m2_4_fixture(
+        "initval_alias_write_is_not_stationary.pir.json",
+    ))
+    .unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let table = analysis.lookup_global("@Table").unwrap();
+    assert!(analysis.globals()[table].mutable);
+    assert!(!analysis.globals()[table].stationary);
+    assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
+    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().icalls_simple, 0);
+    assert!(analysis.call_edges().iter().any(|edge| {
+        edge.kind == pangs_api::CallKind::Indirect && edge.tier == pangs_api::Tier::Andersen
+    }));
+}
+
+#[test]
 fn indirect_call_component_taint_uses_callsite_witness_and_matches_external_targets() {
     let target_sig = sig(AbiClass::Void, vec![Param::Integer]);
     let pir = Pir {
