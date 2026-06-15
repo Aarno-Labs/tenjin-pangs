@@ -23,6 +23,8 @@
     "icalls_fsa",
     "icalls_unknown",
     "confined_functions",
+    "globals_with_complete_initval",
+    "stationary_globals",
     "analysis_wall_us",
     "pag_build_us",
     "solve_us",
@@ -177,6 +179,14 @@
       "minimum": 0
     },
     "confined_functions": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "globals_with_complete_initval": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "stationary_globals": {
       "type": "integer",
       "minimum": 0
     },

@@ -57,6 +57,12 @@ fn m2_3_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn m2_4_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m2_4")
+        .join(name)
+}
+
 fn assert_single_simple_target(analysis: &Analysis, target: &str) {
     let target_id = analysis.lookup_func(target).unwrap();
     let concrete_edges = analysis
@@ -345,6 +351,48 @@ fn m2_3_confined_function_is_subtracted_from_complex_icall_site() {
     }
     assert!(simple_cb);
     assert!(complex_other);
+}
+
+#[test]
+fn m2_4_initval_stationary_dispatch_table_resolves_exactly() {
+    let pir = Pir::from_path(m2_4_fixture("initval_dispatch_table.pir.json")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_single_simple_target(&analysis, "other");
+    assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
+    assert_eq!(analysis.metrics().stationary_globals, 1);
+}
+
+#[test]
+fn m2_4_runtime_write_blocks_initval_exact_dispatch_resolution() {
+    let pir = Pir::from_path(m2_4_fixture(
+        "initval_runtime_write_is_not_stationary.pir.json",
+    ))
+    .unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
+    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().icalls_simple, 0);
+    assert!(analysis.call_edges().iter().any(|edge| {
+        edge.kind == pangs_api::CallKind::Indirect && edge.tier == pangs_api::Tier::Andersen
+    }));
 }
 
 #[test]

@@ -53,6 +53,12 @@ fn m2_3_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn m2_4_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m2_4")
+        .join(name)
+}
+
 fn scrub_timing_fields(mut metrics: Value) -> Value {
     let object = metrics.as_object_mut().unwrap();
     for key in [
@@ -182,6 +188,34 @@ fn analyze_exports_m2_3_confined_subtraction() {
     assert_eq!(metrics["confined_functions"], 1);
     assert_eq!(metrics["icalls_simple"], 1);
     assert_eq!(metrics["icalls_andersen"], 1);
+}
+
+#[test]
+fn analyze_exports_m2_4_initval_dispatch_table_resolution() {
+    let fixture = m2_4_fixture("initval_dispatch_table.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "andersen");
+
+    let callgraph: Vec<Value> = fs::read_to_string(out.join("callgraph.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let indirect = callgraph
+        .iter()
+        .filter(|row| row["kind"] == "indirect")
+        .collect::<Vec<_>>();
+    assert_eq!(indirect.len(), 1, "{indirect:#?}");
+    assert_eq!(indirect[0]["callee"]["func"], "other");
+    assert_eq!(indirect[0]["tier"], "simple");
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert_eq!(metrics["icalls_simple"], 1);
+    assert_eq!(metrics["globals_with_complete_initval"], 1);
+    assert_eq!(metrics["stationary_globals"], 1);
 }
 
 #[test]

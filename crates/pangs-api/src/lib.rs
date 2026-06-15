@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod differential;
+mod initval;
 mod simple;
 pub use differential::{run_differential, DifferentialReport};
+use initval::resolve_initval_icalls;
 use simple::{resolve_simple_icalls, SimpleIcallQuery, SimpleIcallResolution};
 
 #[derive(Debug, Error)]
@@ -229,6 +231,8 @@ pub struct Metrics {
     pub icalls_fsa: usize,
     pub icalls_unknown: usize,
     pub confined_functions: usize,
+    pub globals_with_complete_initval: usize,
+    pub stationary_globals: usize,
     pub analysis_wall_us: u64,
     pub pag_build_us: u64,
     pub solve_us: u64,
@@ -631,7 +635,14 @@ impl Analysis {
             }
         }
         let simple_report = resolve_simple_icalls(module, &simple_icall_queries);
-        let simple_icalls = &simple_report.resolutions;
+        let initval_report = resolve_initval_icalls(module, &simple_icall_queries);
+        let mut exact_icalls = simple_report.resolutions.clone();
+        for (callsite, resolution) in &initval_report.resolutions {
+            exact_icalls
+                .entry(*callsite)
+                .or_insert_with(|| resolution.clone());
+        }
+        let simple_icalls = &exact_icalls;
         let confined_functions = &simple_report.confined_functions;
         let simple_queries: BTreeMap<CallsiteId, &SimpleIcallQuery> = simple_icall_queries
             .iter()
@@ -940,6 +951,8 @@ impl Analysis {
             icalls_fsa,
             icalls_unknown,
             confined_functions: confined_functions.len(),
+            globals_with_complete_initval: initval_report.complete_globals.len(),
+            stationary_globals: initval_report.stationary_globals.len(),
             audit_findings: findings.len(),
             mutable_globals_total,
             in_rewritable_components,
