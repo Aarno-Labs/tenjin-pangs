@@ -1,0 +1,20 @@
+{
+  "module": "m2_1.const_store_dynamic_load",
+  "comment": "M2.1 soundness regression, reverse direction. A function pointer stored at a CONSTANT offset must be visible to a NON-constant-offset (⊤) load of the same object — the dynamic read could resolve to that offset. Expected icall targets: {beta}.",
+  "functions": [
+    {
+      "key": "caller",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%s", "ty": "struct.S" },
+        { "kind": "gep", "dest": "%p0", "base": "%s", "byte_off": 0 },
+        { "kind": "store", "address": "%p0", "value": "beta" },
+        { "kind": "gep", "dest": "%pdyn", "base": "%s", "byte_off": null },
+        { "kind": "load", "dest": "%t", "address": "%pdyn" },
+        { "kind": "call_indirect", "operand": "%t", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [] }
+      ]
+    },
+    { "key": "beta", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "address_taken": true, "body": [] }
+  ],
+  "globals": []
+}

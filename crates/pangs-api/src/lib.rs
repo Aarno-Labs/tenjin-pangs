@@ -139,6 +139,11 @@ pub enum Callee {
     Unknown(String),
 }
 
+/// Provenance of a resolved call edge. Tiers are ordered by *exactness*: a later phase may
+/// only narrow an earlier one (`Simple ⊆ Andersen ⊆ Steens ⊆ Fsa`); `Direct` is a
+/// syntactic call. `Simple` is the M2 lite provenance (`DESIGN_lite.md` §2F) for icalls
+/// resolved exactly by a B1/B2 def-use walk — it bypasses the FSA envelope entirely. It is
+/// declared now (M2.0) and populated by M2.2/M2.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
@@ -146,6 +151,7 @@ pub enum Tier {
     Fsa,
     Steens,
     Andersen,
+    Simple,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +216,14 @@ pub struct Metrics {
     pub partition_max_size: usize,
     pub oversize_fallbacks: usize,
     pub rounds: usize,
+    /// Flat per-provenance icall attribution (M2.0, `DESIGN_lite.md` §2F). Counts indirect
+    /// callsites whose resolved edges carry each tier; the ablation signal M2.7 reads.
+    /// `icalls_unknown` counts sites with an Ω/unknown-callee edge. No certificate cascade.
+    pub icalls_simple: usize,
+    pub icalls_andersen: usize,
+    pub icalls_steens: usize,
+    pub icalls_fsa: usize,
+    pub icalls_unknown: usize,
     pub analysis_wall_us: u64,
     pub pag_build_us: u64,
     pub solve_us: u64,
@@ -812,11 +826,46 @@ impl Analysis {
             .collect::<BTreeSet<_>>()
             .len();
 
+        // M2.0 flat per-provenance icall attribution: one verdict per indirect callsite
+        // (all of a site's edges share its `tier`), plus a count of sites carrying an
+        // Ω/unknown-callee edge. This is bookkeeping, not a certificate cascade.
+        let mut site_tier: BTreeMap<CallsiteId, Tier> = BTreeMap::new();
+        let mut site_unknown: BTreeSet<CallsiteId> = BTreeSet::new();
+        for edge in &call_edges {
+            if edge.kind != CallKind::Indirect {
+                continue;
+            }
+            let Some(cs) = edge.callsite else { continue };
+            site_tier.insert(cs, edge.tier);
+            if matches!(edge.callee, Callee::Unknown(_)) {
+                site_unknown.insert(cs);
+            }
+        }
+        let mut icalls_simple = 0;
+        let mut icalls_andersen = 0;
+        let mut icalls_steens = 0;
+        let mut icalls_fsa = 0;
+        for tier in site_tier.values() {
+            match tier {
+                Tier::Simple => icalls_simple += 1,
+                Tier::Andersen => icalls_andersen += 1,
+                Tier::Steens => icalls_steens += 1,
+                Tier::Fsa => icalls_fsa += 1,
+                Tier::Direct => {}
+            }
+        }
+        let icalls_unknown = site_unknown.len();
+
         let metrics = Metrics {
             functions: functions.len(),
             globals: globals.len(),
             callsites: callsites.len(),
             call_edges: call_edges.len(),
+            icalls_simple,
+            icalls_andersen,
+            icalls_steens,
+            icalls_fsa,
+            icalls_unknown,
             audit_findings: findings.len(),
             mutable_globals_total,
             in_rewritable_components,

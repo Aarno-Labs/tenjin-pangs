@@ -17,6 +17,11 @@
     "partition_max_size",
     "oversize_fallbacks",
     "rounds",
+    "icalls_simple",
+    "icalls_andersen",
+    "icalls_steens",
+    "icalls_fsa",
+    "icalls_unknown",
     "analysis_wall_us",
     "pag_build_us",
     "solve_us",
@@ -147,6 +152,26 @@
       "minimum": 0
     },
     "rounds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "icalls_simple": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "icalls_andersen": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "icalls_steens": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "icalls_fsa": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "icalls_unknown": {
       "type": "integer",
       "minimum": 0
     },

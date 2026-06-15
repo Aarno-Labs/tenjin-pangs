@@ -1,0 +1,20 @@
+{
+  "module": "m2_1.dynamic_store_const_load",
+  "comment": "M2.1 soundness regression (ju_steens_overmerge_bug.md sibling / PLAN-M2_lite_delta.md §1 M2.1). A function pointer stored through a NON-constant-offset GEP (byte_off:null = the ⊤ unknown offset) must be visible to a CONSTANT-offset load of the same object — the dynamic write could have landed at offset 0. Before the (o,⊤) generalization, M1.4b Andersen dropped alpha here (steens kept it). Expected icall targets: {alpha}.",
+  "functions": [
+    {
+      "key": "caller",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%s", "ty": "struct.S" },
+        { "kind": "gep", "dest": "%pdyn", "base": "%s", "byte_off": null },
+        { "kind": "store", "address": "%pdyn", "value": "alpha" },
+        { "kind": "gep", "dest": "%p0", "base": "%s", "byte_off": 0 },
+        { "kind": "load", "dest": "%t", "address": "%p0" },
+        { "kind": "call_indirect", "operand": "%t", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "args": [] }
+      ]
+    },
+    { "key": "alpha", "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" }, "address_taken": true, "body": [] }
+  ],
+  "globals": []
+}

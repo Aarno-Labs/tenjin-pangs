@@ -430,6 +430,11 @@ impl<'a> Refiner<'a> {
                     .map(|fs| fs.iter().map(|&i| self.pir.functions[i].key.clone()).collect())
                     .unwrap_or_default();
                 targets.sort();
+                // M2.0 subset tripwire: a more-exact tier may only narrow. Andersen's
+                // per-site targets must be ⊆ the Steensgaard envelope it refined.
+                if let Some(steens) = steens {
+                    crate::debug_assert_narrows(&cs.key, "andersen", &targets, "steens", &steens.targets);
+                }
                 out.push(IndirectCallResolution {
                     callsite_key: cs.key.clone(),
                     targets,
@@ -487,6 +492,13 @@ struct Solve {
     fields: HashMap<(Cell, i64), Cell>,
     /// field cell -> base object cell, so a refined field resolves back to its global.
     field_base: HashMap<Cell, Cell>,
+    /// base object cell -> its materialized constant-offset field cells. Needed to
+    /// retroactively conflate them when the base later receives a non-constant access (M2.1).
+    obj_fields: HashMap<Cell, Vec<Cell>>,
+    /// base object cells that have had a non-constant (`⊤`) access — their fields are
+    /// conflated with the whole object (the generalization pair, `PLAN-M2_lite_delta.md`
+    /// §1 M2.1). A field distinction is unsound once an unknown offset can alias it.
+    collapsed: HashSet<Cell>,
     worklist: Vec<Cell>,
     queued: HashSet<Cell>,
 }
@@ -504,6 +516,8 @@ impl Solve {
             memcpys: Vec::new(),
             fields: HashMap::new(),
             field_base: HashMap::new(),
+            obj_fields: HashMap::new(),
+            collapsed: HashSet::new(),
             worklist: Vec::new(),
             queued: HashSet::new(),
         };
@@ -547,10 +561,29 @@ impl Solve {
         }
     }
 
+    /// Field/subobject identity for `base + off` (M2.1, `PLAN-M2_lite_delta.md` §1 M2.1).
+    ///
+    /// A **constant** offset gets its own subobject cell, giving field sensitivity. A
+    /// **non-constant** offset (`None`) is the unknown-offset `⊤` case: it can alias *any*
+    /// field of `base`, so we **conflate** `base`'s fields with the whole-object cell and
+    /// route the access there. This is the generalization pair recast as a collapse — it is
+    /// the principled fix for the M1.4b false negative where a value stored through a
+    /// dynamic-index GEP was invisible to a constant-offset load of the same object. The
+    /// collapse is sound (a superset) and only touches objects actually indexed by an
+    /// unknown offset; all-constant objects keep full field precision.
     fn field_of(&mut self, base: Cell, off: Option<i64>) -> Cell {
+        if base == self.omega {
+            return self.omega;
+        }
+        if self.collapsed.contains(&base) {
+            // Every access to a `⊤`-collapsed object names the whole-object cell.
+            return base;
+        }
         match off {
-            None => base, // non-constant GEP collapses to the whole object (coarse, sound)
-            Some(_) if base == self.omega => self.omega,
+            None => {
+                self.collapse(base);
+                base
+            }
             Some(off) => {
                 if let Some(&cell) = self.fields.get(&(base, off)) {
                     return cell;
@@ -561,7 +594,24 @@ impl Solve {
                 // A field of a field still ultimately names the original base object.
                 let root = self.field_base.get(&base).copied().unwrap_or(base);
                 self.field_base.insert(cell, root);
+                self.obj_fields.entry(base).or_default().push(cell);
                 cell
+            }
+        }
+    }
+
+    /// Mark `base` as `⊤`-accessed and conflate its already-materialized field cells with
+    /// the whole-object cell, in both directions: a value stored to any field becomes
+    /// visible to the unknown-offset access, and vice versa. Idempotent; future fields of a
+    /// collapsed object route straight to `base` via `field_of`.
+    fn collapse(&mut self, base: Cell) {
+        if !self.collapsed.insert(base) {
+            return;
+        }
+        if let Some(fields) = self.obj_fields.get(&base).cloned() {
+            for f in fields {
+                self.add_copy(f, base);
+                self.add_copy(base, f);
             }
         }
     }
@@ -674,6 +724,44 @@ mod tests {
         let pir = Pir::from_path(fixture(name)).unwrap();
         let pag = Pag::from_pir(&pir, &PagOpts::default());
         (pir, pag)
+    }
+
+    fn load_m2_1(name: &str) -> (Pir, Pag) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/m2_1")
+            .join(name);
+        let pir = Pir::from_path(path).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        (pir, pag)
+    }
+
+    #[test]
+    fn m2_1_dynamic_store_is_seen_by_constant_load() {
+        // The (o,⊤) generalization: a value written through a non-constant-offset GEP must
+        // reach a constant-offset load of the same object. Before M2.1, andersen dropped it.
+        let (pir, pag) = load_m2_1("dynamic_store_const_load.pir.json");
+        let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert_eq!(steens.indirect_calls[0].targets, vec!["alpha".to_string()]);
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
+        assert_eq!(
+            andersen.indirect_calls[0].targets,
+            vec!["alpha".to_string()],
+            "M2.1: dynamic-offset store must be visible to a constant-offset load"
+        );
+    }
+
+    #[test]
+    fn m2_1_constant_store_is_seen_by_dynamic_load() {
+        // Reverse direction: a constant-offset store must reach a non-constant (⊤) load.
+        let (pir, pag) = load_m2_1("const_store_dynamic_load.pir.json");
+        let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert_eq!(steens.indirect_calls[0].targets, vec!["beta".to_string()]);
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
+        assert_eq!(
+            andersen.indirect_calls[0].targets,
+            vec!["beta".to_string()],
+            "M2.1: constant-offset store must be visible to a non-constant-offset load"
+        );
     }
 
     #[test]

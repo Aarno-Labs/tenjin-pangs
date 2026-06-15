@@ -7,6 +7,34 @@ use serde::{Deserialize, Serialize};
 mod andersen;
 pub use andersen::solve_andersen;
 
+/// M2.0 subset-narrowing tripwire (`PLAN-M2_lite_delta.md` §1 M2.0). A more-exact
+/// provenance may only *narrow* an answer; if `refined` is not a subset of `envelope`, a
+/// tier produced a target the coarser tier did not — a soundness regression. This is the
+/// cheapest such tripwire we buy: it costs a set membership per resolved site and fires in
+/// debug builds. Reused by every narrowing source (Andersen∩FSA now; B1/B2 overrides in
+/// M2.2/M2.4). In release it is a no-op (we never widen silently — the coarser answer is
+/// already sound).
+#[track_caller]
+pub(crate) fn debug_assert_narrows(
+    site: &str,
+    refined_tier: &str,
+    refined: &[String],
+    envelope_tier: &str,
+    envelope: &[String],
+) {
+    if cfg!(debug_assertions) {
+        let env: HashSet<&str> = envelope.iter().map(|s| s.as_str()).collect();
+        for t in refined {
+            assert!(
+                env.contains(t.as_str()),
+                "subset-narrowing violation at {site}: {refined_tier} target {t:?} \
+                 is not in the {envelope_tier} envelope {envelope:?} (a more-exact tier \
+                 widened the answer — soundness regression)",
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SolveMetrics {
     pub partition_count: usize,
@@ -793,6 +821,21 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/synthetic/m1_4")
             .join(name)
+    }
+
+    #[test]
+    fn narrowing_tripwire_is_silent_when_refined_is_a_subset() {
+        // M2.0: a more-exact tier narrowing within the envelope must not fire.
+        debug_assert_narrows("site", "andersen", &["f".into()], "steens", &["f".into(), "g".into()]);
+        debug_assert_narrows("site", "simple", &[], "steens", &["f".into()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "subset-narrowing violation")]
+    fn narrowing_tripwire_fires_when_refined_adds_a_target() {
+        // M2.0: a "more-exact" tier that introduces a target the envelope lacks is a
+        // soundness regression — the tripwire must catch it.
+        debug_assert_narrows("site", "simple", &["g".into()], "steens", &["f".into()]);
     }
 
     fn fixture_m1_5(name: &str) -> std::path::PathBuf {
