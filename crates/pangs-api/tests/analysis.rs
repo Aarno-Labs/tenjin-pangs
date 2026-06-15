@@ -193,6 +193,41 @@ fn m2_2_simple_never_address_taken_global_slot_resolves_exactly() {
 }
 
 #[test]
+fn m2_2_simple_constant_global_field_resolves_exactly() {
+    let pir = Pir::from_path(m2_2_fixture("simple_global_fields.pir.json")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_single_simple_target(&analysis, "cb");
+}
+
+#[test]
+fn m2_2_dynamic_global_field_access_is_not_marked_simple() {
+    let pir = Pir::from_path(m2_2_fixture("dynamic_global_field_is_complex.pir.json")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.metrics().icalls_simple, 0);
+    assert!(analysis.call_edges().iter().any(|edge| {
+        edge.kind == pangs_api::CallKind::Indirect && edge.tier == pangs_api::Tier::Andersen
+    }));
+}
+
+#[test]
 fn m2_2_simple_param_actual_resolves_through_internal_direct_call() {
     let pir = Pir::from_path(m2_2_fixture("simple_param_actual.pir.json")).unwrap();
 

@@ -55,6 +55,12 @@ struct SimpleResolver<'a> {
     definitions: Vec<HashMap<&'a str, usize>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SubObj {
+    root: String,
+    byte_off: i64,
+}
+
 impl<'a> SimpleResolver<'a> {
     fn new(module: &'a Pir) -> Self {
         let functions = module
@@ -189,14 +195,17 @@ impl<'a> SimpleResolver<'a> {
             Stmt::Gep { base, .. } => {
                 self.resolve_value(func_index, stmt_index, base, depth, visiting, out)
             }
-            Stmt::Load { address, .. } if self.globals.contains(address.as_str()) => {
-                self.resolve_global(address, depth, visiting, out)
+            Stmt::Load { address, .. } => {
+                if let Some(place) = self.function_place(func_index, stmt_index, address) {
+                    self.resolve_global_place(&place, depth, visiting, out)
+                } else {
+                    WalkResult::Complex
+                }
             }
             Stmt::CallDirect { callee, .. } => {
                 self.resolve_return_values(callee, depth + 1, visiting, out)
             }
             Stmt::Alloca { .. }
-            | Stmt::Load { .. }
             | Stmt::PtrToInt { .. }
             | Stmt::IntToPtr { .. }
             | Stmt::Memcpy { .. }
@@ -321,7 +330,25 @@ impl<'a> SimpleResolver<'a> {
         visiting: &mut HashSet<(usize, String, usize)>,
         out: &mut ValueResolution,
     ) -> WalkResult {
-        if depth > DEFAULT_CONTEXT_DEPTH || !self.global_is_never_address_taken(global) {
+        self.resolve_global_place(
+            &SubObj {
+                root: global.to_string(),
+                byte_off: 0,
+            },
+            depth,
+            visiting,
+            out,
+        )
+    }
+
+    fn resolve_global_place(
+        &mut self,
+        place: &SubObj,
+        depth: usize,
+        visiting: &mut HashSet<(usize, String, usize)>,
+        out: &mut ValueResolution,
+    ) -> WalkResult {
+        if depth > DEFAULT_CONTEXT_DEPTH || !self.global_place_is_simple(place) {
             return WalkResult::Complex;
         }
         let mut saw_store = false;
@@ -333,7 +360,11 @@ impl<'a> SimpleResolver<'a> {
                 else {
                     continue;
                 };
-                if address != global {
+                let Some(address_place) = self.function_place(func_index, stmt_index, address)
+                else {
+                    continue;
+                };
+                if &address_place != place {
                     continue;
                 }
                 saw_store = true;
@@ -349,7 +380,10 @@ impl<'a> SimpleResolver<'a> {
             let Stmt::Store { address, value, .. } = stmt else {
                 continue;
             };
-            if address != global {
+            let Some(address_place) = self.global_init_place(stmt_index, address) else {
+                continue;
+            };
+            if &address_place != place {
                 continue;
             }
             saw_store = true;
@@ -436,22 +470,41 @@ impl<'a> SimpleResolver<'a> {
         {
             return false;
         }
-        self.module.functions.iter().all(|func| {
-            func.body
-                .iter()
-                .all(|stmt| global_use_is_safe(stmt, global))
-        }) && self
-            .module
-            .global_init
+        self.module
+            .functions
             .iter()
-            .all(|stmt| global_use_is_safe(stmt, global))
+            .enumerate()
+            .all(|(func_index, func)| {
+                func.body.iter().enumerate().all(|(stmt_index, stmt)| {
+                    self.function_global_use_is_safe(func_index, stmt_index, stmt, global)
+                })
+            })
+            && self
+                .module
+                .global_init
+                .iter()
+                .enumerate()
+                .all(|(stmt_index, stmt)| {
+                    self.global_init_global_use_is_safe(stmt_index, stmt, global)
+                })
+    }
+
+    fn global_place_is_simple(&self, place: &SubObj) -> bool {
+        self.global_is_never_address_taken(&place.root)
     }
 
     fn function_has_unsafe_escape(&self, target: &str) -> bool {
         let mut visiting = HashSet::new();
         for (func_index, func) in self.module.functions.iter().enumerate() {
-            for stmt in &func.body {
-                if self.function_symbol_use_escapes(func_index, stmt, target, 0, &mut visiting) {
+            for (stmt_index, stmt) in func.body.iter().enumerate() {
+                if self.function_symbol_use_escapes(
+                    func_index,
+                    stmt_index,
+                    stmt,
+                    target,
+                    0,
+                    &mut visiting,
+                ) {
                     return true;
                 }
             }
@@ -466,6 +519,7 @@ impl<'a> SimpleResolver<'a> {
     fn function_symbol_use_escapes(
         &self,
         func_index: usize,
+        stmt_index: usize,
         stmt: &Stmt,
         target: &str,
         depth: usize,
@@ -475,9 +529,10 @@ impl<'a> SimpleResolver<'a> {
             Stmt::Assign { dest, sources, .. } if sources.iter().any(|source| source == target) => {
                 self.local_value_escapes(func_index, dest, depth, visiting)
             }
-            Stmt::Store { address, value, .. } if value == target => {
-                !self.global_is_never_address_taken(address)
-            }
+            Stmt::Store { address, value, .. } if value == target => !self
+                .function_place(func_index, stmt_index, address)
+                .map(|place| self.global_place_is_simple(&place))
+                .unwrap_or_else(|| self.global_is_never_address_taken(address)),
             Stmt::CallDirect {
                 callee, sig, args, ..
             } => {
@@ -531,7 +586,10 @@ impl<'a> SimpleResolver<'a> {
         let escapes = self.module.functions[func_index]
             .body
             .iter()
-            .any(|stmt| self.local_value_use_escapes(func_index, stmt, value, depth, visiting));
+            .enumerate()
+            .any(|(stmt_index, stmt)| {
+                self.local_value_use_escapes(func_index, stmt_index, stmt, value, depth, visiting)
+            });
         visiting.remove(&(func_index, value.to_string(), depth));
         escapes
     }
@@ -539,6 +597,7 @@ impl<'a> SimpleResolver<'a> {
     fn local_value_use_escapes(
         &self,
         func_index: usize,
+        stmt_index: usize,
         stmt: &Stmt,
         value: &str,
         depth: usize,
@@ -555,7 +614,10 @@ impl<'a> SimpleResolver<'a> {
                 address,
                 value: stored,
                 ..
-            } if stored == value => !self.global_is_never_address_taken(address),
+            } if stored == value => !self
+                .function_place(func_index, stmt_index, address)
+                .map(|place| self.global_place_is_simple(&place))
+                .unwrap_or_else(|| self.global_is_never_address_taken(address)),
             Stmt::CallDirect {
                 callee, sig, args, ..
             } => args.iter().enumerate().any(|(index, arg)| {
@@ -649,6 +711,149 @@ impl<'a> SimpleResolver<'a> {
         !saw_caller && !value.is_empty()
     }
 
+    fn function_place(&self, func_index: usize, before_stmt: usize, value: &str) -> Option<SubObj> {
+        if self.globals.contains(value) {
+            return Some(SubObj {
+                root: value.to_string(),
+                byte_off: 0,
+            });
+        }
+        let stmt_index = *self.definitions.get(func_index)?.get(value)?;
+        if stmt_index >= before_stmt {
+            return None;
+        }
+        match &self.module.functions[func_index].body[stmt_index] {
+            Stmt::Gep {
+                base,
+                byte_off: Some(byte_off),
+                ..
+            } => {
+                let mut base = self.function_place(func_index, stmt_index, base)?;
+                base.byte_off = base.byte_off.checked_add(*byte_off)?;
+                Some(base)
+            }
+            Stmt::Assign { sources, .. } if sources.len() == 1 => {
+                self.function_place(func_index, stmt_index, &sources[0])
+            }
+            _ => None,
+        }
+    }
+
+    fn global_init_place(&self, before_stmt: usize, value: &str) -> Option<SubObj> {
+        if self.globals.contains(value) {
+            return Some(SubObj {
+                root: value.to_string(),
+                byte_off: 0,
+            });
+        }
+        for stmt_index in (0..before_stmt).rev() {
+            let Some(dest) = stmt_dest(&self.module.global_init[stmt_index]) else {
+                continue;
+            };
+            if dest != value {
+                continue;
+            }
+            return match &self.module.global_init[stmt_index] {
+                Stmt::Gep {
+                    base,
+                    byte_off: Some(byte_off),
+                    ..
+                } => {
+                    let mut base = self.global_init_place(stmt_index, base)?;
+                    base.byte_off = base.byte_off.checked_add(*byte_off)?;
+                    Some(base)
+                }
+                Stmt::Assign { sources, .. } if sources.len() == 1 => {
+                    self.global_init_place(stmt_index, &sources[0])
+                }
+                _ => None,
+            };
+        }
+        None
+    }
+
+    fn function_global_use_is_safe(
+        &self,
+        func_index: usize,
+        stmt_index: usize,
+        stmt: &Stmt,
+        global: &str,
+    ) -> bool {
+        match stmt {
+            Stmt::Load { address, .. } => self
+                .function_place(func_index, stmt_index, address)
+                .map(|place| place.root == global)
+                .unwrap_or_else(|| !operand_mentions_global(address, global)),
+            Stmt::Store { address, value, .. } => {
+                let address_safe = self
+                    .function_place(func_index, stmt_index, address)
+                    .map(|place| place.root == global)
+                    .unwrap_or_else(|| !operand_mentions_global(address, global));
+                address_safe
+                    && self
+                        .function_place(func_index, stmt_index, value)
+                        .map(|place| place.root != global)
+                        .unwrap_or_else(|| !operand_mentions_global(value, global))
+            }
+            Stmt::Gep {
+                base,
+                byte_off: Some(_),
+                ..
+            } => self
+                .function_place(func_index, stmt_index, base)
+                .map(|place| place.root == global)
+                .unwrap_or_else(|| !operand_mentions_global(base, global)),
+            Stmt::Gep { base, .. } => self
+                .function_place(func_index, stmt_index, base)
+                .map(|place| place.root != global)
+                .unwrap_or_else(|| !operand_mentions_global(base, global)),
+            Stmt::GlobalRef { .. } => true,
+            _ => stmt_operands(stmt).into_iter().all(|operand| {
+                self.function_place(func_index, stmt_index, operand)
+                    .map(|place| place.root != global)
+                    .unwrap_or_else(|| !operand_mentions_global(operand, global))
+            }),
+        }
+    }
+
+    fn global_init_global_use_is_safe(&self, stmt_index: usize, stmt: &Stmt, global: &str) -> bool {
+        match stmt {
+            Stmt::Load { address, .. } => self
+                .global_init_place(stmt_index, address)
+                .map(|place| place.root == global)
+                .unwrap_or_else(|| !operand_mentions_global(address, global)),
+            Stmt::Store { address, value, .. } => {
+                let address_safe = self
+                    .global_init_place(stmt_index, address)
+                    .map(|place| place.root == global)
+                    .unwrap_or_else(|| !operand_mentions_global(address, global));
+                address_safe
+                    && self
+                        .global_init_place(stmt_index, value)
+                        .map(|place| place.root != global)
+                        .unwrap_or_else(|| !operand_mentions_global(value, global))
+            }
+            Stmt::Gep {
+                base,
+                byte_off: Some(_),
+                ..
+            } => self
+                .global_init_place(stmt_index, base)
+                .map(|place| place.root == global)
+                .unwrap_or_else(|| !operand_mentions_global(base, global)),
+            Stmt::Gep { base, .. } => self
+                .global_init_place(stmt_index, base)
+                .map(|place| place.root != global)
+                .unwrap_or_else(|| !operand_mentions_global(base, global)),
+            Stmt::GlobalRef { .. } => true,
+            _ => stmt_operands(stmt).into_iter().all(|operand| {
+                self.global_init_place(stmt_index, operand)
+                    .map(|place| place.root != global)
+                    .unwrap_or_else(|| !operand_mentions_global(operand, global))
+            }),
+        }
+    }
+
     fn param_index(&self, func_index: usize, value: &str) -> Option<usize> {
         self.module.functions[func_index]
             .param_names
@@ -683,46 +888,37 @@ fn stmt_dest(stmt: &Stmt) -> Option<&str> {
     }
 }
 
-fn global_use_is_safe(stmt: &Stmt, global: &str) -> bool {
+fn stmt_operands(stmt: &Stmt) -> Vec<&str> {
     match stmt {
-        Stmt::Load { address, .. } => address == global,
-        Stmt::Store { address, value, .. } => address == global && value != global,
-        Stmt::GlobalRef { .. } => true,
-        Stmt::Assign { dest, sources, .. } => {
-            dest != global && !sources.iter().any(|source| source == global)
+        Stmt::Alloca { .. } | Stmt::GlobalRef { .. } => Vec::new(),
+        Stmt::Assign { sources, .. } => sources.iter().map(String::as_str).collect(),
+        Stmt::Load { address, .. } => vec![address.as_str()],
+        Stmt::Store { address, value, .. } => vec![address.as_str(), value.as_str()],
+        Stmt::Gep { base, .. } => vec![base.as_str()],
+        Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => {
+            vec![source.as_str()]
         }
-        Stmt::Gep { dest, base, .. } => dest != global && base != global,
-        Stmt::PtrToInt { dest, source, .. } | Stmt::IntToPtr { dest, source, .. } => {
-            dest != global && source != global
-        }
-        Stmt::Memcpy { dst, src, .. } => dst != global && src != global,
-        Stmt::Memset { dst, value, .. } => dst != global && value != global,
+        Stmt::Memcpy { dst, src, .. } => vec![dst.as_str(), src.as_str()],
+        Stmt::Memset { dst, value, .. } => vec![dst.as_str(), value.as_str()],
         Stmt::Unknown {
             operands, results, ..
-        } => {
-            !operands.iter().any(|operand| operand == global)
-                && !results.iter().any(|result| result == global)
-        }
-        Stmt::Return { value, .. } => value.as_deref() != Some(global),
-        Stmt::CallDirect {
-            callee, args, dest, ..
-        } => {
-            callee != global
-                && dest.as_deref() != Some(global)
-                && !args.iter().any(|arg| arg == global)
-        }
-        Stmt::CallIndirect {
-            operand,
-            args,
-            dest,
-            ..
-        } => {
-            operand != global
-                && dest.as_deref() != Some(global)
-                && !args.iter().any(|arg| arg == global)
-        }
-        Stmt::Alloca { dest, .. } => dest != global,
+        } => operands
+            .iter()
+            .chain(results.iter())
+            .map(String::as_str)
+            .collect(),
+        Stmt::Return { value, .. } => value.as_deref().into_iter().collect(),
+        Stmt::CallDirect { callee, args, .. } => std::iter::once(callee.as_str())
+            .chain(args.iter().map(String::as_str))
+            .collect(),
+        Stmt::CallIndirect { operand, args, .. } => std::iter::once(operand.as_str())
+            .chain(args.iter().map(String::as_str))
+            .collect(),
     }
+}
+
+fn operand_mentions_global(operand: &str, global: &str) -> bool {
+    operand == global
 }
 
 fn function_use_is_unsafe<F>(stmt: &Stmt, target: &str, mut global_is_safe_slot: F) -> bool
