@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use pangs_pag::{BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts};
 use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, Stmt};
-use pangs_solve::{debug_assert_narrows, solve_andersen, solve_steensgaard, NodeResolution};
+use pangs_solve::{
+    debug_assert_narrows, solve_andersen_with_overrides, solve_steensgaard, NodeResolution,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -635,6 +637,14 @@ impl Analysis {
             .iter()
             .map(|query| (query.callsite, query))
             .collect();
+        let simple_exact_targets: BTreeMap<String, Vec<String>> = simple_icalls
+            .iter()
+            .filter_map(|(callsite, resolution)| {
+                simple_queries
+                    .get(callsite)
+                    .map(|query| (query.callsite_key.clone(), resolution.targets.clone()))
+            })
+            .collect();
 
         match opts.stage {
             Stage::Conservative => {
@@ -682,9 +692,14 @@ impl Analysis {
                 pag_build_us = pag_started.elapsed().as_micros() as u64;
                 let solve_started = Instant::now();
                 let solved = match opts.stage {
-                    Stage::Andersen => {
-                        solve_andersen(module, &pag, opts.build_mode.into(), opts.partition_budget)
-                    }
+                    Stage::Andersen => solve_andersen_with_overrides(
+                        module,
+                        &pag,
+                        opts.build_mode.into(),
+                        opts.partition_budget,
+                        &simple_exact_targets,
+                        confined_functions,
+                    ),
                     _ => solve_steensgaard(module, &pag, opts.build_mode.into()),
                 };
                 solve_us = solve_started.elapsed().as_micros() as u64;

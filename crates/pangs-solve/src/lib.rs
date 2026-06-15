@@ -5,7 +5,7 @@ use pangs_pir::{fsa_compatible, Pir, Signature};
 use serde::{Deserialize, Serialize};
 
 mod andersen;
-pub use andersen::solve_andersen;
+pub use andersen::{solve_andersen, solve_andersen_with_overrides};
 
 /// M2.0 subset-narrowing tripwire (`PLAN-M2_lite_delta.md` §1 M2.0). A more-exact
 /// provenance may only *narrow* an answer; if `refined` is not a subset of `envelope`, a

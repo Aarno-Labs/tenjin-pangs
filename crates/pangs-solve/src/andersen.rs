@@ -16,7 +16,7 @@
 //! * Anything reachable only through Ω stays Ω (absorbing), and the escape/unknown outputs
 //!   that drive component freezing are taken verbatim from Steensgaard.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use pangs_pag::{CallKind, EdgeKind, NodeId, NodeKind, ObjectKind, Pag};
 use pangs_pir::{fsa_compatible, Pir};
@@ -35,8 +35,41 @@ pub fn solve_andersen(
     build_mode: pangs_pag::BuildMode,
     partition_budget: u64,
 ) -> SolveResult {
+    solve_andersen_with_overrides(
+        pir,
+        pag,
+        build_mode,
+        partition_budget,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+    )
+}
+
+/// Solve Andersen with exact per-callsite target overrides and globally confined targets.
+///
+/// Exact overrides represent higher-precedence callsites already proven by a def-use
+/// walker. They remain active even when their target is globally confined, so the fixed
+/// call graph still binds params/returns for the real exact call. Confined targets are
+/// removed only from non-exact candidate sites.
+pub fn solve_andersen_with_overrides(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: pangs_pag::BuildMode,
+    partition_budget: u64,
+    exact_targets: &BTreeMap<String, Vec<String>>,
+    confined_targets: &BTreeSet<String>,
+) -> SolveResult {
     let (mut base, classes) = crate::solve_steensgaard_with_classes(pir, pag, build_mode);
-    let refined = Refiner::new(pir, pag, &classes, &base, partition_budget).run();
+    let refined = Refiner::new(
+        pir,
+        pag,
+        &classes,
+        &base,
+        partition_budget,
+        exact_targets,
+        confined_targets,
+    )
+    .run();
 
     // Override only the refined facts; keep escape/unknown/globals from Steensgaard.
     base.indirect_calls = refined.indirect_calls;
@@ -67,6 +100,8 @@ struct Refiner<'a> {
     classes: &'a SteensClasses,
     base: &'a SolveResult,
     budget: u64,
+    exact_targets: &'a BTreeMap<String, Vec<String>>,
+    confined_targets: &'a BTreeSet<String>,
 
     n_base: usize,
     omega: Cell,
@@ -96,6 +131,8 @@ impl<'a> Refiner<'a> {
         classes: &'a SteensClasses,
         base: &'a SolveResult,
         budget: u64,
+        exact_targets: &'a BTreeMap<String, Vec<String>>,
+        confined_targets: &'a BTreeSet<String>,
     ) -> Self {
         let n_base = pag.nodes.len();
         let omega = n_base as Cell;
@@ -157,6 +194,8 @@ impl<'a> Refiner<'a> {
             classes,
             base,
             budget,
+            exact_targets,
+            confined_targets,
             n_base,
             omega,
             func_index,
@@ -272,8 +311,8 @@ impl<'a> Refiner<'a> {
             })
             .collect();
 
-        // Round-0 seed: FSA ∩ Steensgaard targets for the in-scope sites. (The empty
-        // `exact_overrides` seam of `PLAN-M1_lite_delta.md` §M1.4b would be subtracted here.)
+        // Round-0 seed: exact overrides for proven sites, otherwise FSA ∩ Steensgaard
+        // targets with confined targets removed from candidate callsites.
         let steens_by_key: HashMap<&str, &IndirectCallResolution> = self
             .base
             .indirect_calls
@@ -283,15 +322,14 @@ impl<'a> Refiner<'a> {
         let mut target_map: HashMap<usize, Vec<usize>> = HashMap::new();
         for &site in &in_scope_sites {
             let key = self.pag.callsites[site].key.as_str();
-            let funcs = steens_by_key
-                .get(key)
-                .map(|r| {
-                    r.targets
-                        .iter()
-                        .filter_map(|t| self.func_index.get(t).copied())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let funcs = if let Some(funcs) = self.exact_target_indices(key) {
+                funcs
+            } else {
+                steens_by_key
+                    .get(key)
+                    .map(|r| self.non_confined_target_indices(&r.targets))
+                    .unwrap_or_default()
+            };
             target_map.insert(site, funcs);
         }
 
@@ -384,13 +422,20 @@ impl<'a> Refiner<'a> {
         let mut map = HashMap::new();
         for &site in sites {
             let cs = &self.pag.callsites[site];
+            if let Some(funcs) = self.exact_target_indices(&cs.key) {
+                map.insert(site, funcs);
+                continue;
+            }
             let operand = cs.operand.unwrap();
             let mut funcs: Vec<usize> = Vec::new();
             if let Some(set) = pts.pts.get(&operand.0) {
                 for &cell in set {
                     if let Some(&idx) = self.fn_cell_to_index.get(&cell) {
                         let f = &self.pir.functions[idx];
-                        if f.address_taken && fsa_compatible(&cs.sig, &f.sig) {
+                        if f.address_taken
+                            && !self.confined_targets.contains(&f.key)
+                            && fsa_compatible(&cs.sig, &f.sig)
+                        {
                             funcs.push(idx);
                         }
                     }
@@ -401,6 +446,29 @@ impl<'a> Refiner<'a> {
             map.insert(site, funcs);
         }
         map
+    }
+
+    fn exact_target_indices(&self, callsite_key: &str) -> Option<Vec<usize>> {
+        let targets = self.exact_targets.get(callsite_key)?;
+        Some(self.target_indices(targets.iter().map(String::as_str)))
+    }
+
+    fn non_confined_target_indices(&self, targets: &[String]) -> Vec<usize> {
+        self.target_indices(
+            targets
+                .iter()
+                .map(String::as_str)
+                .filter(|target| !self.confined_targets.contains(*target)),
+        )
+    }
+
+    fn target_indices<'b>(&self, targets: impl Iterator<Item = &'b str>) -> Vec<usize> {
+        let mut funcs: Vec<usize> = targets
+            .filter_map(|target| self.func_index.get(target).copied())
+            .collect();
+        funcs.sort_unstable();
+        funcs.dedup();
+        funcs
     }
 
     fn emit_indirect_calls(
@@ -726,12 +794,13 @@ impl ValueLike for NodeKind {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
     use pangs_pag::{BuildMode, Pag, PagOpts};
     use pangs_pir::Pir;
 
-    use super::solve_andersen;
+    use super::{solve_andersen, solve_andersen_with_overrides};
     use crate::solve_steensgaard;
 
     fn fixture(name: &str) -> std::path::PathBuf {
@@ -749,6 +818,15 @@ mod tests {
     fn load_m2_1(name: &str) -> (Pir, Pag) {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/synthetic/m2_1")
+            .join(name);
+        let pir = Pir::from_path(path).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        (pir, pag)
+    }
+
+    fn load_m2_3(name: &str) -> (Pir, Pag) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/m2_3")
             .join(name);
         let pir = Pir::from_path(path).unwrap();
         let pag = Pag::from_pir(&pir, &PagOpts::default());
@@ -782,6 +860,36 @@ mod tests {
             vec!["beta".to_string()],
             "M2.1: constant-offset store must be visible to a non-constant-offset load"
         );
+    }
+
+    #[test]
+    fn exact_overrides_survive_confined_subtraction_while_candidate_sites_narrow() {
+        let (pir, pag) = load_m2_3("confined_subtraction.pir.json");
+        let mut exact = BTreeMap::new();
+        exact.insert("driver@!noloc#0".to_string(), vec!["cb".to_string()]);
+        let confined = BTreeSet::from(["cb".to_string()]);
+
+        let andersen = solve_andersen_with_overrides(
+            &pir,
+            &pag,
+            BuildMode::Library,
+            1_000_000,
+            &exact,
+            &confined,
+        );
+        let exact_site = andersen
+            .indirect_calls
+            .iter()
+            .find(|r| r.callsite_key == "driver@!noloc#0")
+            .unwrap();
+        assert_eq!(exact_site.targets, vec!["cb".to_string()]);
+
+        let candidate_site = andersen
+            .indirect_calls
+            .iter()
+            .find(|r| r.callsite_key == "driver@!noloc#1")
+            .unwrap();
+        assert_eq!(candidate_site.targets, vec!["other".to_string()]);
     }
 
     #[test]
