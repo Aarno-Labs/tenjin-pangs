@@ -206,10 +206,29 @@ M2 step. Delete the row from the schedule.
 - Synthetic tests cover the ablation switches and CLI JSON output. The existing M1.8
   dynamic icall tests remain in the full suite and validate observed indirect calls
   against Andersen exports after B1/B2 exact precedence.
-- The solved-stage CLI exposes `--partition-budget` for `analyze`, `differential`, and
-  `m2-ablation`. The default budget is 1,000: on `exe-jq-O1.bc` this keeps the default
+- The solved-stage pipeline uses an automatic Andersen refinement budget with a default of
+  1,000 nodes per AP partition. Oversized partitions fall back to the Steensgaard result
+  and are reported in `metrics.json` as `oversize_fallbacks` plus
+  `oversize_fallback_max_size`. A hidden `--partition-budget` override remains accepted
+  on `analyze`, `differential`, and `m2-ablation` for diagnostics and ablation work, but it
+  is not a normal client-facing tuning surface. On `exe-jq-O1.bc`, the default keeps the
   Andersen path to ~36s by falling back 17 oversized partitions. The previous 1,000,000
   default admitted an expensive jq partition and did not finish within an hour.
+- Release-mode `m2-ablation` on `/home/brk/pangs-corpus/_out_bc/exe-jq-O1.bc` completes
+  within the timeout with the default budget (`ju_out/m2_7/exe-jq-O1-m2-ablation.json`,
+  97.01s wall-clock). All four variants report `oversize_fallbacks=17` and
+  `oversize_fallback_max_size=26647`.
+- Additional release-mode corpus ablations completed on `exe-jpegoptim-O1`,
+  `exe-chibicc-O1`, `exe-curl-O1`, `exe-gifsicle-O1`, `exe-jpegoptim-O0`,
+  `lib-parson-O0`, and `lib-parson-O1` under `ju_out/m2_7/`. None showed a B1/B2
+  precision delta: `call_edges` were identical across variants and `icalls_simple=0` in
+  every completed real-corpus run. `exe-gifsicle-O1` did exercise Andersen-resolved
+  indirect calls (`icalls_andersen=4`) but B1/B2 did not resolve additional sites.
+  `exe-lua-O1` and `exe-chibicc-O0` timed out under the bounded ablation run, so they are
+  recorded as performance follow-up candidates rather than M2.7 blockers. Current M2.7
+  validation therefore freezes the semantics based on synthetic coverage and records that
+  this corpus snapshot did not expose a measurable B1/B2 precision win. The detailed
+  table is in `notes/m2_7_validation.md`.
 
 ## 2. Contract/schema deltas
 
