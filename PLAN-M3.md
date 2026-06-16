@@ -162,6 +162,13 @@ Acceptance:
 - any revived tier-E work is explicitly justified by load-bearing, non-Ω, internal
   context-insensitive icall residue.
 
+**Implementation status:** initial smoke/medium measurements are recorded in
+`notes/m3_lite_measurements.md`. Five O1 rows completed and `exe-lua-O1` timed out under
+a 300s cap. The jq/chibicc/gifsicle transitive mod/ref closure cost was traced to
+witness-instance duplication and reduced by keying closure payloads on semantic mod/ref facts.
+No final design decision yet; the next investigation is the remaining normal-path lua timeout
+and any now-visible local mod/ref duplicate-witness cost.
+
 ## 6. What To Stop Doing For Lite M3
 
 The following are not active lite work:

@@ -318,7 +318,7 @@ fn component_summary(outdir: &Path) -> Result<ComponentSummary> {
                 let taints = if component.taint_kinds.is_empty() {
                     "none".to_string()
                 } else {
-                    component.taint_kinds.join("+")
+                    format_histogram(&histogram_from_strings(&component.taint_kinds))
                 };
                 format!(
                     "{}(members={}, mutable_globals={}, taints={taints})",
@@ -499,6 +499,14 @@ fn format_histogram(histogram: &BTreeMap<String, usize>) -> String {
         .map(|(key, count)| format!("{key}={count}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn histogram_from_strings(values: &[String]) -> BTreeMap<String, usize> {
+    let mut histogram = BTreeMap::new();
+    for value in values {
+        *histogram.entry(value.clone()).or_insert(0) += 1;
+    }
+    histogram
 }
 
 fn percentile(sorted: &[usize], percentile: usize) -> usize {
