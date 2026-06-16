@@ -42,6 +42,7 @@ pub struct SolveMetrics {
     pub partition_p95_size: usize,
     pub partition_max_size: usize,
     pub oversize_fallbacks: usize,
+    pub oversize_fallback_max_size: usize,
     pub rounds: usize,
 }
 
@@ -556,6 +557,7 @@ impl<'a> Solver<'a> {
             partition_p95_size: percentile(&sizes, 95),
             partition_max_size: sizes.last().copied().unwrap_or(0),
             oversize_fallbacks: 0,
+            oversize_fallback_max_size: 0,
             rounds: 1,
         };
 

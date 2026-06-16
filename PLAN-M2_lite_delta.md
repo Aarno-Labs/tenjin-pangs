@@ -206,9 +206,10 @@ M2 step. Delete the row from the schedule.
 - Synthetic tests cover the ablation switches and CLI JSON output. The existing M1.8
   dynamic icall tests remain in the full suite and validate observed indirect calls
   against Andersen exports after B1/B2 exact precedence.
-- Large real-corpus ablations should be run as longer release jobs. A release CLI build
-  succeeds; an interactive `jq` O1 ablation did not finish within the short turn budget
-  and was terminated cleanly, so no generated corpus results were checked in.
+- The solved-stage CLI exposes `--partition-budget` for `analyze`, `differential`, and
+  `m2-ablation`. The default budget is 1,000: on `exe-jq-O1.bc` this keeps the default
+  Andersen path to ~36s by falling back 17 oversized partitions. The previous 1,000,000
+  default admitted an expensive jq partition and did not finish within an hour.
 
 ## 2. Contract/schema deltas
 

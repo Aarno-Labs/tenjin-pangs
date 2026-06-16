@@ -182,7 +182,7 @@ pub fn report(outdir: &Path) -> Result<String> {
     )?;
     let wall_ms = manifest["wall_ms"].as_u64().unwrap_or(0);
     Ok(format!(
-        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\nconfined functions: {}\ninitval complete globals: {}\nstationary globals: {}\naudit findings: {}\nmutable globals rewritable: {}/{}\npipeline wall: {} ms\nanalysis wall: {} us\npag build: {} us\nsolve: {} us\ntransitive modref: {} us\ncomponents: {} us\n",
+        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\nconfined functions: {}\ninitval complete globals: {}\nstationary globals: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\nmutable globals rewritable: {}/{}\npipeline wall: {} ms\nanalysis wall: {} us\npag build: {} us\nsolve: {} us\ntransitive modref: {} us\ncomponents: {} us\n",
         metrics.functions,
         metrics.globals,
         metrics.call_edges,
@@ -194,6 +194,8 @@ pub fn report(outdir: &Path) -> Result<String> {
         metrics.confined_functions,
         metrics.globals_with_complete_initval,
         metrics.stationary_globals,
+        metrics.oversize_fallbacks,
+        metrics.oversize_fallback_max_size,
         metrics.audit_findings,
         metrics.in_rewritable_components,
         metrics.mutable_globals_total,
@@ -626,6 +628,7 @@ mod tests {
         assert!(text.contains("confined functions: "));
         assert!(text.contains("initval complete globals: "));
         assert!(text.contains("stationary globals: "));
+        assert!(text.contains("oversize fallbacks: "));
     }
 
     fn workspace_root() -> PathBuf {

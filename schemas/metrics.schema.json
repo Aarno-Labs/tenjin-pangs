@@ -16,6 +16,7 @@
     "partition_p95_size",
     "partition_max_size",
     "oversize_fallbacks",
+    "oversize_fallback_max_size",
     "rounds",
     "icalls_simple",
     "icalls_andersen",
@@ -151,6 +152,10 @@
       "minimum": 0
     },
     "oversize_fallbacks": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "oversize_fallback_max_size": {
       "type": "integer",
       "minimum": 0
     },

@@ -80,6 +80,7 @@ pub fn solve_andersen_with_overrides(
     }
     base.metrics.rounds = refined.rounds;
     base.metrics.oversize_fallbacks = refined.oversize_fallbacks;
+    base.metrics.oversize_fallback_max_size = refined.oversize_fallback_max_size;
     base
 }
 
@@ -88,6 +89,7 @@ struct RefinerOutput {
     pointee_globals: Vec<(String, Vec<String>)>,
     rounds: usize,
     oversize_fallbacks: usize,
+    oversize_fallback_max_size: usize,
 }
 
 /// One abstract object that can appear in a points-to set: a PAG object node, a lazily
@@ -122,6 +124,7 @@ struct Refiner<'a> {
     /// Whether a base node sits in an interesting, within-budget partition.
     in_scope: Vec<bool>,
     oversize_fallbacks: usize,
+    oversize_fallback_max_size: usize,
 }
 
 impl<'a> Refiner<'a> {
@@ -206,6 +209,7 @@ impl<'a> Refiner<'a> {
             ap_parent: Vec::new(),
             in_scope: vec![false; n_base],
             oversize_fallbacks: 0,
+            oversize_fallback_max_size: 0,
         };
         refiner.build_scope();
         refiner
@@ -289,6 +293,11 @@ impl<'a> Refiner<'a> {
             }
         }
         self.oversize_fallbacks = oversize.len();
+        self.oversize_fallback_max_size = oversize
+            .iter()
+            .filter_map(|ap| nodes_in.get(ap).copied())
+            .max()
+            .unwrap_or(0) as usize;
 
         for i in 0..self.n_base {
             let ap = self.ap_find(self.classes.class_of(NodeId(i as u32)));
@@ -360,6 +369,7 @@ impl<'a> Refiner<'a> {
             pointee_globals,
             rounds,
             oversize_fallbacks: self.oversize_fallbacks,
+            oversize_fallback_max_size: self.oversize_fallback_max_size,
         }
     }
 
@@ -1075,5 +1085,6 @@ mod tests {
             vec!["f0".to_string(), "f1".to_string()]
         );
         assert!(andersen.metrics.oversize_fallbacks >= 1);
+        assert!(andersen.metrics.oversize_fallback_max_size >= 1);
     }
 }

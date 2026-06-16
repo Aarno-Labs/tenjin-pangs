@@ -57,7 +57,7 @@ impl Default for Opts {
             stage: Stage::Conservative,
             build_mode: BuildMode::Library,
             exports: BTreeSet::new(),
-            partition_budget: 1_000_000,
+            partition_budget: 1_000,
             enable_b1_initval: true,
             enable_b2_simple: true,
             enable_b3_confined: true,
@@ -261,6 +261,7 @@ pub struct Metrics {
     pub partition_p95_size: usize,
     pub partition_max_size: usize,
     pub oversize_fallbacks: usize,
+    pub oversize_fallback_max_size: usize,
     pub rounds: usize,
     /// Flat per-provenance icall attribution (M2.0, `DESIGN_lite.md` §2F). Counts indirect
     /// callsites whose resolved edges carry each tier; the ablation signal M2.7 reads.
@@ -298,6 +299,8 @@ pub struct M2AblationVariant {
     pub confined_functions: usize,
     pub globals_with_complete_initval: usize,
     pub stationary_globals: usize,
+    pub oversize_fallbacks: usize,
+    pub oversize_fallback_max_size: usize,
     pub mutable_globals_total: usize,
     pub in_rewritable_components: usize,
     pub call_edges: usize,
@@ -1071,6 +1074,7 @@ impl Analysis {
             partition_p95_size: 0,
             partition_max_size: 0,
             oversize_fallbacks: 0,
+            oversize_fallback_max_size: 0,
             rounds: 0,
             analysis_wall_us: 0,
             pag_build_us,
@@ -1087,6 +1091,7 @@ impl Analysis {
                 partition_p95_size: solved.partition_p95_size,
                 partition_max_size: solved.partition_max_size,
                 oversize_fallbacks: solved.oversize_fallbacks,
+                oversize_fallback_max_size: solved.oversize_fallback_max_size,
                 rounds: solved.rounds,
                 ..metrics
             }
@@ -1227,6 +1232,8 @@ impl M2AblationVariant {
             confined_functions: metrics.confined_functions,
             globals_with_complete_initval: metrics.globals_with_complete_initval,
             stationary_globals: metrics.stationary_globals,
+            oversize_fallbacks: metrics.oversize_fallbacks,
+            oversize_fallback_max_size: metrics.oversize_fallback_max_size,
             mutable_globals_total: metrics.mutable_globals_total,
             in_rewritable_components: metrics.in_rewritable_components,
             call_edges: metrics.call_edges,

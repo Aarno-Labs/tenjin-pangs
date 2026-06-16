@@ -10,5 +10,6 @@
   "partition_p95_size": 0,
   "partition_max_size": 0,
   "oversize_fallbacks": 0,
+  "oversize_fallback_max_size": 0,
   "rounds": 0
 }

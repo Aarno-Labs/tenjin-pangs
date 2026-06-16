@@ -31,6 +31,8 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
+        #[arg(long, default_value_t = 1_000)]
+        partition_budget: u64,
         #[arg(long)]
         validate: bool,
     },
@@ -68,6 +70,8 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
+        #[arg(long, default_value_t = 1_000)]
+        partition_budget: u64,
     },
     /// Run the M2.7 pre-analysis ablation: M1 baseline, B2 only, B1 only, and both.
     M2Ablation {
@@ -78,6 +82,8 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
+        #[arg(long, default_value_t = 1_000)]
+        partition_budget: u64,
     },
     /// Instrument every indirect call in a module, writing an instrumented `.bc`.
     Instrument {
@@ -140,6 +146,7 @@ fn run() -> Result<()> {
             stage,
             build_mode,
             exports,
+            partition_budget,
             validate,
         } => {
             let pipeline_started = Instant::now();
@@ -148,6 +155,7 @@ fn run() -> Result<()> {
                 stage: stage.into(),
                 build_mode: build_mode.into(),
                 exports: read_exports(exports)?,
+                partition_budget,
                 ..Opts::default()
             };
             eprintln!(
@@ -228,11 +236,13 @@ fn run() -> Result<()> {
             module,
             build_mode,
             exports,
+            partition_budget,
         } => {
             let pir = Pir::from_path(&module)?;
             let opts = Opts {
                 build_mode: build_mode.into(),
                 exports: read_exports(exports)?,
+                partition_budget,
                 ..Opts::default()
             };
             let report = pangs_api::run_differential(&pir, &opts)?;
@@ -253,12 +263,14 @@ fn run() -> Result<()> {
             stage,
             build_mode,
             exports,
+            partition_budget,
         } => {
             let pir = Pir::from_path(&module)?;
             let opts = Opts {
                 stage: stage.into(),
                 build_mode: build_mode.into(),
                 exports: read_exports(exports)?,
+                partition_budget,
                 ..Opts::default()
             };
             let report = pangs_api::run_m2_ablation(&pir, &opts)?;
