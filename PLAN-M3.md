@@ -174,9 +174,11 @@ cover argument-driven discovery, return-driven discovery, and incompatible-signa
 rejection. Signature-aware M3.1/M3.2/M3.3 query answers are checked against the synthetic
 suite's Steensgaard/FSA envelope. The all-query path now skips non-address-materialized
 function objects, uses top-of-stack MHS memoization, and reports automatic 25k query-budget
-truncation. Initial release-mode corpus smokes complete on jpegoptim/parson/jq/chibicc/lua,
-but jq/chibicc/lua require truncation, so M3.3 is not yet ready for adoption into the main
-`analyze` callgraph export. See `notes/m3_3_fixpoint.md`.
+truncation. Truncated source queries mark their touched callsites unresolved by tier-E;
+the CLI merges those sites with the Steensgaard/FSA envelope and reports fallback counts.
+Initial release-mode corpus smokes complete on jpegoptim/parson/jq/chibicc/lua; jq/chibicc/lua
+still require fallback, so the next decision is whether that rate is acceptable for tier-E
+adoption or whether M3.6 partition bounding should move earlier. See `notes/m3_3_fixpoint.md`.
 
 ### M3.4 — Parallel query pool (2–4 days)
 `rayon` over pending queries per round; PAG and all M1/M2 outputs are frozen/read-only;

@@ -432,6 +432,15 @@ fn query_callees_fixpoint_reports_rounds_and_indirect_bindings() {
     assert_eq!(report["rounds"].as_array().unwrap().len(), 2);
     assert_eq!(report["rounds"][0]["new_targets"], 1);
     assert_eq!(report["rounds"][1]["new_targets"], 1);
+    assert_eq!(report["truncated_queries"], 0);
+    assert_eq!(report["fallback_callsites"], 0);
+    assert_eq!(report["fallback_targets"], 0);
+    assert!(report["fallback_by_callsite"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+    assert!(report["truncated_functions"].as_array().unwrap().is_empty());
+    assert_eq!(report["raw_by_callsite"], report["by_callsite"]);
 }
 
 #[test]

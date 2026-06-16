@@ -270,6 +270,14 @@ pub struct CflFixpointReport {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CflCalleeFallbackReport {
+    pub by_callsite: BTreeMap<String, BTreeSet<String>>,
+    pub fallback_by_callsite: BTreeMap<String, BTreeSet<String>>,
+    pub fallback_callsites: BTreeSet<String>,
+    pub truncated_functions: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CflFixpointRound {
     pub round: usize,
     pub queries_run: usize,
@@ -304,6 +312,27 @@ impl CflFixpointReport {
     pub fn truncated_queries(&self) -> usize {
         truncated_queries(&self.queries)
     }
+
+    pub fn truncated_functions(&self) -> BTreeSet<String> {
+        truncated_functions(&self.queries)
+    }
+
+    pub fn fallback_for_truncated_queries(
+        &self,
+        envelope_by_callsite: &BTreeMap<String, BTreeSet<String>>,
+    ) -> CflCalleeFallbackReport {
+        fallback_for_truncated_queries(&self.by_callsite, &self.queries, envelope_by_callsite)
+    }
+}
+
+impl CflCalleeFallbackReport {
+    pub fn fallback_callsite_count(&self) -> usize {
+        self.fallback_callsites.len()
+    }
+
+    pub fn fallback_target_count(&self) -> usize {
+        self.fallback_by_callsite.values().map(BTreeSet::len).sum()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -312,6 +341,32 @@ pub struct CflVisitHistogram {
     pub le_100: usize,
     pub le_1000: usize,
     pub gt_1000: usize,
+}
+
+pub fn fallback_for_truncated_queries(
+    by_callsite: &BTreeMap<String, BTreeSet<String>>,
+    queries: &[CflCalleeQuery],
+    envelope_by_callsite: &BTreeMap<String, BTreeSet<String>>,
+) -> CflCalleeFallbackReport {
+    let truncated_functions = truncated_functions(queries);
+    let fallback_callsites = truncated_queries_touched_callsites(queries);
+    let mut merged = by_callsite.clone();
+    let mut fallback_by_callsite = BTreeMap::new();
+
+    for callsite in &fallback_callsites {
+        let Some(envelope_targets) = envelope_by_callsite.get(callsite) else {
+            continue;
+        };
+        merged.insert(callsite.clone(), envelope_targets.clone());
+        fallback_by_callsite.insert(callsite.clone(), envelope_targets.clone());
+    }
+
+    CflCalleeFallbackReport {
+        by_callsite: merged,
+        fallback_by_callsite,
+        fallback_callsites,
+        truncated_functions,
+    }
 }
 
 struct QueryGraph<'a> {
@@ -876,6 +931,28 @@ fn truncated_queries(queries: &[CflCalleeQuery]) -> usize {
         .count()
 }
 
+fn truncated_functions(queries: &[CflCalleeQuery]) -> BTreeSet<String> {
+    queries
+        .iter()
+        .filter(|query| query.metrics.truncated)
+        .map(|query| query.function.clone())
+        .collect()
+}
+
+fn truncated_queries_touched_callsites(queries: &[CflCalleeQuery]) -> BTreeSet<String> {
+    queries
+        .iter()
+        .filter(|query| query.metrics.truncated)
+        .flat_map(|query| {
+            query
+                .callsites
+                .iter()
+                .chain(query.dependencies.iter())
+                .cloned()
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Phase {
     Forward,
@@ -963,13 +1040,14 @@ mod tests {
     use crate::solve_steensgaard;
 
     use super::{
-        query_all_callees_field_insensitive, query_all_callees_field_insensitive_report,
+        fallback_for_truncated_queries, query_all_callees_field_insensitive,
+        query_all_callees_field_insensitive_report,
         query_all_callees_field_insensitive_report_with_signatures,
         query_all_callees_field_sensitive, query_all_callees_field_sensitive_fixpoint_report,
         query_all_callees_field_sensitive_fixpoint_report_with_signatures,
         query_all_callees_field_sensitive_report,
         query_all_callees_field_sensitive_report_with_signatures, query_callees_field_insensitive,
-        query_callees_field_sensitive,
+        query_callees_field_sensitive, CflCalleeQuery, CflQueryMetrics,
     };
 
     fn load(root: &str, name: &str) -> Pag {
@@ -1245,6 +1323,98 @@ mod tests {
         assert!(!fixpoint.by_callsite.contains_key("driver@!noloc#0"));
         assert_eq!(fixpoint.rounds.len(), 1);
         assert_eq!(fixpoint.rounds[0].new_targets, 0);
+    }
+
+    #[test]
+    fn m3_3_untruncated_fallback_preserves_narrowing() {
+        let by_callsite = BTreeMap::from([(
+            "driver@!noloc#0".to_string(),
+            ["precise".to_string(), "outside_envelope".to_string()]
+                .into_iter()
+                .collect(),
+        )]);
+        let envelope = BTreeMap::from([(
+            "driver@!noloc#0".to_string(),
+            ["precise".to_string(), "coarse".to_string()]
+                .into_iter()
+                .collect(),
+        )]);
+        let queries = vec![CflCalleeQuery {
+            function: "precise".to_string(),
+            callsites: ["driver@!noloc#0".to_string()].into_iter().collect(),
+            metrics: CflQueryMetrics {
+                visited_states: 12,
+                ..CflQueryMetrics::default()
+            },
+            ..CflCalleeQuery::default()
+        }];
+
+        let fallback = fallback_for_truncated_queries(&by_callsite, &queries, &envelope);
+        assert_eq!(fallback.by_callsite, by_callsite);
+        assert!(fallback.fallback_by_callsite.is_empty());
+        assert!(fallback.fallback_callsites.is_empty());
+        assert!(fallback.truncated_functions.is_empty());
+    }
+
+    #[test]
+    fn m3_3_truncated_touched_sites_fall_back_to_envelope() {
+        let by_callsite = BTreeMap::from([(
+            "driver@!noloc#0".to_string(),
+            ["precise".to_string()].into_iter().collect(),
+        )]);
+        let envelope = BTreeMap::from([
+            (
+                "driver@!noloc#0".to_string(),
+                ["precise".to_string(), "missed".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+            (
+                "invoke@!noloc#0".to_string(),
+                ["nested".to_string()].into_iter().collect(),
+            ),
+            (
+                "untouched@!noloc#0".to_string(),
+                ["ignored".to_string()].into_iter().collect(),
+            ),
+        ]);
+        let queries = vec![
+            CflCalleeQuery {
+                function: "precise".to_string(),
+                callsites: ["driver@!noloc#0".to_string()].into_iter().collect(),
+                dependencies: ["invoke@!noloc#0".to_string()].into_iter().collect(),
+                metrics: CflQueryMetrics {
+                    visited_states: 25_000,
+                    truncated: true,
+                    ..CflQueryMetrics::default()
+                },
+                ..CflCalleeQuery::default()
+            },
+            CflCalleeQuery {
+                function: "ignored".to_string(),
+                callsites: ["untouched@!noloc#0".to_string()].into_iter().collect(),
+                ..CflCalleeQuery::default()
+            },
+        ];
+
+        let fallback = fallback_for_truncated_queries(&by_callsite, &queries, &envelope);
+        assert_eq!(
+            fallback.by_callsite["driver@!noloc#0"],
+            ["precise".to_string(), "missed".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            fallback.by_callsite["invoke@!noloc#0"],
+            ["nested".to_string()].into_iter().collect()
+        );
+        assert!(!fallback.by_callsite.contains_key("untouched@!noloc#0"));
+        assert_eq!(fallback.fallback_callsite_count(), 2);
+        assert_eq!(fallback.fallback_target_count(), 3);
+        assert_eq!(
+            fallback.truncated_functions,
+            ["precise".to_string()].into_iter().collect()
+        );
     }
 
     #[test]

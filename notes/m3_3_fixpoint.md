@@ -28,8 +28,12 @@ pangs query callees <module.bc|module.pir.json> --mode field-sensitive-fixpoint
   preserving the full stack in the work item for transitions.
 - Each query has an automatic 25k state/worklist budget. Over-budget queries are stopped
   and reported with `truncated: true`; the aggregate JSON includes `truncated_queries`.
-  Truncated query reports are diagnostic only and are not suitable for tier-E callgraph
-  adoption without a sound fallback.
+  Truncated source queries mark the callsites they reached or depended on as unresolved
+  by tier-E.
+- The fixpoint CLI computes a Steensgaard/FSA envelope and uses that envelope for
+  truncated-query touched callsites. The exported `by_callsite` field is the merged,
+  adoption-safe answer; `raw_by_callsite`, `fallback_by_callsite`, `fallback_callsites`,
+  `fallback_targets`, and `truncated_functions` expose the precision loss.
 - Scheduling is dependency tracked:
   - queries that touched an unresolved indirect call's argument/result positions are
     rerun when that callsite gains a target;
@@ -49,8 +53,11 @@ Focused tests cover:
 - incompatible signature filtering: a raw PAG-only query may see an incompatible function
   address reach an indirect-call operand, while the signature-aware CLI/report path
   rejects the target and does not create fixpoint bindings for it.
+- truncation fallback policy: untruncated M3.3 answers may narrow below the envelope,
+  while truncated-query touched sites are widened back to the fallback envelope instead
+  of silently dropping targets.
 - CLI JSON reports fixpoint rounds, new target counts, dependency-bearing queries, and
-  final `by_callsite` answers.
+  final `by_callsite` answers, plus truncation/fallback counts and raw answers.
 - synthetic-suite ledger: signature-aware M3.1, M3.2, and M3.3 answers stay inside the
   Steensgaard/FSA envelope.
 
@@ -69,18 +76,20 @@ target/release/pangs query callees <module.bc> \
 O1 corpus results after address-materialized source filtering, top-of-stack MHS
 memoization, and the automatic 25k query budget:
 
-| module | callsites | targets | source queries | truncated queries | rounds | new targets | new interproc edges | max visited | wall s |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `exe-jpegoptim-O1` | 0 | 0 | 13 | 0 | 1 | 0 | 0 | 115 | 0.02 |
-| `lib-parson-O1` | 132 | 132 | 2 | 0 | 1 | 132 | 0 | 78 | 0.02 |
-| `exe-jq-O1` | 0 | 0 | 144 | 5 | 1 | 0 | 0 | 25000 | 0.21 |
-| `exe-chibicc-O1` | 0 | 0 | 6 | 5 | 1 | 0 | 0 | 25000 | 0.10 |
-| `exe-lua-O1` | 49 | 57 | 188 | 28 | 2 | 57 | 240 | 25000 | 0.28 |
+| module | final callsites | final targets | raw callsites | raw targets | source queries | truncated queries | fallback callsites | fallback targets | rounds | new targets | new interproc edges | max visited | wall s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `exe-jpegoptim-O1` | 0 | 0 | 0 | 0 | 13 | 0 | 0 | 0 | 1 | 0 | 0 | 115 | 0.03 |
+| `lib-parson-O1` | 132 | 132 | 132 | 132 | 2 | 0 | 0 | 0 | 1 | 132 | 0 | 78 | 0.02 |
+| `exe-jq-O1` | 1 | 2 | 0 | 0 | 144 | 5 | 1 | 2 | 1 | 0 | 0 | 25000 | 0.47 |
+| `exe-chibicc-O1` | 1 | 5 | 0 | 0 | 6 | 5 | 1 | 5 | 1 | 0 | 0 | 25000 | 0.20 |
+| `exe-lua-O1` | 57 | 1127 | 49 | 57 | 188 | 28 | 18 | 1088 | 2 | 57 | 240 | 25000 | 0.72 |
 
 Before source filtering/top-of-stack memoization/budgeting, `exe-jq-O1`, `exe-chibicc-O1`,
-and `exe-lua-O1` either timed out or were SIGKILLed. The current guard makes the query
-surface observable on these modules, but the truncated rows show M3.3 is not ready to
-replace exported callgraph answers on larger corpus inputs.
+and `exe-lua-O1` either timed out or were SIGKILLed. The current guard plus fallback makes
+the query surface observable without silently dropping affected-site targets. The jq and
+chibicc fallbacks are small, but lua's 18 fallback sites / 1088 fallback targets dominate
+the final answer; that is the concrete signal for deciding whether to pull M3.6 partition
+bounding earlier.
 
 This is still a query-kernel surface. The main `analyze` pipeline has not yet adopted
 tier-E callee answers or exported them into `callgraph.jsonl`.

@@ -276,20 +276,25 @@ fn run() -> Result<()> {
                 mode,
             } => {
                 let pir = Pir::from_path(&module)?;
+                let pag_build_mode: PagBuildMode = build_mode.into();
                 let opts = PagOpts {
-                    build_mode: build_mode.into(),
+                    build_mode: pag_build_mode,
                     exports: read_exports(exports)?,
                 };
                 let pag = Pag::from_pir(&pir, &opts);
                 let signatures = function_signatures(&pir);
-                let (by_callsite, queries, rounds) = match mode {
+                let run = match mode {
                     QueryModeArg::FieldInsensitive => {
                         let report =
                             pangs_solve::query_all_callees_field_insensitive_report_with_signatures(
                                 &pag,
                                 &signatures,
                             );
-                        (report.by_callsite, report.queries, None)
+                        CalleeQueryRun {
+                            by_callsite: report.by_callsite,
+                            queries: report.queries,
+                            ..CalleeQueryRun::default()
+                        }
                     }
                     QueryModeArg::FieldSensitive => {
                         let report =
@@ -297,17 +302,34 @@ fn run() -> Result<()> {
                                 &pag,
                                 &signatures,
                             );
-                        (report.by_callsite, report.queries, None)
+                        CalleeQueryRun {
+                            by_callsite: report.by_callsite,
+                            queries: report.queries,
+                            ..CalleeQueryRun::default()
+                        }
                     }
                     QueryModeArg::FieldSensitiveFixpoint => {
                         let report = pangs_solve::query_all_callees_field_sensitive_fixpoint_report_with_signatures(
                             &pag,
                             &signatures,
                         );
-                        (report.by_callsite, report.queries, Some(report.rounds))
+                        let envelope = steens_targets_by_callsite(&pir, &pag, pag_build_mode);
+                        let fallback = report.fallback_for_truncated_queries(&envelope);
+                        let fallback_callsites = fallback.fallback_callsite_count();
+                        let fallback_targets = fallback.fallback_target_count();
+                        CalleeQueryRun {
+                            by_callsite: fallback.by_callsite,
+                            raw_by_callsite: Some(report.by_callsite),
+                            fallback_by_callsite: fallback.fallback_by_callsite,
+                            fallback_callsites,
+                            fallback_targets,
+                            truncated_functions: fallback.truncated_functions,
+                            queries: report.queries,
+                            rounds: Some(report.rounds),
+                        }
                     }
                 };
-                let rounds_json = rounds.map(|rounds| {
+                let rounds_json = run.rounds.as_ref().map(|rounds| {
                     rounds
                         .iter()
                         .map(|round| {
@@ -321,7 +343,8 @@ fn run() -> Result<()> {
                         })
                         .collect::<Vec<_>>()
                 });
-                let queries_json = queries
+                let queries_json = run
+                    .queries
                     .iter()
                     .map(|query| {
                         serde_json::json!({
@@ -337,7 +360,7 @@ fn run() -> Result<()> {
                     })
                     .collect::<Vec<_>>();
                 let mut histogram = [0usize; 4];
-                for query in &queries {
+                for query in &run.queries {
                     match query.metrics.visited_states {
                         0..=10 => histogram[0] += 1,
                         11..=100 => histogram[1] += 1,
@@ -345,12 +368,14 @@ fn run() -> Result<()> {
                         _ => histogram[3] += 1,
                     }
                 }
-                let max_visited_states = queries
+                let max_visited_states = run
+                    .queries
                     .iter()
                     .map(|query| query.metrics.visited_states)
                     .max()
                     .unwrap_or(0);
-                let truncated_queries = queries
+                let truncated_queries = run
+                    .queries
                     .iter()
                     .filter(|query| query.metrics.truncated)
                     .count();
@@ -359,7 +384,12 @@ fn run() -> Result<()> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "kind": "callees",
                         "mode": mode.label(),
-                        "by_callsite": by_callsite,
+                        "by_callsite": run.by_callsite,
+                        "raw_by_callsite": run.raw_by_callsite,
+                        "fallback_by_callsite": run.fallback_by_callsite,
+                        "fallback_callsites": run.fallback_callsites,
+                        "fallback_targets": run.fallback_targets,
+                        "truncated_functions": run.truncated_functions,
                         "queries": queries_json,
                         "rounds": rounds_json,
                         "visit_histogram": {
@@ -449,6 +479,18 @@ impl From<BuildModeArg> for PagBuildMode {
     }
 }
 
+#[derive(Debug, Default)]
+struct CalleeQueryRun {
+    by_callsite: BTreeMap<String, BTreeSet<String>>,
+    raw_by_callsite: Option<BTreeMap<String, BTreeSet<String>>>,
+    fallback_by_callsite: BTreeMap<String, BTreeSet<String>>,
+    fallback_callsites: usize,
+    fallback_targets: usize,
+    truncated_functions: BTreeSet<String>,
+    queries: Vec<pangs_solve::CflCalleeQuery>,
+    rounds: Option<Vec<pangs_solve::CflFixpointRound>>,
+}
+
 fn read_exports(path: Option<PathBuf>) -> Result<BTreeSet<String>> {
     let Some(path) = path else {
         return Ok(BTreeSet::new());
@@ -466,5 +508,22 @@ fn function_signatures(pir: &Pir) -> BTreeMap<String, pangs_pir::Signature> {
     pir.functions
         .iter()
         .map(|func| (func.key.clone(), func.sig.clone()))
+        .collect()
+}
+
+fn steens_targets_by_callsite(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: PagBuildMode,
+) -> BTreeMap<String, BTreeSet<String>> {
+    pangs_solve::solve_steensgaard(pir, pag, build_mode)
+        .indirect_calls
+        .into_iter()
+        .map(|resolution| {
+            (
+                resolution.callsite_key,
+                resolution.targets.into_iter().collect(),
+            )
+        })
         .collect()
 }
