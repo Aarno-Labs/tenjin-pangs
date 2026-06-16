@@ -5,6 +5,8 @@ use pangs_pag::{
 };
 use pangs_pir::{fsa_compatible, Signature};
 
+const QUERY_STATE_BUDGET: usize = 25_000;
+
 /// M3.1 field-insensitive CFL query kernel for callees.
 ///
 /// This first cut intentionally has no byte-offset memory-history stack and no call-graph
@@ -52,21 +54,13 @@ fn query_all_callees_field_insensitive_report_inner(
     let graph = QueryGraph::with_signatures(pag, signatures);
     let mut by_callsite: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut queries = Vec::new();
-    for node in &pag.nodes {
-        let NodeKind::Object {
-            object: ObjectKind::Function,
-            key,
-            ..
-        } = &node.kind
-        else {
-            continue;
-        };
+    for key in callee_query_function_keys(pag) {
         let answer = graph.query_function(key);
         for callsite in &answer.callsites {
             by_callsite
                 .entry(callsite.clone())
                 .or_default()
-                .insert(key.clone());
+                .insert(key.to_string());
         }
         queries.push(answer);
     }
@@ -102,21 +96,13 @@ fn query_all_callees_field_sensitive_report_inner(
     let graph = QueryGraph::with_signatures(pag, signatures);
     let mut by_callsite: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut queries = Vec::new();
-    for node in &pag.nodes {
-        let NodeKind::Object {
-            object: ObjectKind::Function,
-            key,
-            ..
-        } = &node.kind
-        else {
-            continue;
-        };
+    for key in callee_query_function_keys(pag) {
         let answer = graph.query_function_mhs(key);
         for callsite in &answer.callsites {
             by_callsite
                 .entry(callsite.clone())
                 .or_default()
-                .insert(key.clone());
+                .insert(key.to_string());
         }
         queries.push(answer);
     }
@@ -149,7 +135,10 @@ fn query_all_callees_field_sensitive_fixpoint_report_inner(
     pag: &Pag,
     signatures: Option<&BTreeMap<String, Signature>>,
 ) -> CflFixpointReport {
-    let function_keys = function_object_keys(pag);
+    let function_keys = callee_query_function_keys(pag)
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
     let mut pending: BTreeSet<String> = function_keys.iter().cloned().collect();
     let mut targets_by_site: BTreeMap<CallsiteId, BTreeSet<String>> = BTreeMap::new();
     let mut latest_queries: BTreeMap<String, CflCalleeQuery> = BTreeMap::new();
@@ -264,6 +253,7 @@ pub struct CflCalleeQuery {
 pub struct CflQueryMetrics {
     pub visited_states: usize,
     pub max_worklist: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -296,6 +286,10 @@ impl CflCalleeReport {
     pub fn max_visited_states(&self) -> usize {
         max_visited_states(&self.queries)
     }
+
+    pub fn truncated_queries(&self) -> usize {
+        truncated_queries(&self.queries)
+    }
 }
 
 impl CflFixpointReport {
@@ -305,6 +299,10 @@ impl CflFixpointReport {
 
     pub fn max_visited_states(&self) -> usize {
         max_visited_states(&self.queries)
+    }
+
+    pub fn truncated_queries(&self) -> usize {
+        truncated_queries(&self.queries)
     }
 }
 
@@ -472,6 +470,10 @@ impl<'a> QueryGraph<'a> {
             }
             out.metrics.visited_states = visited.len();
             out.metrics.max_worklist = out.metrics.max_worklist.max(worklist.len() + 1);
+            if visited.len() >= QUERY_STATE_BUDGET || worklist.len() >= QUERY_STATE_BUDGET {
+                out.metrics.truncated = true;
+                break;
+            }
             self.record_dependencies(node, &mut out);
 
             if phase == Phase::Forward {
@@ -512,11 +514,15 @@ impl<'a> QueryGraph<'a> {
         }]);
 
         while let Some(state) = worklist.pop_back() {
-            if !visited.insert(state.clone()) {
+            if !visited.insert(state.visit_key()) {
                 continue;
             }
             out.metrics.visited_states = visited.len();
             out.metrics.max_worklist = out.metrics.max_worklist.max(worklist.len() + 1);
+            if visited.len() >= QUERY_STATE_BUDGET || worklist.len() >= QUERY_STATE_BUDGET {
+                out.metrics.truncated = true;
+                break;
+            }
             self.record_dependencies(state.node, &mut out);
 
             if state.phase == Phase::Forward && state.stack.is_empty() {
@@ -714,6 +720,32 @@ fn function_object_keys(pag: &Pag) -> Vec<String> {
         .collect()
 }
 
+fn callee_query_function_keys(pag: &Pag) -> Vec<&str> {
+    let address_materialized = pag
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            if edge.kind != EdgeKind::AddrOf {
+                return None;
+            }
+            let node = pag.nodes.get(edge.src.0 as usize)?;
+            match &node.kind {
+                NodeKind::Object {
+                    object: ObjectKind::Function,
+                    key,
+                    ..
+                } => Some(key.as_str()),
+                _ => None,
+            }
+        })
+        .collect::<BTreeSet<_>>();
+
+    function_object_keys(pag)
+        .into_iter()
+        .filter_map(|key| address_materialized.get(key.as_str()).copied())
+        .collect()
+}
+
 fn external_function_keys(pag: &Pag) -> HashSet<&str> {
     pag.omega_seeds
         .iter()
@@ -837,6 +869,13 @@ fn max_visited_states(queries: &[CflCalleeQuery]) -> usize {
         .unwrap_or(0)
 }
 
+fn truncated_queries(queries: &[CflCalleeQuery]) -> usize {
+    queries
+        .iter()
+        .filter(|query| query.metrics.truncated)
+        .count()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Phase {
     Forward,
@@ -851,6 +890,14 @@ struct MhsState {
 }
 
 impl MhsState {
+    fn visit_key(&self) -> MhsVisitState {
+        MhsVisitState {
+            node: self.node,
+            phase: self.phase,
+            top: self.stack.last().copied(),
+        }
+    }
+
     fn next(mut self, node: NodeId, phase: Phase) -> Self {
         self.node = node;
         self.phase = phase;
@@ -890,6 +937,13 @@ impl MhsState {
         }
         self
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MhsVisitState {
+    node: NodeId,
+    phase: Phase,
+    top: Option<Offset>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1006,7 +1060,7 @@ mod tests {
             ["target".to_string()].into_iter().collect()
         );
         assert!(!report.by_callsite["driver@!noloc#0"].contains("other"));
-        assert_eq!(report.queries.len(), 3);
+        assert_eq!(report.queries.len(), 1);
         assert!(report.max_visited_states() >= 6);
         let histogram = report.visit_histogram();
         assert_eq!(
@@ -1047,7 +1101,7 @@ mod tests {
             ["target".to_string()].into_iter().collect()
         );
         assert!(!report.by_callsite["driver@!noloc#0"].contains("other"));
-        assert_eq!(report.queries.len(), 3);
+        assert_eq!(report.queries.len(), 1);
         assert!(report.max_visited_states() >= 6);
     }
 

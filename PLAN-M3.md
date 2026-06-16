@@ -172,9 +172,11 @@ signature filtering when PIR signatures are available, and schedules queries fro
 callsite argument/result dependencies and callee-return dependencies. Focused fixtures
 cover argument-driven discovery, return-driven discovery, and incompatible-signature
 rejection. Signature-aware M3.1/M3.2/M3.3 query answers are checked against the synthetic
-suite's Steensgaard/FSA envelope. This is not yet wired into the main `analyze` callgraph
-export, and corpus convergence/precision measurements are still pending. See
-`notes/m3_3_fixpoint.md`.
+suite's Steensgaard/FSA envelope. The all-query path now skips non-address-materialized
+function objects, uses top-of-stack MHS memoization, and reports automatic 25k query-budget
+truncation. Initial release-mode corpus smokes complete on jpegoptim/parson/jq/chibicc/lua,
+but jq/chibicc/lua require truncation, so M3.3 is not yet ready for adoption into the main
+`analyze` callgraph export. See `notes/m3_3_fixpoint.md`.
 
 ### M3.4 — Parallel query pool (2–4 days)
 `rayon` over pending queries per round; PAG and all M1/M2 outputs are frozen/read-only;

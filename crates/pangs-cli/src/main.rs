@@ -332,6 +332,7 @@ fn run() -> Result<()> {
                             "return_dependencies": query.return_dependencies,
                             "visited_states": query.metrics.visited_states,
                             "max_worklist": query.metrics.max_worklist,
+                            "truncated": query.metrics.truncated,
                         })
                     })
                     .collect::<Vec<_>>();
@@ -349,6 +350,10 @@ fn run() -> Result<()> {
                     .map(|query| query.metrics.visited_states)
                     .max()
                     .unwrap_or(0);
+                let truncated_queries = queries
+                    .iter()
+                    .filter(|query| query.metrics.truncated)
+                    .count();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -364,6 +369,7 @@ fn run() -> Result<()> {
                             "gt_1000": histogram[3],
                         },
                         "max_visited_states": max_visited_states,
+                        "truncated_queries": truncated_queries,
                     }))?
                 );
             }

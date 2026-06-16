@@ -349,13 +349,13 @@ fn query_callees_reports_m3_1_field_insensitive_results() {
         report["by_callsite"]["driver@!noloc#0"],
         serde_json::json!(["target"])
     );
-    assert_eq!(report["queries"].as_array().unwrap().len(), 3);
+    assert_eq!(report["queries"].as_array().unwrap().len(), 1);
     assert!(report["max_visited_states"].as_u64().unwrap() >= 6);
     let histogram_total = report["visit_histogram"]["le_10"].as_u64().unwrap()
         + report["visit_histogram"]["le_100"].as_u64().unwrap()
         + report["visit_histogram"]["le_1000"].as_u64().unwrap()
         + report["visit_histogram"]["gt_1000"].as_u64().unwrap();
-    assert_eq!(histogram_total, 3);
+    assert_eq!(histogram_total, 1);
 }
 
 #[test]
