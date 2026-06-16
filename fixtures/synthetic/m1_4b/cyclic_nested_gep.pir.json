@@ -1,0 +1,29 @@
+{
+  "module": "m1_4b.cyclic_nested_gep",
+  "functions": [
+    {
+      "key": "driver",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%s", "ty": "struct.S" },
+        { "kind": "assign", "dest": "%p", "sources": ["%s"] },
+        { "kind": "gep", "dest": "%p", "base": "%p", "byte_off": 8 },
+        { "kind": "store", "address": "%p", "value": "target" },
+        { "kind": "load", "dest": "%fp", "address": "%p" },
+        {
+          "kind": "call_indirect",
+          "operand": "%fp",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "target",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": []
+}

@@ -160,10 +160,32 @@ timeout 300s target/release/pangs analyze \
   --validate
 ```
 
-Result: timed out with exit status 124 and no metrics/export files were produced. This means
-the curl row is not sufficient evidence that the current path scales to the next corpus size
-class. The next large-row step should be targeted profiling/instrumentation on tmux or sqlite,
-not more blind stress runs.
+Initial result: timed out with exit status 124 and no metrics/export files were produced.
+
+`perf` and opt-in `PANGS_ANDERSEN_PROFILE=1` instrumentation localized the timeout to the
+first Andersen fixed-graph solve. The pre-fix profile showed a finite-looking scope
+(`5448` in-scope nodes, `1721` in-scope edges, `4` in-scope icalls), but the solve never
+converged because cyclic nested GEPs could materialize an unbounded chain of synthetic field
+cells (`fields` grew by about `5000` every `10000` worklist steps).
+
+The fix makes Andersen's field abstraction finite without collapsing ordinary non-zero GEPs.
+Nested constant GEPs from an already-materialized field are canonicalized back to
+`root + combined_offset` when that offset is part of the fixed graph's finite offset
+vocabulary; zero-offset casts remain precise. Nested unknown offsets, overflowing offset
+arithmetic, or combined offsets outside that finite vocabulary collapse conservatively back to
+the root object. Regression coverage includes both the cyclic field-growth case
+(`fixtures/synthetic/m1_4b/cyclic_nested_gep.pir.json`) and a container-of-style negative
+offset case that still resolves precisely.
+
+Fixed `exe-tmux-O1` result:
+
+| input | funcs | globals | call edges | mutable rewritable | icalls andersen | icalls steens | icalls unknown | oversize fallbacks | max fallback size | max component | max frozen component | wall s | analysis s | solve s | transitive modref s | local modref rows | modref size |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `exe-tmux-O1` | 1315 | 3237 | 10848 | 0/107 | 4 | 53 | 51 | 18 | 45132 | 1261 | 1261 | 59.43 | 42.61 | 2.73 | 0.356 | 1,221,727 | 190M |
+
+The large row now completes, but it exposes a new scale concern: even after semantic local
+deduplication, tmux exports a very large mod/ref surface. The solver itself is no longer the
+timeout bottleneck on this row.
 
 ## M3 Lite Decision Table
 
@@ -179,6 +201,7 @@ This table uses the current local-dedup exports under
 | `exe-gifsicle-O1` | 333 | 646 | 1.55 | 1.11 | 0.18 | 0.027 | 21,760 | 1/93 | 4 | 203 | 203 | 10 | 14,015 |
 | `exe-lua-O1` | 715 | 787 | 5.62 | 4.02 | 0.42 | 0.038 | 106,899 | 0/5 | 1 | 64 | 64 | 13 | 25,564 |
 | `exe-curl-O1` | 320 | 1,944 | 3.79 | 2.59 | 0.21 | 0.022 | 76,530 | 16/80 | 0 | 1 | 1 | 26 | 7,891 |
+| `exe-tmux-O1` | 1,315 | 3,237 | 59.43 | 42.61 | 2.73 | 0.356 | 1,221,727 | 0/107 | 4 | 53 | 51 | 18 | 45,132 |
 
 Largest frozen component/blocker summary:
 
@@ -191,12 +214,13 @@ Largest frozen component/blocker summary:
 | `exe-gifsicle-O1` | 284 | 284 | `unknown_callee=203`, `unknown_global=118`, `fnptr_varargs=54`, `fnptr_ptrtoint=19` | outgoing `steens=2543 andersen=11`, incoming `steens=2340 andersen=11`, unknown callees 203, unknown modrefs 128 |
 | `exe-lua-O1` | 694 | 694 | `unknown_global=319`, `fnptr_varargs=109`, `unknown_callee=64`, `fnptr_ptrtoint=48` | outgoing `steens=4336 andersen=8`, incoming `steens=4272 andersen=8`, unknown callees 64, unknown modrefs 321 |
 | `exe-curl-O1` | 304 | 304 | `fnptr_varargs=268`, `unknown_global=86`, `fnptr_ptrtoint=14`, `inline_asm=1` | outgoing `steens=5`, incoming `steens=4`, unknown callees 1, unknown modrefs 88 |
+| `exe-tmux-O1` | 1261 | 1261 | `fnptr_varargs=637`, `unknown_global=564`, `unknown_callee=49`, `fnptr_ptrtoint=37` | outgoing `steens=2879 andersen=10`, incoming `steens=2830 andersen=10`, unknown callees 49, unknown modrefs 580 |
 
 Decision read:
 
-- Runtime is acceptable for lite M3 on the smoke/medium rows and the first larger curl row.
-  The previous transitive and export-size issues were duplicate-witness problems, not solver
-  scalability problems.
+- Runtime is acceptable for lite M3 on the smoke/medium rows and curl. The tmux-sized row now
+  completes after the finite-field fix, but it is large enough (`~60s`, `190M` modref export)
+  that M3 should not claim broad large-module scaling without more export/modref work.
 - The coverage failures are still dominated by modeling/audit envelopes: unknown globals,
   unknown mod/ref facts, varargs, ptrtoint/inttoptr, inline asm, setjmp/longjmp, and broad
   Steensgaard fallback partitions.
@@ -207,8 +231,8 @@ Decision read:
 
 ## Next
 
-The immediate next step is targeted profiling/instrumentation on `exe-tmux-O1` or
-`lib-sqlite-O1`, since the first tmux-sized stress row timed out before metrics/export.
+The immediate next step is to decide whether M3 freezes with tmux as a known large-row scale
+warning, or whether to do one more export/modref-size slice before freezing.
 
 The main remaining design question is still coverage, not raw runtime: the largest frozen
 components in the first pass were dominated by unknown globals, unknown mod/ref facts, vararg

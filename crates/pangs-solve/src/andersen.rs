@@ -92,6 +92,16 @@ struct RefinerOutput {
     oversize_fallback_max_size: usize,
 }
 
+#[derive(Debug, Default)]
+struct ScopeProfile {
+    in_scope_nodes: usize,
+    in_scope_edges: usize,
+    in_scope_loads: usize,
+    in_scope_stores: usize,
+    in_scope_geps: usize,
+    in_scope_memcpys: usize,
+}
+
 /// One abstract object that can appear in a points-to set: a PAG object node, a lazily
 /// materialized field of one, or the single Ω object.
 type Cell = u32;
@@ -319,6 +329,21 @@ impl<'a> Refiner<'a> {
                         .unwrap_or(false)
             })
             .collect();
+        if andersen_profile_enabled() {
+            let scope = self.scope_profile();
+            eprintln!(
+                "pangs andersen profile: scope nodes={} edges={} loads={} stores={} geps={} memcpys={} in_scope_icalls={} oversize_fallbacks={} oversize_fallback_max_size={}",
+                scope.in_scope_nodes,
+                scope.in_scope_edges,
+                scope.in_scope_loads,
+                scope.in_scope_stores,
+                scope.in_scope_geps,
+                scope.in_scope_memcpys,
+                in_scope_sites.len(),
+                self.oversize_fallbacks,
+                self.oversize_fallback_max_size
+            );
+        }
 
         // Round-0 seed: exact overrides for proven sites, otherwise FSA ∩ Steensgaard
         // targets with confined targets removed from candidate callsites.
@@ -358,6 +383,12 @@ impl<'a> Refiner<'a> {
             if maps_equal(&new_map, &target_map) || rounds >= MAX_ROUNDS {
                 break;
             }
+            if andersen_profile_enabled() {
+                eprintln!(
+                    "pangs andersen profile: round {} target map changed; rerunning fixed-graph solve",
+                    rounds
+                );
+            }
             target_map = new_map;
             pts = self.solve_once(&target_map);
         }
@@ -378,7 +409,8 @@ impl<'a> Refiner<'a> {
     /// Solve one fixed call graph from scratch (no caches across rounds). Returns the
     /// points-to set of every in-scope cell.
     fn solve_once(&mut self, target_map: &HashMap<usize, Vec<usize>>) -> Solve {
-        let mut solve = Solve::new(self.n_base, self.omega);
+        let profile = andersen_profile_enabled();
+        let mut solve = Solve::new(self.n_base, self.omega, profile);
 
         // Base constraints from PAG edges (in-scope only; partitions are self-contained).
         for edge in &self.pag.edges {
@@ -390,11 +422,16 @@ impl<'a> Refiner<'a> {
                 EdgeKind::Assign => solve.add_copy(edge.src.0, edge.dst.0),
                 EdgeKind::Load => solve.loads.entry(edge.src.0).or_default().push(edge.dst.0),
                 EdgeKind::Store => solve.stores.entry(edge.dst.0).or_default().push(edge.src.0),
-                EdgeKind::Gep { byte_off } => solve
-                    .geps
-                    .entry(edge.src.0)
-                    .or_default()
-                    .push((byte_off, edge.dst.0)),
+                EdgeKind::Gep { byte_off } => {
+                    if let Some(byte_off) = byte_off {
+                        solve.known_offsets.insert(byte_off);
+                    }
+                    solve
+                        .geps
+                        .entry(edge.src.0)
+                        .or_default()
+                        .push((byte_off, edge.dst.0));
+                }
                 EdgeKind::Memcpy { .. } => solve.memcpys.push((edge.dst.0, edge.src.0)),
             }
         }
@@ -422,8 +459,54 @@ impl<'a> Refiner<'a> {
             }
         }
 
+        if profile {
+            eprintln!(
+                "pangs andersen profile: solve start target_sites={} target_edges={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} loads={} stores={} geps={} memcpys={}",
+                target_map.len(),
+                target_map.values().map(Vec::len).sum::<usize>(),
+                solve.pts.len(),
+                solve.pts_facts(),
+                solve.succ.len(),
+                solve.copy_edges(),
+                solve.loads.values().map(Vec::len).sum::<usize>(),
+                solve.stores.values().map(Vec::len).sum::<usize>(),
+                solve.geps.values().map(Vec::len).sum::<usize>(),
+                solve.memcpys.len()
+            );
+        }
         solve.run();
+        if profile {
+            eprintln!(
+                "pangs andersen profile: solve done steps={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} collapsed={}",
+                solve.steps,
+                solve.pts.len(),
+                solve.pts_facts(),
+                solve.succ.len(),
+                solve.copy_edges(),
+                solve.fields.len(),
+                solve.collapsed.len()
+            );
+        }
         solve
+    }
+
+    fn scope_profile(&self) -> ScopeProfile {
+        let mut profile = ScopeProfile::default();
+        profile.in_scope_nodes = self.in_scope.iter().filter(|&&in_scope| in_scope).count();
+        for edge in &self.pag.edges {
+            if !self.in_scope[edge.dst.0 as usize] && !self.in_scope[edge.src.0 as usize] {
+                continue;
+            }
+            profile.in_scope_edges += 1;
+            match edge.kind {
+                EdgeKind::Load => profile.in_scope_loads += 1,
+                EdgeKind::Store => profile.in_scope_stores += 1,
+                EdgeKind::Gep { .. } => profile.in_scope_geps += 1,
+                EdgeKind::Memcpy { .. } => profile.in_scope_memcpys += 1,
+                EdgeKind::AddrOf | EdgeKind::Assign => {}
+            }
+        }
+        profile
     }
 
     /// Recompute each in-scope site's targets = FSA ∩ {address-taken functions in
@@ -568,6 +651,10 @@ fn maps_equal(a: &HashMap<usize, Vec<usize>>, b: &HashMap<usize, Vec<usize>>) ->
             .all(|(k, v)| b.get(k).map(|w| w == v).unwrap_or(false))
 }
 
+fn andersen_profile_enabled() -> bool {
+    std::env::var_os("PANGS_ANDERSEN_PROFILE").is_some()
+}
+
 /// One stateless inclusion solve over a fixed constraint set.
 struct Solve {
     omega: Cell,
@@ -581,6 +668,11 @@ struct Solve {
     fields: HashMap<(Cell, i64), Cell>,
     /// field cell -> base object cell, so a refined field resolves back to its global.
     field_base: HashMap<Cell, Cell>,
+    /// field cell -> byte offset from its root object.
+    field_offset: HashMap<Cell, i64>,
+    /// Constant offsets that occur in the fixed constraint graph. Nested GEPs are
+    /// canonicalized only into this finite vocabulary.
+    known_offsets: HashSet<i64>,
     /// base object cell -> its materialized constant-offset field cells. Needed to
     /// retroactively conflate them when the base later receives a non-constant access (M2.1).
     obj_fields: HashMap<Cell, Vec<Cell>>,
@@ -590,10 +682,12 @@ struct Solve {
     collapsed: HashSet<Cell>,
     worklist: Vec<Cell>,
     queued: HashSet<Cell>,
+    profile: bool,
+    steps: usize,
 }
 
 impl Solve {
-    fn new(n_base: usize, omega: Cell) -> Self {
+    fn new(n_base: usize, omega: Cell, profile: bool) -> Self {
         let mut solve = Self {
             omega,
             next_field: omega + 1,
@@ -605,10 +699,14 @@ impl Solve {
             memcpys: Vec::new(),
             fields: HashMap::new(),
             field_base: HashMap::new(),
+            field_offset: HashMap::new(),
+            known_offsets: HashSet::new(),
             obj_fields: HashMap::new(),
             collapsed: HashSet::new(),
             worklist: Vec::new(),
             queued: HashSet::new(),
+            profile,
+            steps: 0,
         };
         let _ = n_base;
         // Ω is absorbing: it points only to itself.
@@ -664,6 +762,28 @@ impl Solve {
         if base == self.omega {
             return self.omega;
         }
+        if let Some(&root) = self.field_base.get(&base) {
+            // Keep nested constant GEPs finite by canonicalizing them back to root+offset
+            // rather than creating field-of-field chains. We only materialize combined
+            // offsets that occur in the fixed graph's finite offset vocabulary; other nested
+            // constants collapse to root. Unknown nested offsets also collapse the root
+            // object because they may alias any root field.
+            let base_off = self.field_offset.get(&base).copied().unwrap_or(0);
+            return match off.and_then(|delta| base_off.checked_add(delta)) {
+                Some(combined) if combined == base_off => base,
+                Some(combined) if self.known_offsets.contains(&combined) => {
+                    self.field_of(root, Some(combined))
+                }
+                Some(_) => {
+                    self.collapse(root);
+                    root
+                }
+                None => {
+                    self.collapse(root);
+                    root
+                }
+            };
+        }
         if self.collapsed.contains(&base) {
             // Every access to a `⊤`-collapsed object names the whole-object cell.
             return base;
@@ -680,9 +800,8 @@ impl Solve {
                 let cell = self.next_field;
                 self.next_field += 1;
                 self.fields.insert((base, off), cell);
-                // A field of a field still ultimately names the original base object.
-                let root = self.field_base.get(&base).copied().unwrap_or(base);
-                self.field_base.insert(cell, root);
+                self.field_base.insert(cell, base);
+                self.field_offset.insert(cell, off);
                 self.obj_fields.entry(base).or_default().push(cell);
                 cell
             }
@@ -705,6 +824,47 @@ impl Solve {
         }
     }
 
+    fn pts_facts(&self) -> usize {
+        self.pts.values().map(HashSet::len).sum()
+    }
+
+    fn copy_edges(&self) -> usize {
+        self.succ.values().map(HashSet::len).sum()
+    }
+
+    fn maybe_report_progress(&self) {
+        if self.profile && self.steps % 10_000 == 0 {
+            eprintln!(
+                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} collapsed={}",
+                self.steps,
+                self.worklist.len(),
+                self.queued.len(),
+                self.pts.len(),
+                self.pts_facts(),
+                self.succ.len(),
+                self.copy_edges(),
+                self.fields.len(),
+                self.collapsed.len()
+            );
+        }
+    }
+
+    fn report_large_product(&self, kind: &str, base: Cell, lhs: usize, rhs: usize) {
+        if self.profile && lhs.saturating_mul(rhs) >= 50_000 {
+            eprintln!(
+                "pangs andersen profile: large {} expansion base={} lhs={} rhs={} product={} steps={} pts_facts={} copy_edges={}",
+                kind,
+                base,
+                lhs,
+                rhs,
+                lhs.saturating_mul(rhs),
+                self.steps,
+                self.pts_facts(),
+                self.copy_edges()
+            );
+        }
+    }
+
     fn run(&mut self) {
         // Prime the worklist with every cell that already has points-to facts.
         let seeded: Vec<Cell> = self.pts.keys().copied().collect();
@@ -713,6 +873,8 @@ impl Solve {
         }
 
         while let Some(n) = self.worklist.pop() {
+            self.steps += 1;
+            self.maybe_report_progress();
             self.queued.remove(&n);
             let objs: Vec<Cell> = self
                 .pts
@@ -722,6 +884,7 @@ impl Solve {
 
             // n as a load base: p = *n  ⇒  pts(o) ⊆ pts(p)  for o ∈ pts(n)
             if let Some(ps) = self.loads.get(&n).cloned() {
+                self.report_large_product("load", n, ps.len(), objs.len());
                 for p in ps {
                     for &o in &objs {
                         self.add_copy(o, p);
@@ -730,6 +893,7 @@ impl Solve {
             }
             // n as a store base: *n = q  ⇒  pts(q) ⊆ pts(o)  for o ∈ pts(n)
             if let Some(qs) = self.stores.get(&n).cloned() {
+                self.report_large_product("store", n, qs.len(), objs.len());
                 for q in qs {
                     for &o in &objs {
                         self.add_copy(q, o);
@@ -738,6 +902,7 @@ impl Solve {
             }
             // n as a gep base: p = n + off  ⇒  field(o, off) ∈ pts(p)  for o ∈ pts(n)
             if let Some(gs) = self.geps.get(&n).cloned() {
+                self.report_large_product("gep", n, gs.len(), objs.len());
                 for (off, p) in gs {
                     for &o in &objs {
                         let f = self.field_of(o, off);
@@ -764,6 +929,7 @@ impl Solve {
                         .get(&s)
                         .map(|s| s.iter().copied().collect())
                         .unwrap_or_default();
+                    self.report_large_product("memcpy", n, dobjs.len(), sobjs.len());
                     for &od in &dobjs {
                         for &os in &sobjs {
                             self.add_copy(os, od);
@@ -840,6 +1006,15 @@ mod tests {
     fn load_m2_3(name: &str) -> (Pir, Pag) {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/synthetic/m2_3")
+            .join(name);
+        let pir = Pir::from_path(path).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        (pir, pag)
+    }
+
+    fn load_m3_2(name: &str) -> (Pir, Pag) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/m3_2")
             .join(name);
         let pir = Pir::from_path(path).unwrap();
         let pag = Pag::from_pir(&pir, &PagOpts::default());
@@ -928,6 +1103,28 @@ mod tests {
             .iter()
             .all(|t| steens.indirect_calls[0].targets.contains(t)));
         assert!(andersen.metrics.rounds >= 1);
+    }
+
+    #[test]
+    fn andersen_collapses_nested_gep_cycles_to_finite_field_domain() {
+        let (pir, pag) = load("cyclic_nested_gep.pir.json");
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
+        assert_eq!(andersen.indirect_calls.len(), 1);
+        assert_eq!(
+            andersen.indirect_calls[0].targets,
+            vec!["target".to_string()]
+        );
+    }
+
+    #[test]
+    fn andersen_preserves_known_nested_gep_offsets() {
+        let (pir, pag) = load_m3_2("negative_offset_container.pir.json");
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
+        assert_eq!(andersen.indirect_calls.len(), 1);
+        assert_eq!(
+            andersen.indirect_calls[0].targets,
+            vec!["target".to_string()]
+        );
     }
 
     #[test]

@@ -172,8 +172,13 @@ representative witness. `notes/m3_lite_measurements.md` now includes the current
 decision table for jpegoptim/parson/jq/chibicc/gifsicle/lua plus a first curl stress sanity
 row. Runtime is acceptable on those rows; the blocker profile points to modeling/audit gaps,
 not an immediate tier-E/CFL default-path need. A subsequent `exe-tmux-O1` large stress attempt
-timed out under the 300s cap before metrics/export, so the next step is targeted
-profiling/instrumentation on a tmux/sqlite-sized row before freezing M3 scaling claims.
+timed out under the 300s cap before metrics/export. Profiling localized that timeout to
+unbounded nested-GEP field materialization in Andersen; the finite-field fix canonicalizes
+nested constant field GEPs back to root-relative offsets from the fixed graph's finite offset
+vocabulary, while unknown/unseen nested offsets collapse conservatively to the root object.
+`exe-tmux-O1` now completes in about 60s wall with under 3s solver time, but it still exports
+a large mod/ref surface (~1.2M rows, 190M), so the remaining M3 freeze question is whether to
+accept tmux as a scale warning or spend one more slice on export/modref size.
 
 ## 6. What To Stop Doing For Lite M3
 
