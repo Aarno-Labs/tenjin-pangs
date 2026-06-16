@@ -9,8 +9,11 @@ mod cfl;
 pub use andersen::{solve_andersen, solve_andersen_with_overrides};
 pub use cfl::{
     query_all_callees_field_insensitive, query_all_callees_field_insensitive_report,
-    query_all_callees_field_sensitive, query_all_callees_field_sensitive_fixpoint_report,
-    query_all_callees_field_sensitive_report, query_callees_field_insensitive,
+    query_all_callees_field_insensitive_report_with_signatures, query_all_callees_field_sensitive,
+    query_all_callees_field_sensitive_fixpoint_report,
+    query_all_callees_field_sensitive_fixpoint_report_with_signatures,
+    query_all_callees_field_sensitive_report,
+    query_all_callees_field_sensitive_report_with_signatures, query_callees_field_insensitive,
     query_callees_field_sensitive, CflCalleeQuery, CflCalleeReport, CflFixpointReport,
     CflFixpointRound, CflQueryMetrics, CflVisitHistogram,
 };

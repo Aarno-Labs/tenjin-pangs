@@ -435,6 +435,29 @@ fn query_callees_fixpoint_reports_rounds_and_indirect_bindings() {
 }
 
 #[test]
+fn query_callees_filters_abi_incompatible_targets() {
+    let fixture = m3_3_fixture("incompatible_signature_filter.pir.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("query")
+        .arg("callees")
+        .arg(&fixture)
+        .arg("--mode")
+        .arg("field-sensitive-fixpoint")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "query callees incompatible signature fixture failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "field_sensitive_fixpoint");
+    assert!(report["by_callsite"].as_object().unwrap().is_empty());
+    assert_eq!(report["rounds"].as_array().unwrap().len(), 1);
+    assert_eq!(report["rounds"][0]["new_targets"], 0);
+}
+
+#[test]
 fn analyze_validate_is_deterministic() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/synthetic/trivial/module.pir.json");

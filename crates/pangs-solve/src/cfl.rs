@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use pangs_pag::{
     CallKind, CallsiteId, EdgeKind, NodeId, NodeKind, ObjectKind, OmegaSeedKind, Pag, SeedTarget,
 };
+use pangs_pir::{fsa_compatible, Signature};
 
 /// M3.1 field-insensitive CFL query kernel for callees.
 ///
@@ -33,7 +34,22 @@ pub fn query_all_callees_field_insensitive(pag: &Pag) -> BTreeMap<String, BTreeS
 
 /// Run all M3.1 callee queries and retain per-query traversal metrics.
 pub fn query_all_callees_field_insensitive_report(pag: &Pag) -> CflCalleeReport {
-    let graph = QueryGraph::new(pag);
+    query_all_callees_field_insensitive_report_inner(pag, None)
+}
+
+/// Run all M3.1 callee queries with ABI/FSA-compatible sink filtering.
+pub fn query_all_callees_field_insensitive_report_with_signatures(
+    pag: &Pag,
+    signatures: &BTreeMap<String, Signature>,
+) -> CflCalleeReport {
+    query_all_callees_field_insensitive_report_inner(pag, Some(signatures))
+}
+
+fn query_all_callees_field_insensitive_report_inner(
+    pag: &Pag,
+    signatures: Option<&BTreeMap<String, Signature>>,
+) -> CflCalleeReport {
+    let graph = QueryGraph::with_signatures(pag, signatures);
     let mut by_callsite: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut queries = Vec::new();
     for node in &pag.nodes {
@@ -68,7 +84,22 @@ pub fn query_all_callees_field_sensitive(pag: &Pag) -> BTreeMap<String, BTreeSet
 
 /// Run all M3.2 MHS callee queries and retain per-query traversal metrics.
 pub fn query_all_callees_field_sensitive_report(pag: &Pag) -> CflCalleeReport {
-    let graph = QueryGraph::new(pag);
+    query_all_callees_field_sensitive_report_inner(pag, None)
+}
+
+/// Run all M3.2 MHS callee queries with ABI/FSA-compatible sink filtering.
+pub fn query_all_callees_field_sensitive_report_with_signatures(
+    pag: &Pag,
+    signatures: &BTreeMap<String, Signature>,
+) -> CflCalleeReport {
+    query_all_callees_field_sensitive_report_inner(pag, Some(signatures))
+}
+
+fn query_all_callees_field_sensitive_report_inner(
+    pag: &Pag,
+    signatures: Option<&BTreeMap<String, Signature>>,
+) -> CflCalleeReport {
+    let graph = QueryGraph::with_signatures(pag, signatures);
     let mut by_callsite: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut queries = Vec::new();
     for node in &pag.nodes {
@@ -103,6 +134,21 @@ pub fn query_all_callees_field_sensitive_report(pag: &Pag) -> CflCalleeReport {
 /// callee returns flow to the call result. Queries that touched the unresolved call's
 /// arguments or the discovered callee's return node are scheduled for the next round.
 pub fn query_all_callees_field_sensitive_fixpoint_report(pag: &Pag) -> CflFixpointReport {
+    query_all_callees_field_sensitive_fixpoint_report_inner(pag, None)
+}
+
+/// Run M3.3 dependency-tracked MHS callee queries with ABI/FSA-compatible sink filtering.
+pub fn query_all_callees_field_sensitive_fixpoint_report_with_signatures(
+    pag: &Pag,
+    signatures: &BTreeMap<String, Signature>,
+) -> CflFixpointReport {
+    query_all_callees_field_sensitive_fixpoint_report_inner(pag, Some(signatures))
+}
+
+fn query_all_callees_field_sensitive_fixpoint_report_inner(
+    pag: &Pag,
+    signatures: Option<&BTreeMap<String, Signature>>,
+) -> CflFixpointReport {
     let function_keys = function_object_keys(pag);
     let mut pending: BTreeSet<String> = function_keys.iter().cloned().collect();
     let mut targets_by_site: BTreeMap<CallsiteId, BTreeSet<String>> = BTreeMap::new();
@@ -116,7 +162,11 @@ pub fn query_all_callees_field_sensitive_fixpoint_report(pag: &Pag) -> CflFixpoi
             break;
         }
 
-        let graph = QueryGraph::with_indirect_call_targets(pag, &targets_by_site);
+        let graph = QueryGraph::with_indirect_call_targets_and_signatures(
+            pag,
+            &targets_by_site,
+            signatures,
+        );
         let current = std::mem::take(&mut pending);
         let mut newly_discovered = Vec::new();
         let mut new_targets = 0;
@@ -279,6 +329,7 @@ struct QueryGraph<'a> {
     indirect_operands: HashMap<NodeId, Vec<CallsiteId>>,
     indirect_call_dependencies: HashMap<NodeId, Vec<CallsiteId>>,
     return_dependencies: HashMap<NodeId, &'a str>,
+    function_signatures: Option<&'a BTreeMap<String, Signature>>,
 }
 
 impl<'a> QueryGraph<'a> {
@@ -286,9 +337,24 @@ impl<'a> QueryGraph<'a> {
         Self::with_indirect_call_targets(pag, &BTreeMap::new())
     }
 
+    fn with_signatures(
+        pag: &'a Pag,
+        function_signatures: Option<&'a BTreeMap<String, Signature>>,
+    ) -> Self {
+        Self::with_indirect_call_targets_and_signatures(pag, &BTreeMap::new(), function_signatures)
+    }
+
     fn with_indirect_call_targets(
         pag: &'a Pag,
         indirect_targets: &BTreeMap<CallsiteId, BTreeSet<String>>,
+    ) -> Self {
+        Self::with_indirect_call_targets_and_signatures(pag, indirect_targets, None)
+    }
+
+    fn with_indirect_call_targets_and_signatures(
+        pag: &'a Pag,
+        indirect_targets: &BTreeMap<CallsiteId, BTreeSet<String>>,
+        function_signatures: Option<&'a BTreeMap<String, Signature>>,
     ) -> Self {
         let mut edges = pag
             .edges
@@ -309,6 +375,7 @@ impl<'a> QueryGraph<'a> {
             &external_functions,
             &params,
             &returns,
+            function_signatures,
             &mut edges,
         );
 
@@ -379,6 +446,7 @@ impl<'a> QueryGraph<'a> {
             indirect_operands,
             indirect_call_dependencies,
             return_dependencies,
+            function_signatures,
         }
     }
 
@@ -409,8 +477,7 @@ impl<'a> QueryGraph<'a> {
             if phase == Phase::Forward {
                 if let Some(sites) = self.indirect_operands.get(&node) {
                     for site in sites {
-                        out.callsites
-                            .insert(self.pag.callsites[site.0 as usize].key.clone());
+                        self.record_callsite_sink(function, *site, &mut out);
                     }
                 }
             }
@@ -455,8 +522,7 @@ impl<'a> QueryGraph<'a> {
             if state.phase == Phase::Forward && state.stack.is_empty() {
                 if let Some(sites) = self.indirect_operands.get(&state.node) {
                     for site in sites {
-                        out.callsites
-                            .insert(self.pag.callsites[site.0 as usize].key.clone());
+                        self.record_callsite_sink(function, *site, &mut out);
                     }
                 }
             }
@@ -569,8 +635,37 @@ impl<'a> QueryGraph<'a> {
         }
     }
 
+    fn record_callsite_sink(
+        &self,
+        function: &str,
+        callsite_id: CallsiteId,
+        out: &mut CflCalleeQuery,
+    ) {
+        if !self.compatible_target(function, callsite_id) {
+            return;
+        }
+        out.callsites
+            .insert(self.pag.callsites[callsite_id.0 as usize].key.clone());
+    }
+
+    fn compatible_target(&self, function: &str, callsite: CallsiteId) -> bool {
+        let Some(function_signatures) = self.function_signatures else {
+            return true;
+        };
+        let Some(function_sig) = function_signatures.get(function) else {
+            return true;
+        };
+        let Some(callsite) = self.pag.callsites.get(callsite.0 as usize) else {
+            return true;
+        };
+        fsa_compatible(&callsite.sig, function_sig)
+    }
+
     fn binding_edge_count(&self, callsite: CallsiteId, target: &str) -> usize {
         if self.external_functions.contains(target) {
+            return 0;
+        }
+        if !self.compatible_target(target, callsite) {
             return 0;
         }
         let Some(callsite) = self.pag.callsites.get(callsite.0 as usize) else {
@@ -670,6 +765,7 @@ fn append_indirect_call_binding_edges(
     external_functions: &HashSet<&str>,
     params: &HashMap<&str, BTreeMap<u32, NodeId>>,
     returns: &HashMap<&str, NodeId>,
+    function_signatures: Option<&BTreeMap<String, Signature>>,
     edges: &mut Vec<QueryEdge>,
 ) {
     for (site_id, targets) in indirect_targets {
@@ -681,6 +777,9 @@ fn append_indirect_call_binding_edges(
         }
         for target in targets {
             if external_functions.contains(target.as_str()) {
+                continue;
+            }
+            if !compatible_target(function_signatures, callsite, target) {
                 continue;
             }
             if let Some(target_params) = params.get(target.as_str()) {
@@ -701,6 +800,20 @@ fn append_indirect_call_binding_edges(
             }
         }
     }
+}
+
+fn compatible_target(
+    function_signatures: Option<&BTreeMap<String, Signature>>,
+    callsite: &pangs_pag::Callsite,
+    target: &str,
+) -> bool {
+    let Some(function_signatures) = function_signatures else {
+        return true;
+    };
+    let Some(function_sig) = function_signatures.get(target) else {
+        return true;
+    };
+    fsa_compatible(&callsite.sig, function_sig)
 }
 
 fn visit_histogram(queries: &[CflCalleeQuery]) -> CflVisitHistogram {
@@ -791,14 +904,17 @@ mod tests {
     use std::path::Path;
 
     use pangs_pag::{BuildMode, Pag, PagOpts};
-    use pangs_pir::Pir;
+    use pangs_pir::{Pir, Signature};
 
     use crate::solve_steensgaard;
 
     use super::{
         query_all_callees_field_insensitive, query_all_callees_field_insensitive_report,
+        query_all_callees_field_insensitive_report_with_signatures,
         query_all_callees_field_sensitive, query_all_callees_field_sensitive_fixpoint_report,
-        query_all_callees_field_sensitive_report, query_callees_field_insensitive,
+        query_all_callees_field_sensitive_fixpoint_report_with_signatures,
+        query_all_callees_field_sensitive_report,
+        query_all_callees_field_sensitive_report_with_signatures, query_callees_field_insensitive,
         query_callees_field_sensitive,
     };
 
@@ -826,6 +942,13 @@ mod tests {
                     resolution.targets.into_iter().collect::<BTreeSet<_>>(),
                 )
             })
+            .collect()
+    }
+
+    fn function_signatures(pir: &Pir) -> BTreeMap<String, Signature> {
+        pir.functions
+            .iter()
+            .map(|func| (func.key.clone(), func.sig.clone()))
             .collect()
     }
 
@@ -1050,6 +1173,27 @@ mod tests {
     }
 
     #[test]
+    fn m3_3_signature_filter_rejects_incompatible_callee_sink() {
+        let (pir, pag) = load_pir_pag("m3_3", "incompatible_signature_filter.pir.json");
+
+        let raw = query_all_callees_field_sensitive(&pag);
+        assert_eq!(
+            raw["driver@!noloc#0"],
+            ["bad".to_string()].into_iter().collect()
+        );
+
+        let signatures = function_signatures(&pir);
+        let filtered = query_all_callees_field_sensitive_report_with_signatures(&pag, &signatures);
+        assert!(!filtered.by_callsite.contains_key("driver@!noloc#0"));
+
+        let fixpoint =
+            query_all_callees_field_sensitive_fixpoint_report_with_signatures(&pag, &signatures);
+        assert!(!fixpoint.by_callsite.contains_key("driver@!noloc#0"));
+        assert_eq!(fixpoint.rounds.len(), 1);
+        assert_eq!(fixpoint.rounds[0].new_targets, 0);
+    }
+
+    #[test]
     fn m3_1_answers_stay_inside_steensgaard_envelope_on_synthetic_suite() {
         let roots = [
             "m1_4", "m1_4b", "m1_5", "m2_2", "m2_3", "m2_4", "m3_1", "m3_2", "m3_3",
@@ -1073,8 +1217,16 @@ mod tests {
                 let pir = Pir::from_path(&path).unwrap();
                 let pag = Pag::from_pir(&pir, &PagOpts::default());
                 let steens = steens_targets_by_callsite(&pir, &pag);
-                let report = query_all_callees_field_insensitive_report(&pag);
-                let mhs_report = query_all_callees_field_sensitive_report(&pag);
+                let signatures = function_signatures(&pir);
+                let report =
+                    query_all_callees_field_insensitive_report_with_signatures(&pag, &signatures);
+                let mhs_report =
+                    query_all_callees_field_sensitive_report_with_signatures(&pag, &signatures);
+                let fixpoint_report =
+                    query_all_callees_field_sensitive_fixpoint_report_with_signatures(
+                        &pag,
+                        &signatures,
+                    );
                 max_visited = max_visited.max(report.max_visited_states());
 
                 for (callsite, targets) in &report.by_callsite {
@@ -1106,6 +1258,21 @@ mod tests {
                         assert!(
                             envelope.contains(target),
                             "{}: M3.2 target {target} for {callsite} is outside Steensgaard envelope {envelope:?}",
+                            path.display()
+                        );
+                    }
+                }
+                for (callsite, targets) in &fixpoint_report.by_callsite {
+                    let Some(envelope) = steens.get(callsite) else {
+                        panic!(
+                            "{}: M3.3 found {callsite}, absent from Steensgaard",
+                            path.display()
+                        );
+                    };
+                    for target in targets {
+                        assert!(
+                            envelope.contains(target),
+                            "{}: M3.3 target {target} for {callsite} is outside Steensgaard envelope {envelope:?}",
                             path.display()
                         );
                     }

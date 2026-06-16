@@ -17,6 +17,9 @@ pangs query callees <module.bc|module.pir.json> --mode field-sensitive-fixpoint
   - the target function's return node flows to the call result node.
 - Imported/external function targets do not receive synthetic bindings, matching direct
   call lowering.
+- When PIR signatures are available, callsite sinks and synthetic indirect-call bindings
+  are filtered through the same ABI/FSA compatibility check used by earlier callgraph
+  tiers. The PAG-only helper APIs remain conservative and unfiltered.
 - The fixpoint is monotone: discovered `(callsite, target)` pairs only grow.
 - Scheduling is dependency tracked:
   - queries that touched an unresolved indirect call's argument/result positions are
@@ -34,8 +37,13 @@ Focused tests cover:
 - return-dependent discovery: resolving `driver`'s indirect call to `choose` creates the
   `choose.ret -> driver.result` binding needed to resolve a second indirect call through
   the returned function pointer in round 1.
+- incompatible signature filtering: a raw PAG-only query may see an incompatible function
+  address reach an indirect-call operand, while the signature-aware CLI/report path
+  rejects the target and does not create fixpoint bindings for it.
 - CLI JSON reports fixpoint rounds, new target counts, dependency-bearing queries, and
   final `by_callsite` answers.
+- synthetic-suite ledger: signature-aware M3.1, M3.2, and M3.3 answers stay inside the
+  Steensgaard/FSA envelope.
 
 This is still a query-kernel surface. The main `analyze` pipeline has not yet adopted
 tier-E callee answers or exported them into `callgraph.jsonl`.

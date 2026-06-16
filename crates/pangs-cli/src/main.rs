@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -281,18 +281,29 @@ fn run() -> Result<()> {
                     exports: read_exports(exports)?,
                 };
                 let pag = Pag::from_pir(&pir, &opts);
+                let signatures = function_signatures(&pir);
                 let (by_callsite, queries, rounds) = match mode {
                     QueryModeArg::FieldInsensitive => {
-                        let report = pangs_solve::query_all_callees_field_insensitive_report(&pag);
+                        let report =
+                            pangs_solve::query_all_callees_field_insensitive_report_with_signatures(
+                                &pag,
+                                &signatures,
+                            );
                         (report.by_callsite, report.queries, None)
                     }
                     QueryModeArg::FieldSensitive => {
-                        let report = pangs_solve::query_all_callees_field_sensitive_report(&pag);
+                        let report =
+                            pangs_solve::query_all_callees_field_sensitive_report_with_signatures(
+                                &pag,
+                                &signatures,
+                            );
                         (report.by_callsite, report.queries, None)
                     }
                     QueryModeArg::FieldSensitiveFixpoint => {
-                        let report =
-                            pangs_solve::query_all_callees_field_sensitive_fixpoint_report(&pag);
+                        let report = pangs_solve::query_all_callees_field_sensitive_fixpoint_report_with_signatures(
+                            &pag,
+                            &signatures,
+                        );
                         (report.by_callsite, report.queries, Some(report.rounds))
                     }
                 };
@@ -443,4 +454,11 @@ fn read_exports(path: Option<PathBuf>) -> Result<BTreeSet<String>> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(ToOwned::to_owned)
         .collect())
+}
+
+fn function_signatures(pir: &Pir) -> BTreeMap<String, pangs_pir::Signature> {
+    pir.functions
+        .iter()
+        .map(|func| (func.key.clone(), func.sig.clone()))
+        .collect()
 }

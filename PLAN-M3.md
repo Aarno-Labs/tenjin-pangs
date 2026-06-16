@@ -167,11 +167,14 @@ found — this measures what the bootstrap-free design buys us.
 **Implementation status:** initial dependency-tracked callee fixpoint is available as
 `pangs query callees --mode field-sensitive-fixpoint`. It rebuilds the MHS query graph
 each round with synthetic Assign-shaped arg→param and ret→result bindings for newly
-discovered indirect targets, skips imported/external target bindings, and schedules
-queries from callsite argument/result dependencies and callee-return dependencies.
-Focused fixtures cover argument-driven and return-driven second-round discovery. This is
-not yet wired into the main `analyze` callgraph export, and corpus convergence/precision
-measurements are still pending. See `notes/m3_3_fixpoint.md`.
+discovered indirect targets, skips imported/external target bindings, applies ABI/FSA
+signature filtering when PIR signatures are available, and schedules queries from
+callsite argument/result dependencies and callee-return dependencies. Focused fixtures
+cover argument-driven discovery, return-driven discovery, and incompatible-signature
+rejection. Signature-aware M3.1/M3.2/M3.3 query answers are checked against the synthetic
+suite's Steensgaard/FSA envelope. This is not yet wired into the main `analyze` callgraph
+export, and corpus convergence/precision measurements are still pending. See
+`notes/m3_3_fixpoint.md`.
 
 ### M3.4 — Parallel query pool (2–4 days)
 `rayon` over pending queries per round; PAG and all M1/M2 outputs are frozen/read-only;
