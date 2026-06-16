@@ -130,6 +130,14 @@ PAGs with known answers, incl. the aliasing-through-two-levels-of-memory pattern
 Vim: answers ⊆ tier-C answers for every settled comparison point; per-query node-visit
 histograms published.
 
+**Implementation status:** initial `pangs_solve::query_callees_field_insensitive` and
+`query_all_callees_field_insensitive` kernel is in place as an internal API. It runs one
+source-function query at a time over `(node, phase)` states, treats GEP/memcpy as
+assignment-like edges, collects indirect-call operand sinks, and reports per-query
+visited-state/worklist metrics. Focused fixtures cover direct assignment, store/load,
+two-level memory, independent global function-pointer slots, and the intentional
+field-insensitive over-approximation that M3.2's MHS is expected to narrow.
+
 ### M3.2 — MHS / byte-offset field sensitivity (3–5 days)
 Add the offset stack per §1.2, with `⊤` saturation and the subobject table (M2.1) for
 sink interpretation. **This step has the highest unit-test density of the project**;
