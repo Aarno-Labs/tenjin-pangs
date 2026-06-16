@@ -164,6 +164,15 @@ converges ≤5 rounds on Vim/PHP; final icall sets ⊆ every earlier tier (ledge
 ablation number recorded: edges that round-0 (tiers B/C-seeded) missed and the fixpoint
 found — this measures what the bootstrap-free design buys us.
 
+**Implementation status:** initial dependency-tracked callee fixpoint is available as
+`pangs query callees --mode field-sensitive-fixpoint`. It rebuilds the MHS query graph
+each round with synthetic Assign-shaped arg→param and ret→result bindings for newly
+discovered indirect targets, skips imported/external target bindings, and schedules
+queries from callsite argument/result dependencies and callee-return dependencies.
+Focused fixtures cover argument-driven and return-driven second-round discovery. This is
+not yet wired into the main `analyze` callgraph export, and corpus convergence/precision
+measurements are still pending. See `notes/m3_3_fixpoint.md`.
+
 ### M3.4 — Parallel query pool (2–4 days)
 `rayon` over pending queries per round; PAG and all M1/M2 outputs are frozen/read-only;
 per-query arena reset between queries (allocation discipline matters more than

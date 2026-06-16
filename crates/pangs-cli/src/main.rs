@@ -121,6 +121,7 @@ enum QueryCommand {
 enum QueryModeArg {
     FieldInsensitive,
     FieldSensitive,
+    FieldSensitiveFixpoint,
 }
 
 impl QueryModeArg {
@@ -128,6 +129,7 @@ impl QueryModeArg {
         match self {
             QueryModeArg::FieldInsensitive => "field_insensitive",
             QueryModeArg::FieldSensitive => "field_sensitive",
+            QueryModeArg::FieldSensitiveFixpoint => "field_sensitive_fixpoint",
         }
     }
 }
@@ -279,42 +281,78 @@ fn run() -> Result<()> {
                     exports: read_exports(exports)?,
                 };
                 let pag = Pag::from_pir(&pir, &opts);
-                let report = match mode {
+                let (by_callsite, queries, rounds) = match mode {
                     QueryModeArg::FieldInsensitive => {
-                        pangs_solve::query_all_callees_field_insensitive_report(&pag)
+                        let report = pangs_solve::query_all_callees_field_insensitive_report(&pag);
+                        (report.by_callsite, report.queries, None)
                     }
                     QueryModeArg::FieldSensitive => {
-                        pangs_solve::query_all_callees_field_sensitive_report(&pag)
+                        let report = pangs_solve::query_all_callees_field_sensitive_report(&pag);
+                        (report.by_callsite, report.queries, None)
+                    }
+                    QueryModeArg::FieldSensitiveFixpoint => {
+                        let report =
+                            pangs_solve::query_all_callees_field_sensitive_fixpoint_report(&pag);
+                        (report.by_callsite, report.queries, Some(report.rounds))
                     }
                 };
-                let queries = report
-                    .queries
+                let rounds_json = rounds.map(|rounds| {
+                    rounds
+                        .iter()
+                        .map(|round| {
+                            serde_json::json!({
+                                "round": round.round,
+                                "queries_run": round.queries_run,
+                                "new_targets": round.new_targets,
+                                "new_interproc_edges": round.new_interproc_edges,
+                                "dependency_records": round.dependency_records,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let queries_json = queries
                     .iter()
                     .map(|query| {
                         serde_json::json!({
                             "function": query.function,
                             "source": query.source.map(|id| id.0),
                             "callsites": query.callsites,
+                            "dependencies": query.dependencies,
+                            "return_dependencies": query.return_dependencies,
                             "visited_states": query.metrics.visited_states,
                             "max_worklist": query.metrics.max_worklist,
                         })
                     })
                     .collect::<Vec<_>>();
-                let histogram = report.visit_histogram();
+                let mut histogram = [0usize; 4];
+                for query in &queries {
+                    match query.metrics.visited_states {
+                        0..=10 => histogram[0] += 1,
+                        11..=100 => histogram[1] += 1,
+                        101..=1_000 => histogram[2] += 1,
+                        _ => histogram[3] += 1,
+                    }
+                }
+                let max_visited_states = queries
+                    .iter()
+                    .map(|query| query.metrics.visited_states)
+                    .max()
+                    .unwrap_or(0);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "kind": "callees",
                         "mode": mode.label(),
-                        "by_callsite": report.by_callsite,
-                        "queries": queries,
+                        "by_callsite": by_callsite,
+                        "queries": queries_json,
+                        "rounds": rounds_json,
                         "visit_histogram": {
-                            "le_10": histogram.le_10,
-                            "le_100": histogram.le_100,
-                            "le_1000": histogram.le_1000,
-                            "gt_1000": histogram.gt_1000,
+                            "le_10": histogram[0],
+                            "le_100": histogram[1],
+                            "le_1000": histogram[2],
+                            "gt_1000": histogram[3],
                         },
-                        "max_visited_states": report.max_visited_states(),
+                        "max_visited_states": max_visited_states,
                     }))?
                 );
             }

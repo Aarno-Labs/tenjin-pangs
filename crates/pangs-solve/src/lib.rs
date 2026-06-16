@@ -9,8 +9,10 @@ mod cfl;
 pub use andersen::{solve_andersen, solve_andersen_with_overrides};
 pub use cfl::{
     query_all_callees_field_insensitive, query_all_callees_field_insensitive_report,
-    query_all_callees_field_sensitive, query_all_callees_field_sensitive_report,
-    query_callees_field_insensitive, query_callees_field_sensitive,
+    query_all_callees_field_sensitive, query_all_callees_field_sensitive_fixpoint_report,
+    query_all_callees_field_sensitive_report, query_callees_field_insensitive,
+    query_callees_field_sensitive, CflCalleeQuery, CflCalleeReport, CflFixpointReport,
+    CflFixpointRound, CflQueryMetrics, CflVisitHistogram,
 };
 
 /// M2.0 subset-narrowing tripwire (`PLAN-M2_lite_delta.md` §1 M2.0). A more-exact

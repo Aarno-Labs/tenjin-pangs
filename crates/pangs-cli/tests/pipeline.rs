@@ -59,6 +59,12 @@ fn m2_4_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn m3_3_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m3_3")
+        .join(name)
+}
+
 fn scrub_timing_fields(mut metrics: Value) -> Value {
     let object = metrics.as_object_mut().unwrap();
     for key in [
@@ -395,6 +401,37 @@ fn query_callees_mode_selects_field_sensitivity() {
         sensitive["by_callsite"]["setup@!noloc#0"],
         serde_json::json!(["f0"])
     );
+}
+
+#[test]
+fn query_callees_fixpoint_reports_rounds_and_indirect_bindings() {
+    let fixture = m3_3_fixture("indirect_arg_fixpoint.pir.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("query")
+        .arg("callees")
+        .arg(&fixture)
+        .arg("--mode")
+        .arg("field-sensitive-fixpoint")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "query callees --mode field-sensitive-fixpoint failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "field_sensitive_fixpoint");
+    assert_eq!(
+        report["by_callsite"]["driver@!noloc#0"],
+        serde_json::json!(["invoke"])
+    );
+    assert_eq!(
+        report["by_callsite"]["invoke@!noloc#0"],
+        serde_json::json!(["target"])
+    );
+    assert_eq!(report["rounds"].as_array().unwrap().len(), 2);
+    assert_eq!(report["rounds"][0]["new_targets"], 1);
+    assert_eq!(report["rounds"][1]["new_targets"], 1);
 }
 
 #[test]

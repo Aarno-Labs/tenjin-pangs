@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use pangs_pag::{CallKind, CallsiteId, Edge, EdgeKind, NodeId, NodeKind, ObjectKind, Pag};
+use pangs_pag::{
+    CallKind, CallsiteId, EdgeKind, NodeId, NodeKind, ObjectKind, OmegaSeedKind, Pag, SeedTarget,
+};
 
 /// M3.1 field-insensitive CFL query kernel for callees.
 ///
@@ -93,11 +95,118 @@ pub fn query_all_callees_field_sensitive_report(pag: &Pag) -> CflCalleeReport {
     }
 }
 
+/// Run M3.3 dependency-tracked MHS callee queries to an interprocedural fixpoint.
+///
+/// Round 0 uses only the frozen PAG. When a round discovers that an indirect callsite may
+/// target an internal function, the next round's query graph includes synthetic
+/// Assign-shaped call bindings for that target: actual args flow to callee params, and
+/// callee returns flow to the call result. Queries that touched the unresolved call's
+/// arguments or the discovered callee's return node are scheduled for the next round.
+pub fn query_all_callees_field_sensitive_fixpoint_report(pag: &Pag) -> CflFixpointReport {
+    let function_keys = function_object_keys(pag);
+    let mut pending: BTreeSet<String> = function_keys.iter().cloned().collect();
+    let mut targets_by_site: BTreeMap<CallsiteId, BTreeSet<String>> = BTreeMap::new();
+    let mut latest_queries: BTreeMap<String, CflCalleeQuery> = BTreeMap::new();
+    let mut deps_by_callsite: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut deps_by_return_func: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut rounds = Vec::new();
+
+    for round_index in 0..32 {
+        if pending.is_empty() {
+            break;
+        }
+
+        let graph = QueryGraph::with_indirect_call_targets(pag, &targets_by_site);
+        let current = std::mem::take(&mut pending);
+        let mut newly_discovered = Vec::new();
+        let mut new_targets = 0;
+        let mut new_interproc_edges = 0;
+        let mut dependency_records = 0;
+
+        for function in &current {
+            let answer = graph.query_function_mhs(function);
+            dependency_records += answer.dependencies.len() + answer.return_dependencies.len();
+            for dep in &answer.dependencies {
+                deps_by_callsite
+                    .entry(dep.clone())
+                    .or_default()
+                    .insert(function.clone());
+            }
+            for dep in &answer.return_dependencies {
+                deps_by_return_func
+                    .entry(dep.clone())
+                    .or_default()
+                    .insert(function.clone());
+            }
+
+            for callsite in &answer.callsites {
+                let Some(&site_id) = graph.callsite_ids.get(callsite.as_str()) else {
+                    continue;
+                };
+                let inserted = targets_by_site
+                    .entry(site_id)
+                    .or_default()
+                    .insert(function.clone());
+                if inserted {
+                    new_targets += 1;
+                    new_interproc_edges += graph.binding_edge_count(site_id, function);
+                    newly_discovered.push((callsite.clone(), function.clone()));
+                }
+            }
+
+            latest_queries.insert(function.clone(), answer);
+        }
+
+        let mut next_pending = BTreeSet::new();
+        for (callsite, target) in &newly_discovered {
+            if let Some(dependents) = deps_by_callsite.get(callsite) {
+                next_pending.extend(dependents.iter().cloned());
+            }
+            if let Some(dependents) = deps_by_return_func.get(target) {
+                next_pending.extend(dependents.iter().cloned());
+            }
+        }
+
+        rounds.push(CflFixpointRound {
+            round: round_index,
+            queries_run: current.len(),
+            new_targets,
+            new_interproc_edges,
+            dependency_records,
+        });
+
+        if new_targets == 0 {
+            break;
+        }
+        pending = next_pending;
+    }
+
+    let by_callsite = targets_by_site
+        .iter()
+        .filter_map(|(site_id, targets)| {
+            let callsite = pag.callsites.get(site_id.0 as usize)?;
+            Some((callsite.key.clone(), targets.clone()))
+        })
+        .collect();
+    let queries = function_keys
+        .into_iter()
+        .filter_map(|function| latest_queries.remove(&function))
+        .collect();
+
+    CflFixpointReport {
+        by_callsite,
+        queries,
+        rounds,
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CflCalleeQuery {
     pub function: String,
     pub source: Option<NodeId>,
     pub callsites: BTreeSet<String>,
+    pub dependencies: BTreeSet<String>,
+    pub return_dependencies: BTreeSet<String>,
     pub metrics: CflQueryMetrics,
 }
 
@@ -113,26 +222,39 @@ pub struct CflCalleeReport {
     pub queries: Vec<CflCalleeQuery>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CflFixpointReport {
+    pub by_callsite: BTreeMap<String, BTreeSet<String>>,
+    pub queries: Vec<CflCalleeQuery>,
+    pub rounds: Vec<CflFixpointRound>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CflFixpointRound {
+    pub round: usize,
+    pub queries_run: usize,
+    pub new_targets: usize,
+    pub new_interproc_edges: usize,
+    pub dependency_records: usize,
+}
+
 impl CflCalleeReport {
     pub fn visit_histogram(&self) -> CflVisitHistogram {
-        let mut histogram = CflVisitHistogram::default();
-        for query in &self.queries {
-            match query.metrics.visited_states {
-                0..=10 => histogram.le_10 += 1,
-                11..=100 => histogram.le_100 += 1,
-                101..=1_000 => histogram.le_1000 += 1,
-                _ => histogram.gt_1000 += 1,
-            }
-        }
-        histogram
+        visit_histogram(&self.queries)
     }
 
     pub fn max_visited_states(&self) -> usize {
-        self.queries
-            .iter()
-            .map(|query| query.metrics.visited_states)
-            .max()
-            .unwrap_or(0)
+        max_visited_states(&self.queries)
+    }
+}
+
+impl CflFixpointReport {
+    pub fn visit_histogram(&self) -> CflVisitHistogram {
+        visit_histogram(&self.queries)
+    }
+
+    pub fn max_visited_states(&self) -> usize {
+        max_visited_states(&self.queries)
     }
 }
 
@@ -146,17 +268,53 @@ pub struct CflVisitHistogram {
 
 struct QueryGraph<'a> {
     pag: &'a Pag,
+    edges: Vec<QueryEdge>,
     forward: Vec<Vec<usize>>,
     reverse: Vec<Vec<usize>>,
     function_objects: HashMap<&'a str, NodeId>,
+    external_functions: HashSet<&'a str>,
+    params: HashMap<&'a str, BTreeMap<u32, NodeId>>,
+    returns: HashMap<&'a str, NodeId>,
+    callsite_ids: HashMap<&'a str, CallsiteId>,
     indirect_operands: HashMap<NodeId, Vec<CallsiteId>>,
+    indirect_call_dependencies: HashMap<NodeId, Vec<CallsiteId>>,
+    return_dependencies: HashMap<NodeId, &'a str>,
 }
 
 impl<'a> QueryGraph<'a> {
     fn new(pag: &'a Pag) -> Self {
+        Self::with_indirect_call_targets(pag, &BTreeMap::new())
+    }
+
+    fn with_indirect_call_targets(
+        pag: &'a Pag,
+        indirect_targets: &BTreeMap<CallsiteId, BTreeSet<String>>,
+    ) -> Self {
+        let mut edges = pag
+            .edges
+            .iter()
+            .map(|edge| QueryEdge {
+                kind: edge.kind,
+                src: edge.src,
+                dst: edge.dst,
+            })
+            .collect::<Vec<_>>();
+
+        let external_functions = external_function_keys(pag);
+        let params = param_nodes(pag);
+        let returns = return_nodes(pag);
+        append_indirect_call_binding_edges(
+            pag,
+            indirect_targets,
+            &external_functions,
+            &params,
+            &returns,
+            &mut edges,
+        );
+
         let mut forward = vec![Vec::new(); pag.nodes.len()];
         let mut reverse = vec![Vec::new(); pag.nodes.len()];
-        for (index, edge) in pag.edges.iter().enumerate() {
+        for (index, edge) in edges.iter().enumerate() {
             forward[edge.src.0 as usize].push(index);
             reverse[edge.dst.0 as usize].push(index);
         }
@@ -174,7 +332,14 @@ impl<'a> QueryGraph<'a> {
             })
             .collect();
 
+        let callsite_ids = pag
+            .callsites
+            .iter()
+            .map(|callsite| (callsite.key.as_str(), callsite.id))
+            .collect();
+
         let mut indirect_operands: HashMap<NodeId, Vec<CallsiteId>> = HashMap::new();
+        let mut indirect_call_dependencies: HashMap<NodeId, Vec<CallsiteId>> = HashMap::new();
         for callsite in &pag.callsites {
             if callsite.kind == CallKind::Indirect {
                 if let Some(operand) = callsite.operand {
@@ -183,15 +348,37 @@ impl<'a> QueryGraph<'a> {
                         .or_default()
                         .push(callsite.id);
                 }
+                for node in callsite.args.iter().chain(callsite.result.iter()) {
+                    indirect_call_dependencies
+                        .entry(*node)
+                        .or_default()
+                        .push(callsite.id);
+                }
             }
         }
 
+        let return_dependencies = pag
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                NodeKind::Return { func } => Some((node.id, func.as_str())),
+                _ => None,
+            })
+            .collect();
+
         Self {
             pag,
+            edges,
             forward,
             reverse,
             function_objects,
+            external_functions,
+            params,
+            returns,
+            callsite_ids,
             indirect_operands,
+            indirect_call_dependencies,
+            return_dependencies,
         }
     }
 
@@ -217,6 +404,7 @@ impl<'a> QueryGraph<'a> {
             }
             out.metrics.visited_states = visited.len();
             out.metrics.max_worklist = out.metrics.max_worklist.max(worklist.len() + 1);
+            self.record_dependencies(node, &mut out);
 
             if phase == Phase::Forward {
                 if let Some(sites) = self.indirect_operands.get(&node) {
@@ -262,6 +450,7 @@ impl<'a> QueryGraph<'a> {
             }
             out.metrics.visited_states = visited.len();
             out.metrics.max_worklist = out.metrics.max_worklist.max(worklist.len() + 1);
+            self.record_dependencies(state.node, &mut out);
 
             if state.phase == Phase::Forward && state.stack.is_empty() {
                 if let Some(sites) = self.indirect_operands.get(&state.node) {
@@ -283,7 +472,7 @@ impl<'a> QueryGraph<'a> {
 
     fn step_forward(&self, node: NodeId, worklist: &mut VecDeque<(NodeId, Phase)>) {
         for &edge_index in &self.forward[node.0 as usize] {
-            let edge = &self.pag.edges[edge_index];
+            let edge = &self.edges[edge_index];
             match edge.kind {
                 EdgeKind::AddrOf
                 | EdgeKind::Assign
@@ -304,7 +493,7 @@ impl<'a> QueryGraph<'a> {
         worklist.push_back((node, Phase::Forward));
 
         for &edge_index in &self.reverse[node.0 as usize] {
-            let edge = &self.pag.edges[edge_index];
+            let edge = &self.edges[edge_index];
             if backward_edge(edge) {
                 worklist.push_back((edge.src, Phase::Backward));
             }
@@ -313,7 +502,7 @@ impl<'a> QueryGraph<'a> {
 
     fn step_forward_mhs(&self, state: MhsState, worklist: &mut VecDeque<MhsState>) {
         for &edge_index in &self.forward[state.node.0 as usize] {
-            let edge = &self.pag.edges[edge_index];
+            let edge = &self.edges[edge_index];
             match edge.kind {
                 EdgeKind::AddrOf | EdgeKind::Assign | EdgeKind::Memcpy { .. } => {
                     worklist.push_back(state.clone().next(edge.dst, Phase::Forward));
@@ -343,7 +532,7 @@ impl<'a> QueryGraph<'a> {
         worklist.push_back(state.clone().next(state.node, Phase::Forward));
 
         for &edge_index in &self.reverse[state.node.0 as usize] {
-            let edge = &self.pag.edges[edge_index];
+            let edge = &self.edges[edge_index];
             match edge.kind {
                 EdgeKind::AddrOf | EdgeKind::Assign | EdgeKind::Memcpy { .. } => {
                     worklist.push_back(state.clone().next(edge.src, Phase::Backward));
@@ -367,9 +556,44 @@ impl<'a> QueryGraph<'a> {
             }
         }
     }
+
+    fn record_dependencies(&self, node: NodeId, out: &mut CflCalleeQuery) {
+        if let Some(sites) = self.indirect_call_dependencies.get(&node) {
+            for site in sites {
+                out.dependencies
+                    .insert(self.pag.callsites[site.0 as usize].key.clone());
+            }
+        }
+        if let Some(func) = self.return_dependencies.get(&node) {
+            out.return_dependencies.insert((*func).to_string());
+        }
+    }
+
+    fn binding_edge_count(&self, callsite: CallsiteId, target: &str) -> usize {
+        if self.external_functions.contains(target) {
+            return 0;
+        }
+        let Some(callsite) = self.pag.callsites.get(callsite.0 as usize) else {
+            return 0;
+        };
+        let arg_edges = self
+            .params
+            .get(target)
+            .map(|params| callsite.args.len().min(params.len()))
+            .unwrap_or(0);
+        let ret_edges = usize::from(callsite.result.is_some() && self.returns.contains_key(target));
+        arg_edges + ret_edges
+    }
 }
 
-fn backward_edge(edge: &Edge) -> bool {
+#[derive(Debug, Clone, Copy)]
+struct QueryEdge {
+    kind: EdgeKind,
+    src: NodeId,
+    dst: NodeId,
+}
+
+fn backward_edge(edge: &QueryEdge) -> bool {
     matches!(
         edge.kind,
         EdgeKind::AddrOf
@@ -379,6 +603,125 @@ fn backward_edge(edge: &Edge) -> bool {
             | EdgeKind::Gep { .. }
             | EdgeKind::Memcpy { .. }
     )
+}
+
+fn function_object_keys(pag: &Pag) -> Vec<String> {
+    pag.nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            NodeKind::Object {
+                object: ObjectKind::Function,
+                key,
+                ..
+            } => Some(key.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn external_function_keys(pag: &Pag) -> HashSet<&str> {
+    pag.omega_seeds
+        .iter()
+        .filter_map(|seed| {
+            if seed.kind != OmegaSeedKind::ImportedSymbol {
+                return None;
+            }
+            let SeedTarget::Node(node) = seed.target else {
+                return None;
+            };
+            match &pag.nodes.get(node.0 as usize)?.kind {
+                NodeKind::Object {
+                    object: ObjectKind::Function,
+                    key,
+                    ..
+                } => Some(key.as_str()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn param_nodes(pag: &Pag) -> HashMap<&str, BTreeMap<u32, NodeId>> {
+    let mut params: HashMap<&str, BTreeMap<u32, NodeId>> = HashMap::new();
+    for node in &pag.nodes {
+        if let NodeKind::Param { func, index } = &node.kind {
+            params
+                .entry(func.as_str())
+                .or_default()
+                .insert(*index, node.id);
+        }
+    }
+    params
+}
+
+fn return_nodes(pag: &Pag) -> HashMap<&str, NodeId> {
+    pag.nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            NodeKind::Return { func } => Some((func.as_str(), node.id)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn append_indirect_call_binding_edges(
+    pag: &Pag,
+    indirect_targets: &BTreeMap<CallsiteId, BTreeSet<String>>,
+    external_functions: &HashSet<&str>,
+    params: &HashMap<&str, BTreeMap<u32, NodeId>>,
+    returns: &HashMap<&str, NodeId>,
+    edges: &mut Vec<QueryEdge>,
+) {
+    for (site_id, targets) in indirect_targets {
+        let Some(callsite) = pag.callsites.get(site_id.0 as usize) else {
+            continue;
+        };
+        if callsite.kind != CallKind::Indirect {
+            continue;
+        }
+        for target in targets {
+            if external_functions.contains(target.as_str()) {
+                continue;
+            }
+            if let Some(target_params) = params.get(target.as_str()) {
+                for (arg, param) in callsite.args.iter().zip(target_params.values()) {
+                    edges.push(QueryEdge {
+                        kind: EdgeKind::Assign,
+                        src: *arg,
+                        dst: *param,
+                    });
+                }
+            }
+            if let (Some(result), Some(ret)) = (callsite.result, returns.get(target.as_str())) {
+                edges.push(QueryEdge {
+                    kind: EdgeKind::Assign,
+                    src: *ret,
+                    dst: result,
+                });
+            }
+        }
+    }
+}
+
+fn visit_histogram(queries: &[CflCalleeQuery]) -> CflVisitHistogram {
+    let mut histogram = CflVisitHistogram::default();
+    for query in queries {
+        match query.metrics.visited_states {
+            0..=10 => histogram.le_10 += 1,
+            11..=100 => histogram.le_100 += 1,
+            101..=1_000 => histogram.le_1000 += 1,
+            _ => histogram.gt_1000 += 1,
+        }
+    }
+    histogram
+}
+
+fn max_visited_states(queries: &[CflCalleeQuery]) -> usize {
+    queries
+        .iter()
+        .map(|query| query.metrics.visited_states)
+        .max()
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -454,8 +797,9 @@ mod tests {
 
     use super::{
         query_all_callees_field_insensitive, query_all_callees_field_insensitive_report,
-        query_all_callees_field_sensitive, query_all_callees_field_sensitive_report,
-        query_callees_field_insensitive, query_callees_field_sensitive,
+        query_all_callees_field_sensitive, query_all_callees_field_sensitive_fixpoint_report,
+        query_all_callees_field_sensitive_report, query_callees_field_insensitive,
+        query_callees_field_sensitive,
     };
 
     fn load(root: &str, name: &str) -> Pag {
@@ -654,9 +998,61 @@ mod tests {
     }
 
     #[test]
+    fn m3_3_fixpoint_discovers_argument_dependent_icall() {
+        let pag = load("m3_3", "indirect_arg_fixpoint.pir.json");
+
+        let round0 = query_all_callees_field_sensitive(&pag);
+        assert_eq!(
+            round0["driver@!noloc#0"],
+            ["invoke".to_string()].into_iter().collect()
+        );
+        assert!(!round0.contains_key("invoke@!noloc#0"));
+
+        let report = query_all_callees_field_sensitive_fixpoint_report(&pag);
+        assert_eq!(
+            report.by_callsite["driver@!noloc#0"],
+            ["invoke".to_string()].into_iter().collect()
+        );
+        assert_eq!(
+            report.by_callsite["invoke@!noloc#0"],
+            ["target".to_string()].into_iter().collect()
+        );
+        assert_eq!(report.rounds.len(), 2, "{:?}", report.rounds);
+        assert_eq!(report.rounds[0].new_targets, 1);
+        assert_eq!(report.rounds[1].new_targets, 1);
+        assert!(report.rounds[0].dependency_records > 0);
+    }
+
+    #[test]
+    fn m3_3_fixpoint_discovers_return_dependent_icall() {
+        let pag = load("m3_3", "indirect_return_fixpoint.pir.json");
+
+        let round0 = query_all_callees_field_sensitive(&pag);
+        assert_eq!(
+            round0["driver@!noloc#0"],
+            ["choose".to_string()].into_iter().collect()
+        );
+        assert!(!round0.contains_key("driver@!noloc#1"));
+
+        let report = query_all_callees_field_sensitive_fixpoint_report(&pag);
+        assert_eq!(
+            report.by_callsite["driver@!noloc#0"],
+            ["choose".to_string()].into_iter().collect()
+        );
+        assert_eq!(
+            report.by_callsite["driver@!noloc#1"],
+            ["target".to_string()].into_iter().collect()
+        );
+        assert_eq!(report.rounds.len(), 2, "{:?}", report.rounds);
+        assert_eq!(report.rounds[0].new_targets, 1);
+        assert_eq!(report.rounds[1].new_targets, 1);
+        assert!(report.rounds[0].dependency_records > 0);
+    }
+
+    #[test]
     fn m3_1_answers_stay_inside_steensgaard_envelope_on_synthetic_suite() {
         let roots = [
-            "m1_4", "m1_4b", "m1_5", "m2_2", "m2_3", "m2_4", "m3_1", "m3_2",
+            "m1_4", "m1_4b", "m1_5", "m2_2", "m2_3", "m2_4", "m3_1", "m3_2", "m3_3",
         ];
         let mut checked = 0;
         let mut sites_with_m3_answers = 0;
