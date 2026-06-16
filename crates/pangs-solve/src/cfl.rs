@@ -16,8 +16,14 @@ pub fn query_callees_field_insensitive(pag: &Pag, function: &str) -> CflCalleeQu
 /// Run one M3.1 query per function object and invert the source-oriented answers into
 /// callsite -> target function names.
 pub fn query_all_callees_field_insensitive(pag: &Pag) -> BTreeMap<String, BTreeSet<String>> {
+    query_all_callees_field_insensitive_report(pag).by_callsite
+}
+
+/// Run all M3.1 callee queries and retain per-query traversal metrics.
+pub fn query_all_callees_field_insensitive_report(pag: &Pag) -> CflCalleeReport {
     let graph = QueryGraph::new(pag);
     let mut by_callsite: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut queries = Vec::new();
     for node in &pag.nodes {
         let NodeKind::Object {
             object: ObjectKind::Function,
@@ -28,11 +34,18 @@ pub fn query_all_callees_field_insensitive(pag: &Pag) -> BTreeMap<String, BTreeS
             continue;
         };
         let answer = graph.query_function(key);
-        for callsite in answer.callsites {
-            by_callsite.entry(callsite).or_default().insert(key.clone());
+        for callsite in &answer.callsites {
+            by_callsite
+                .entry(callsite.clone())
+                .or_default()
+                .insert(key.clone());
         }
+        queries.push(answer);
     }
-    by_callsite
+    CflCalleeReport {
+        by_callsite,
+        queries,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,6 +60,43 @@ pub struct CflCalleeQuery {
 pub struct CflQueryMetrics {
     pub visited_states: usize,
     pub max_worklist: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CflCalleeReport {
+    pub by_callsite: BTreeMap<String, BTreeSet<String>>,
+    pub queries: Vec<CflCalleeQuery>,
+}
+
+impl CflCalleeReport {
+    pub fn visit_histogram(&self) -> CflVisitHistogram {
+        let mut histogram = CflVisitHistogram::default();
+        for query in &self.queries {
+            match query.metrics.visited_states {
+                0..=10 => histogram.le_10 += 1,
+                11..=100 => histogram.le_100 += 1,
+                101..=1_000 => histogram.le_1000 += 1,
+                _ => histogram.gt_1000 += 1,
+            }
+        }
+        histogram
+    }
+
+    pub fn max_visited_states(&self) -> usize {
+        self.queries
+            .iter()
+            .map(|query| query.metrics.visited_states)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CflVisitHistogram {
+    pub le_10: usize,
+    pub le_100: usize,
+    pub le_1000: usize,
+    pub gt_1000: usize,
 }
 
 struct QueryGraph<'a> {
@@ -192,20 +242,44 @@ enum Phase {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
-    use pangs_pag::{Pag, PagOpts};
+    use pangs_pag::{BuildMode, Pag, PagOpts};
     use pangs_pir::Pir;
 
-    use super::{query_all_callees_field_insensitive, query_callees_field_insensitive};
+    use crate::solve_steensgaard;
+
+    use super::{
+        query_all_callees_field_insensitive, query_all_callees_field_insensitive_report,
+        query_callees_field_insensitive,
+    };
 
     fn load(root: &str, name: &str) -> Pag {
+        load_pir_pag(root, name).1
+    }
+
+    fn load_pir_pag(root: &str, name: &str) -> (Pir, Pag) {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/synthetic")
             .join(root)
             .join(name);
         let pir = Pir::from_path(path).unwrap();
-        Pag::from_pir(&pir, &PagOpts::default())
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        (pir, pag)
+    }
+
+    fn steens_targets_by_callsite(pir: &Pir, pag: &Pag) -> BTreeMap<String, BTreeSet<String>> {
+        solve_steensgaard(pir, pag, BuildMode::Library)
+            .indirect_calls
+            .into_iter()
+            .map(|resolution| {
+                (
+                    resolution.callsite_key,
+                    resolution.targets.into_iter().collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -253,12 +327,19 @@ mod tests {
     fn m3_1_reaches_through_two_levels_of_memory() {
         let pag = load("m3_1", "two_level_memory.pir.json");
 
-        let by_callsite = query_all_callees_field_insensitive(&pag);
+        let report = query_all_callees_field_insensitive_report(&pag);
         assert_eq!(
-            by_callsite["driver@!noloc#0"],
+            report.by_callsite["driver@!noloc#0"],
             ["target".to_string()].into_iter().collect()
         );
-        assert!(!by_callsite["driver@!noloc#0"].contains("other"));
+        assert!(!report.by_callsite["driver@!noloc#0"].contains("other"));
+        assert_eq!(report.queries.len(), 3);
+        assert!(report.max_visited_states() >= 6);
+        let histogram = report.visit_histogram();
+        assert_eq!(
+            histogram.le_10 + histogram.le_100 + histogram.le_1000 + histogram.gt_1000,
+            report.queries.len()
+        );
     }
 
     #[test]
@@ -270,5 +351,60 @@ mod tests {
             by_callsite["setup@!noloc#0"],
             ["f0".to_string(), "f1".to_string()].into_iter().collect()
         );
+    }
+
+    #[test]
+    fn m3_1_answers_stay_inside_steensgaard_envelope_on_synthetic_suite() {
+        let roots = ["m1_4", "m1_4b", "m1_5", "m2_2", "m2_3", "m2_4", "m3_1"];
+        let mut checked = 0;
+        let mut sites_with_m3_answers = 0;
+        let mut max_visited = 0;
+
+        for root in roots {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/synthetic")
+                .join(root);
+            if !dir.exists() {
+                continue;
+            }
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    continue;
+                }
+                let pir = Pir::from_path(&path).unwrap();
+                let pag = Pag::from_pir(&pir, &PagOpts::default());
+                let steens = steens_targets_by_callsite(&pir, &pag);
+                let report = query_all_callees_field_insensitive_report(&pag);
+                max_visited = max_visited.max(report.max_visited_states());
+
+                for (callsite, targets) in &report.by_callsite {
+                    let Some(envelope) = steens.get(callsite) else {
+                        panic!(
+                            "{}: M3.1 found {callsite}, absent from Steensgaard",
+                            path.display()
+                        );
+                    };
+                    for target in targets {
+                        assert!(
+                            envelope.contains(target),
+                            "{}: M3.1 target {target} for {callsite} is outside Steensgaard envelope {envelope:?}",
+                            path.display()
+                        );
+                    }
+                    if !targets.is_empty() {
+                        sites_with_m3_answers += 1;
+                    }
+                }
+                checked += 1;
+            }
+        }
+
+        assert!(checked >= 25, "checked only {checked} fixtures");
+        assert!(
+            sites_with_m3_answers >= 6,
+            "expected several non-empty M3.1 answers, got {sites_with_m3_answers}"
+        );
+        assert!(max_visited > 0);
     }
 }

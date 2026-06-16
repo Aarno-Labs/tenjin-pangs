@@ -910,6 +910,7 @@ dependencies = [
  "pangs-clients",
  "pangs-pag",
  "pangs-pir",
+ "pangs-solve",
  "serde_json",
  "tempfile",
 ]

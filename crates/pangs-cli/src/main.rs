@@ -63,6 +63,11 @@ enum Command {
     Report {
         dir: PathBuf,
     },
+    /// Run demand-driven query experiments over the frozen PAG.
+    Query {
+        #[command(subcommand)]
+        query: QueryCommand,
+    },
     /// Run conservative→steens→andersen and check the narrowing/monotonicity ledger.
     Differential {
         module: PathBuf,
@@ -95,6 +100,18 @@ enum Command {
     CheckTraces {
         dir: PathBuf,
         trace: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum QueryCommand {
+    /// Run the M3.1 field-insensitive callee query kernel.
+    Callees {
+        module: PathBuf,
+        #[arg(long, default_value = "library")]
+        build_mode: BuildModeArg,
+        #[arg(long)]
+        exports: Option<PathBuf>,
     },
 }
 
@@ -232,6 +249,51 @@ fn run() -> Result<()> {
         Command::Report { dir } => {
             print!("{}", pangs_clients::report(&dir)?);
         }
+        Command::Query { query } => match query {
+            QueryCommand::Callees {
+                module,
+                build_mode,
+                exports,
+            } => {
+                let pir = Pir::from_path(&module)?;
+                let opts = PagOpts {
+                    build_mode: build_mode.into(),
+                    exports: read_exports(exports)?,
+                };
+                let pag = Pag::from_pir(&pir, &opts);
+                let report = pangs_solve::query_all_callees_field_insensitive_report(&pag);
+                let queries = report
+                    .queries
+                    .iter()
+                    .map(|query| {
+                        serde_json::json!({
+                            "function": query.function,
+                            "source": query.source.map(|id| id.0),
+                            "callsites": query.callsites,
+                            "visited_states": query.metrics.visited_states,
+                            "max_worklist": query.metrics.max_worklist,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let histogram = report.visit_histogram();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "callees",
+                        "mode": "field_insensitive",
+                        "by_callsite": report.by_callsite,
+                        "queries": queries,
+                        "visit_histogram": {
+                            "le_10": histogram.le_10,
+                            "le_100": histogram.le_100,
+                            "le_1000": histogram.le_1000,
+                            "gt_1000": histogram.gt_1000,
+                        },
+                        "max_visited_states": report.max_visited_states(),
+                    }))?
+                );
+            }
+        },
         Command::Differential {
             module,
             build_mode,

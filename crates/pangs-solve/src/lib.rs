@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 mod andersen;
 mod cfl;
 pub use andersen::{solve_andersen, solve_andersen_with_overrides};
-pub use cfl::{query_all_callees_field_insensitive, query_callees_field_insensitive};
+pub use cfl::{
+    query_all_callees_field_insensitive, query_all_callees_field_insensitive_report,
+    query_callees_field_insensitive,
+};
 
 /// M2.0 subset-narrowing tripwire (`PLAN-M2_lite_delta.md` §1 M2.0). A more-exact
 /// provenance may only *narrow* an answer; if `refined` is not a subset of `envelope`, a

@@ -15,6 +15,7 @@ pangs-api = { path = "../pangs-api" }
 pangs-clients = { path = "../pangs-clients" }
 pangs-pag = { path = "../pangs-pag" }
 pangs-pir = { path = "../pangs-pir" }
+pangs-solve = { path = "../pangs-solve" }
 serde_json.workspace = true
 
 [dev-dependencies]

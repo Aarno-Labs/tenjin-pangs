@@ -136,7 +136,10 @@ source-function query at a time over `(node, phase)` states, treats GEP/memcpy a
 assignment-like edges, collects indirect-call operand sinks, and reports per-query
 visited-state/worklist metrics. Focused fixtures cover direct assignment, store/load,
 two-level memory, independent global function-pointer slots, and the intentional
-field-insensitive over-approximation that M3.2's MHS is expected to narrow.
+field-insensitive over-approximation that M3.2's MHS is expected to narrow. The
+`pangs query callees` CLI exposes the current kernel for inspection. A synthetic-suite
+ledger test asserts M3.1 answers stay inside the Steensgaard envelope, and
+`notes/m3_1_query_kernel.md` records the first real-corpus query histogram.
 
 ### M3.2 — MHS / byte-offset field sensitivity (3–5 days)
 Add the offset stack per §1.2, with `⊤` saturation and the subobject table (M2.1) for

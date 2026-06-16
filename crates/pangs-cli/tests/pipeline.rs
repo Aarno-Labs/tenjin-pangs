@@ -320,6 +320,39 @@ fn m2_ablation_reports_preanalysis_variants() {
 }
 
 #[test]
+fn query_callees_reports_m3_1_field_insensitive_results() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m3_1/two_level_memory.pir.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("query")
+        .arg("callees")
+        .arg(&fixture)
+        .arg("--build-mode")
+        .arg("executable")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "query callees failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["kind"], "callees");
+    assert_eq!(report["mode"], "field_insensitive");
+    assert_eq!(
+        report["by_callsite"]["driver@!noloc#0"],
+        serde_json::json!(["target"])
+    );
+    assert_eq!(report["queries"].as_array().unwrap().len(), 3);
+    assert!(report["max_visited_states"].as_u64().unwrap() >= 6);
+    let histogram_total = report["visit_histogram"]["le_10"].as_u64().unwrap()
+        + report["visit_histogram"]["le_100"].as_u64().unwrap()
+        + report["visit_histogram"]["le_1000"].as_u64().unwrap()
+        + report["visit_histogram"]["gt_1000"].as_u64().unwrap();
+    assert_eq!(histogram_total, 3);
+}
+
+#[test]
 fn analyze_validate_is_deterministic() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/synthetic/trivial/module.pir.json");
