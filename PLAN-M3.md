@@ -104,6 +104,11 @@ Acceptance:
 - selected corpus has at least one small fast case and at least one larger case likely
   to stress the callgraph and component structure.
 
+**Implementation status:** runbook committed in `notes/m3_lite_runbook.md`. It records
+candidate O1 corpus inputs, release-mode command shapes, export naming conventions,
+currently available export/report fields, diagnosis gates, and the next reporting slice.
+No measurements have been run for this step.
+
 ### M3.2 — Coverage Dashboard
 
 Build or document a repeatable report over existing `analyze` exports. The report should
@@ -115,6 +120,12 @@ Acceptance:
 - one command produces the summary for an export directory;
 - fields are stable enough to compare runs;
 - report distinguishes exact, Andersen/FSA, fallback, and unknown callgraph edges.
+
+**Implementation status:** `pangs report <export-dir>` now summarizes existing exports
+for M3: component-size histogram, largest frozen components, component taint histogram,
+call-edge tier histogram, stationarity reason histogram, audit kind/effect histograms,
+coverage, fallback counts, and phase timings. This is a reporting-only change over
+exported files and does not alter `analyze`.
 
 ### M3.3 — Blocking-Edge Attribution
 

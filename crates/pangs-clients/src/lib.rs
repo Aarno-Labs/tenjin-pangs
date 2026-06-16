@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -181,8 +182,13 @@ pub fn report(outdir: &Path) -> Result<String> {
             .with_context(|| format!("read {}", manifest_path.display()))?,
     )?;
     let wall_ms = manifest["wall_ms"].as_u64().unwrap_or(0);
+    let component_summary = component_summary(outdir)?;
+    let callgraph_summary = jsonl_histogram(outdir, "callgraph.jsonl", &["tier"])?;
+    let stationarity_summary = jsonl_histogram(outdir, "stationarity.jsonl", &["reason"])?;
+    let audit_kind_summary = jsonl_histogram(outdir, "audit.jsonl", &["kind"])?;
+    let audit_effect_summary = jsonl_histogram(outdir, "audit.jsonl", &["effect"])?;
     Ok(format!(
-        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\nconfined functions: {}\ninitval complete globals: {}\nstationary globals: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\nmutable globals rewritable: {}/{}\npipeline wall: {} ms\nanalysis wall: {} us\npag build: {} us\nsolve: {} us\ntransitive modref: {} us\ncomponents: {} us\n",
+        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\ncall edges by tier: {}\nconfined functions: {}\ninitval complete globals: {}\nstationary globals: {}\nstationarity reasons: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\naudit kinds: {}\naudit effects: {}\nmutable globals rewritable: {}/{}\ncomponent sizes: {}\nlargest frozen components: {}\ncomponent taints: {}\npipeline wall: {} ms\nanalysis wall: {} us\npag build: {} us\nsolve: {} us\ntransitive modref: {} us\ncomponents: {} us\n",
         metrics.functions,
         metrics.globals,
         metrics.call_edges,
@@ -191,14 +197,21 @@ pub fn report(outdir: &Path) -> Result<String> {
         metrics.icalls_steens,
         metrics.icalls_fsa,
         metrics.icalls_unknown,
+        format_histogram(&callgraph_summary),
         metrics.confined_functions,
         metrics.globals_with_complete_initval,
         metrics.stationary_globals,
+        format_histogram(&stationarity_summary),
         metrics.oversize_fallbacks,
         metrics.oversize_fallback_max_size,
         metrics.audit_findings,
+        format_histogram(&audit_kind_summary),
+        format_histogram(&audit_effect_summary),
         metrics.in_rewritable_components,
         metrics.mutable_globals_total,
+        component_summary.sizes,
+        component_summary.largest_frozen,
+        format_histogram(&component_summary.taints),
         wall_ms,
         metrics.analysis_wall_us,
         metrics.pag_build_us,
@@ -206,6 +219,136 @@ pub fn report(outdir: &Path) -> Result<String> {
         metrics.transitive_modref_us,
         metrics.components_us,
     ))
+}
+
+#[derive(Debug, Default)]
+struct ComponentSummary {
+    sizes: String,
+    largest_frozen: String,
+    taints: BTreeMap<String, usize>,
+}
+
+fn component_summary(outdir: &Path) -> Result<ComponentSummary> {
+    let path = outdir.join("components.json");
+    let value: Value = serde_json::from_str(
+        &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    let components = value["components"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("components.json missing components array"))?;
+
+    let mut sizes = Vec::new();
+    let mut frozen = Vec::new();
+    let mut taints = BTreeMap::new();
+
+    for component in components {
+        let id = component["id"].as_str().unwrap_or("<unknown>").to_string();
+        let member_count = component["members"].as_array().map(Vec::len).unwrap_or(0);
+        let mutable_count = component["mutable_globals"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0);
+        let taint_values = component["taint"].as_array().cloned().unwrap_or_default();
+        let taint_kinds = taint_values
+            .iter()
+            .filter_map(|taint| taint["kind"].as_str())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+
+        sizes.push(member_count);
+        for kind in &taint_kinds {
+            *taints.entry(kind.clone()).or_insert(0) += 1;
+        }
+        if component["frozen"].as_bool().unwrap_or(false) {
+            frozen.push((member_count, mutable_count, id, taint_kinds));
+        }
+    }
+
+    sizes.sort_unstable();
+    frozen.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
+
+    let sizes = if sizes.is_empty() {
+        "count=0 p50=0 p95=0 max=0".to_string()
+    } else {
+        format!(
+            "count={} p50={} p95={} max={}",
+            sizes.len(),
+            percentile(&sizes, 50),
+            percentile(&sizes, 95),
+            sizes.last().copied().unwrap_or(0)
+        )
+    };
+
+    let largest_frozen = if frozen.is_empty() {
+        "none".to_string()
+    } else {
+        frozen
+            .into_iter()
+            .take(5)
+            .map(|(members, mutable_globals, id, taint_kinds)| {
+                let taints = if taint_kinds.is_empty() {
+                    "none".to_string()
+                } else {
+                    taint_kinds.join("+")
+                };
+                format!(
+                    "{id}(members={members}, mutable_globals={mutable_globals}, taints={taints})"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    Ok(ComponentSummary {
+        sizes,
+        largest_frozen,
+        taints,
+    })
+}
+
+fn jsonl_histogram(
+    outdir: &Path,
+    filename: &str,
+    field_path: &[&str],
+) -> Result<BTreeMap<String, usize>> {
+    let path = outdir.join(filename);
+    let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let mut histogram = BTreeMap::new();
+    for (line_no, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&line)
+            .with_context(|| format!("parse {} line {}", path.display(), line_no + 1))?;
+        let key = field_path
+            .iter()
+            .try_fold(&value, |current, field| current.get(*field))
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        *histogram.entry(key.to_string()).or_insert(0) += 1;
+    }
+    Ok(histogram)
+}
+
+fn format_histogram(histogram: &BTreeMap<String, usize>) -> String {
+    if histogram.is_empty() {
+        return "none".to_string();
+    }
+    histogram
+        .iter()
+        .map(|(key, count)| format!("{key}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn percentile(sorted: &[usize], percentile: usize) -> usize {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted.len() - 1) * percentile).div_ceil(100);
+    sorted[rank]
 }
 
 #[derive(Serialize)]
@@ -625,10 +768,17 @@ mod tests {
         assert!(text.contains("transitive modref: "));
         assert!(text.contains("components: "));
         assert!(text.contains("icalls by tier: "));
+        assert!(text.contains("call edges by tier: "));
         assert!(text.contains("confined functions: "));
         assert!(text.contains("initval complete globals: "));
         assert!(text.contains("stationary globals: "));
+        assert!(text.contains("stationarity reasons: "));
         assert!(text.contains("oversize fallbacks: "));
+        assert!(text.contains("audit kinds: "));
+        assert!(text.contains("audit effects: "));
+        assert!(text.contains("component sizes: "));
+        assert!(text.contains("largest frozen components: "));
+        assert!(text.contains("component taints: "));
     }
 
     fn workspace_root() -> PathBuf {
