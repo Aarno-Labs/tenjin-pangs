@@ -145,10 +145,70 @@ by modeling/audit issues rather than solver time: the largest frozen component h
 `unknown_global=86`, `fnptr_varargs=268`, `fnptr_ptrtoint=14`, `inline_asm=1`, and only one
 unknown indirect callsite.
 
+## Large Stress Attempt
+
+`exe-tmux-O1` was then tried as the first sqlite/tmux-sized executable row:
+
+```bash
+LLVM_SYS_140_PREFIX=/home/brk/tenjin/_local/xj-llvm-14 \
+LD_LIBRARY_PATH=/home/brk/tenjin/_local/xj-llvm-14/lib \
+timeout 300s target/release/pangs analyze \
+  /home/brk/pangs-corpus/_out_bc/exe-tmux-O1.bc \
+  --build-mode executable \
+  --stage andersen \
+  --out /tmp/pangs-m3-lite-local-modref-facts/exe-tmux-O1-andersen \
+  --validate
+```
+
+Result: timed out with exit status 124 and no metrics/export files were produced. This means
+the curl row is not sufficient evidence that the current path scales to the next corpus size
+class. The next large-row step should be targeted profiling/instrumentation on tmux or sqlite,
+not more blind stress runs.
+
+## M3 Lite Decision Table
+
+This table uses the current local-dedup exports under
+`/tmp/pangs-m3-lite-local-modref-facts/`.
+
+| input | funcs | globals | wall s | analysis s | solve s | transitive modref s | local modref rows | mutable rewritable | icalls andersen | icalls steens | icalls unknown | oversize fallbacks | max fallback size |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `exe-jpegoptim-O1` | 129 | 317 | 0.17 | 0.08 | 0.01 | 0.001 | 3,706 | 0/48 | 0 | 14 | 14 | 6 | 1,339 |
+| `lib-parson-O1` | 147 | 44 | 0.03 | 0.01 | 0.00 | 0.000 | 290 | 4/5 | 0 | 132 | 0 | 5 | 2,304 |
+| `exe-jq-O1` | 709 | 1,313 | 3.60 | 2.51 | 0.22 | 0.035 | 60,238 | 5/14 | 0 | 8 | 8 | 17 | 26,647 |
+| `exe-chibicc-O1` | 221 | 956 | 2.23 | 1.64 | 0.09 | 0.012 | 33,861 | 0/133 | 0 | 1 | 1 | 10 | 11,017 |
+| `exe-gifsicle-O1` | 333 | 646 | 1.55 | 1.11 | 0.18 | 0.027 | 21,760 | 1/93 | 4 | 203 | 203 | 10 | 14,015 |
+| `exe-lua-O1` | 715 | 787 | 5.62 | 4.02 | 0.42 | 0.038 | 106,899 | 0/5 | 1 | 64 | 64 | 13 | 25,564 |
+| `exe-curl-O1` | 320 | 1,944 | 3.79 | 2.59 | 0.21 | 0.022 | 76,530 | 16/80 | 0 | 1 | 1 | 26 | 7,891 |
+
+Largest frozen component/blocker summary:
+
+| input | max component | max frozen component | dominant taints in largest frozen component | largest component blockers |
+|---|---:|---:|---|---|
+| `exe-jpegoptim-O1` | 121 | 121 | `fnptr_varargs=53`, `unknown_global=17`, `unknown_callee=14`, `setjmp_longjmp=1` | outgoing `steens=170`, incoming `steens=156`, unknown callees 14, unknown modrefs 18 |
+| `lib-parson-O1` | 107 | 107 | `unknown_global=41`, `fnptr_ptrtoint=6` | outgoing `steens=132`, incoming `steens=132`, unknown modrefs 52 |
+| `exe-jq-O1` | 636 | 636 | `unknown_global=217`, `fnptr_varargs=115`, `fnptr_ptrtoint=37`, `unknown_callee=8` | outgoing `steens=42`, incoming `steens=34`, unknown callees 8, unknown modrefs 217 |
+| `exe-chibicc-O1` | 213 | 213 | `fnptr_varargs=100`, `unknown_global=65`, `fnptr_ptrtoint=14`, `unknown_callee=1` | outgoing `steens=6`, incoming `steens=5`, unknown callees 1, unknown modrefs 72 |
+| `exe-gifsicle-O1` | 284 | 284 | `unknown_callee=203`, `unknown_global=118`, `fnptr_varargs=54`, `fnptr_ptrtoint=19` | outgoing `steens=2543 andersen=11`, incoming `steens=2340 andersen=11`, unknown callees 203, unknown modrefs 128 |
+| `exe-lua-O1` | 694 | 694 | `unknown_global=319`, `fnptr_varargs=109`, `unknown_callee=64`, `fnptr_ptrtoint=48` | outgoing `steens=4336 andersen=8`, incoming `steens=4272 andersen=8`, unknown callees 64, unknown modrefs 321 |
+| `exe-curl-O1` | 304 | 304 | `fnptr_varargs=268`, `unknown_global=86`, `fnptr_ptrtoint=14`, `inline_asm=1` | outgoing `steens=5`, incoming `steens=4`, unknown callees 1, unknown modrefs 88 |
+
+Decision read:
+
+- Runtime is acceptable for lite M3 on the smoke/medium rows and the first larger curl row.
+  The previous transitive and export-size issues were duplicate-witness problems, not solver
+  scalability problems.
+- The coverage failures are still dominated by modeling/audit envelopes: unknown globals,
+  unknown mod/ref facts, varargs, ptrtoint/inttoptr, inline asm, setjmp/longjmp, and broad
+  Steensgaard fallback partitions.
+- Tier-E/CFL is not justified as the next default implementation step from this table. The
+  only row with a strong unknown-icall signal is gifsicle, and even that row is heavily mixed
+  with unknown-global/modref and audit taints. jq/chibicc/curl have very small unknown-icall
+  residue relative to their frozen-component blockers.
+
 ## Next
 
-The immediate next step is to rerun the full smoke/medium decision table text from the
-local-dedup exports and then decide whether to try a sqlite/tmux-sized stress row.
+The immediate next step is targeted profiling/instrumentation on `exe-tmux-O1` or
+`lib-sqlite-O1`, since the first tmux-sized stress row timed out before metrics/export.
 
 The main remaining design question is still coverage, not raw runtime: the largest frozen
 components in the first pass were dominated by unknown globals, unknown mod/ref facts, vararg

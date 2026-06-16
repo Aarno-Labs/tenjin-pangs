@@ -168,8 +168,12 @@ under a 300s cap. The jq/chibicc/gifsicle transitive mod/ref closure cost was tr
 witness-instance duplication and reduced by keying closure payloads on semantic mod/ref facts;
 the same fix cleared the lua timeout. The remaining local mod/ref export cost had the same
 duplicate-witness shape and now deduplicates by `(func, global, access, via)` while retaining a
-representative witness. No final design decision yet; the next step is to rerun the medium
-decision table from the local-dedup exports and optionally add one stress row.
+representative witness. `notes/m3_lite_measurements.md` now includes the current lite M3
+decision table for jpegoptim/parson/jq/chibicc/gifsicle/lua plus a first curl stress sanity
+row. Runtime is acceptable on those rows; the blocker profile points to modeling/audit gaps,
+not an immediate tier-E/CFL default-path need. A subsequent `exe-tmux-O1` large stress attempt
+timed out under the 300s cap before metrics/export, so the next step is targeted
+profiling/instrumentation on a tmux/sqlite-sized row before freezing M3 scaling claims.
 
 ## 6. What To Stop Doing For Lite M3
 
