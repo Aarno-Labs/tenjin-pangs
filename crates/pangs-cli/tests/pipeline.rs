@@ -344,6 +344,8 @@ fn query_callees_reports_m3_1_field_insensitive_results() {
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["kind"], "callees");
+    assert_eq!(report["experimental"], "tier_e_prototype");
+    assert_eq!(report["used_by_lite_analyze"], false);
     assert_eq!(report["mode"], "field_sensitive");
     assert_eq!(
         report["by_callsite"]["driver@!noloc#0"],

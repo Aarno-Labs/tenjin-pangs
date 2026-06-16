@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 mod andersen;
 mod cfl;
 pub use andersen::{solve_andersen, solve_andersen_with_overrides};
+
+// Experimental tier-E prototype APIs. These are intentionally kept out of the
+// PANGS-lite `analyze` path; use them only through diagnostic/query surfaces or a
+// future explicit graduation back to the full tier-E design.
 pub use cfl::{
     fallback_for_truncated_queries, query_all_callees_field_insensitive,
     query_all_callees_field_insensitive_report,

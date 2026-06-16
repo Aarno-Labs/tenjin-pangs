@@ -63,7 +63,9 @@ enum Command {
     Report {
         dir: PathBuf,
     },
-    /// Run demand-driven query experiments over the frozen PAG.
+    /// Run experimental tier-E query prototypes over the frozen PAG.
+    ///
+    /// These diagnostics are not used by the PANGS-lite `analyze` pipeline.
     Query {
         #[command(subcommand)]
         query: QueryCommand,
@@ -105,7 +107,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum QueryCommand {
-    /// Run the M3 callee query kernel.
+    /// Run the experimental tier-E M3 callee query prototype.
     Callees {
         module: PathBuf,
         #[arg(long, default_value = "library")]
@@ -383,6 +385,8 @@ fn run() -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "kind": "callees",
+                        "experimental": "tier_e_prototype",
+                        "used_by_lite_analyze": false,
                         "mode": mode.label(),
                         "by_callsite": run.by_callsite,
                         "raw_by_callsite": run.raw_by_callsite,

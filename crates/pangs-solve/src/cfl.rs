@@ -1,3 +1,11 @@
+//! Experimental tier-E CFL query prototype.
+//!
+//! PANGS-lite does not use this module for `analyze` results. The active lite pipeline
+//! uses B1/B2 exact answers plus partition-scoped Andersen/FSA materialized results.
+//! These queries remain as an isolated diagnostic and reversible upgrade-path surface
+//! for investigating whether context-insensitive indirect-call residue justifies
+//! graduating back to the full tier-E design.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use pangs_pag::{
@@ -7,7 +15,7 @@ use pangs_pir::{fsa_compatible, Signature};
 
 const QUERY_STATE_BUDGET: usize = 25_000;
 
-/// M3.1 field-insensitive CFL query kernel for callees.
+/// Experimental tier-E prototype: M3.1 field-insensitive CFL query kernel for callees.
 ///
 /// This first cut intentionally has no byte-offset memory-history stack and no call-graph
 /// fixpoint. It answers one source-function query at a time: "which indirect-call operands
@@ -18,7 +26,7 @@ pub fn query_callees_field_insensitive(pag: &Pag, function: &str) -> CflCalleeQu
     graph.query_function(function)
 }
 
-/// M3.2 byte-offset-sensitive callee query kernel.
+/// Experimental tier-E prototype: M3.2 byte-offset-sensitive callee query kernel.
 ///
 /// This adds the memory-history stack (MHS) from the M3 plan: Store pushes a fresh
 /// zero-offset memory level, GEP adjusts the active level, and Load may close a memory
@@ -28,18 +36,20 @@ pub fn query_callees_field_sensitive(pag: &Pag, function: &str) -> CflCalleeQuer
     graph.query_function_mhs(function)
 }
 
-/// Run one M3.1 query per function object and invert the source-oriented answers into
-/// callsite -> target function names.
+/// Experimental tier-E prototype: run one M3.1 query per function object and invert the
+/// source-oriented answers into callsite -> target function names.
 pub fn query_all_callees_field_insensitive(pag: &Pag) -> BTreeMap<String, BTreeSet<String>> {
     query_all_callees_field_insensitive_report(pag).by_callsite
 }
 
-/// Run all M3.1 callee queries and retain per-query traversal metrics.
+/// Experimental tier-E prototype: run all M3.1 callee queries and retain per-query
+/// traversal metrics.
 pub fn query_all_callees_field_insensitive_report(pag: &Pag) -> CflCalleeReport {
     query_all_callees_field_insensitive_report_inner(pag, None)
 }
 
-/// Run all M3.1 callee queries with ABI/FSA-compatible sink filtering.
+/// Experimental tier-E prototype: run all M3.1 callee queries with ABI/FSA-compatible
+/// sink filtering.
 pub fn query_all_callees_field_insensitive_report_with_signatures(
     pag: &Pag,
     signatures: &BTreeMap<String, Signature>,
@@ -70,18 +80,20 @@ fn query_all_callees_field_insensitive_report_inner(
     }
 }
 
-/// Run one M3.2 MHS query per function object and invert the source-oriented answers into
-/// callsite -> target function names.
+/// Experimental tier-E prototype: run one M3.2 MHS query per function object and invert
+/// the source-oriented answers into callsite -> target function names.
 pub fn query_all_callees_field_sensitive(pag: &Pag) -> BTreeMap<String, BTreeSet<String>> {
     query_all_callees_field_sensitive_report(pag).by_callsite
 }
 
-/// Run all M3.2 MHS callee queries and retain per-query traversal metrics.
+/// Experimental tier-E prototype: run all M3.2 MHS callee queries and retain per-query
+/// traversal metrics.
 pub fn query_all_callees_field_sensitive_report(pag: &Pag) -> CflCalleeReport {
     query_all_callees_field_sensitive_report_inner(pag, None)
 }
 
-/// Run all M3.2 MHS callee queries with ABI/FSA-compatible sink filtering.
+/// Experimental tier-E prototype: run all M3.2 MHS callee queries with ABI/FSA-compatible
+/// sink filtering.
 pub fn query_all_callees_field_sensitive_report_with_signatures(
     pag: &Pag,
     signatures: &BTreeMap<String, Signature>,
@@ -112,7 +124,8 @@ fn query_all_callees_field_sensitive_report_inner(
     }
 }
 
-/// Run M3.3 dependency-tracked MHS callee queries to an interprocedural fixpoint.
+/// Experimental tier-E prototype: run M3.3 dependency-tracked MHS callee queries to an
+/// interprocedural fixpoint.
 ///
 /// Round 0 uses only the frozen PAG. When a round discovers that an indirect callsite may
 /// target an internal function, the next round's query graph includes synthetic
@@ -123,7 +136,8 @@ pub fn query_all_callees_field_sensitive_fixpoint_report(pag: &Pag) -> CflFixpoi
     query_all_callees_field_sensitive_fixpoint_report_inner(pag, None)
 }
 
-/// Run M3.3 dependency-tracked MHS callee queries with ABI/FSA-compatible sink filtering.
+/// Experimental tier-E prototype: run M3.3 dependency-tracked MHS callee queries with
+/// ABI/FSA-compatible sink filtering.
 pub fn query_all_callees_field_sensitive_fixpoint_report_with_signatures(
     pag: &Pag,
     signatures: &BTreeMap<String, Signature>,
@@ -343,6 +357,8 @@ pub struct CflVisitHistogram {
     pub gt_1000: usize,
 }
 
+/// Experimental tier-E prototype: replace truncated-query touched callsites with a
+/// sound fallback envelope so diagnostic query output does not silently drop targets.
 pub fn fallback_for_truncated_queries(
     by_callsite: &BTreeMap<String, BTreeSet<String>>,
     queries: &[CflCalleeQuery],
