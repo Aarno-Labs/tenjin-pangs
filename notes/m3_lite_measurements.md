@@ -40,7 +40,7 @@ target/release/pangs report /tmp/pangs-m3-lite/<input>-andersen
 | `exe-jq-O1` | ok | 709 | 1313 | 6436 | 5/14 | 0 | 0 | 8 | 8 | 17 | 26647 | 636 | 636 | 22.88 | 0.19 | 19.51 |
 | `exe-chibicc-O1` | ok | 221 | 956 | 2657 | 0/133 | 0 | 0 | 1 | 1 | 10 | 11017 | 213 | 213 | 21.67 | 0.09 | 19.28 |
 | `exe-gifsicle-O1` | ok | 333 | 646 | 4199 | 1/93 | 0 | 4 | 203 | 203 | 10 | 14015 | 284 | 284 | 29.07 | 0.17 | 27.55 |
-| `exe-lua-O1` | timeout 300s | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - |
+| `exe-lua-O1` | timeout 300s before closure fix | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - |
 
 Export/report directories for completed rows are under `/tmp/pangs-m3-lite/`.
 
@@ -71,8 +71,8 @@ Largest frozen components from `pangs report`:
 - Runtime is dominated by transitive mod/ref closure on the larger completed rows.
   Andersen solve itself is small (`0.09s` to `0.19s` on jq/chibicc/gifsicle), while
   transitive mod/ref takes about `19s` to `28s`.
-- `exe-lua-O1` timed out under the 300s cap on the normal lite analysis path. That needs
-  separate investigation before using lua as an M3 gate input.
+- `exe-lua-O1` initially timed out under the 300s cap on the normal lite analysis path,
+  but the transitive closure fix below cleared that timeout.
 
 ## Transitive Mod/Ref Closure Investigation
 
@@ -102,17 +102,19 @@ Rerun output directory: `/tmp/pangs-m3-lite-modref-facts/`.
 | `exe-jq-O1` | 22.88 | 4.05 | 19.51 | 0.073 | 933,767 |
 | `exe-chibicc-O1` | 21.67 | 2.60 | 19.28 | 0.036 | 660,228 |
 | `exe-gifsicle-O1` | 29.07 | 1.64 | 27.55 | 0.057 | 423,204 |
+| `exe-lua-O1` | timeout 300s | 5.33 | unknown | 0.079 | 1,437,754 |
 
 After this change, transitive closure is no longer the dominant cost on these rows. The
-remaining cost is in earlier local mod/ref generation and export/validation wall time.
+remaining cost is in earlier local mod/ref generation and export/validation wall time. The
+same fix also cleared the earlier `exe-lua-O1` 300s timeout: the rerun completed with status
+0 under `/tmp/pangs-m3-lite-modref-facts/exe-lua-O1-andersen`.
 
 ## Next
 
 Do not run stress rows yet. The immediate next step should be to investigate the remaining
-normal-path timeout:
+normal-path cost:
 
-1. Why `exe-lua-O1` times out on the normal `analyze` path.
-2. Whether the now-visible local mod/ref generation cost on jq/chibicc/gifsicle has a
+1. Whether the now-visible local mod/ref generation cost on jq/chibicc/gifsicle/lua has a
    similar duplicate-witness component worth addressing before stress rows.
 
 After those are understood, rerun this same table and then decide whether stress rows

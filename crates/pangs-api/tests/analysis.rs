@@ -792,6 +792,73 @@ fn modref_api_closes_over_direct_calls_but_export_rows_stay_local() {
 }
 
 #[test]
+fn transitive_modref_api_collapses_duplicate_witnesses() {
+    let pir = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            Func {
+                key: "entry".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::CallDirect {
+                    callee: "leaf".to_string(),
+                    sig: sig(AbiClass::Void, vec![]),
+                    args: vec![],
+                    dest: None,
+                    loc: None,
+                }],
+            },
+            Func {
+                key: "leaf".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![
+                    Stmt::GlobalRef {
+                        global: "@G".to_string(),
+                        access: Access::Mod,
+                        loc: None,
+                    },
+                    Stmt::GlobalRef {
+                        global: "@G".to_string(),
+                        access: Access::Mod,
+                        loc: None,
+                    },
+                ],
+            },
+        ],
+        globals: vec![Global {
+            key: "@G".to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            exported: false,
+        }],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
+    let entry = analysis.lookup_func("entry").unwrap();
+
+    assert_eq!(analysis.modrefs().len(), 2);
+    let entry_modrefs: Vec<_> = analysis.modref(entry).collect();
+    assert_eq!(entry_modrefs.len(), 1);
+    assert_eq!(entry_modrefs[0].witness.as_deref(), Some("leaf@!noloc#0"));
+}
+
+#[test]
 fn modref_api_closes_over_fsa_indirect_targets() {
     let target_sig = sig(AbiClass::Void, vec![Param::Integer]);
     let pir = Pir {

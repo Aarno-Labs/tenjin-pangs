@@ -2131,6 +2131,13 @@ struct ModRefPayload {
     witness: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ModRefFactKey {
+    global: GlobalTarget,
+    access_rank: u8,
+    via_rank: u8,
+}
+
 impl PartialOrd for ModRefPayload {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -2170,6 +2177,15 @@ fn via_rank(via: Via) -> u8 {
     }
 }
 
+fn preferred_modref_witness(existing: Option<String>, candidate: Option<String>) -> Option<String> {
+    match (existing, candidate) {
+        (None, witness @ Some(_)) => witness,
+        (witness @ Some(_), None) => witness,
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (None, None) => None,
+    }
+}
+
 fn compute_transitive_modrefs(
     func_count: usize,
     funcs: &[FuncInfo],
@@ -2189,7 +2205,7 @@ fn compute_transitive_modrefs(
     }
 
     let (scc_members, scc_of_func) = strongly_connected_components(&callees_by_func);
-    let mut payload_ids = BTreeMap::<ModRefPayload, usize>::new();
+    let mut payload_ids = BTreeMap::<ModRefFactKey, usize>::new();
     let mut payloads = Vec::<ModRefPayload>::new();
     let mut local_by_scc = vec![Vec::<usize>::new(); scc_members.len()];
     for mr in local_modrefs {
@@ -2199,11 +2215,18 @@ fn compute_transitive_modrefs(
             via: mr.via,
             witness: mr.witness.clone(),
         };
-        let id = if let Some(&id) = payload_ids.get(&payload) {
+        let key = ModRefFactKey {
+            global: mr.global.clone(),
+            access_rank: access_rank(mr.access),
+            via_rank: via_rank(mr.via),
+        };
+        let id = if let Some(&id) = payload_ids.get(&key) {
+            let existing = &mut payloads[id];
+            existing.witness = preferred_modref_witness(existing.witness.take(), payload.witness);
             id
         } else {
             let id = payloads.len();
-            payload_ids.insert(payload.clone(), id);
+            payload_ids.insert(key, id);
             payloads.push(payload);
             id
         };
