@@ -852,7 +852,7 @@ fn transitive_modref_api_collapses_duplicate_witnesses() {
     let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
     let entry = analysis.lookup_func("entry").unwrap();
 
-    assert_eq!(analysis.modrefs().len(), 2);
+    assert_eq!(analysis.modrefs().len(), 1);
     let entry_modrefs: Vec<_> = analysis.modref(entry).collect();
     assert_eq!(entry_modrefs.len(), 1);
     assert_eq!(entry_modrefs[0].witness.as_deref(), Some("leaf@!noloc#0"));

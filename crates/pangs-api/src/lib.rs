@@ -944,8 +944,7 @@ impl Analysis {
 
         call_edges.sort_by_key(|edge| edge_sort_key(edge, &functions, &callsites));
         call_edges.dedup_by_key(|edge| edge_sort_key(edge, &functions, &callsites));
-        modrefs.sort_by_key(|mr| modref_sort_key(mr, &functions, &globals));
-        modrefs.dedup_by_key(|mr| modref_sort_key(mr, &functions, &globals));
+        dedup_modrefs_by_fact(&mut modrefs, &functions, &globals);
 
         let (stationary_globals, stationarity) = if opts.stage == Stage::Conservative {
             conservative_stationarity_verdicts(module, &global_lookup)
@@ -1866,6 +1865,45 @@ fn modref_sort_key(
         format!("{:?}", mr.via),
         mr.witness.clone().unwrap_or_default(),
     )
+}
+
+fn modref_fact_sort_key(
+    mr: &ModRef,
+    funcs: &[FuncInfo],
+    globals: &[GlobalInfo],
+) -> (String, String, String, String) {
+    (
+        funcs[mr.func.0 as usize].key.clone(),
+        match mr.global {
+            GlobalTarget::Name(id) => globals[id.0 as usize].key.clone(),
+            GlobalTarget::Unknown(ref reason) => reason.clone(),
+        },
+        format!("{:?}", mr.access),
+        format!("{:?}", mr.via),
+    )
+}
+
+fn dedup_modrefs_by_fact(modrefs: &mut Vec<ModRef>, funcs: &[FuncInfo], globals: &[GlobalInfo]) {
+    modrefs.sort_by_key(|mr| modref_fact_sort_key(mr, funcs, globals));
+    let mut deduped = Vec::<ModRef>::with_capacity(modrefs.len());
+    for mut row in modrefs.drain(..) {
+        if let Some(last) = deduped.last_mut() {
+            if same_modref_fact(last, &row) {
+                last.witness = preferred_modref_witness(last.witness.take(), row.witness.take());
+                continue;
+            }
+        }
+        deduped.push(row);
+    }
+    deduped.sort_by_key(|mr| modref_sort_key(mr, funcs, globals));
+    *modrefs = deduped;
+}
+
+fn same_modref_fact(left: &ModRef, right: &ModRef) -> bool {
+    left.func == right.func
+        && left.global == right.global
+        && left.access == right.access
+        && left.via == right.via
 }
 
 fn push_pointer_modrefs_from_pag(

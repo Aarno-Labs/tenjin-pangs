@@ -109,13 +109,47 @@ remaining cost is in earlier local mod/ref generation and export/validation wall
 same fix also cleared the earlier `exe-lua-O1` 300s timeout: the rerun completed with status
 0 under `/tmp/pangs-m3-lite-modref-facts/exe-lua-O1-andersen`.
 
+## Local Mod/Ref Row Investigation
+
+The remaining local `modref.jsonl` size was also mostly witness-instance duplication. Local
+rows now use the same semantic fact identity as transitive closure: `(func, global, access,
+via)`, with one deterministic representative witness retained for diagnostics. This preserves
+the sound mod/ref fact while avoiding one exported row per duplicate witness suffix.
+
+Rerun output directory: `/tmp/pangs-m3-lite-local-modref-facts/`.
+
+| input | old local rows | new local rows | old modref size | new modref size | old wall s | new wall s | old analysis s | new analysis s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `exe-jq-O1` | 933,767 | 60,238 | 109M | 7.2M | 17.06 | 3.60 | 4.05 | 2.51 |
+| `exe-chibicc-O1` | 660,228 | 33,861 | 75M | 4.0M | 11.78 | 2.23 | 2.60 | 1.64 |
+| `exe-gifsicle-O1` | 423,204 | 21,760 | 54M | 2.8M | 7.55 | 1.55 | 1.64 | 1.11 |
+| `exe-lua-O1` | 1,437,754 | 106,899 | 164M | 13M | 23.02 | 5.62 | 5.33 | 4.02 |
+
+After local deduplication, export/validation no longer dominates the medium rows nearly as
+strongly. Lua remains the largest medium case in this set, but completes comfortably under
+the 300s cap.
+
+## First Stress Sanity Check
+
+`exe-curl-O1` was run after local deduplication as a first larger input before attempting
+sqlite/tmux-sized rows.
+
+Command output directory: `/tmp/pangs-m3-lite-local-modref-facts/exe-curl-O1-andersen/`.
+
+| input | funcs | globals | call edges | mutable rewritable | icalls andersen | icalls steens | icalls unknown | oversize fallbacks | max fallback size | max component | max frozen component | wall s | analysis s | solve s | transitive modref s | local modref rows |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `exe-curl-O1` | 320 | 1944 | 2265 | 16/80 | 0 | 1 | 1 | 26 | 7891 | 304 | 304 | 3.79 | 2.59 | 0.21 | 0.022 | 76,530 |
+
+The runtime behavior holds on this first larger row. The blocker profile is still dominated
+by modeling/audit issues rather than solver time: the largest frozen component has
+`unknown_global=86`, `fnptr_varargs=268`, `fnptr_ptrtoint=14`, `inline_asm=1`, and only one
+unknown indirect callsite.
+
 ## Next
 
-Do not run stress rows yet. The immediate next step should be to investigate the remaining
-normal-path cost:
+The immediate next step is to rerun the full smoke/medium decision table text from the
+local-dedup exports and then decide whether to try a sqlite/tmux-sized stress row.
 
-1. Whether the now-visible local mod/ref generation cost on jq/chibicc/gifsicle/lua has a
-   similar duplicate-witness component worth addressing before stress rows.
-
-After those are understood, rerun this same table and then decide whether stress rows
-(`curl`, `sqlite`, `tmux`) add useful information.
+The main remaining design question is still coverage, not raw runtime: the largest frozen
+components in the first pass were dominated by unknown globals, unknown mod/ref facts, vararg
+function-pointer taints, int-punning taints, and unknown callees.

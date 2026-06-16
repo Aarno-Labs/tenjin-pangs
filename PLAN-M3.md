@@ -166,8 +166,10 @@ Acceptance:
 `notes/m3_lite_measurements.md`. Five O1 rows initially completed and `exe-lua-O1` timed out
 under a 300s cap. The jq/chibicc/gifsicle transitive mod/ref closure cost was traced to
 witness-instance duplication and reduced by keying closure payloads on semantic mod/ref facts;
-the same fix cleared the lua timeout. No final design decision yet; the next investigation is
-any now-visible local mod/ref duplicate-witness cost.
+the same fix cleared the lua timeout. The remaining local mod/ref export cost had the same
+duplicate-witness shape and now deduplicates by `(func, global, access, via)` while retaining a
+representative witness. No final design decision yet; the next step is to rerun the medium
+decision table from the local-dedup exports and optionally add one stress row.
 
 ## 6. What To Stop Doing For Lite M3
 
