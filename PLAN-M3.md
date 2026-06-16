@@ -140,6 +140,12 @@ Acceptance:
 - indirect-call edges name their producing phase;
 - unsupported/Ω reasons are separated from precision-loss reasons.
 
+**Implementation status:** `pangs report <export-dir>` now includes `component blockers`
+for the top frozen components. Each entry summarizes outgoing/incoming indirect edges by
+tier, unknown callee/caller counts, unknown mod/ref rows touching the component, and
+matching audit finding kinds. This is computed entirely from `components.json`,
+`callgraph.jsonl`, `modref.jsonl`, and `audit.jsonl`.
+
 ### M3.4 — Decision Gate
 
 Apply the `DESIGN_lite.md` §6 gates:

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -188,7 +188,7 @@ pub fn report(outdir: &Path) -> Result<String> {
     let audit_kind_summary = jsonl_histogram(outdir, "audit.jsonl", &["kind"])?;
     let audit_effect_summary = jsonl_histogram(outdir, "audit.jsonl", &["effect"])?;
     Ok(format!(
-        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\ncall edges by tier: {}\nconfined functions: {}\ninitval complete globals: {}\nstationary globals: {}\nstationarity reasons: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\naudit kinds: {}\naudit effects: {}\nmutable globals rewritable: {}/{}\ncomponent sizes: {}\nlargest frozen components: {}\ncomponent taints: {}\npipeline wall: {} ms\nanalysis wall: {} us\npag build: {} us\nsolve: {} us\ntransitive modref: {} us\ncomponents: {} us\n",
+        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\ncall edges by tier: {}\nconfined functions: {}\ninitval complete globals: {}\nstationary globals: {}\nstationarity reasons: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\naudit kinds: {}\naudit effects: {}\nmutable globals rewritable: {}/{}\ncomponent sizes: {}\nlargest frozen components: {}\ncomponent taints: {}\ncomponent blockers: {}\npipeline wall: {} ms\nanalysis wall: {} us\npag build: {} us\nsolve: {} us\ntransitive modref: {} us\ncomponents: {} us\n",
         metrics.functions,
         metrics.globals,
         metrics.call_edges,
@@ -212,6 +212,7 @@ pub fn report(outdir: &Path) -> Result<String> {
         component_summary.sizes,
         component_summary.largest_frozen,
         format_histogram(&component_summary.taints),
+        component_summary.blockers,
         wall_ms,
         metrics.analysis_wall_us,
         metrics.pag_build_us,
@@ -226,6 +227,7 @@ struct ComponentSummary {
     sizes: String,
     largest_frozen: String,
     taints: BTreeMap<String, usize>,
+    blockers: String,
 }
 
 fn component_summary(outdir: &Path) -> Result<ComponentSummary> {
@@ -241,14 +243,28 @@ fn component_summary(outdir: &Path) -> Result<ComponentSummary> {
     let mut sizes = Vec::new();
     let mut frozen = Vec::new();
     let mut taints = BTreeMap::new();
+    let call_edges = read_jsonl_values(outdir, "callgraph.jsonl")?;
+    let modrefs = read_jsonl_values(outdir, "modref.jsonl")?;
+    let audits = read_jsonl_values(outdir, "audit.jsonl")?;
 
     for component in components {
         let id = component["id"].as_str().unwrap_or("<unknown>").to_string();
-        let member_count = component["members"].as_array().map(Vec::len).unwrap_or(0);
-        let mutable_count = component["mutable_globals"]
+        let members = component["members"]
             .as_array()
-            .map(Vec::len)
-            .unwrap_or(0);
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|member| member.as_str().map(ToOwned::to_owned))
+            .collect::<BTreeSet<_>>();
+        let mutable_globals = component["mutable_globals"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|global| global.as_str().map(ToOwned::to_owned))
+            .collect::<BTreeSet<_>>();
+        let member_count = members.len();
+        let mutable_count = mutable_globals.len();
         let taint_values = component["taint"].as_array().cloned().unwrap_or_default();
         let taint_kinds = taint_values
             .iter()
@@ -261,12 +277,24 @@ fn component_summary(outdir: &Path) -> Result<ComponentSummary> {
             *taints.entry(kind.clone()).or_insert(0) += 1;
         }
         if component["frozen"].as_bool().unwrap_or(false) {
-            frozen.push((member_count, mutable_count, id, taint_kinds));
+            frozen.push(FrozenComponent {
+                member_count,
+                mutable_count,
+                id,
+                members,
+                mutable_globals,
+                taint_kinds,
+            });
         }
     }
 
     sizes.sort_unstable();
-    frozen.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
+    frozen.sort_by(|left, right| {
+        right
+            .member_count
+            .cmp(&left.member_count)
+            .then_with(|| left.id.cmp(&right.id))
+    });
 
     let sizes = if sizes.is_empty() {
         "count=0 p50=0 p95=0 max=0".to_string()
@@ -284,27 +312,148 @@ fn component_summary(outdir: &Path) -> Result<ComponentSummary> {
         "none".to_string()
     } else {
         frozen
-            .into_iter()
+            .iter()
             .take(5)
-            .map(|(members, mutable_globals, id, taint_kinds)| {
-                let taints = if taint_kinds.is_empty() {
+            .map(|component| {
+                let taints = if component.taint_kinds.is_empty() {
                     "none".to_string()
                 } else {
-                    taint_kinds.join("+")
+                    component.taint_kinds.join("+")
                 };
                 format!(
-                    "{id}(members={members}, mutable_globals={mutable_globals}, taints={taints})"
+                    "{}(members={}, mutable_globals={}, taints={taints})",
+                    component.id, component.member_count, component.mutable_count
                 )
             })
             .collect::<Vec<_>>()
             .join("; ")
     };
+    let blockers = format_component_blockers(&frozen, &call_edges, &modrefs, &audits);
 
     Ok(ComponentSummary {
         sizes,
         largest_frozen,
         taints,
+        blockers,
     })
+}
+
+#[derive(Debug)]
+struct FrozenComponent {
+    id: String,
+    member_count: usize,
+    mutable_count: usize,
+    members: BTreeSet<String>,
+    mutable_globals: BTreeSet<String>,
+    taint_kinds: Vec<String>,
+}
+
+fn format_component_blockers(
+    frozen: &[FrozenComponent],
+    call_edges: &[Value],
+    modrefs: &[Value],
+    audits: &[Value],
+) -> String {
+    if frozen.is_empty() {
+        return "none".to_string();
+    }
+
+    frozen
+        .iter()
+        .take(5)
+        .map(|component| {
+            let mut incoming_indirect = BTreeMap::new();
+            let mut outgoing_indirect = BTreeMap::new();
+            let mut unknown_callees = 0usize;
+            let mut unknown_callers = 0usize;
+
+            for edge in call_edges {
+                if edge["kind"].as_str() != Some("indirect") {
+                    continue;
+                }
+                let tier = edge["tier"].as_str().unwrap_or("<missing>");
+                let caller = endpoint_func(&edge["caller"]);
+                let callee = endpoint_func(&edge["callee"]);
+                let caller_unknown = endpoint_unknown(&edge["caller"]).is_some();
+                let callee_unknown = endpoint_unknown(&edge["callee"]).is_some();
+
+                if caller
+                    .as_deref()
+                    .is_some_and(|func| component.members.contains(func))
+                {
+                    *outgoing_indirect.entry(tier.to_string()).or_insert(0) += 1;
+                    if callee_unknown {
+                        unknown_callees += 1;
+                    }
+                }
+                if callee
+                    .as_deref()
+                    .is_some_and(|func| component.members.contains(func))
+                {
+                    *incoming_indirect.entry(tier.to_string()).or_insert(0) += 1;
+                    if caller_unknown {
+                        unknown_callers += 1;
+                    }
+                }
+            }
+
+            let mut unknown_modrefs = 0usize;
+            for row in modrefs {
+                let func_touches_component = row["func"]
+                    .as_str()
+                    .is_some_and(|func| component.members.contains(func));
+                let global_touches_component = row["global"]["name"]
+                    .as_str()
+                    .is_some_and(|global| component.mutable_globals.contains(global));
+                let unknown_global = row["global"]["unknown"].as_str().is_some();
+                if (func_touches_component || global_touches_component) && unknown_global {
+                    unknown_modrefs += 1;
+                }
+            }
+
+            let mut audit_kinds = BTreeMap::new();
+            for audit in audits {
+                let Some(affected) = audit["affected"].as_array() else {
+                    continue;
+                };
+                let touches_component = affected.iter().any(|item| {
+                    let Some(affected) = item.as_str() else {
+                        return false;
+                    };
+                    affected
+                        .strip_prefix("function:")
+                        .is_some_and(|func| component.members.contains(func))
+                        || affected
+                            .strip_prefix("global:")
+                            .is_some_and(|global| component.mutable_globals.contains(global))
+                });
+                if touches_component {
+                    let kind = audit["kind"].as_str().unwrap_or("<missing>");
+                    *audit_kinds.entry(kind.to_string()).or_insert(0) += 1;
+                }
+            }
+
+            format!(
+                "{}(out_indirect={}, in_indirect={}, unknown_callees={}, unknown_callers={}, unknown_modrefs={}, audits={})",
+                component.id,
+                format_histogram(&outgoing_indirect),
+                format_histogram(&incoming_indirect),
+                unknown_callees,
+                unknown_callers,
+                unknown_modrefs,
+                format_histogram(&audit_kinds)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn endpoint_func(endpoint: &Value) -> Option<String> {
+    endpoint["func"].as_str().map(ToOwned::to_owned)
+}
+
+fn endpoint_unknown(endpoint: &Value) -> Option<String> {
+    endpoint["unknown"].as_str().map(ToOwned::to_owned)
 }
 
 fn jsonl_histogram(
@@ -312,9 +461,23 @@ fn jsonl_histogram(
     filename: &str,
     field_path: &[&str],
 ) -> Result<BTreeMap<String, usize>> {
+    let values = read_jsonl_values(outdir, filename)?;
+    let mut histogram = BTreeMap::new();
+    for value in &values {
+        let key = field_path
+            .iter()
+            .try_fold(value, |current, field| current.get(*field))
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        *histogram.entry(key.to_string()).or_insert(0) += 1;
+    }
+    Ok(histogram)
+}
+
+fn read_jsonl_values(outdir: &Path, filename: &str) -> Result<Vec<Value>> {
     let path = outdir.join(filename);
     let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-    let mut histogram = BTreeMap::new();
+    let mut values = Vec::new();
     for (line_no, line) in BufReader::new(file).lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -322,14 +485,9 @@ fn jsonl_histogram(
         }
         let value = serde_json::from_str::<Value>(&line)
             .with_context(|| format!("parse {} line {}", path.display(), line_no + 1))?;
-        let key = field_path
-            .iter()
-            .try_fold(&value, |current, field| current.get(*field))
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>");
-        *histogram.entry(key.to_string()).or_insert(0) += 1;
+        values.push(value);
     }
-    Ok(histogram)
+    Ok(values)
 }
 
 fn format_histogram(histogram: &BTreeMap<String, usize>) -> String {
@@ -779,6 +937,7 @@ mod tests {
         assert!(text.contains("component sizes: "));
         assert!(text.contains("largest frozen components: "));
         assert!(text.contains("component taints: "));
+        assert!(text.contains("component blockers: "));
     }
 
     fn workspace_root() -> PathBuf {

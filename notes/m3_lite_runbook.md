@@ -85,8 +85,8 @@ The current exports already contain the main M3 inputs:
 
 `pangs report` prints the M3 dashboard over existing exports: coverage, icall tier
 counts, call-edge tier histograms, oversize fallbacks, audits, stationarity reasons,
-component-size histograms, largest frozen components, component taint histograms, and
-phase timings. It does not yet identify load-bearing edges inside blocked components.
+component-size histograms, largest frozen components, component taint histograms,
+component blocker summaries, and phase timings.
 
 ## Metrics To Record
 
@@ -117,12 +117,15 @@ Use `DESIGN_lite.md` §6 gates:
 
 ## Next Implementation Slice
 
-Add blocking-edge attribution over existing export files:
+Run the corpus measurements and capture the decision data:
 
-- for top frozen components, list incoming/outgoing indirect edges by tier;
-- list unknown-callee edges and unknown mod/ref rows that touch the component;
-- connect component taints back to audit findings or unknown rows where possible;
-- keep this as a reporting-only change unless missing provenance makes that impossible.
+- build release once;
+- run `pangs analyze --stage andersen --build-mode executable --validate` for the smoke
+  and medium corpus rows;
+- run `pangs report` for each export directory;
+- record the table in a new M3 measurement note;
+- inspect the largest frozen components before deciding whether the stress rows are
+  necessary.
 
-This should be a client/export reporting change only. It should not run the experimental
-tier-E CFL query prototype and should not change `pangs analyze` behavior.
+This should not run the experimental tier-E CFL query prototype and should not change
+`pangs analyze` behavior.
