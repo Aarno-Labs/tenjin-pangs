@@ -1,5 +1,10 @@
 # M4 Implementation Plan — Tier D: partition-scoped inclusion-based (Andersen) solving
 
+> Lite-track note: after `notes/m3_lite_decision.md`, the current follow-up plan is
+> `PLAN-M4_lite_delta.md` (vararg/function-pointer boundary modeling). This file is the
+> older full-design M4 plan and is retained as background, not the active lite-track next
+> milestone.
+
 *Companion to `DESIGN.md` §4D/§10-M4. Prerequisites: M1–M3. This tier slots **between**
 Steensgaard (tier C) and the demand-driven queries (tier E): an exhaustive, field-
 sensitive, inclusion-based points-to solve — but never whole-program: each run is scoped
