@@ -177,8 +177,9 @@ unbounded nested-GEP field materialization in Andersen; the finite-field fix can
 nested constant field GEPs back to root-relative offsets from the fixed graph's finite offset
 vocabulary, while unknown/unseen nested offsets collapse conservatively to the root object.
 `exe-tmux-O1` now completes in about 60s wall with under 3s solver time, but it still exports
-a large mod/ref surface (~1.2M rows, 190M), so the remaining M3 freeze question is whether to
-accept tmux as a scale warning or spend one more slice on export/modref size.
+a large mod/ref surface (~1.2M rows, 190M). Final decision recorded in
+`notes/m3_lite_decision.md`: freeze lite M3 as the default path, keep tier-E/CFL out of the
+default analyzer, and carry tmux-scale JSONL/modref size as a known follow-up caveat.
 
 ## 6. What To Stop Doing For Lite M3
 
