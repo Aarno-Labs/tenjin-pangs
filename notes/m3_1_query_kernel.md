@@ -5,7 +5,8 @@ Date: 2026-06-16
 M3.1 adds the first field-insensitive demand-driven callee query kernel:
 
 ```bash
-pangs query callees <module.bc|module.pir.json> --build-mode <library|executable>
+pangs query callees <module.bc|module.pir.json> --mode field-insensitive \
+  --build-mode <library|executable>
 ```
 
 The command emits JSON with:
@@ -14,6 +15,9 @@ The command emits JSON with:
 - `queries`: one source-function traversal record per function object
 - `visit_histogram`: coarse visited-state buckets
 - `max_visited_states`: largest per-query traversal
+
+After M3.2, `field-sensitive` is the default mode. Use `--mode field-insensitive` to
+reproduce the M3.1 kernel.
 
 ## Synthetic coverage
 
@@ -36,6 +40,7 @@ LLVM_SYS_140_PREFIX=/home/brk/tenjin/_local/xj-llvm-14 \
 LD_LIBRARY_PATH=/home/brk/tenjin/_local/xj-llvm-14/lib \
 cargo run -q -p pangs-cli -- query callees \
   /home/brk/pangs-corpus/_out_bc/exe-jpegoptim-O1.bc \
+  --mode field-insensitive \
   --build-mode executable
 ```
 

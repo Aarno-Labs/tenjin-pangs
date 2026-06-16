@@ -1,0 +1,35 @@
+{
+  "module": "m3_2.unknown_offset_saturates",
+  "functions": [
+    {
+      "key": "driver",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%s", "ty": "struct.S" },
+        { "kind": "gep", "dest": "%dyn", "base": "%s", "byte_off": null },
+        { "kind": "store", "address": "%dyn", "value": "target" },
+        { "kind": "gep", "dest": "%q", "base": "%s", "byte_off": 8 },
+        { "kind": "load", "dest": "%fp", "address": "%q" },
+        {
+          "kind": "call_indirect",
+          "operand": "%fp",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "target",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    },
+    {
+      "key": "other",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": []
+}

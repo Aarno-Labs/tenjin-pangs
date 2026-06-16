@@ -338,7 +338,7 @@ fn query_callees_reports_m3_1_field_insensitive_results() {
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["kind"], "callees");
-    assert_eq!(report["mode"], "field_insensitive");
+    assert_eq!(report["mode"], "field_sensitive");
     assert_eq!(
         report["by_callsite"]["driver@!noloc#0"],
         serde_json::json!(["target"])
@@ -350,6 +350,51 @@ fn query_callees_reports_m3_1_field_insensitive_results() {
         + report["visit_histogram"]["le_1000"].as_u64().unwrap()
         + report["visit_histogram"]["gt_1000"].as_u64().unwrap();
     assert_eq!(histogram_total, 3);
+}
+
+#[test]
+fn query_callees_mode_selects_field_sensitivity() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_4b/field_sensitive_fnptr.pir.json");
+    let insensitive = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("query")
+        .arg("callees")
+        .arg(&fixture)
+        .arg("--mode")
+        .arg("field-insensitive")
+        .output()
+        .unwrap();
+    assert!(
+        insensitive.status.success(),
+        "query callees --mode field-insensitive failed:\n{}",
+        String::from_utf8_lossy(&insensitive.stderr)
+    );
+    let insensitive: Value = serde_json::from_slice(&insensitive.stdout).unwrap();
+    assert_eq!(insensitive["mode"], "field_insensitive");
+    assert_eq!(
+        insensitive["by_callsite"]["setup@!noloc#0"],
+        serde_json::json!(["f0", "f1"])
+    );
+
+    let sensitive = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("query")
+        .arg("callees")
+        .arg(&fixture)
+        .arg("--mode")
+        .arg("field-sensitive")
+        .output()
+        .unwrap();
+    assert!(
+        sensitive.status.success(),
+        "query callees --mode field-sensitive failed:\n{}",
+        String::from_utf8_lossy(&sensitive.stderr)
+    );
+    let sensitive: Value = serde_json::from_slice(&sensitive.stdout).unwrap();
+    assert_eq!(sensitive["mode"], "field_sensitive");
+    assert_eq!(
+        sensitive["by_callsite"]["setup@!noloc#0"],
+        serde_json::json!(["f0"])
+    );
 }
 
 #[test]

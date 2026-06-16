@@ -13,6 +13,16 @@ pub fn query_callees_field_insensitive(pag: &Pag, function: &str) -> CflCalleeQu
     graph.query_function(function)
 }
 
+/// M3.2 byte-offset-sensitive callee query kernel.
+///
+/// This adds the memory-history stack (MHS) from the M3 plan: Store pushes a fresh
+/// zero-offset memory level, GEP adjusts the active level, and Load may close a memory
+/// level only when the active offset is zero (or ⊤, which is soundly imprecise).
+pub fn query_callees_field_sensitive(pag: &Pag, function: &str) -> CflCalleeQuery {
+    let graph = QueryGraph::new(pag);
+    graph.query_function_mhs(function)
+}
+
 /// Run one M3.1 query per function object and invert the source-oriented answers into
 /// callsite -> target function names.
 pub fn query_all_callees_field_insensitive(pag: &Pag) -> BTreeMap<String, BTreeSet<String>> {
@@ -34,6 +44,41 @@ pub fn query_all_callees_field_insensitive_report(pag: &Pag) -> CflCalleeReport 
             continue;
         };
         let answer = graph.query_function(key);
+        for callsite in &answer.callsites {
+            by_callsite
+                .entry(callsite.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        queries.push(answer);
+    }
+    CflCalleeReport {
+        by_callsite,
+        queries,
+    }
+}
+
+/// Run one M3.2 MHS query per function object and invert the source-oriented answers into
+/// callsite -> target function names.
+pub fn query_all_callees_field_sensitive(pag: &Pag) -> BTreeMap<String, BTreeSet<String>> {
+    query_all_callees_field_sensitive_report(pag).by_callsite
+}
+
+/// Run all M3.2 MHS callee queries and retain per-query traversal metrics.
+pub fn query_all_callees_field_sensitive_report(pag: &Pag) -> CflCalleeReport {
+    let graph = QueryGraph::new(pag);
+    let mut by_callsite: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut queries = Vec::new();
+    for node in &pag.nodes {
+        let NodeKind::Object {
+            object: ObjectKind::Function,
+            key,
+            ..
+        } = &node.kind
+        else {
+            continue;
+        };
+        let answer = graph.query_function_mhs(key);
         for callsite in &answer.callsites {
             by_callsite
                 .entry(callsite.clone())
@@ -191,6 +236,51 @@ impl<'a> QueryGraph<'a> {
         out
     }
 
+    fn query_function_mhs(&self, function: &str) -> CflCalleeQuery {
+        let Some(&source) = self.function_objects.get(function) else {
+            return CflCalleeQuery {
+                function: function.to_string(),
+                ..CflCalleeQuery::default()
+            };
+        };
+
+        let mut out = CflCalleeQuery {
+            function: function.to_string(),
+            source: Some(source),
+            ..CflCalleeQuery::default()
+        };
+        let mut visited = HashSet::new();
+        let mut worklist = VecDeque::from([MhsState {
+            node: source,
+            phase: Phase::Forward,
+            stack: Vec::new(),
+        }]);
+
+        while let Some(state) = worklist.pop_back() {
+            if !visited.insert(state.clone()) {
+                continue;
+            }
+            out.metrics.visited_states = visited.len();
+            out.metrics.max_worklist = out.metrics.max_worklist.max(worklist.len() + 1);
+
+            if state.phase == Phase::Forward && state.stack.is_empty() {
+                if let Some(sites) = self.indirect_operands.get(&state.node) {
+                    for site in sites {
+                        out.callsites
+                            .insert(self.pag.callsites[site.0 as usize].key.clone());
+                    }
+                }
+            }
+
+            match state.phase {
+                Phase::Forward => self.step_forward_mhs(state, &mut worklist),
+                Phase::Backward => self.step_backward_mhs(state, &mut worklist),
+            }
+        }
+
+        out
+    }
+
     fn step_forward(&self, node: NodeId, worklist: &mut VecDeque<(NodeId, Phase)>) {
         for &edge_index in &self.forward[node.0 as usize] {
             let edge = &self.pag.edges[edge_index];
@@ -220,6 +310,63 @@ impl<'a> QueryGraph<'a> {
             }
         }
     }
+
+    fn step_forward_mhs(&self, state: MhsState, worklist: &mut VecDeque<MhsState>) {
+        for &edge_index in &self.forward[state.node.0 as usize] {
+            let edge = &self.pag.edges[edge_index];
+            match edge.kind {
+                EdgeKind::AddrOf | EdgeKind::Assign | EdgeKind::Memcpy { .. } => {
+                    worklist.push_back(state.clone().next(edge.dst, Phase::Forward));
+                }
+                EdgeKind::Gep { byte_off } => {
+                    worklist.push_back(state.clone().adjust(
+                        edge.dst,
+                        Phase::Forward,
+                        byte_off,
+                        -1,
+                    ));
+                }
+                EdgeKind::Store => {
+                    worklist.push_back(state.clone().push(edge.dst, Phase::Backward));
+                }
+                EdgeKind::Load => {
+                    if let Some(next) = state.clone().pop_if_zero(edge.dst, Phase::Forward) {
+                        worklist.push_back(next);
+                    }
+                }
+            }
+        }
+    }
+
+    fn step_backward_mhs(&self, state: MhsState, worklist: &mut VecDeque<MhsState>) {
+        // I-Alias may choose this node as the midpoint, then continue forward.
+        worklist.push_back(state.clone().next(state.node, Phase::Forward));
+
+        for &edge_index in &self.reverse[state.node.0 as usize] {
+            let edge = &self.pag.edges[edge_index];
+            match edge.kind {
+                EdgeKind::AddrOf | EdgeKind::Assign | EdgeKind::Memcpy { .. } => {
+                    worklist.push_back(state.clone().next(edge.src, Phase::Backward));
+                }
+                EdgeKind::Gep { byte_off } => {
+                    worklist.push_back(state.clone().adjust(
+                        edge.src,
+                        Phase::Backward,
+                        byte_off,
+                        1,
+                    ));
+                }
+                EdgeKind::Load => {
+                    worklist.push_back(state.clone().push(edge.src, Phase::Backward));
+                }
+                EdgeKind::Store => {
+                    if let Some(next) = state.clone().pop_if_zero(edge.src, Phase::Backward) {
+                        worklist.push_back(next);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn backward_edge(edge: &Edge) -> bool {
@@ -240,6 +387,61 @@ enum Phase {
     Backward,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MhsState {
+    node: NodeId,
+    phase: Phase,
+    stack: Vec<Offset>,
+}
+
+impl MhsState {
+    fn next(mut self, node: NodeId, phase: Phase) -> Self {
+        self.node = node;
+        self.phase = phase;
+        self
+    }
+
+    fn push(mut self, node: NodeId, phase: Phase) -> Self {
+        self.node = node;
+        self.phase = phase;
+        self.stack.push(Offset::Known(0));
+        self
+    }
+
+    fn pop_if_zero(mut self, node: NodeId, phase: Phase) -> Option<Self> {
+        match self.stack.last() {
+            None => Some(self.next(node, phase)),
+            Some(Offset::Known(0) | Offset::Top) => {
+                self.stack.pop();
+                Some(self.next(node, phase))
+            }
+            Some(Offset::Known(_)) => None,
+        }
+    }
+
+    fn adjust(mut self, node: NodeId, phase: Phase, byte_off: Option<i64>, sign: i64) -> Self {
+        self.node = node;
+        self.phase = phase;
+        let Some(top) = self.stack.last_mut() else {
+            return self;
+        };
+        match (top, byte_off) {
+            (slot @ Offset::Known(_), None) => *slot = Offset::Top,
+            (Offset::Known(value), Some(off)) => {
+                *value = value.saturating_add(sign.saturating_mul(off));
+            }
+            (Offset::Top, _) => {}
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Offset {
+    Known(i64),
+    Top,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -252,7 +454,8 @@ mod tests {
 
     use super::{
         query_all_callees_field_insensitive, query_all_callees_field_insensitive_report,
-        query_callees_field_insensitive,
+        query_all_callees_field_sensitive, query_all_callees_field_sensitive_report,
+        query_callees_field_insensitive, query_callees_field_sensitive,
     };
 
     fn load(root: &str, name: &str) -> Pag {
@@ -306,6 +509,9 @@ mod tests {
             answer.callsites,
             ["caller@!noloc#0".to_string()].into_iter().collect()
         );
+
+        let mhs = query_callees_field_sensitive(&pag, "f");
+        assert_eq!(mhs.callsites, answer.callsites);
     }
 
     #[test]
@@ -354,8 +560,104 @@ mod tests {
     }
 
     #[test]
+    fn m3_2_mhs_distinguishes_struct_function_pointer_fields() {
+        let pag = load("m1_4b", "field_sensitive_fnptr.pir.json");
+
+        let by_callsite = query_all_callees_field_sensitive(&pag);
+        assert_eq!(
+            by_callsite["setup@!noloc#0"],
+            ["f0".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn m3_2_mhs_preserves_two_level_memory_aliasing() {
+        let pag = load("m3_1", "two_level_memory.pir.json");
+
+        let report = query_all_callees_field_sensitive_report(&pag);
+        assert_eq!(
+            report.by_callsite["driver@!noloc#0"],
+            ["target".to_string()].into_iter().collect()
+        );
+        assert!(!report.by_callsite["driver@!noloc#0"].contains("other"));
+        assert_eq!(report.queries.len(), 3);
+        assert!(report.max_visited_states() >= 6);
+    }
+
+    #[test]
+    fn m3_2_unknown_gep_offset_saturates_to_top() {
+        let pag = load("m3_2", "unknown_offset_saturates.pir.json");
+
+        let by_callsite = query_all_callees_field_sensitive(&pag);
+        assert_eq!(
+            by_callsite["driver@!noloc#0"],
+            ["target".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn m3_2_handles_container_of_style_negative_offsets() {
+        let pag = load("m3_2", "negative_offset_container.pir.json");
+
+        let by_callsite = query_all_callees_field_sensitive(&pag);
+        assert_eq!(
+            by_callsite["driver@!noloc#0"],
+            ["target".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn m3_2_zero_offset_gep_cast_preserves_match() {
+        let pag = load("m3_2", "zero_offset_cast.pir.json");
+
+        let by_callsite = query_all_callees_field_sensitive(&pag);
+        assert_eq!(
+            by_callsite["driver@!noloc#0"],
+            ["target".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn m3_2_mismatched_offsets_do_not_match() {
+        let pag = load("m3_2", "mismatched_offsets_do_not_match.pir.json");
+
+        let insensitive = query_all_callees_field_insensitive(&pag);
+        assert_eq!(
+            insensitive["driver@!noloc#0"],
+            ["target".to_string()].into_iter().collect()
+        );
+
+        let sensitive = query_all_callees_field_sensitive(&pag);
+        assert!(!sensitive.contains_key("driver@!noloc#0"));
+    }
+
+    #[test]
+    fn m3_2_unknown_load_offset_saturates_to_top() {
+        let pag = load("m3_2", "unknown_offset_load_saturates.pir.json");
+
+        let by_callsite = query_all_callees_field_sensitive(&pag);
+        assert_eq!(
+            by_callsite["driver@!noloc#0"],
+            ["target".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn m3_2_nested_field_memory_keeps_stack_frames_separate() {
+        let pag = load("m3_2", "nested_field_memory.pir.json");
+
+        let by_callsite = query_all_callees_field_sensitive(&pag);
+        assert_eq!(
+            by_callsite["driver@!noloc#0"],
+            ["target".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
     fn m3_1_answers_stay_inside_steensgaard_envelope_on_synthetic_suite() {
-        let roots = ["m1_4", "m1_4b", "m1_5", "m2_2", "m2_3", "m2_4", "m3_1"];
+        let roots = [
+            "m1_4", "m1_4b", "m1_5", "m2_2", "m2_3", "m2_4", "m3_1", "m3_2",
+        ];
         let mut checked = 0;
         let mut sites_with_m3_answers = 0;
         let mut max_visited = 0;
@@ -376,6 +678,7 @@ mod tests {
                 let pag = Pag::from_pir(&pir, &PagOpts::default());
                 let steens = steens_targets_by_callsite(&pir, &pag);
                 let report = query_all_callees_field_insensitive_report(&pag);
+                let mhs_report = query_all_callees_field_sensitive_report(&pag);
                 max_visited = max_visited.max(report.max_visited_states());
 
                 for (callsite, targets) in &report.by_callsite {
@@ -394,6 +697,21 @@ mod tests {
                     }
                     if !targets.is_empty() {
                         sites_with_m3_answers += 1;
+                    }
+                }
+                for (callsite, targets) in &mhs_report.by_callsite {
+                    let Some(envelope) = steens.get(callsite) else {
+                        panic!(
+                            "{}: M3.2 found {callsite}, absent from Steensgaard",
+                            path.display()
+                        );
+                    };
+                    for target in targets {
+                        assert!(
+                            envelope.contains(target),
+                            "{}: M3.2 target {target} for {callsite} is outside Steensgaard envelope {envelope:?}",
+                            path.display()
+                        );
                     }
                 }
                 checked += 1;

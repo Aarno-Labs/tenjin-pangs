@@ -149,6 +149,14 @@ nested struct copies, container_of-style negative offsets, zero-offset Gep-as-ca
 **Acceptance:** fixtures green; on Vim/PHP icall target sets shrink vs M3.1 (record
 deltas); no dynamic-trace violations (M1.8 harness).
 
+**Implementation status:** initial MHS mode is in place for callee queries. `pangs query
+callees` defaults to `--mode field-sensitive`, with `--mode field-insensitive` retained
+for M3.1 comparison. Fixtures cover field narrowing, two-level memory, unknown-offset
+top saturation on store and load sides, negative-offset arithmetic, zero-offset GEP
+casts, concrete-offset mismatch rejection, and nested field memory; the synthetic-suite
+ledger checks M3.1 and M3.2 answers against the Steensgaard envelope. The first corpus
+smoke is recorded in `notes/m3_2_mhs.md`.
+
 ### M3.3 — Dependency-tracked CG fixpoint (3–5 days)
 Implement §1.4: Dep maps recorded during traversal, per-round re-query scheduling,
 convergence detection, round metrics (queries run, new edges, rounds). **Acceptance:**

@@ -1,0 +1,35 @@
+{
+  "module": "m3_2.mismatched_offsets_do_not_match",
+  "functions": [
+    {
+      "key": "driver",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%s", "ty": "struct.S" },
+        { "kind": "gep", "dest": "%p8", "base": "%s", "byte_off": 8 },
+        { "kind": "store", "address": "%p8", "value": "target" },
+        { "kind": "gep", "dest": "%p16", "base": "%s", "byte_off": 16 },
+        { "kind": "load", "dest": "%fp", "address": "%p16" },
+        {
+          "kind": "call_indirect",
+          "operand": "%fp",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "target",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    },
+    {
+      "key": "other",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": []
+}

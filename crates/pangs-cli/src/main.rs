@@ -105,14 +105,31 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum QueryCommand {
-    /// Run the M3.1 field-insensitive callee query kernel.
+    /// Run the M3 callee query kernel.
     Callees {
         module: PathBuf,
         #[arg(long, default_value = "library")]
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
+        #[arg(long, default_value = "field-sensitive")]
+        mode: QueryModeArg,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum QueryModeArg {
+    FieldInsensitive,
+    FieldSensitive,
+}
+
+impl QueryModeArg {
+    fn label(self) -> &'static str {
+        match self {
+            QueryModeArg::FieldInsensitive => "field_insensitive",
+            QueryModeArg::FieldSensitive => "field_sensitive",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -254,6 +271,7 @@ fn run() -> Result<()> {
                 module,
                 build_mode,
                 exports,
+                mode,
             } => {
                 let pir = Pir::from_path(&module)?;
                 let opts = PagOpts {
@@ -261,7 +279,14 @@ fn run() -> Result<()> {
                     exports: read_exports(exports)?,
                 };
                 let pag = Pag::from_pir(&pir, &opts);
-                let report = pangs_solve::query_all_callees_field_insensitive_report(&pag);
+                let report = match mode {
+                    QueryModeArg::FieldInsensitive => {
+                        pangs_solve::query_all_callees_field_insensitive_report(&pag)
+                    }
+                    QueryModeArg::FieldSensitive => {
+                        pangs_solve::query_all_callees_field_sensitive_report(&pag)
+                    }
+                };
                 let queries = report
                     .queries
                     .iter()
@@ -280,7 +305,7 @@ fn run() -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "kind": "callees",
-                        "mode": "field_insensitive",
+                        "mode": mode.label(),
                         "by_callsite": report.by_callsite,
                         "queries": queries,
                         "visit_histogram": {
