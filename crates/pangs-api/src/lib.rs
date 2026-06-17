@@ -2144,6 +2144,29 @@ struct ModRefFactHashKey {
     pointee_globals: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CompactModRefFactKey {
+    func: u32,
+    global: u32,
+    access_rank: u8,
+    via_rank: u8,
+}
+
+fn compact_modref_key(row: &ModRef) -> Option<CompactModRefFactKey> {
+    if row.detail.is_some() || row.address_node.is_some() || !row.pointee_globals.is_empty() {
+        return None;
+    }
+    let GlobalTarget::Name(global) = row.global else {
+        return None;
+    };
+    Some(CompactModRefFactKey {
+        func: row.func.0,
+        global: global.0,
+        access_rank: access_rank(row.access),
+        via_rank: via_rank(row.via),
+    })
+}
+
 #[derive(Debug, Default)]
 struct ModRefFactInterners {
     strings: HashMap<String, u32>,
@@ -2198,6 +2221,7 @@ impl ModRefFactInterners {
 struct ModRefBuilder {
     rows: Vec<ModRef>,
     interners: ModRefFactInterners,
+    compact_by_fact: HashMap<CompactModRefFactKey, usize>,
     by_fact: HashMap<ModRefFactHashKey, usize>,
 }
 
@@ -2207,6 +2231,18 @@ impl ModRefBuilder {
     }
 
     fn push(&mut self, mut row: ModRef) {
+        if let Some(key) = compact_modref_key(&row) {
+            if let Some(&idx) = self.compact_by_fact.get(&key) {
+                let existing = &mut self.rows[idx];
+                existing.witness =
+                    preferred_modref_witness(existing.witness.take(), row.witness.take());
+                return;
+            }
+            self.compact_by_fact.insert(key, self.rows.len());
+            self.rows.push(row);
+            return;
+        }
+
         let key = self.interners.key_for(&row);
         if let Some(&idx) = self.by_fact.get(&key) {
             let existing = &mut self.rows[idx];
@@ -2216,6 +2252,37 @@ impl ModRefBuilder {
         }
         self.by_fact.insert(key, self.rows.len());
         self.rows.push(row);
+    }
+
+    fn push_named_empty(
+        &mut self,
+        func: FuncId,
+        global: GlobalId,
+        access: Access,
+        via: Via,
+        witness: Option<&str>,
+    ) {
+        let key = CompactModRefFactKey {
+            func: func.0,
+            global: global.0,
+            access_rank: access_rank(access),
+            via_rank: via_rank(via),
+        };
+        if let Some(&idx) = self.compact_by_fact.get(&key) {
+            prefer_modref_witness_ref(&mut self.rows[idx].witness, witness);
+            return;
+        }
+        self.compact_by_fact.insert(key, self.rows.len());
+        self.rows.push(ModRef {
+            func,
+            global: GlobalTarget::Name(global),
+            access,
+            via,
+            witness: witness.map(str::to_owned),
+            detail: None,
+            address_node: None,
+            pointee_globals: Vec::new(),
+        });
     }
 
     fn into_vec(self) -> Vec<ModRef> {
@@ -2336,16 +2403,13 @@ fn push_pointer_modrefs_from_pag(
                 {
                     continue;
                 }
-                modrefs.push(ModRef {
+                modrefs.push_named_empty(
                     func,
-                    global: GlobalTarget::Name(gid),
-                    access: pointer_access.access,
-                    via: Via::Aliased,
-                    witness: witness.clone(),
-                    detail: None,
-                    address_node: None,
-                    pointee_globals: Vec::new(),
-                });
+                    gid,
+                    pointer_access.access,
+                    Via::Aliased,
+                    witness.as_deref(),
+                );
             }
 
             if summary.external {
@@ -2384,16 +2448,14 @@ fn push_pointer_memset_modrefs_from_pir(
                 continue;
             };
             if let Some(&gid) = global_lookup.get(dst) {
-                modrefs.push(ModRef {
-                    func: func_id,
-                    global: GlobalTarget::Name(gid),
-                    access: Access::Mod,
-                    via: Via::Aliased,
-                    witness: witness_key(&func.key, loc, noloc_ord, "global"),
-                    detail: None,
-                    address_node: None,
-                    pointee_globals: Vec::new(),
-                });
+                let witness = witness_key(&func.key, loc, noloc_ord, "global");
+                modrefs.push_named_empty(
+                    func_id,
+                    gid,
+                    Access::Mod,
+                    Via::Aliased,
+                    witness.as_deref(),
+                );
                 continue;
             }
             let label = pag_value_label(module, &func.key, dst);
@@ -2405,16 +2467,13 @@ fn push_pointer_memset_modrefs_from_pir(
                 let Some(&gid) = global_lookup.get(global_key) else {
                     continue;
                 };
-                modrefs.push(ModRef {
-                    func: func_id,
-                    global: GlobalTarget::Name(gid),
-                    access: Access::Mod,
-                    via: Via::Aliased,
-                    witness: witness.clone(),
-                    detail: None,
-                    address_node: None,
-                    pointee_globals: Vec::new(),
-                });
+                modrefs.push_named_empty(
+                    func_id,
+                    gid,
+                    Access::Mod,
+                    Via::Aliased,
+                    witness.as_deref(),
+                );
             }
             if resolution.external {
                 modrefs.push(ModRef {
@@ -2730,6 +2789,16 @@ fn preferred_modref_witness(existing: Option<String>, candidate: Option<String>)
         (witness @ Some(_), None) => witness,
         (Some(left), Some(right)) => Some(left.min(right)),
         (None, None) => None,
+    }
+}
+
+fn prefer_modref_witness_ref(existing: &mut Option<String>, candidate: Option<&str>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    match existing {
+        Some(current) if current.as_str() <= candidate => {}
+        _ => *existing = Some(candidate.to_owned()),
     }
 }
 
