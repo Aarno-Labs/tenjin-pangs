@@ -3762,27 +3762,29 @@ fn compute_transitive_modrefs(
         succs.dedup();
     }
 
-    let mut memo = vec![None::<Vec<usize>>; scc_members.len()];
-    for scc in 0..scc_members.len() {
-        collect_scc_payload_ids(scc, &local_by_scc, &scc_succs, &mut memo);
-    }
-
     let mut metrics = ModRefPhaseMetrics::default();
     let high_fanout_limit = transitive_modref_high_fanout_limit();
-    let mut row_sets = Vec::with_capacity(scc_members.len());
-    let mut max_fanout_by_scc = Vec::with_capacity(scc_members.len());
+    let mut memo = vec![None; scc_members.len()];
     for scc in 0..scc_members.len() {
-        let mut rows = memo[scc].take().unwrap_or_default();
-        rows.sort_by(|&left, &right| {
-            modref_payload_cmp(&payloads[left], &payloads[right], globals)
-        });
-        collapse_high_fanout_transitive_rows(
-            &mut rows,
+        collect_scc_payload_ids(
+            scc,
+            &local_by_scc,
+            &scc_succs,
+            &mut memo,
             &mut payload_ids,
             &mut payloads,
             &mut metrics,
             high_fanout_limit,
         );
+    }
+
+    let mut row_sets = Vec::with_capacity(scc_members.len());
+    let mut max_fanout_by_scc = Vec::with_capacity(scc_members.len());
+    for scc in 0..scc_members.len() {
+        let mut rows = memo[scc].take().unwrap_or_default().rows;
+        rows.sort_by(|&left, &right| {
+            modref_payload_cmp(&payloads[left], &payloads[right], globals)
+        });
         max_fanout_by_scc.push(max_modref_payload_fanout(&rows, &payloads));
         row_sets.push(rows);
     }
@@ -3833,27 +3835,47 @@ fn same_modref_fanout_fact(left: &ModRefPayload, right: &ModRefPayload) -> bool 
     left.global == right.global && left.access == right.access && left.via == right.via
 }
 
+#[derive(Debug, Clone, Default)]
+struct SccPayloadIds {
+    rows: Vec<usize>,
+    approximate: bool,
+}
+
 fn collapse_high_fanout_transitive_rows(
     rows: &mut Vec<usize>,
     payload_ids: &mut BTreeMap<ModRefFactKey, usize>,
     payloads: &mut Vec<ModRefPayload>,
     metrics: &mut ModRefPhaseMetrics,
     high_fanout_limit: usize,
-) {
+) -> bool {
     if high_fanout_limit == 0 || rows.len() <= high_fanout_limit {
-        return;
+        return false;
     }
 
     let precise_rows = rows.len() as u64;
+    let detail = Some(format!(
+        "high_fanout_transitive_modref:limit={high_fanout_limit}"
+    ));
+    compact_transitive_rows(rows, payload_ids, payloads, detail);
+    metrics.high_fanout_fallbacks += 1;
+    metrics.high_fanout_fallback_rows = metrics
+        .high_fanout_fallback_rows
+        .saturating_add(precise_rows);
+    true
+}
+
+fn compact_transitive_rows(
+    rows: &mut Vec<usize>,
+    payload_ids: &mut BTreeMap<ModRefFactKey, usize>,
+    payloads: &mut Vec<ModRefPayload>,
+    detail: Option<String>,
+) {
     let has_ref = rows
         .iter()
         .any(|&payload_id| payloads[payload_id].access == Access::Ref);
     let has_mod = rows
         .iter()
         .any(|&payload_id| payloads[payload_id].access == Access::Mod);
-    let detail = Some(format!(
-        "high_fanout_transitive_modref:rows={precise_rows}:limit={high_fanout_limit}"
-    ));
     let mut fallback_rows = Vec::with_capacity(2);
     if has_ref {
         fallback_rows.push(intern_modref_payload(
@@ -3872,10 +3894,6 @@ fn collapse_high_fanout_transitive_rows(
     fallback_rows.sort_unstable();
     fallback_rows.dedup();
     *rows = fallback_rows;
-    metrics.high_fanout_fallbacks += 1;
-    metrics.high_fanout_fallback_rows = metrics
-        .high_fanout_fallback_rows
-        .saturating_add(precise_rows);
 }
 
 fn high_fanout_transitive_payload(access: Access, detail: Option<String>) -> ModRefPayload {
@@ -3898,19 +3916,56 @@ fn collect_scc_payload_ids(
     scc: usize,
     local_by_scc: &[Vec<usize>],
     scc_succs: &[Vec<usize>],
-    memo: &mut [Option<Vec<usize>>],
-) -> Vec<usize> {
+    memo: &mut [Option<SccPayloadIds>],
+    payload_ids: &mut BTreeMap<ModRefFactKey, usize>,
+    payloads: &mut Vec<ModRefPayload>,
+    metrics: &mut ModRefPhaseMetrics,
+    high_fanout_limit: usize,
+) -> SccPayloadIds {
     if let Some(existing) = &memo[scc] {
         return existing.clone();
     }
     let mut rows = local_by_scc[scc].clone();
+    let mut approximate = collapse_high_fanout_transitive_rows(
+        &mut rows,
+        payload_ids,
+        payloads,
+        metrics,
+        high_fanout_limit,
+    );
     for &succ in &scc_succs[scc] {
-        let succ_rows = collect_scc_payload_ids(succ, local_by_scc, scc_succs, memo);
-        rows = merge_sorted_unique(rows, succ_rows);
+        let succ_rows = collect_scc_payload_ids(
+            succ,
+            local_by_scc,
+            scc_succs,
+            memo,
+            payload_ids,
+            payloads,
+            metrics,
+            high_fanout_limit,
+        );
+        rows = merge_sorted_unique(rows, succ_rows.rows);
+        approximate |= succ_rows.approximate;
+        approximate |= collapse_high_fanout_transitive_rows(
+            &mut rows,
+            payload_ids,
+            payloads,
+            metrics,
+            high_fanout_limit,
+        );
+        if approximate {
+            compact_transitive_rows(
+                &mut rows,
+                payload_ids,
+                payloads,
+                Some("high_fanout_transitive_modref:propagated".to_string()),
+            );
+        }
     }
     rows.dedup();
-    memo[scc] = Some(rows.clone());
-    rows
+    let result = SccPayloadIds { rows, approximate };
+    memo[scc] = Some(result.clone());
+    result
 }
 
 fn merge_sorted_unique(left: Vec<usize>, right: Vec<usize>) -> Vec<usize> {
