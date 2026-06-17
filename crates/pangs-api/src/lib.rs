@@ -2768,6 +2768,50 @@ struct LocalPointerModRefRow {
     count: u64,
 }
 
+struct LocalPointerModRefRows {
+    rows: Vec<Option<LocalPointerModRefRow>>,
+    touched: Vec<usize>,
+}
+
+impl LocalPointerModRefRows {
+    fn new(global_count: usize) -> Self {
+        let row_count = global_count.saturating_mul(2);
+        Self {
+            rows: (0..row_count).map(|_| None).collect(),
+            touched: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, global: GlobalId, access: Access, witness: Option<&str>, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let idx = global.0 as usize * 2 + access_rank(access) as usize;
+        let Some(slot) = self.rows.get_mut(idx) else {
+            return;
+        };
+        match slot {
+            Some(row) => {
+                row.count += count;
+                prefer_modref_witness_ref(&mut row.witness, witness);
+            }
+            None => {
+                *slot = Some(LocalPointerModRefRow {
+                    witness: witness.map(str::to_owned),
+                    count,
+                });
+                self.touched.push(idx);
+            }
+        }
+    }
+
+    fn drain_touched(&mut self) -> impl Iterator<Item = (usize, LocalPointerModRefRow)> + '_ {
+        self.touched
+            .drain(..)
+            .filter_map(|idx| self.rows[idx].take().map(|row| (idx, row)))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LocalPointerAccessKey {
     func: u32,
@@ -2895,36 +2939,17 @@ impl PointerAccessEmitterProfile {
 }
 
 fn push_local_pointer_modref_row(
-    local_rows: &mut HashMap<CompactModRefFactKey, LocalPointerModRefRow>,
-    func: FuncId,
+    local_rows: &mut LocalPointerModRefRows,
     global: GlobalId,
     access: Access,
     witness: Option<&str>,
     count: u64,
 ) {
-    if count == 0 {
-        return;
-    }
-    let key = CompactModRefFactKey {
-        func: func.0,
-        global: global.0,
-        access_rank: access_rank(access),
-        via_rank: via_rank(Via::Aliased),
-    };
-    local_rows
-        .entry(key)
-        .and_modify(|row| {
-            row.count += count;
-            prefer_modref_witness_ref(&mut row.witness, witness);
-        })
-        .or_insert_with(|| LocalPointerModRefRow {
-            witness: witness.map(str::to_owned),
-            count,
-        });
+    local_rows.push(global, access, witness, count);
 }
 
 fn flush_local_pointer_access_rows(
-    local_rows: &mut HashMap<CompactModRefFactKey, LocalPointerModRefRow>,
+    local_rows: &mut LocalPointerModRefRows,
     local_accesses: &mut HashMap<LocalPointerAccessKey, LocalPointerAccessRow>,
     node_summaries: &[Option<ModRefNodeSummary<'_>>],
     access_profile: &mut PointerAccessEmitterProfile,
@@ -2933,7 +2958,6 @@ fn flush_local_pointer_access_rows(
         let Some(Some(summary)) = node_summaries.get(key.address_node as usize) else {
             continue;
         };
-        let func = FuncId(key.func);
         let access = match key.access_rank {
             0 => Access::Ref,
             _ => Access::Mod,
@@ -2952,7 +2976,6 @@ fn flush_local_pointer_access_rows(
             }
             push_local_pointer_modref_row(
                 local_rows,
-                func,
                 gid,
                 access,
                 row.witness.as_deref(),
@@ -2964,12 +2987,15 @@ fn flush_local_pointer_access_rows(
 
 fn flush_local_pointer_modref_rows(
     modrefs: &mut ModRefBuilder,
-    local_rows: &mut HashMap<CompactModRefFactKey, LocalPointerModRefRow>,
+    func: Option<FuncId>,
+    local_rows: &mut LocalPointerModRefRows,
 ) {
-    for (key, row) in local_rows.drain() {
-        let func = FuncId(key.func);
-        let global = GlobalId(key.global);
-        let access = match key.access_rank {
+    let Some(func) = func else {
+        return;
+    };
+    for (idx, row) in local_rows.drain_touched() {
+        let global = GlobalId((idx / 2) as u32);
+        let access = match idx % 2 {
             0 => Access::Ref,
             _ => Access::Mod,
         };
@@ -3031,7 +3057,7 @@ fn push_pointer_modrefs_from_pag(
     node_summaries.resize_with(pag.nodes.len(), || None);
     let mut missing_nodes = vec![false; pag.nodes.len()];
     let mut local_accesses = HashMap::<LocalPointerAccessKey, LocalPointerAccessRow>::new();
-    let mut local_rows = HashMap::<CompactModRefFactKey, LocalPointerModRefRow>::new();
+    let mut local_rows = LocalPointerModRefRows::new(global_lookup.len());
     let mut access_profile = PointerAccessEmitterProfile::from_env();
     let mut active_func = None;
     for edge in &pag.edges {
@@ -3045,7 +3071,7 @@ fn push_pointer_modrefs_from_pag(
                 &node_summaries,
                 &mut access_profile,
             );
-            flush_local_pointer_modref_rows(modrefs, &mut local_rows);
+            flush_local_pointer_modref_rows(modrefs, active_func, &mut local_rows);
             active_func = Some(func);
         }
         let witness = witness_key(&owner, &edge.loc, noloc_ord, "global");
@@ -3081,7 +3107,7 @@ fn push_pointer_modrefs_from_pag(
                     &node_summaries,
                     &mut access_profile,
                 );
-                flush_local_pointer_modref_rows(modrefs, &mut local_rows);
+                flush_local_pointer_modref_rows(modrefs, active_func, &mut local_rows);
             }
 
             if phase == ModRefSourcePhase::PagPointer {
@@ -3146,7 +3172,7 @@ fn push_pointer_modrefs_from_pag(
         &mut access_profile,
     );
     access_profile.print("top-emitters-done");
-    flush_local_pointer_modref_rows(modrefs, &mut local_rows);
+    flush_local_pointer_modref_rows(modrefs, active_func, &mut local_rows);
 }
 
 fn push_pointer_memset_modrefs_from_pir(
