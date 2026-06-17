@@ -97,6 +97,13 @@ Acceptance:
 
 Expected output: `notes/m4_vararg_evidence.md`.
 
+Implementation status:
+
+- `scripts/m4_vararg_evidence.sh` summarizes vararg audit kind histograms, affected-value
+  prefixes, largest frozen components with vararg taint, and top vararg taint witnesses from
+  one or more export directories.
+- Corpus rerun and committed evidence note are still pending.
+
 ### M4.1 — Split Audit Kinds Without Changing Semantics
 
 Refine audit taxonomy while preserving behavior:
@@ -115,6 +122,13 @@ Acceptance:
 - existing `fnptr_varargs` tests continue to pass after updating expected names/summaries;
 - `pangs report` clearly shows the split kinds;
 - no coverage or callgraph behavior changes yet.
+
+Implementation status:
+
+- Analysis now emits `fnptr_varargs_external`, `fnptr_varargs_internal_unmodeled`, and
+  `fnptr_varargs_indirect` according to callsite shape.
+- Syntactic-symbol versus solved-value evidence remains visible through the `affected`
+  prefix (`function:` versus `value:`) and the M4 evidence script's affected-prefix summary.
 
 ### M4.2 — Direct Internal Vararg Body Modeling
 

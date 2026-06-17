@@ -333,6 +333,7 @@ enum DeferredAudit {
     VarargFnPtr {
         caller: FuncId,
         owner: String,
+        kind: String,
         values: Vec<String>,
         loc: Option<pangs_pir::Loc>,
         witness: String,
@@ -541,10 +542,12 @@ impl Analysis {
                             &callsite_key,
                         );
                         if let Stmt::CallDirect { sig, .. } = stmt {
+                            let kind = direct_vararg_audit_kind(module, callee);
                             record_vararg_deferred_audit(
                                 &mut deferred_audits,
                                 caller,
                                 &func.key,
+                                kind,
                                 stmt,
                                 sig,
                                 loc,
@@ -595,6 +598,7 @@ impl Analysis {
                             &mut deferred_audits,
                             caller,
                             &func.key,
+                            "fnptr_varargs_indirect",
                             stmt,
                             sig,
                             loc,
@@ -1299,6 +1303,7 @@ fn emit_deferred_steens_audits(
             DeferredAudit::VarargFnPtr {
                 caller,
                 owner,
+                kind,
                 values,
                 loc,
                 witness,
@@ -1319,7 +1324,7 @@ fn emit_deferred_steens_audits(
                         findings,
                         audit_taints,
                         caller,
-                        "fnptr_varargs",
+                        &kind,
                         &loc,
                         affected,
                         Some(witness),
@@ -1677,6 +1682,7 @@ fn detect_direct_call_audits(
             audit_taints,
             module,
             caller,
+            direct_vararg_audit_kind(module, callee),
             sig,
             args,
             loc,
@@ -1701,6 +1707,7 @@ fn detect_indirect_call_audits(
             audit_taints,
             module,
             caller,
+            "fnptr_varargs_indirect",
             sig,
             args,
             loc,
@@ -1714,6 +1721,7 @@ fn detect_vararg_fnptr_audit(
     audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
     module: &Pir,
     caller: FuncId,
+    kind: &str,
     sig: &pangs_pir::Signature,
     args: &[String],
     loc: &Option<pangs_pir::Loc>,
@@ -1738,7 +1746,7 @@ fn detect_vararg_fnptr_audit(
         findings,
         audit_taints,
         caller,
-        "fnptr_varargs",
+        kind,
         loc,
         affected,
         Some(callsite_key.to_string()),
@@ -1772,6 +1780,7 @@ fn record_vararg_deferred_audit(
     deferred: &mut Vec<DeferredAudit>,
     caller: FuncId,
     owner: &str,
+    kind: &str,
     stmt: &Stmt,
     sig: &pangs_pir::Signature,
     loc: &Option<pangs_pir::Loc>,
@@ -1795,10 +1804,18 @@ fn record_vararg_deferred_audit(
     deferred.push(DeferredAudit::VarargFnPtr {
         caller,
         owner: owner.to_string(),
+        kind: kind.to_string(),
         values,
         loc: loc.clone(),
         witness: callsite_key.to_string(),
     });
+}
+
+fn direct_vararg_audit_kind(module: &Pir, callee: &str) -> &'static str {
+    match module.functions.iter().find(|func| func.key == callee) {
+        Some(func) if !func.external => "fnptr_varargs_internal_unmodeled",
+        _ => "fnptr_varargs_external",
+    }
 }
 
 fn direct_boundary_kind(callee: &str) -> Option<&'static str> {

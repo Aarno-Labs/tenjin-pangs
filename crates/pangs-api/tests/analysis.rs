@@ -1606,16 +1606,123 @@ fn audit_surface_fixture_reports_varargs_and_boundary_findings() {
         vec![
             "dlopen_dlsym",
             "dlopen_dlsym",
-            "fnptr_varargs",
+            "fnptr_varargs_external",
             "inline_asm",
             "setjmp_longjmp",
             "setjmp_longjmp"
         ]
     );
     assert!(analysis.audit_findings().iter().any(|finding| {
-        finding.kind == "fnptr_varargs" && finding.affected == vec!["function:cb".to_string()]
+        finding.kind == "fnptr_varargs_external"
+            && finding.affected == vec!["function:cb".to_string()]
     }));
     assert_eq!(analysis.metrics().audit_findings, 6);
+}
+
+#[test]
+fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
+    let vararg_sig = Signature {
+        ret: AbiClass::Void,
+        params: vec![Param::Integer],
+        vararg: true,
+        cc: "ccc".to_string(),
+    };
+    let pir = Pir {
+        module: "m4_vararg_taxonomy".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            Func {
+                key: "external_sink".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: true,
+                exported: false,
+                address_taken: false,
+                body: vec![],
+            },
+            Func {
+                key: "internal_sink".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![],
+            },
+            Func {
+                key: "cb".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: true,
+                body: vec![],
+            },
+            Func {
+                key: "driver".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![
+                    Stmt::CallDirect {
+                        callee: "external_sink".to_string(),
+                        sig: vararg_sig.clone(),
+                        args: vec!["%tag".to_string(), "cb".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                    Stmt::CallDirect {
+                        callee: "internal_sink".to_string(),
+                        sig: vararg_sig.clone(),
+                        args: vec!["%tag".to_string(), "cb".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                    Stmt::CallIndirect {
+                        operand: "%callee".to_string(),
+                        sig: vararg_sig,
+                        args: vec!["%tag".to_string(), "cb".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                ],
+            },
+        ],
+        globals: vec![],
+        global_init: vec![],
+    };
+    let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
+    let kinds = analysis
+        .audit_findings()
+        .iter()
+        .map(|finding| finding.kind.as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert!(kinds.contains("fnptr_varargs_external"));
+    assert!(kinds.contains("fnptr_varargs_internal_unmodeled"));
+    assert!(kinds.contains("fnptr_varargs_indirect"));
+    assert_eq!(analysis.metrics().audit_findings, 3);
+    let driver = analysis.lookup_func("driver").unwrap();
+    let component = analysis.component(analysis.component_of(driver));
+    assert!(component.frozen);
+    for kind in [
+        "fnptr_varargs_external",
+        "fnptr_varargs_internal_unmodeled",
+        "fnptr_varargs_indirect",
+    ] {
+        assert!(component.taint.iter().any(|taint| taint.kind == kind));
+    }
 }
 
 #[test]
@@ -1758,14 +1865,14 @@ fn steens_detects_vararg_function_pointers_through_local_values() {
     assert!(analysis
         .audit_findings()
         .iter()
-        .any(|finding| finding.kind == "fnptr_varargs"
+        .any(|finding| finding.kind == "fnptr_varargs_internal_unmodeled"
             && finding.affected == vec!["value:%fp".to_string()]));
     let driver = analysis.lookup_func("driver").unwrap();
     let component = analysis.component(analysis.component_of(driver));
     assert!(component
         .taint
         .iter()
-        .any(|taint| taint.kind == "fnptr_varargs"
+        .any(|taint| taint.kind == "fnptr_varargs_internal_unmodeled"
             && taint.witness.as_deref() == Some("driver@!noloc#0")));
 }
 

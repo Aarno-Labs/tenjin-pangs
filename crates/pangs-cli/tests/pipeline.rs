@@ -1238,7 +1238,9 @@ fn analyze_audit_surface_exports_boundary_and_vararg_findings() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(audit.len(), 6);
-    assert!(audit.iter().any(|row| row["kind"] == "fnptr_varargs"));
+    assert!(audit
+        .iter()
+        .any(|row| row["kind"] == "fnptr_varargs_external"));
     assert!(
         audit
             .iter()
@@ -1344,7 +1346,8 @@ fn analyze_steens_exports_vararg_function_pointer_audits_from_local_values() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(audit.iter().any(|row| {
-        row["kind"] == "fnptr_varargs" && row["affected"] == serde_json::json!(["value:%fp"])
+        row["kind"] == "fnptr_varargs_internal_unmodeled"
+            && row["affected"] == serde_json::json!(["value:%fp"])
     }));
 
     let callgraph = fs::read_to_string(out.join("callgraph.jsonl")).unwrap();
@@ -1359,7 +1362,8 @@ fn analyze_steens_exports_vararg_function_pointer_audits_from_local_values() {
         .any(
             |component| component["members"] == serde_json::json!(["driver", "sink"])
                 && component["taint"].as_array().unwrap().iter().any(|taint| {
-                    taint["kind"] == "fnptr_varargs" && taint["witness"] == "driver@!noloc#0"
+                    taint["kind"] == "fnptr_varargs_internal_unmodeled"
+                        && taint["witness"] == "driver@!noloc#0"
                 })
         ));
 }

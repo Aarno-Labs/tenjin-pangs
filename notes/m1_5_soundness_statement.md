@@ -73,7 +73,9 @@ The current code emits the following audit finding kinds:
 - `inline_asm`
 - `dlopen_dlsym`
 - `setjmp_longjmp`
-- `fnptr_varargs`
+- `fnptr_varargs_external`
+- `fnptr_varargs_internal_unmodeled`
+- `fnptr_varargs_indirect`
 - `fnptr_ptrtoint`
 - `fnptr_inttoptr`
 - `memcpy_fnptr_aggregate`
@@ -87,8 +89,19 @@ Their current trigger conditions are:
   - direct calls to `dlopen` or `dlsym`
 - `setjmp_longjmp`
   - direct calls to `setjmp` or `longjmp`
-- `fnptr_varargs`
-  - all stages: direct function symbols passed through varargs
+- `fnptr_varargs_external`
+  - all stages: direct calls to external or unresolved vararg callees where a direct
+    function symbol is passed through varargs
+  - `steens` / `andersen`: local values passed through those varargs whose solved PAG
+    class reaches function-pointer space
+- `fnptr_varargs_internal_unmodeled`
+  - all stages: direct calls to visible internal vararg callees where a direct function
+    symbol is passed through varargs
+  - `steens` / `andersen`: local values passed through those varargs whose solved PAG
+    class reaches function-pointer space
+- `fnptr_varargs_indirect`
+  - all stages: indirect vararg callsites where a direct function symbol is passed
+    through varargs
   - `steens` / `andersen`: local values passed through varargs whose solved PAG class
     reaches function-pointer space
 - `fnptr_ptrtoint`
