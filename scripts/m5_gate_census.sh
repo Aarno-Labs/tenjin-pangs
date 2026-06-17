@@ -220,6 +220,97 @@ for dir in "$@"; do
 done
 
 echo
+echo "## Steens External Mod Shape"
+echo
+echo "| row | pointee shape | rows |"
+echo "|---|---|---:|"
+for dir in "$@"; do
+  modrefs="$dir/modref.jsonl"
+  label="$(basename "$dir")"
+  label="${label%-andersen}"
+  jq -r '
+    select(.access == "mod" and .global.unknown == "omega_store")
+    | select((.detail // "") | contains("omega:steens_external"))
+    | if ((.pointee_globals // []) | length) > 0 then "has_pointee_globals" else "no_pointee_globals" end
+  ' "$modrefs" \
+    | sort \
+    | uniq -c \
+    | sort -nr \
+    | awk -v label="$label" '{ printf "| `%s` | `%s` | %s |\n", label, $2, $1 }'
+done
+
+echo
+echo "## Top Steens External Mod Nodes"
+echo
+for dir in "$@"; do
+  modrefs="$dir/modref.jsonl"
+  label="$(basename "$dir")"
+  label="${label%-andersen}"
+  echo "### $label"
+  echo
+  node_count="$(
+    jq -r '
+      def pointee_summary:
+        (.pointee_globals // [] | sort) as $globals
+        | if ($globals | length) == 0 then "<none>"
+          elif ($globals | length) <= 4 then ($globals | join("+"))
+          else "\($globals | length) globals: \($globals[0:4] | join("+"))+..."
+          end;
+      select(.access == "mod" and .global.unknown == "omega_store")
+      | select((.detail // "") | contains("omega:steens_external"))
+      | [
+          (.detail // "<none>"),
+          .func,
+          (.witness // "<none>"),
+          (.address_node // "<none>"),
+          pointee_summary
+        ]
+      | @tsv
+    ' "$modrefs" | wc -l | tr -d ' '
+  )"
+  if [[ "$node_count" -eq 0 ]]; then
+    echo "- none"
+  else
+    echo "| detail | func | witness | address node | pointee globals | rows |"
+    echo "|---|---|---|---|---|---:|"
+    jq -r '
+      def pointee_summary:
+        (.pointee_globals // [] | sort) as $globals
+        | if ($globals | length) == 0 then "<none>"
+          elif ($globals | length) <= 4 then ($globals | join("+"))
+          else "\($globals | length) globals: \($globals[0:4] | join("+"))+..."
+          end;
+      select(.access == "mod" and .global.unknown == "omega_store")
+      | select((.detail // "") | contains("omega:steens_external"))
+      | [
+          (.detail // "<none>"),
+          .func,
+          (.witness // "<none>"),
+          (.address_node // "<none>"),
+          pointee_summary
+        ]
+      | @tsv
+    ' "$modrefs" \
+      | sort \
+      | uniq -c \
+      | sort -nr \
+      | awk -F'\t' '{
+          if (printed >= 20) {
+            next
+          }
+          printed += 1
+          count=$1
+          sub(/^[[:space:]]+/, "", count)
+          split(count, parts, /[[:space:]]+/)
+          rows=parts[1]
+          detail=parts[2]
+          printf "| `%s` | `%s` | `%s` | `%s` | `%s` | %s |\n", detail, $2, $3, $4, $5, rows
+        }'
+  fi
+  echo
+done
+
+echo
 echo "## Top Unknown Mod Sites"
 echo
 for dir in "$@"; do

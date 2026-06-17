@@ -55,6 +55,18 @@
     "detail": {
       "type": "string",
       "minLength": 1
+    },
+    "address_node": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pointee_globals": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
     }
   }
 }

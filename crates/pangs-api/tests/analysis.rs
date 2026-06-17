@@ -2586,6 +2586,8 @@ fn andersen_refines_spurious_external_store_address_modref() {
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("driver@m5_store.c:8:1#0")
             && mr.detail.as_deref() == Some("edge:store|omega:steens_external")
+            && mr.address_node.as_deref() == Some("val:driver:%gp")
+            && mr.pointee_globals == vec!["@Table".to_string()]
     }));
     assert!(andersen.modrefs().iter().any(|mr| {
         mr.global == pangs_api::GlobalTarget::Name(table)

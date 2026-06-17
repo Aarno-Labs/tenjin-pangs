@@ -181,6 +181,10 @@ pub struct ModRef {
     pub witness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pointee_globals: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -714,6 +718,8 @@ impl Analysis {
                                 via: Via::Direct,
                                 witness: witness_key(&func.key, loc, &mut noloc_ord, "global"),
                                 detail: None,
+                                address_node: None,
+                                pointee_globals: Vec::new(),
                             });
                         }
                     }
@@ -2087,7 +2093,16 @@ fn modref_sort_key(
     mr: &ModRef,
     funcs: &[FuncInfo],
     globals: &[GlobalInfo],
-) -> (String, String, String, String, String, String) {
+) -> (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+) {
     (
         funcs[mr.func.0 as usize].key.clone(),
         match mr.global {
@@ -2098,6 +2113,8 @@ fn modref_sort_key(
         format!("{:?}", mr.via),
         mr.witness.clone().unwrap_or_default(),
         mr.detail.clone().unwrap_or_default(),
+        mr.address_node.clone().unwrap_or_default(),
+        mr.pointee_globals.join("\0"),
     )
 }
 
@@ -2105,7 +2122,7 @@ fn modref_fact_sort_key(
     mr: &ModRef,
     funcs: &[FuncInfo],
     globals: &[GlobalInfo],
-) -> (String, String, String, String, String) {
+) -> (String, String, String, String, String, String, String) {
     (
         funcs[mr.func.0 as usize].key.clone(),
         match mr.global {
@@ -2115,6 +2132,8 @@ fn modref_fact_sort_key(
         format!("{:?}", mr.access),
         format!("{:?}", mr.via),
         mr.detail.clone().unwrap_or_default(),
+        mr.address_node.clone().unwrap_or_default(),
+        mr.pointee_globals.join("\0"),
     )
 }
 
@@ -2140,6 +2159,8 @@ fn same_modref_fact(left: &ModRef, right: &ModRef) -> bool {
         && left.access == right.access
         && left.via == right.via
         && left.detail == right.detail
+        && left.address_node == right.address_node
+        && left.pointee_globals == right.pointee_globals
 }
 
 struct PointerAccess {
@@ -2187,6 +2208,8 @@ fn push_pointer_modrefs_from_pag(
                     via: Via::Aliased,
                     witness: witness.clone(),
                     detail: None,
+                    address_node: None,
+                    pointee_globals: Vec::new(),
                 });
             }
 
@@ -2201,6 +2224,8 @@ fn push_pointer_modrefs_from_pag(
                         pointer_access.detail,
                         &resolution.external_sources,
                     )),
+                    address_node: Some(node.label.clone()),
+                    pointee_globals: resolution.pointee_globals.clone(),
                 });
             }
         }
@@ -2231,6 +2256,8 @@ fn push_pointer_memset_modrefs_from_pir(
                     via: Via::Aliased,
                     witness: witness_key(&func.key, loc, noloc_ord, "global"),
                     detail: None,
+                    address_node: None,
+                    pointee_globals: Vec::new(),
                 });
                 continue;
             }
@@ -2250,6 +2277,8 @@ fn push_pointer_memset_modrefs_from_pir(
                     via: Via::Aliased,
                     witness: witness.clone(),
                     detail: None,
+                    address_node: None,
+                    pointee_globals: Vec::new(),
                 });
             }
             if resolution.external {
@@ -2263,6 +2292,8 @@ fn push_pointer_memset_modrefs_from_pir(
                         "stmt:memset_dst",
                         &resolution.external_sources,
                     )),
+                    address_node: Some(label.clone()),
+                    pointee_globals: resolution.pointee_globals.clone(),
                 });
             }
         }
@@ -2455,6 +2486,8 @@ struct ModRefPayload {
     via: Via,
     witness: Option<String>,
     detail: Option<String>,
+    address_node: Option<String>,
+    pointee_globals: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2463,6 +2496,8 @@ struct ModRefFactKey {
     access_rank: u8,
     via_rank: u8,
     detail: Option<String>,
+    address_node: Option<String>,
+    pointee_globals: Vec<String>,
 }
 
 impl PartialOrd for ModRefPayload {
@@ -2489,7 +2524,15 @@ impl Ord for ModRefPayload {
             Ordering::Equal => {}
             order => return order,
         }
-        self.detail.cmp(&other.detail)
+        match self.detail.cmp(&other.detail) {
+            Ordering::Equal => {}
+            order => return order,
+        }
+        match self.address_node.cmp(&other.address_node) {
+            Ordering::Equal => {}
+            order => return order,
+        }
+        self.pointee_globals.cmp(&other.pointee_globals)
     }
 }
 
@@ -2546,12 +2589,16 @@ fn compute_transitive_modrefs(
             via: mr.via,
             witness: mr.witness.clone(),
             detail: mr.detail.clone(),
+            address_node: mr.address_node.clone(),
+            pointee_globals: mr.pointee_globals.clone(),
         };
         let key = ModRefFactKey {
             global: mr.global.clone(),
             access_rank: access_rank(mr.access),
             via_rank: via_rank(mr.via),
             detail: mr.detail.clone(),
+            address_node: mr.address_node.clone(),
+            pointee_globals: mr.pointee_globals.clone(),
         };
         let id = if let Some(&id) = payload_ids.get(&key) {
             let existing = &mut payloads[id];
@@ -2606,6 +2653,8 @@ fn compute_transitive_modrefs(
                     via: payload.via,
                     witness: payload.witness.clone(),
                     detail: payload.detail.clone(),
+                    address_node: payload.address_node.clone(),
+                    pointee_globals: payload.pointee_globals.clone(),
                 }
             })
             .collect::<Vec<_>>();

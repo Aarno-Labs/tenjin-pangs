@@ -641,6 +641,10 @@ struct ModRefRecord {
     witness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_node: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pointee_globals: Vec<String>,
 }
 
 impl ModRefRecord {
@@ -659,6 +663,8 @@ impl ModRefRecord {
             via: mr.via,
             witness: mr.witness.clone(),
             detail: mr.detail.clone(),
+            address_node: mr.address_node.clone(),
+            pointee_globals: mr.pointee_globals.clone(),
         }
     }
 }

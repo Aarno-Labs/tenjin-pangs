@@ -175,6 +175,17 @@ Implementation status:
   direct boundary model; it is reducing Steensgaard external overmerge for store-address
   nodes or deciding that M5.0 should stop here and defer this precision to a later
   field/object-sensitive pass.
+- The Steens-external audit slice adds optional `address_node` and `pointee_globals`
+  metadata to unknown pointer-derived mod/ref rows and reports them in
+  `metrics/m5_0_gate_census.md`. The comparable O1 audit set
+  (`/tmp/pangs-m5-steens-external-audit`) has 1,640 node-preserved `omega_store` rows:
+  1,587 `omega:steens_external`, 39 `omega:external_call_result`, and 14
+  `omega:unknown`. Of the Steens-external rows, 1,546 still carry finite pointee globals
+  while only 41 are pure external with no finite globals. The large repeated finite sets
+  in the top-node table support the current decision: M5.0 should not grow another direct
+  boundary model here; the remaining precision issue is Steensgaard overmerge and is a
+  better fit for a later field/object-sensitive pass unless a client specifically needs
+  this population reduced.
 - M5b remains not green-lit because no current lite client consumes thread-confinement
   facts.
 

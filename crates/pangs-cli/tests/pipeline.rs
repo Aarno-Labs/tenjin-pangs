@@ -1645,9 +1645,27 @@ fn analyze_steens_exports_memset_pointer_modref_rows() {
 fn analyze_andersen_refines_spurious_external_store_address_modref() {
     let fixture = m5_fixture("andersen_refines_store_external.pir.json");
     let tmp = TempDir::new().unwrap();
+    let out_steens = tmp.path().join("steens");
     let out = tmp.path().join("out");
 
+    run_analyze_stage(&fixture, &out_steens, "steens");
     run_analyze_stage(&fixture, &out, "andersen");
+
+    let steens_modref: Vec<Value> = fs::read_to_string(out_steens.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(steens_modref.iter().any(|row| {
+        row["func"] == "driver"
+            && row["global"]["unknown"] == "omega_store"
+            && row["access"] == "mod"
+            && row["via"] == "unknown"
+            && row["witness"] == "driver@m5_store.c:8:1#0"
+            && row["detail"] == "edge:store|omega:steens_external"
+            && row["address_node"] == "val:driver:%gp"
+            && row["pointee_globals"] == serde_json::json!(["@Table"])
+    }));
 
     let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
         .unwrap()
