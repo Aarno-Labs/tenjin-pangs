@@ -174,6 +174,13 @@ struct ClassData {
     global_objs: HashSet<usize>,
 }
 
+#[derive(Clone)]
+struct CachedRootNodeSummary {
+    reaches_function_pointer: bool,
+    external: bool,
+    pointee: Option<usize>,
+}
+
 struct Solver<'a> {
     pir: &'a Pir,
     pag: &'a Pag,
@@ -519,6 +526,11 @@ impl<'a> Solver<'a> {
             );
         }
 
+        let mut pointee_globals_by_root: Vec<Option<Vec<String>>> = vec![None; self.classes.len()];
+        let mut reaches_function_pointer_by_root: Vec<Option<bool>> =
+            vec![None; self.classes.len()];
+        let mut node_summary_by_root: Vec<Option<CachedRootNodeSummary>> =
+            vec![None; self.classes.len()];
         let mut nodes = BTreeMap::new();
         for node in &self.pag.nodes {
             if !matches!(
@@ -528,36 +540,56 @@ impl<'a> Solver<'a> {
                 continue;
             }
             let root = self.class_of(node.id);
-            let external = self.classes[root].ext;
-            let pointee_globals = self.classes[root]
+            let summary = if let Some(cached) = &node_summary_by_root[root] {
+                cached.clone()
+            } else {
+                let external = self.classes[root].ext;
+                let pointee = self.classes[root].pointee.map(|p| self.find(p));
+                let reaches_function_pointer = pointee
+                    .map(|pointee| {
+                        if let Some(reaches) = reaches_function_pointer_by_root[pointee] {
+                            reaches
+                        } else {
+                            let reaches = !self.classes[pointee].fn_objs.is_empty()
+                                || self.classes[pointee].ext
+                                || !self.classes[pointee].icall_sites.is_empty();
+                            reaches_function_pointer_by_root[pointee] = Some(reaches);
+                            reaches
+                        }
+                    })
+                    .unwrap_or(false);
+                let cached = CachedRootNodeSummary {
+                    reaches_function_pointer,
+                    external,
+                    pointee,
+                };
+                node_summary_by_root[root] = Some(cached.clone());
+                cached
+            };
+            let pointee_globals = summary
                 .pointee
-                .map(|p| {
-                    let pointee = self.find(p);
-                    let mut globals = self.classes[pointee]
-                        .global_objs
-                        .iter()
-                        .map(|&global_index| self.global_keys[global_index].clone())
-                        .collect::<Vec<_>>();
-                    globals.sort();
-                    globals
+                .map(|pointee| {
+                    if let Some(globals) = &pointee_globals_by_root[pointee] {
+                        globals.clone()
+                    } else {
+                        let mut globals = self.classes[pointee]
+                            .global_objs
+                            .iter()
+                            .map(|&global_index| self.global_keys[global_index].clone())
+                            .collect::<Vec<_>>();
+                        globals.sort();
+                        pointee_globals_by_root[pointee] = Some(globals.clone());
+                        globals
+                    }
                 })
                 .unwrap_or_default();
-            let reaches_function_pointer = self.classes[root]
-                .pointee
-                .map(|p| {
-                    let pointee = self.find(p);
-                    !self.classes[pointee].fn_objs.is_empty()
-                        || self.classes[pointee].ext
-                        || !self.classes[pointee].icall_sites.is_empty()
-                })
-                .unwrap_or(false);
             nodes.insert(
                 node.label.clone(),
                 NodeResolution {
-                    reaches_function_pointer,
-                    external,
+                    reaches_function_pointer: summary.reaches_function_pointer,
+                    external: summary.external,
                     pointee_globals,
-                    external_sources: if external {
+                    external_sources: if summary.external {
                         vec!["omega:steens_external".to_string()]
                     } else {
                         Vec::new()
