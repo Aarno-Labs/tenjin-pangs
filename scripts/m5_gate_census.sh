@@ -124,8 +124,8 @@ if [[ "$total_runtime" -eq 0 && "$total_incomplete" -gt 0 ]]; then
   echo "summary machinery in \`PLAN-M5.md\` would not currently target a measured population."
   echo
   echo "The dominant earlier blocker is \`incomplete_initval\`: every mutable global in this"
-  echo "census falls into that bucket. Some of those rows may be B1 poisoning cases, but that"
-  echo "requires a separate initval-completeness audit before M5a can be justified."
+  echo "census falls into that bucket. Use the Initval Diagnostics section below to distinguish"
+  echo "ordinary globals with no modeled pointer initializer from explicit B1 poison cases."
 elif [[ "$total_runtime" -gt 0 ]]; then
   echo "M5a has a measured known-runtime-writer population. Audit a sample of those rows before"
   echo "building summaries; only green-light M5a if the sample shows flow-insensitive smearing."
@@ -150,6 +150,31 @@ for dir in "$@"; do
     | select(.frozen and ((.mutable_globals | length) > 0))
     | .taint[]?.kind
   ' "$components" | histogram
+  echo
+done
+
+echo "## Initval Diagnostics"
+echo
+for dir in "$@"; do
+  stationarity="$dir/stationarity.jsonl"
+  label="$(basename "$dir")"
+  label="${label%-andersen}"
+  echo "### $label"
+  echo
+  diagnostic_count="$(
+    jq -r '
+      select(.reason == "incomplete_initval")
+      | .initval_diagnostics[]?.reason
+    ' "$stationarity" | wc -l | tr -d ' '
+  )"
+  if [[ "$diagnostic_count" -eq 0 ]]; then
+    echo "- none"
+  else
+    jq -r '
+      select(.reason == "incomplete_initval")
+      | .initval_diagnostics[]?.reason
+    ' "$stationarity" | histogram
+  fi
   echo
 done
 

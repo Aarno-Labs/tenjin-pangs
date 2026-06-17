@@ -143,6 +143,10 @@ Implementation status:
   M5a flow-sensitive summaries are not green-lit by the available evidence.
 - Every mutable global in the census is blocked first by `incomplete_initval`, so the next
   precision slice should audit/improve B1 initval completeness before building M5a.
+- After adding initval diagnostics and rerunning the O1 corpus, every mutable incomplete
+  row is classified as `no_modeled_pointer_initializer`; no current row shows an explicit
+  poisoned initializer shape such as dynamic GEP, unsupported initializer call, or unresolved
+  initializer value.
 - M5b remains not green-lit because no current lite client consumes thread-confinement
   facts.
 

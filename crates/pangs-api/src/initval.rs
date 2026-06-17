@@ -3,13 +3,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use pangs_pir::{Pir, Stmt};
 
 use crate::simple::{SimpleIcallQuery, SimpleIcallResolution};
-use crate::CallsiteId;
+use crate::{CallsiteId, InitValDiagnostic};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InitValReport {
     pub resolutions: BTreeMap<CallsiteId, SimpleIcallResolution>,
     pub complete_globals: BTreeSet<String>,
     pub stationary_globals: BTreeSet<String>,
+    pub diagnostics: BTreeMap<String, Vec<InitValDiagnostic>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -42,6 +43,7 @@ pub(crate) fn resolve_initval_icalls(
         resolutions,
         complete_globals,
         stationary_globals: stationary_globals.clone(),
+        diagnostics: resolver.diagnostics,
     }
 }
 
@@ -52,6 +54,7 @@ struct InitValResolver<'a> {
     definitions: Vec<HashMap<&'a str, usize>>,
     init_slots: BTreeMap<SubObj, SlotValue>,
     poisoned_globals: BTreeSet<String>,
+    diagnostics: BTreeMap<String, Vec<InitValDiagnostic>>,
 }
 
 impl<'a> InitValResolver<'a> {
@@ -87,6 +90,7 @@ impl<'a> InitValResolver<'a> {
             definitions,
             init_slots: BTreeMap::new(),
             poisoned_globals: BTreeSet::new(),
+            diagnostics: BTreeMap::new(),
         }
     }
 
@@ -95,11 +99,11 @@ impl<'a> InitValResolver<'a> {
             match stmt {
                 Stmt::Store { address, value, .. } => {
                     let Some(place) = self.global_init_place(stmt_index, address) else {
-                        self.poison_mentioned_globals(stmt);
+                        self.poison_mentioned_globals(stmt, "store_address_unresolved", stmt_index);
                         continue;
                     };
                     let Some(value) = self.resolve_global_init_value(stmt_index, value) else {
-                        self.poisoned_globals.insert(place.root);
+                        self.poison_global(place.root, "store_value_unresolved", stmt_index);
                         continue;
                     };
                     self.init_slots.insert(place, value);
@@ -110,16 +114,18 @@ impl<'a> InitValResolver<'a> {
                 | Stmt::Memcpy { .. }
                 | Stmt::Memset { .. }
                 | Stmt::CallDirect { .. }
-                | Stmt::CallIndirect { .. } => self.poison_mentioned_globals(stmt),
+                | Stmt::CallIndirect { .. } => {
+                    self.poison_mentioned_globals(stmt, unsupported_stmt_reason(stmt), stmt_index)
+                }
                 Stmt::Gep {
                     base,
                     byte_off: None,
                     ..
                 } => {
                     if let Some(place) = self.global_init_place(stmt_index, base) {
-                        self.poisoned_globals.insert(place.root);
+                        self.poison_global(place.root, "dynamic_initializer_gep", stmt_index);
                     } else {
-                        self.poison_mentioned_globals(stmt);
+                        self.poison_mentioned_globals(stmt, "dynamic_initializer_gep", stmt_index);
                     }
                 }
                 _ => {}
@@ -329,9 +335,22 @@ impl<'a> InitValResolver<'a> {
         None
     }
 
-    fn poison_mentioned_globals(&mut self, stmt: &Stmt) {
+    fn poison_mentioned_globals(&mut self, stmt: &Stmt, reason: &str, stmt_index: usize) {
         let globals = self.mentioned_globals(stmt);
-        self.poisoned_globals.extend(globals);
+        for global in globals {
+            self.poison_global(global, reason, stmt_index);
+        }
+    }
+
+    fn poison_global(&mut self, global: String, reason: &str, stmt_index: usize) {
+        self.poisoned_globals.insert(global.clone());
+        self.diagnostics
+            .entry(global)
+            .or_default()
+            .push(InitValDiagnostic {
+                reason: reason.to_string(),
+                witness: Some(format!("global_init#{stmt_index}")),
+            });
     }
 
     fn mentioned_globals(&self, stmt: &Stmt) -> BTreeSet<String> {
@@ -340,6 +359,19 @@ impl<'a> InitValResolver<'a> {
             .filter(|operand| self.globals.contains(*operand))
             .map(str::to_string)
             .collect()
+    }
+}
+
+fn unsupported_stmt_reason(stmt: &Stmt) -> &'static str {
+    match stmt {
+        Stmt::Unknown { .. } => "unsupported_initializer_unknown",
+        Stmt::PtrToInt { .. } => "unsupported_initializer_ptrtoint",
+        Stmt::IntToPtr { .. } => "unsupported_initializer_inttoptr",
+        Stmt::Memcpy { .. } => "unsupported_initializer_memcpy",
+        Stmt::Memset { .. } => "unsupported_initializer_memset",
+        Stmt::CallDirect { .. } => "unsupported_initializer_direct_call",
+        Stmt::CallIndirect { .. } => "unsupported_initializer_indirect_call",
+        _ => "unsupported_initializer_stmt",
     }
 }
 

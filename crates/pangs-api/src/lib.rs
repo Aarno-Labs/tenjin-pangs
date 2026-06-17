@@ -228,6 +228,7 @@ pub struct StationarityVerdict {
     pub stationary: bool,
     pub reason: StationarityReason,
     pub runtime_writers: Vec<StationarityWriter>,
+    pub initval_diagnostics: Vec<InitValDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +248,12 @@ pub struct StationarityWriter {
     pub global: GlobalTarget,
     pub access: Access,
     pub via: Via,
+    pub witness: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitValDiagnostic {
+    pub reason: String,
     pub witness: Option<String>,
 }
 
@@ -1002,6 +1009,7 @@ impl Analysis {
             stationarity_verdicts_from_modrefs(
                 module,
                 &initval_report.complete_globals,
+                &initval_report.diagnostics,
                 &global_lookup,
                 &modrefs,
             )
@@ -1478,6 +1486,7 @@ fn conservative_stationarity_verdicts(
                     stationary: false,
                     reason: StationarityReason::ConservativeStage,
                     runtime_writers: Vec::new(),
+                    initval_diagnostics: Vec::new(),
                 })
         })
         .collect();
@@ -1487,6 +1496,7 @@ fn conservative_stationarity_verdicts(
 fn stationarity_verdicts_from_modrefs(
     module: &Pir,
     complete_globals: &BTreeSet<String>,
+    initval_diagnostics: &BTreeMap<String, Vec<InitValDiagnostic>>,
     global_lookup: &HashMap<String, GlobalId>,
     modrefs: &[ModRef],
 ) -> (BTreeSet<String>, Vec<StationarityVerdict>) {
@@ -1523,6 +1533,22 @@ fn stationarity_verdicts_from_modrefs(
             continue;
         };
         let complete_initval = complete_globals.contains(&global.key);
+        let mut initval_diagnostics = if complete_initval || !global.mutable {
+            Vec::new()
+        } else {
+            initval_diagnostics
+                .get(&global.key)
+                .cloned()
+                .filter(|diagnostics| !diagnostics.is_empty())
+                .unwrap_or_else(|| {
+                    vec![InitValDiagnostic {
+                        reason: "no_modeled_pointer_initializer".to_string(),
+                        witness: None,
+                    }]
+                })
+        };
+        initval_diagnostics.sort_by_key(initval_diagnostic_sort_key);
+        initval_diagnostics.dedup_by_key(|diagnostic| initval_diagnostic_sort_key(diagnostic));
         let mut writers = Vec::new();
         let reason = if !complete_initval {
             StationarityReason::IncompleteInitval
@@ -1544,6 +1570,7 @@ fn stationarity_verdicts_from_modrefs(
             stationary: reason == StationarityReason::Stationary,
             reason,
             runtime_writers: writers,
+            initval_diagnostics,
         });
     }
     verdicts.sort_by_key(|verdict| module.globals[verdict.global.0 as usize].key.clone());
@@ -1572,6 +1599,13 @@ fn stationarity_writer_sort_key(
         format!("{:?}", writer.access),
         format!("{:?}", writer.via),
         writer.witness.clone().unwrap_or_default(),
+    )
+}
+
+fn initval_diagnostic_sort_key(diagnostic: &InitValDiagnostic) -> (String, String) {
+    (
+        diagnostic.reason.clone(),
+        diagnostic.witness.clone().unwrap_or_default(),
     )
 }
 

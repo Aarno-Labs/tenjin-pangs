@@ -62,6 +62,33 @@
           "minLength": 1
         }
       }
+    },
+    "initval_diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "witness"],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "enum": [
+            "dynamic_initializer_gep",
+            "no_modeled_pointer_initializer",
+            "store_address_unresolved",
+            "store_value_unresolved",
+            "unsupported_initializer_direct_call",
+            "unsupported_initializer_indirect_call",
+            "unsupported_initializer_inttoptr",
+            "unsupported_initializer_memcpy",
+            "unsupported_initializer_memset",
+            "unsupported_initializer_ptrtoint",
+            "unsupported_initializer_unknown"
+          ]
+        },
+        "witness": {
+          "type": ["string", "null"],
+          "minLength": 1
+        }
+      }
     }
   },
   "properties": {
@@ -90,6 +117,12 @@
       "type": "array",
       "items": {
         "$ref": "#/$defs/writer"
+      }
+    },
+    "initval_diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/initval_diagnostic"
       }
     }
   }

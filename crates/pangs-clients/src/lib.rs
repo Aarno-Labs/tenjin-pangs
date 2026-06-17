@@ -674,6 +674,8 @@ struct StationarityRecord {
     stationary: bool,
     reason: pangs_api::StationarityReason,
     runtime_writers: Vec<StationarityWriterRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    initval_diagnostics: Vec<InitValDiagnosticRecord>,
 }
 
 impl StationarityRecord {
@@ -688,6 +690,26 @@ impl StationarityRecord {
                 .iter()
                 .map(|writer| StationarityWriterRecord::from_writer(writer, analysis))
                 .collect(),
+            initval_diagnostics: verdict
+                .initval_diagnostics
+                .iter()
+                .map(InitValDiagnosticRecord::from_diagnostic)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct InitValDiagnosticRecord {
+    reason: String,
+    witness: Option<String>,
+}
+
+impl InitValDiagnosticRecord {
+    fn from_diagnostic(diagnostic: &pangs_api::InitValDiagnostic) -> Self {
+        Self {
+            reason: diagnostic.reason.clone(),
+            witness: diagnostic.witness.clone(),
         }
     }
 }

@@ -387,6 +387,7 @@ fn m2_4_initval_stationary_dispatch_table_resolves_exactly() {
     assert!(verdict.stationary);
     assert_eq!(verdict.reason, StationarityReason::Stationary);
     assert!(verdict.runtime_writers.is_empty());
+    assert!(verdict.initval_diagnostics.is_empty());
     let driver = analysis.lookup_func("driver").unwrap();
     let component = analysis.component(analysis.component_of(driver));
     assert!(
@@ -477,6 +478,11 @@ fn m2_4_unknown_initializer_poisons_initval() {
         .unwrap();
     assert!(!verdict.complete_initval);
     assert_eq!(verdict.reason, StationarityReason::IncompleteInitval);
+    assert!(verdict
+        .initval_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.reason == "store_value_unresolved"
+            && diagnostic.witness.as_deref() == Some("global_init#3")));
     assert_eq!(analysis.metrics().globals_with_complete_initval, 0);
     assert_eq!(analysis.metrics().stationary_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);
@@ -500,6 +506,16 @@ fn m2_4_dynamic_initializer_gep_poisons_initval() {
 
     let table = analysis.lookup_global("@Table").unwrap();
     assert!(!analysis.globals()[table].stationary);
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == table)
+        .unwrap();
+    assert!(verdict
+        .initval_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.reason == "dynamic_initializer_gep"
+            && diagnostic.witness.as_deref() == Some("global_init#1")));
     assert_eq!(analysis.metrics().globals_with_complete_initval, 0);
     assert_eq!(analysis.metrics().stationary_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);

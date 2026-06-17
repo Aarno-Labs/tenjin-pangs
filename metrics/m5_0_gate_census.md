@@ -32,8 +32,8 @@ stationarity verdict is blocked by a known `runtime_writer`, so the flow-sensiti
 summary machinery in `PLAN-M5.md` would not currently target a measured population.
 
 The dominant earlier blocker is `incomplete_initval`: every mutable global in this
-census falls into that bucket. Some of those rows may be B1 poisoning cases, but that
-requires a separate initval-completeness audit before M5a can be justified.
+census falls into that bucket. Use the Initval Diagnostics section below to distinguish
+ordinary globals with no modeled pointer initializer from explicit B1 poison cases.
 
 M5b is not green-lit by this census alone; it still requires a client that consumes
 thread-confinement facts.
@@ -118,6 +118,40 @@ thread-confinement facts.
 - `unknown_global`: 41
 - `fnptr_ptrtoint`: 6
 - `unknown_caller`: 4
+
+## Initval Diagnostics
+
+### exe-chibicc-O1
+
+- `no_modeled_pointer_initializer`: 133
+
+### exe-curl-O1
+
+- `no_modeled_pointer_initializer`: 80
+
+### exe-gifsicle-O1
+
+- `no_modeled_pointer_initializer`: 93
+
+### exe-jpegoptim-O1
+
+- `no_modeled_pointer_initializer`: 48
+
+### exe-jq-O1
+
+- `no_modeled_pointer_initializer`: 14
+
+### exe-lua-O1
+
+- `no_modeled_pointer_initializer`: 5
+
+### exe-tmux-O1
+
+- `no_modeled_pointer_initializer`: 107
+
+### lib-parson-O1
+
+- `no_modeled_pointer_initializer`: 5
 
 ## Top Runtime Writers
 
