@@ -248,6 +248,15 @@ Acceptance:
 - `notes/m4_vararg_decision.md` records whether the modeling reduces real blockers;
 - if coverage does not move, stop and move to the next blocker class instead of polishing.
 
+Implementation status:
+
+- Full O1 decision corpus rerun is recorded in `notes/m4_vararg_decision.md`.
+- M4.3's curl/tmux summary reductions persisted, but mutable-global rewritable coverage did
+  not change on any row.
+- M4.4's indirect filtering is covered by fixtures, but the observed gifsicle indirect sites
+  remain conservative.
+- Decision: freeze M4 for the lite track and move to the next non-vararg blocker class.
+
 ## 5. Non-Goals
 
 - Do not revive tier-E/CFL.
