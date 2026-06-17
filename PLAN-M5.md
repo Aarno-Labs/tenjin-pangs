@@ -189,6 +189,27 @@ Implementation status:
 - M5b remains not green-lit because no current lite client consumes thread-confinement
   facts.
 
+M5.0 freeze decision:
+
+- **Freeze M5.0 for the lite track.** The gate did its job: it found no measured
+  known-runtime-writer population that would justify building M5a's flow-sensitive
+  summary machinery now.
+- **Do not start M5a.** Current stationarity blockers are dominated by unknown mod rows,
+  not by audited flow-insensitive phase smearing. Building auxiliary-formal summaries,
+  strong updates, and phase-aware recertification would spend substantial implementation
+  time before we have evidence that those mechanisms target the active blocker class.
+- **Do not start M5b.** Thread escape remains a valid future analysis, but it should wait
+  for a client that consumes thread-confinement facts for `Send`/`Sync`/`Mutex` or a
+  similar ownership decision.
+- **Defer residual `omega:steens_external` precision work.** The latest audit shows the
+  remaining unknown mod rows are mostly Steensgaard overmerge with large finite pointee
+  sets, not a missing direct boundary rule. Reopen this only if a client is materially
+  blocked by the `omega:steens_external` population or if a later field/object-sensitive
+  pass is being scheduled anyway.
+- **Carry forward the audit surface.** Keep `address_node`, `pointee_globals`, Ω-source
+  detail, and the M5 census script as diagnostics for future precision work, but treat
+  them as evidence-gathering infrastructure rather than a reason to keep extending M5.0.
+
 ### M5a.1 — Auxiliary-formal transformation & summary domain (3–5 days)
 The §1.2 formal-derived-cell naming, depth-k expansion, summary data model, substitution
 at call sites, havoc fallback. Fixtures: out-parameter init (`init(&x)` patterns —
