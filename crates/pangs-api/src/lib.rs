@@ -2089,75 +2089,8 @@ fn push_audit_finding_with_detail(
     });
 }
 
-fn modref_sort_key(
-    mr: &ModRef,
-    funcs: &[FuncInfo],
-    globals: &[GlobalInfo],
-) -> (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-) {
-    (
-        funcs[mr.func.0 as usize].key.clone(),
-        match mr.global {
-            GlobalTarget::Name(id) => globals[id.0 as usize].key.clone(),
-            GlobalTarget::Unknown(ref reason) => reason.clone(),
-        },
-        format!("{:?}", mr.access),
-        format!("{:?}", mr.via),
-        mr.witness.clone().unwrap_or_default(),
-        mr.detail.clone().unwrap_or_default(),
-        mr.address_node.clone().unwrap_or_default(),
-        mr.pointee_globals.join("\0"),
-    )
-}
-
-fn modref_payload_sort_key(
-    payload: &ModRefPayload,
-    _funcs: &[FuncInfo],
-    globals: &[GlobalInfo],
-) -> (String, String, String, String, String, String, String) {
-    (
-        match payload.global {
-            GlobalTarget::Name(id) => globals[id.0 as usize].key.clone(),
-            GlobalTarget::Unknown(ref reason) => reason.clone(),
-        },
-        format!("{:?}", payload.access),
-        format!("{:?}", payload.via),
-        payload.witness.clone().unwrap_or_default(),
-        payload.detail.clone().unwrap_or_default(),
-        payload.address_node.clone().unwrap_or_default(),
-        payload.pointee_globals.join("\0"),
-    )
-}
-
-fn modref_fact_sort_key(
-    mr: &ModRef,
-    funcs: &[FuncInfo],
-    globals: &[GlobalInfo],
-) -> (String, String, String, String, String, String, String) {
-    (
-        funcs[mr.func.0 as usize].key.clone(),
-        match mr.global {
-            GlobalTarget::Name(id) => globals[id.0 as usize].key.clone(),
-            GlobalTarget::Unknown(ref reason) => reason.clone(),
-        },
-        format!("{:?}", mr.access),
-        format!("{:?}", mr.via),
-        mr.detail.clone().unwrap_or_default(),
-        mr.address_node.clone().unwrap_or_default(),
-        mr.pointee_globals.join("\0"),
-    )
-}
-
 fn dedup_modrefs_by_fact(modrefs: &mut Vec<ModRef>, funcs: &[FuncInfo], globals: &[GlobalInfo]) {
-    modrefs.sort_by_key(|mr| modref_fact_sort_key(mr, funcs, globals));
+    modrefs.sort_by(|left, right| modref_fact_cmp(left, right, funcs, globals));
     let mut deduped = Vec::<ModRef>::with_capacity(modrefs.len());
     for mut row in modrefs.drain(..) {
         if let Some(last) = deduped.last_mut() {
@@ -2168,8 +2101,75 @@ fn dedup_modrefs_by_fact(modrefs: &mut Vec<ModRef>, funcs: &[FuncInfo], globals:
         }
         deduped.push(row);
     }
-    deduped.sort_by_key(|mr| modref_sort_key(mr, funcs, globals));
+    deduped.sort_by(|left, right| modref_cmp(left, right, funcs, globals));
     *modrefs = deduped;
+}
+
+fn modref_cmp(
+    left: &ModRef,
+    right: &ModRef,
+    funcs: &[FuncInfo],
+    globals: &[GlobalInfo],
+) -> Ordering {
+    funcs[left.func.0 as usize]
+        .key
+        .cmp(&funcs[right.func.0 as usize].key)
+        .then_with(|| {
+            global_target_label(&left.global, globals)
+                .cmp(global_target_label(&right.global, globals))
+        })
+        .then_with(|| access_rank(left.access).cmp(&access_rank(right.access)))
+        .then_with(|| via_rank(left.via).cmp(&via_rank(right.via)))
+        .then_with(|| option_str(&left.witness).cmp(option_str(&right.witness)))
+        .then_with(|| option_str(&left.detail).cmp(option_str(&right.detail)))
+        .then_with(|| option_str(&left.address_node).cmp(option_str(&right.address_node)))
+        .then_with(|| left.pointee_globals.cmp(&right.pointee_globals))
+}
+
+fn modref_fact_cmp(
+    left: &ModRef,
+    right: &ModRef,
+    funcs: &[FuncInfo],
+    globals: &[GlobalInfo],
+) -> Ordering {
+    funcs[left.func.0 as usize]
+        .key
+        .cmp(&funcs[right.func.0 as usize].key)
+        .then_with(|| {
+            global_target_label(&left.global, globals)
+                .cmp(global_target_label(&right.global, globals))
+        })
+        .then_with(|| access_rank(left.access).cmp(&access_rank(right.access)))
+        .then_with(|| via_rank(left.via).cmp(&via_rank(right.via)))
+        .then_with(|| option_str(&left.detail).cmp(option_str(&right.detail)))
+        .then_with(|| option_str(&left.address_node).cmp(option_str(&right.address_node)))
+        .then_with(|| left.pointee_globals.cmp(&right.pointee_globals))
+}
+
+fn modref_payload_cmp(
+    left: &ModRefPayload,
+    right: &ModRefPayload,
+    globals: &[GlobalInfo],
+) -> Ordering {
+    global_target_label(&left.global, globals)
+        .cmp(global_target_label(&right.global, globals))
+        .then_with(|| access_rank(left.access).cmp(&access_rank(right.access)))
+        .then_with(|| via_rank(left.via).cmp(&via_rank(right.via)))
+        .then_with(|| option_str(&left.witness).cmp(option_str(&right.witness)))
+        .then_with(|| option_str(&left.detail).cmp(option_str(&right.detail)))
+        .then_with(|| option_str(&left.address_node).cmp(option_str(&right.address_node)))
+        .then_with(|| left.pointee_globals.cmp(&right.pointee_globals))
+}
+
+fn global_target_label<'a>(target: &'a GlobalTarget, globals: &'a [GlobalInfo]) -> &'a str {
+    match target {
+        GlobalTarget::Name(id) => &globals[id.0 as usize].key,
+        GlobalTarget::Unknown(reason) => reason,
+    }
+}
+
+fn option_str(value: &Option<String>) -> &str {
+    value.as_deref().unwrap_or("")
 }
 
 fn same_modref_fact(left: &ModRef, right: &ModRef) -> bool {
@@ -2608,7 +2608,7 @@ fn preferred_modref_witness(existing: Option<String>, candidate: Option<String>)
 
 fn compute_transitive_modrefs(
     func_count: usize,
-    funcs: &[FuncInfo],
+    _funcs: &[FuncInfo],
     globals: &[GlobalInfo],
     edges: &[CallEdge],
     local_modrefs: &[ModRef],
@@ -2687,11 +2687,7 @@ fn compute_transitive_modrefs(
     for root_idx in 0..func_count {
         let mut rows = memo[scc_of_func[root_idx]].as_ref().unwrap().clone();
         rows.sort_by(|&left, &right| {
-            modref_payload_sort_key(&payloads[left], funcs, globals).cmp(&modref_payload_sort_key(
-                &payloads[right],
-                funcs,
-                globals,
-            ))
+            modref_payload_cmp(&payloads[left], &payloads[right], globals)
         });
         transitive.push(rows);
     }
