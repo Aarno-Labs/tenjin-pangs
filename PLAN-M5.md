@@ -147,6 +147,10 @@ Implementation status:
   row is classified as `no_modeled_pointer_initializer`; no current row shows an explicit
   poisoned initializer shape such as dynamic GEP, unsupported initializer call, or unresolved
   initializer value.
+- Absence-only initvals are now allowed to be stationary when the solved module has no known
+  or unknown runtime writer for the global. This fixes a synthetic read-only-global false
+  blocker, but the O1 corpus does not move because every row still has `omega_store`
+  unknown mod rows; see the Runtime Mod Evidence section in `metrics/m5_0_gate_census.md`.
 - M5b remains not green-lit because no current lite client consumes thread-confinement
   facts.
 

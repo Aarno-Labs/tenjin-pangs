@@ -38,6 +38,22 @@ ordinary globals with no modeled pointer initializer from explicit B1 poison cas
 M5b is not green-lit by this census alone; it still requires a client that consumes
 thread-confinement facts.
 
+If the Runtime Mod Evidence section reports unknown mod rows, those rows independently
+block stationarity and should be addressed before M5a flow summaries.
+
+## Runtime Mod Evidence
+
+| row | unknown mod rows | mutable globals with known mod rows | absence-only initval globals | absence-only without known mod |
+|---|---:|---:|---:|---:|
+| `exe-chibicc-O1` | 36 | 81 | 133 | 52 |
+| `exe-curl-O1` | 28 | 51 | 80 | 29 |
+| `exe-gifsicle-O1` | 54 | 90 | 93 | 3 |
+| `exe-jpegoptim-O1` | 10 | 46 | 48 | 2 |
+| `exe-jq-O1` | 112 | 8 | 14 | 6 |
+| `exe-lua-O1` | 123 | 5 | 5 | 0 |
+| `exe-tmux-O1` | 237 | 79 | 107 | 28 |
+| `lib-parson-O1` | 34 | 5 | 5 | 0 |
+
 ## Frozen-Component Taints
 
 ### exe-chibicc-O1

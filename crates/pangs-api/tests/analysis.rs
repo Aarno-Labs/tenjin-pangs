@@ -560,6 +560,71 @@ fn m2_4_unknown_runtime_mod_blocks_stationarity() {
 }
 
 #[test]
+fn absence_only_initval_is_stationary_without_runtime_writers() {
+    let pir = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![Func {
+            key: "reader".to_string(),
+            sig: sig(AbiClass::Void, vec![]),
+            param_names: vec![],
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: false,
+            body: vec![Stmt::GlobalRef {
+                global: "@G".to_string(),
+                access: Access::Ref,
+                loc: None,
+            }],
+        }],
+        globals: vec![Global {
+            key: "@G".to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            exported: false,
+        }],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let global = analysis.lookup_global("@G").unwrap();
+    let reader = analysis.lookup_func("reader").unwrap();
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == global)
+        .unwrap();
+
+    assert!(!verdict.complete_initval);
+    assert!(verdict.stationary);
+    assert_eq!(verdict.reason, StationarityReason::Stationary);
+    assert!(verdict
+        .initval_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.reason == "no_modeled_pointer_initializer"));
+    assert!(analysis.globals()[global].stationary);
+    assert_eq!(analysis.metrics().stationary_globals, 1);
+    assert_eq!(analysis.metrics().mutable_globals_total, 0);
+    assert!(analysis
+        .component(analysis.component_of(reader))
+        .mutable_globals
+        .is_empty());
+}
+
+#[test]
 fn m2_7_ablation_toggles_isolate_b2_and_b1_effects() {
     let b2_pir = Pir::from_path(m2_2_fixture("simple_local_assign.pir.json")).unwrap();
     let b2_report = run_m2_ablation(
@@ -2519,9 +2584,10 @@ fn steens_alias_rows_increase_rewritable_coverage_over_conservative() {
     }));
     let steens_component = steens.component(steens.component_of(worker_steens));
     assert!(!steens_component.frozen);
-    assert_eq!(steens_component.mutable_globals, vec![g_steens]);
-    assert_eq!(steens.metrics().mutable_globals_total, 1);
-    assert_eq!(steens.metrics().in_rewritable_components, 1);
+    assert!(steens_component.mutable_globals.is_empty());
+    assert!(steens.globals()[g_steens].stationary);
+    assert_eq!(steens.metrics().mutable_globals_total, 0);
+    assert_eq!(steens.metrics().in_rewritable_components, 0);
 }
 
 #[test]
@@ -2550,6 +2616,7 @@ fn steens_alias_rows_improve_split_component_coverage_over_conservative() {
     let worker_cons = conservative.lookup_func("worker").unwrap();
     let driver_steens = steens.lookup_func("driver").unwrap();
     let worker_steens = steens.lookup_func("worker").unwrap();
+    let frozen_steens = steens.lookup_global("@Frozen").unwrap();
     let rewrite_steens = steens.lookup_global("@Rewrite").unwrap();
 
     let cons_driver_component = conservative.component(conservative.component_of(driver_cons));
@@ -2564,10 +2631,9 @@ fn steens_alias_rows_improve_split_component_coverage_over_conservative() {
     assert!(steens_driver_component.frozen);
     let steens_worker_component = steens.component(steens.component_of(worker_steens));
     assert!(!steens_worker_component.frozen);
-    assert_eq!(
-        steens_worker_component.mutable_globals,
-        vec![rewrite_steens]
-    );
+    assert!(steens_worker_component.mutable_globals.is_empty());
+    assert!(!steens.globals()[frozen_steens].stationary);
+    assert!(steens.globals()[rewrite_steens].stationary);
     assert!(steens.modrefs().iter().any(|mr| {
         mr.func == worker_steens
             && mr.global == pangs_api::GlobalTarget::Name(rewrite_steens)
@@ -2575,8 +2641,8 @@ fn steens_alias_rows_improve_split_component_coverage_over_conservative() {
             && mr.via == pangs_api::Via::Aliased
             && mr.witness.as_deref() == Some("worker@m1_6_split.c:11:1#0")
     }));
-    assert_eq!(steens.metrics().mutable_globals_total, 2);
-    assert_eq!(steens.metrics().in_rewritable_components, 1);
+    assert_eq!(steens.metrics().mutable_globals_total, 1);
+    assert_eq!(steens.metrics().in_rewritable_components, 0);
 }
 
 #[test]

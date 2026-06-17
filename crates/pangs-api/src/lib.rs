@@ -1008,6 +1008,7 @@ impl Analysis {
         } else {
             stationarity_verdicts_from_modrefs(
                 module,
+                &globals,
                 &initval_report.complete_globals,
                 &initval_report.diagnostics,
                 &global_lookup,
@@ -1495,6 +1496,7 @@ fn conservative_stationarity_verdicts(
 
 fn stationarity_verdicts_from_modrefs(
     module: &Pir,
+    globals: &[GlobalInfo],
     complete_globals: &BTreeSet<String>,
     initval_diagnostics: &BTreeMap<String, Vec<InitValDiagnostic>>,
     global_lookup: &HashMap<String, GlobalId>,
@@ -1532,8 +1534,9 @@ fn stationarity_verdicts_from_modrefs(
         let Some(&gid) = global_lookup.get(&global.key) else {
             continue;
         };
+        let global_info = &globals[gid.0 as usize];
         let complete_initval = complete_globals.contains(&global.key);
-        let mut initval_diagnostics = if complete_initval || !global.mutable {
+        let mut initval_diagnostics = if complete_initval || !global_info.mutable {
             Vec::new()
         } else {
             initval_diagnostics
@@ -1549,10 +1552,16 @@ fn stationarity_verdicts_from_modrefs(
         };
         initval_diagnostics.sort_by_key(initval_diagnostic_sort_key);
         initval_diagnostics.dedup_by_key(|diagnostic| initval_diagnostic_sort_key(diagnostic));
+        let absence_only_initval = initval_is_absence_only(&initval_diagnostics);
         let mut writers = Vec::new();
-        let reason = if !complete_initval {
+        let reason = if !complete_initval
+            && !(absence_only_initval
+                && global_info.escape == EscapeStatus::Module
+                && unknown_writers.is_empty()
+                && !runtime_writers.contains_key(&global.key))
+        {
             StationarityReason::IncompleteInitval
-        } else if global.exported {
+        } else if global_info.escape == EscapeStatus::External {
             StationarityReason::ExportedGlobal
         } else if !unknown_writers.is_empty() {
             writers.extend(unknown_writers.iter().cloned());
@@ -1607,6 +1616,13 @@ fn initval_diagnostic_sort_key(diagnostic: &InitValDiagnostic) -> (String, Strin
         diagnostic.reason.clone(),
         diagnostic.witness.clone().unwrap_or_default(),
     )
+}
+
+fn initval_is_absence_only(diagnostics: &[InitValDiagnostic]) -> bool {
+    !diagnostics.is_empty()
+        && diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.reason == "no_modeled_pointer_initializer")
 }
 
 fn apply_initval_exact_call_edges(

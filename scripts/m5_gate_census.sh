@@ -135,6 +135,46 @@ fi
 echo
 echo "M5b is not green-lit by this census alone; it still requires a client that consumes"
 echo "thread-confinement facts."
+echo
+echo "If the Runtime Mod Evidence section reports unknown mod rows, those rows independently"
+echo "block stationarity and should be addressed before M5a flow summaries."
+
+echo
+echo "## Runtime Mod Evidence"
+echo
+echo "| row | unknown mod rows | mutable globals with known mod rows | absence-only initval globals | absence-only without known mod |"
+echo "|---|---:|---:|---:|---:|"
+for dir in "$@"; do
+  globals="$dir/globals.jsonl"
+  stationarity="$dir/stationarity.jsonl"
+  modrefs="$dir/modref.jsonl"
+  label="$(basename "$dir")"
+  label="${label%-andersen}"
+  jq -n -r \
+    --arg label "$label" \
+    --slurpfile globals "$globals" \
+    --slurpfile stationarity "$stationarity" \
+    --slurpfile modrefs "$modrefs" '
+      ($globals | map(select(.mutable) | .key) | unique) as $mutable
+      | ($stationarity
+          | map(select(.reason == "incomplete_initval")
+                | select(any(.initval_diagnostics[]?; .reason == "no_modeled_pointer_initializer"))
+                | .global)
+          | unique) as $absence
+      | ($modrefs
+          | map(select(.access == "mod" and (.global.name? != null))
+                | .global.name)
+          | map(select(. as $global | ($mutable | index($global)) != null))
+          | unique) as $known_mod_globals
+      | ($modrefs
+          | map(select(.access == "mod" and (.global.unknown? != null)))
+          | length) as $unknown_mod_rows
+      | ($absence
+          | map(select(. as $global | ($known_mod_globals | index($global)) == null))
+          | length) as $absence_without_known_mod
+      | "| `\($label)` | \($unknown_mod_rows) | \($known_mod_globals | length) | \($absence | length) | \($absence_without_known_mod) |"
+    '
+done
 
 echo
 echo "## Frozen-Component Taints"
