@@ -22,6 +22,8 @@ use crate::{
 
 type AliasMap = BTreeMap<String, AliasTarget>;
 
+const MAX_CONSTANT_EXPR_LOWER_DEPTH: usize = 4096;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AliasTarget {
     Function(String),
@@ -1166,6 +1168,19 @@ unsafe fn lower_constant_expr_value(
     temp_ordinal: &mut u64,
     lowering: &mut LoweringStats,
 ) -> String {
+    let mut path = BTreeSet::new();
+    lower_constant_expr_value_inner(ctx, constant, body, temp_ordinal, lowering, &mut path, 0)
+}
+
+unsafe fn lower_constant_expr_value_inner(
+    ctx: &ModuleCtx,
+    constant: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    temp_ordinal: &mut u64,
+    lowering: &mut LoweringStats,
+    path: &mut BTreeSet<usize>,
+    depth: usize,
+) -> String {
     if !LLVMIsAFunction(constant).is_null()
         || !LLVMIsAGlobalVariable(constant).is_null()
         || !LLVMIsAGlobalAlias(constant).is_null()
@@ -1174,15 +1189,31 @@ unsafe fn lower_constant_expr_value(
         let name = value_name(constant);
         return format!("@{}", resolve_symbol_name(ctx, &name).unwrap_or(name));
     }
-    if !LLVMIsAConstantExpr(constant).is_null() {
+    if depth >= MAX_CONSTANT_EXPR_LOWER_DEPTH || !path.insert(constant as usize) {
+        let dest = global_init_temp(temp_ordinal);
+        lowering.bump_tainted("global_initializer_constant_traversal_limit");
+        push_unknown(
+            body,
+            "constant_expr:traversal_limit",
+            constant_pointer_operand_keys(ctx, constant),
+            vec![dest.clone()],
+            "global_initializer_pointer_constant",
+            None,
+            lowering,
+        );
+        return dest;
+    }
+    let result = if !LLVMIsAConstantExpr(constant).is_null() {
         match LLVMGetConstOpcode(constant) {
             LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast => {
-                let source = lower_constant_expr_value(
+                let source = lower_constant_expr_value_inner(
                     ctx,
                     LLVMGetOperand(constant, 0),
                     body,
                     temp_ordinal,
                     lowering,
+                    path,
+                    depth + 1,
                 );
                 let dest = global_init_temp(temp_ordinal);
                 body.push(Stmt::Assign {
@@ -1194,12 +1225,14 @@ unsafe fn lower_constant_expr_value(
                 dest
             }
             LLVMOpcode::LLVMGetElementPtr => {
-                let base = lower_constant_expr_value(
+                let base = lower_constant_expr_value_inner(
                     ctx,
                     LLVMGetOperand(constant, 0),
                     body,
                     temp_ordinal,
                     lowering,
+                    path,
+                    depth + 1,
                 );
                 let dest = global_init_temp(temp_ordinal);
                 body.push(Stmt::Gep {
@@ -1212,12 +1245,14 @@ unsafe fn lower_constant_expr_value(
                 dest
             }
             LLVMOpcode::LLVMPtrToInt => {
-                let source = lower_constant_expr_value(
+                let source = lower_constant_expr_value_inner(
                     ctx,
                     LLVMGetOperand(constant, 0),
                     body,
                     temp_ordinal,
                     lowering,
+                    path,
+                    depth + 1,
                 );
                 let dest = global_init_temp(temp_ordinal);
                 body.push(Stmt::PtrToInt {
@@ -1242,19 +1277,23 @@ unsafe fn lower_constant_expr_value(
                 dest
             }
             LLVMOpcode::LLVMSelect => {
-                let true_value = lower_constant_expr_value(
+                let true_value = lower_constant_expr_value_inner(
                     ctx,
                     LLVMGetOperand(constant, 1),
                     body,
                     temp_ordinal,
                     lowering,
+                    path,
+                    depth + 1,
                 );
-                let false_value = lower_constant_expr_value(
+                let false_value = lower_constant_expr_value_inner(
                     ctx,
                     LLVMGetOperand(constant, 2),
                     body,
                     temp_ordinal,
                     lowering,
+                    path,
+                    depth + 1,
                 );
                 let dest = global_init_temp(temp_ordinal);
                 body.push(Stmt::Assign {
@@ -1296,7 +1335,9 @@ unsafe fn lower_constant_expr_value(
             lowering,
         );
         dest
-    }
+    };
+    path.remove(&(constant as usize));
+    result
 }
 
 unsafe fn collect_address_taken(
@@ -1389,22 +1430,20 @@ unsafe fn collect_constant_func_refs(
     constant: LLVMValueRef,
     out: &mut BTreeSet<String>,
 ) {
-    if let Some(name) = direct_symbol_name(constant) {
-        if let Some(resolved) = resolve_function_name(ctx, &name) {
-            out.insert(resolved);
+    let mut stack = vec![constant];
+    let mut visited = BTreeSet::new();
+    while let Some(value) = stack.pop() {
+        if value.is_null() || !visited.insert(value as usize) {
+            continue;
         }
-        return;
-    }
-    if !LLVMIsAConstantStruct(constant).is_null()
-        || !LLVMIsAConstantArray(constant).is_null()
-        || !LLVMIsAConstantVector(constant).is_null()
-        || !LLVMIsAConstantDataArray(constant).is_null()
-        || !LLVMIsAConstantDataVector(constant).is_null()
-        || !LLVMIsAConstantExpr(constant).is_null()
-    {
-        let count = LLVMGetNumOperands(constant);
-        for index in 0..count {
-            collect_constant_func_refs(ctx, LLVMGetOperand(constant, index as u32), out);
+        if let Some(name) = direct_symbol_name(value) {
+            if let Some(resolved) = resolve_function_name(ctx, &name) {
+                out.insert(resolved);
+            }
+            continue;
+        }
+        if constant_has_traversable_operands(value) {
+            push_operands(value, &mut stack);
         }
     }
 }
@@ -1742,63 +1781,69 @@ unsafe fn struct_element_type(struct_ty: LLVMTypeRef, index: u32) -> Option<LLVM
 }
 
 unsafe fn constant_has_pointer_flow(constant: LLVMValueRef) -> bool {
-    if !LLVMIsAConstantPointerNull(constant).is_null()
-        || !LLVMIsAConstantAggregateZero(constant).is_null()
-        || !LLVMIsAUndefValue(constant).is_null()
-        || !LLVMIsAPoisonValue(constant).is_null()
-    {
-        return false;
-    }
-    if !LLVMIsAFunction(constant).is_null()
-        || !LLVMIsAGlobalVariable(constant).is_null()
-        || !LLVMIsAGlobalAlias(constant).is_null()
-        || !LLVMIsAGlobalIFunc(constant).is_null()
-    {
-        return true;
-    }
-    if !LLVMIsAConstantExpr(constant).is_null() {
-        return match LLVMGetConstOpcode(constant) {
-            LLVMOpcode::LLVMGetElementPtr | LLVMOpcode::LLVMIntToPtr => true,
-            _ => {
-                let count = LLVMGetNumOperands(constant);
-                (0..count)
-                    .any(|index| constant_has_pointer_flow(LLVMGetOperand(constant, index as u32)))
-                    || is_pointer_like_type(LLVMTypeOf(constant))
+    let mut stack = vec![constant];
+    let mut visited = BTreeSet::new();
+    while let Some(value) = stack.pop() {
+        if value.is_null() || !visited.insert(value as usize) {
+            continue;
+        }
+        if !LLVMIsAConstantPointerNull(value).is_null()
+            || !LLVMIsAConstantAggregateZero(value).is_null()
+            || !LLVMIsAUndefValue(value).is_null()
+            || !LLVMIsAPoisonValue(value).is_null()
+        {
+            continue;
+        }
+        if !LLVMIsAFunction(value).is_null()
+            || !LLVMIsAGlobalVariable(value).is_null()
+            || !LLVMIsAGlobalAlias(value).is_null()
+            || !LLVMIsAGlobalIFunc(value).is_null()
+        {
+            return true;
+        }
+        if !LLVMIsAConstantExpr(value).is_null() {
+            match LLVMGetConstOpcode(value) {
+                LLVMOpcode::LLVMGetElementPtr | LLVMOpcode::LLVMIntToPtr => return true,
+                _ if is_pointer_like_type(LLVMTypeOf(value)) => return true,
+                _ => push_operands(value, &mut stack),
             }
-        };
+            continue;
+        }
+        if constant_has_traversable_operands(value) {
+            push_operands(value, &mut stack);
+            continue;
+        }
+        if is_pointer_like_type(LLVMTypeOf(value)) {
+            return true;
+        }
     }
-    if !LLVMIsAConstantStruct(constant).is_null()
-        || !LLVMIsAConstantArray(constant).is_null()
-        || !LLVMIsAConstantVector(constant).is_null()
-        || !LLVMIsAConstantDataArray(constant).is_null()
-        || !LLVMIsAConstantDataVector(constant).is_null()
-    {
-        let count = LLVMGetNumOperands(constant);
-        return (0..count)
-            .any(|index| constant_has_pointer_flow(LLVMGetOperand(constant, index as u32)));
-    }
-    is_pointer_like_type(LLVMTypeOf(constant))
+    false
 }
 
 unsafe fn constant_pointer_operand_keys(ctx: &ModuleCtx, constant: LLVMValueRef) -> Vec<String> {
     let mut out = BTreeSet::new();
-    collect_constant_pointer_operand_keys(ctx, constant, &mut out);
+    let mut stack = vec![constant];
+    let mut visited = BTreeSet::new();
+    collect_constant_pointer_operand_keys(ctx, &mut stack, &mut visited, &mut out);
     out.into_iter().collect()
 }
 
 unsafe fn collect_constant_pointer_operand_keys(
     ctx: &ModuleCtx,
-    constant: LLVMValueRef,
+    stack: &mut Vec<LLVMValueRef>,
+    visited: &mut BTreeSet<usize>,
     out: &mut BTreeSet<String>,
 ) {
-    if let Some(name) = direct_symbol_name(constant) {
-        let resolved = resolve_symbol_name(ctx, &name).unwrap_or(name);
-        out.insert(format!("@{resolved}"));
-        return;
-    }
-    let count = LLVMGetNumOperands(constant);
-    for index in 0..count {
-        collect_constant_pointer_operand_keys(ctx, LLVMGetOperand(constant, index as u32), out);
+    while let Some(value) = stack.pop() {
+        if value.is_null() || !visited.insert(value as usize) {
+            continue;
+        }
+        if let Some(name) = direct_symbol_name(value) {
+            let resolved = resolve_symbol_name(ctx, &name).unwrap_or(name);
+            out.insert(format!("@{resolved}"));
+            continue;
+        }
+        push_operands(value, stack);
     }
 }
 
@@ -1828,39 +1873,71 @@ unsafe fn call_result_key(fctx: &mut FunctionCtx, inst: LLVMValueRef) -> Option<
 }
 
 unsafe fn direct_symbol_name(value: LLVMValueRef) -> Option<String> {
-    if !LLVMIsAFunction(value).is_null()
-        || !LLVMIsAGlobalAlias(value).is_null()
-        || !LLVMIsAGlobalIFunc(value).is_null()
-    {
-        return Some(value_name(value));
-    }
-    if !LLVMIsAConstantExpr(value).is_null() {
-        match LLVMGetConstOpcode(value) {
-            LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast => {
-                return direct_symbol_name(LLVMGetOperand(value, 0));
-            }
-            _ => {}
+    let mut value = value;
+    let mut visited = BTreeSet::new();
+    loop {
+        if value.is_null() || !visited.insert(value as usize) {
+            return None;
         }
+        if !LLVMIsAFunction(value).is_null()
+            || !LLVMIsAGlobalAlias(value).is_null()
+            || !LLVMIsAGlobalIFunc(value).is_null()
+        {
+            return Some(value_name(value));
+        }
+        if !LLVMIsAConstantExpr(value).is_null() {
+            match LLVMGetConstOpcode(value) {
+                LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast => {
+                    value = LLVMGetOperand(value, 0);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return None;
     }
-    None
 }
 
 unsafe fn operand_global_name(ctx: &ModuleCtx, value: LLVMValueRef) -> Option<String> {
-    if !LLVMIsAGlobalVariable(value).is_null() || !LLVMIsAGlobalAlias(value).is_null() {
-        let name = value_name(value);
-        return resolve_global_name(ctx, &name);
-    }
-    if !LLVMIsAConstantExpr(value).is_null() {
-        match LLVMGetConstOpcode(value) {
-            LLVMOpcode::LLVMBitCast
-            | LLVMOpcode::LLVMAddrSpaceCast
-            | LLVMOpcode::LLVMGetElementPtr => {
-                return operand_global_name(ctx, LLVMGetOperand(value, 0));
-            }
-            _ => {}
+    let mut value = value;
+    let mut visited = BTreeSet::new();
+    loop {
+        if value.is_null() || !visited.insert(value as usize) {
+            return None;
         }
+        if !LLVMIsAGlobalVariable(value).is_null() || !LLVMIsAGlobalAlias(value).is_null() {
+            let name = value_name(value);
+            return resolve_global_name(ctx, &name);
+        }
+        if !LLVMIsAConstantExpr(value).is_null() {
+            match LLVMGetConstOpcode(value) {
+                LLVMOpcode::LLVMBitCast
+                | LLVMOpcode::LLVMAddrSpaceCast
+                | LLVMOpcode::LLVMGetElementPtr => {
+                    value = LLVMGetOperand(value, 0);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return None;
     }
-    None
+}
+
+unsafe fn constant_has_traversable_operands(value: LLVMValueRef) -> bool {
+    !LLVMIsAConstantStruct(value).is_null()
+        || !LLVMIsAConstantArray(value).is_null()
+        || !LLVMIsAConstantVector(value).is_null()
+        || !LLVMIsAConstantDataArray(value).is_null()
+        || !LLVMIsAConstantDataVector(value).is_null()
+        || !LLVMIsAConstantExpr(value).is_null()
+}
+
+unsafe fn push_operands(value: LLVMValueRef, stack: &mut Vec<LLVMValueRef>) {
+    let count = LLVMGetNumOperands(value);
+    for index in (0..count).rev() {
+        stack.push(LLVMGetOperand(value, index as u32));
+    }
 }
 
 unsafe fn is_pointer_like_type(ty: LLVMTypeRef) -> bool {
@@ -2085,24 +2162,32 @@ unsafe fn is_non_interposable_alias(alias: LLVMValueRef) -> bool {
 }
 
 unsafe fn constant_symbol_name(constant: LLVMValueRef) -> Option<String> {
-    if !LLVMIsAFunction(constant).is_null()
-        || !LLVMIsAGlobalVariable(constant).is_null()
-        || !LLVMIsAGlobalAlias(constant).is_null()
-        || !LLVMIsAGlobalIFunc(constant).is_null()
-    {
-        return Some(value_name(constant));
-    }
-    if !LLVMIsAConstantExpr(constant).is_null() {
-        match LLVMGetConstOpcode(constant) {
-            LLVMOpcode::LLVMBitCast
-            | LLVMOpcode::LLVMAddrSpaceCast
-            | LLVMOpcode::LLVMGetElementPtr => {
-                return constant_symbol_name(LLVMGetOperand(constant, 0));
-            }
-            _ => {}
+    let mut value = constant;
+    let mut visited = BTreeSet::new();
+    loop {
+        if value.is_null() || !visited.insert(value as usize) {
+            return None;
         }
+        if !LLVMIsAFunction(value).is_null()
+            || !LLVMIsAGlobalVariable(value).is_null()
+            || !LLVMIsAGlobalAlias(value).is_null()
+            || !LLVMIsAGlobalIFunc(value).is_null()
+        {
+            return Some(value_name(value));
+        }
+        if !LLVMIsAConstantExpr(value).is_null() {
+            match LLVMGetConstOpcode(value) {
+                LLVMOpcode::LLVMBitCast
+                | LLVMOpcode::LLVMAddrSpaceCast
+                | LLVMOpcode::LLVMGetElementPtr => {
+                    value = LLVMGetOperand(value, 0);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return None;
     }
-    None
 }
 
 fn resolve_function_name(ctx: &ModuleCtx, name: &str) -> Option<String> {
