@@ -1644,7 +1644,7 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                 body: vec![],
             },
             Func {
-                key: "internal_sink".to_string(),
+                key: "safe_internal_sink".to_string(),
                 sig: vararg_sig.clone(),
                 param_names: vec![],
                 file: None,
@@ -1653,6 +1653,23 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                 exported: false,
                 address_taken: false,
                 body: vec![],
+            },
+            Func {
+                key: "unsafe_internal_sink".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::Unknown {
+                    op: "va_arg".to_string(),
+                    operands: vec!["%ap".to_string()],
+                    results: vec!["%next".to_string()],
+                    reason: "va_arg".to_string(),
+                    loc: None,
+                }],
             },
             Func {
                 key: "cb".to_string(),
@@ -1683,7 +1700,14 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                         loc: None,
                     },
                     Stmt::CallDirect {
-                        callee: "internal_sink".to_string(),
+                        callee: "safe_internal_sink".to_string(),
+                        sig: vararg_sig.clone(),
+                        args: vec!["%tag".to_string(), "cb".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                    Stmt::CallDirect {
+                        callee: "unsafe_internal_sink".to_string(),
                         sig: vararg_sig.clone(),
                         args: vec!["%tag".to_string(), "cb".to_string()],
                         dest: None,
@@ -1723,6 +1747,14 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
     ] {
         assert!(component.taint.iter().any(|taint| taint.kind == kind));
     }
+    assert_eq!(
+        component
+            .taint
+            .iter()
+            .filter(|taint| taint.kind == "fnptr_varargs_internal_unmodeled")
+            .count(),
+        1
+    );
 }
 
 #[test]

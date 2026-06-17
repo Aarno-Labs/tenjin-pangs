@@ -1042,7 +1042,7 @@ impl<'a> Builder<'a> {
                         Some(callee.clone()),
                     );
                 }
-                if sig.vararg {
+                if sig.vararg && self.direct_vararg_call_requires_boundary(callee) {
                     self.add_seed(
                         OmegaSeedKind::VarargCallBoundary,
                         SeedTarget::Callsite(callsite),
@@ -1100,6 +1100,17 @@ impl<'a> Builder<'a> {
         self.nodes.push(Node { id, label, kind });
         self.node_ids.insert(key, id);
         id
+    }
+
+    fn direct_vararg_call_requires_boundary(&self, callee: &str) -> bool {
+        let Some(func) = self
+            .functions
+            .get(callee)
+            .and_then(|index| self.pir.functions.get(*index))
+        else {
+            return true;
+        };
+        func.external || func.body.iter().any(stmt_consumes_varargs)
     }
 
     fn add_edge(
@@ -1293,6 +1304,15 @@ fn loc_key(loc: Option<&Loc>) -> String {
     match loc {
         Some(loc) => format!("{}:{}:{}", loc.file, loc.line, loc.col),
         None => "!noloc".to_string(),
+    }
+}
+
+fn stmt_consumes_varargs(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Unknown { op, reason, .. } => {
+            reason == "va_arg" || reason == "varargs_intrinsic" || op.starts_with("llvm.va_")
+        }
+        _ => false,
     }
 }
 

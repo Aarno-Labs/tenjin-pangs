@@ -542,17 +542,18 @@ impl Analysis {
                             &callsite_key,
                         );
                         if let Stmt::CallDirect { sig, .. } = stmt {
-                            let kind = direct_vararg_audit_kind(module, callee);
-                            record_vararg_deferred_audit(
-                                &mut deferred_audits,
-                                caller,
-                                &func.key,
-                                kind,
-                                stmt,
-                                sig,
-                                loc,
-                                &callsite_key,
-                            );
+                            if let Some(kind) = direct_vararg_audit_kind(module, callee) {
+                                record_vararg_deferred_audit(
+                                    &mut deferred_audits,
+                                    caller,
+                                    &func.key,
+                                    kind,
+                                    stmt,
+                                    sig,
+                                    loc,
+                                    &callsite_key,
+                                );
+                            }
                         }
                         if let Some(&callee_id) = func_lookup.get(callee) {
                             call_edges.push(CallEdge {
@@ -1707,7 +1708,7 @@ fn detect_indirect_call_audits(
             audit_taints,
             module,
             caller,
-            "fnptr_varargs_indirect",
+            Some("fnptr_varargs_indirect"),
             sig,
             args,
             loc,
@@ -1721,7 +1722,7 @@ fn detect_vararg_fnptr_audit(
     audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
     module: &Pir,
     caller: FuncId,
-    kind: &str,
+    kind: Option<&str>,
     sig: &pangs_pir::Signature,
     args: &[String],
     loc: &Option<pangs_pir::Loc>,
@@ -1730,6 +1731,9 @@ fn detect_vararg_fnptr_audit(
     if !sig.vararg {
         return;
     }
+    let Some(kind) = kind else {
+        return;
+    };
     let fixed = sig.params.len();
     let mut affected = args
         .iter()
@@ -1811,10 +1815,20 @@ fn record_vararg_deferred_audit(
     });
 }
 
-fn direct_vararg_audit_kind(module: &Pir, callee: &str) -> &'static str {
+fn direct_vararg_audit_kind(module: &Pir, callee: &str) -> Option<&'static str> {
     match module.functions.iter().find(|func| func.key == callee) {
-        Some(func) if !func.external => "fnptr_varargs_internal_unmodeled",
-        _ => "fnptr_varargs_external",
+        Some(func) if !func.external && !func.body.iter().any(stmt_consumes_varargs) => None,
+        Some(func) if !func.external => Some("fnptr_varargs_internal_unmodeled"),
+        _ => Some("fnptr_varargs_external"),
+    }
+}
+
+fn stmt_consumes_varargs(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Unknown { op, reason, .. } => {
+            reason == "va_arg" || reason == "varargs_intrinsic" || op.starts_with("llvm.va_")
+        }
+        _ => false,
     }
 }
 

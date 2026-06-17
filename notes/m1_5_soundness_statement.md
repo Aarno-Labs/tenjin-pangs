@@ -95,10 +95,13 @@ Their current trigger conditions are:
   - `steens` / `andersen`: local values passed through those varargs whose solved PAG
     class reaches function-pointer space
 - `fnptr_varargs_internal_unmodeled`
-  - all stages: direct calls to visible internal vararg callees where a direct function
-    symbol is passed through varargs
+  - all stages: direct calls to visible internal vararg callees with modeled vararg
+    consumption (`va_arg` / `llvm.va_*`) where a direct function symbol is passed
+    through varargs
   - `steens` / `andersen`: local values passed through those varargs whose solved PAG
     class reaches function-pointer space
+  - visible internal vararg callees with no modeled vararg consumption do not emit this
+    audit kind
 - `fnptr_varargs_indirect`
   - all stages: indirect vararg callsites where a direct function symbol is passed
     through varargs

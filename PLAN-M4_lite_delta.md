@@ -102,7 +102,7 @@ Implementation status:
 - `scripts/m4_vararg_evidence.sh` summarizes vararg audit kind histograms, affected-value
   prefixes, largest frozen components with vararg taint, and top vararg taint witnesses from
   one or more export directories.
-- Corpus rerun and committed evidence note are still pending.
+- Corpus rerun is recorded in `notes/m4_vararg_evidence.md`.
 
 ### M4.1 — Split Audit Kinds Without Changing Semantics
 
@@ -150,6 +150,16 @@ Acceptance fixtures:
 - internal vararg wrapper that passes the extra value to an external call remains tainted;
 - internal vararg wrapper with unmodeled vararg consumption remains tainted;
 - external `printf`-style call remains tainted when a function pointer reaches an extra arg.
+
+Implementation status:
+
+- Direct internal vararg calls only keep the opaque vararg boundary when the visible callee
+  body contains modeled vararg consumption (`va_arg` / `llvm.va_*` lowering).
+- API audit emission follows the same predicate, so modeled-safe internal vararg calls do
+  not receive `fnptr_varargs_internal_unmodeled` taint.
+- Synthetic tests cover safe no-read internal callees and unsafe `va_arg` callees.
+- Corpus rerun showed no coverage change: the observed internal vararg findings still have
+  visible vararg consumption and remain conservatively tainted.
 
 ### M4.3 — Known Benign Boundary Summaries
 

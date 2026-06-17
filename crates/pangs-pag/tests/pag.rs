@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use pangs_pag::{BuildMode, OmegaSeedKind, Pag, PagOpts, ValidationIssue};
-use pangs_pir::Pir;
+use pangs_pag::{BuildMode, OmegaSeedKind, Pag, PagOpts, SeedTarget, ValidationIssue};
+use pangs_pir::{AbiClass, Func, Param, Pir, Signature, Stmt};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -19,6 +19,15 @@ fn m1_4_fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/synthetic/m1_4")
         .join(name)
+}
+
+fn sig(ret: AbiClass, params: Vec<Param>) -> Signature {
+    Signature {
+        ret,
+        params,
+        vararg: false,
+        cc: "ccc".to_string(),
+    }
 }
 
 #[test]
@@ -162,6 +171,111 @@ fn builds_core_nodes_edges_callsites_and_seeds() {
         .omega_seeds
         .iter()
         .any(|seed| seed.kind == OmegaSeedKind::UnknownResultExternal));
+}
+
+#[test]
+fn direct_internal_vararg_boundary_requires_visible_vararg_consumption() {
+    let vararg_sig = Signature {
+        ret: AbiClass::Void,
+        params: vec![Param::Integer],
+        vararg: true,
+        cc: "ccc".to_string(),
+    };
+    let pir = Pir {
+        module: "m4_vararg_boundary".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            Func {
+                key: "safe_sink".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![],
+            },
+            Func {
+                key: "unsafe_sink".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::Unknown {
+                    op: "va_arg".to_string(),
+                    operands: vec!["%ap".to_string()],
+                    results: vec!["%next".to_string()],
+                    reason: "va_arg".to_string(),
+                    loc: None,
+                }],
+            },
+            Func {
+                key: "cb".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: true,
+                body: vec![],
+            },
+            Func {
+                key: "driver".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![
+                    Stmt::CallDirect {
+                        callee: "safe_sink".to_string(),
+                        sig: vararg_sig.clone(),
+                        args: vec!["%tag".to_string(), "cb".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                    Stmt::CallDirect {
+                        callee: "unsafe_sink".to_string(),
+                        sig: vararg_sig,
+                        args: vec!["%tag".to_string(), "cb".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                ],
+            },
+        ],
+        globals: vec![],
+        global_init: vec![],
+    };
+    let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+    let safe = pag
+        .callsites
+        .iter()
+        .find(|callsite| callsite.callee.as_deref() == Some("safe_sink"))
+        .unwrap();
+    let unsafe_site = pag
+        .callsites
+        .iter()
+        .find(|callsite| callsite.callee.as_deref() == Some("unsafe_sink"))
+        .unwrap();
+
+    assert!(!pag.omega_seeds.iter().any(|seed| {
+        seed.kind == OmegaSeedKind::VarargCallBoundary
+            && seed.target == SeedTarget::Callsite(safe.id)
+    }));
+    assert!(pag.omega_seeds.iter().any(|seed| {
+        seed.kind == OmegaSeedKind::VarargCallBoundary
+            && seed.target == SeedTarget::Callsite(unsafe_site.id)
+    }));
 }
 
 #[test]
