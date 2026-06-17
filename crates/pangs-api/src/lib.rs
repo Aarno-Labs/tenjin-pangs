@@ -2704,6 +2704,13 @@ fn pointer_modref_profile_interval_attempts() -> u64 {
         .unwrap_or(10_000_000)
 }
 
+fn pointer_modref_profile_top_emitters() -> usize {
+    std::env::var("PANGS_POINTER_MODREF_PROFILE_TOP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ModRefFanoutKey {
     func: FuncId,
@@ -2774,6 +2781,119 @@ struct LocalPointerAccessRow {
     count: u64,
 }
 
+#[derive(Debug, Clone)]
+struct PointerAccessEmitterEntry {
+    expanded_rows: u64,
+    occurrences: u64,
+    fanout: usize,
+    func: FuncId,
+    node_label: String,
+    access_rank: u8,
+    suppress_direct_symbol: bool,
+}
+
+#[derive(Debug)]
+struct PointerAccessEmitterProfile {
+    enabled: bool,
+    limit: usize,
+    started: Instant,
+    observed_rows: u64,
+    interval_rows: u64,
+    next_rows: u64,
+    entries: Vec<PointerAccessEmitterEntry>,
+}
+
+impl PointerAccessEmitterProfile {
+    fn from_env() -> Self {
+        let limit = pointer_modref_profile_top_emitters();
+        let interval_rows = pointer_modref_profile_interval_attempts();
+        Self {
+            enabled: pointer_modref_profile_enabled() && limit > 0,
+            limit,
+            started: Instant::now(),
+            observed_rows: 0,
+            interval_rows,
+            next_rows: interval_rows,
+            entries: Vec::new(),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        key: LocalPointerAccessKey,
+        summary: &ModRefNodeSummary<'_>,
+        fanout: usize,
+        occurrences: u64,
+    ) {
+        if !self.enabled || fanout == 0 || occurrences == 0 {
+            return;
+        }
+        let expanded_rows = occurrences.saturating_mul(fanout as u64);
+        self.observed_rows = self.observed_rows.saturating_add(expanded_rows);
+        if self.should_keep(expanded_rows) {
+            self.entries.push(PointerAccessEmitterEntry {
+                expanded_rows,
+                occurrences,
+                fanout,
+                func: FuncId(key.func),
+                node_label: summary.label.to_string(),
+                access_rank: key.access_rank,
+                suppress_direct_symbol: key.suppress_direct_symbol,
+            });
+            self.entries.sort_by(|left, right| {
+                right
+                    .expanded_rows
+                    .cmp(&left.expanded_rows)
+                    .then_with(|| right.occurrences.cmp(&left.occurrences))
+                    .then_with(|| right.fanout.cmp(&left.fanout))
+                    .then_with(|| left.func.cmp(&right.func))
+                    .then_with(|| left.node_label.cmp(&right.node_label))
+            });
+            self.entries.truncate(self.limit);
+        }
+        if self.observed_rows >= self.next_rows {
+            self.print("top-emitters-progress");
+            while self.next_rows <= self.observed_rows {
+                self.next_rows += self.interval_rows;
+            }
+        }
+    }
+
+    fn should_keep(&self, expanded_rows: u64) -> bool {
+        self.entries.len() < self.limit
+            || self
+                .entries
+                .last()
+                .is_some_and(|entry| expanded_rows > entry.expanded_rows)
+    }
+
+    fn print(&self, label: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "pangs pointer modref profile {label}: elapsed_ms={} observed_expanded_rows={} entries={}",
+            self.started.elapsed().as_millis(),
+            self.observed_rows,
+            self.entries.len(),
+        );
+        for (idx, entry) in self.entries.iter().enumerate() {
+            eprintln!(
+                "pangs pointer modref profile {label} #{}: expanded_rows={} occurrences={} \
+                 fanout={} func={} access_rank={} suppress_direct_symbol={} node={}",
+                idx + 1,
+                entry.expanded_rows,
+                entry.occurrences,
+                entry.fanout,
+                entry.func.0,
+                entry.access_rank,
+                entry.suppress_direct_symbol,
+                entry.node_label,
+            );
+        }
+    }
+}
+
 fn push_local_pointer_modref_row(
     local_rows: &mut HashMap<CompactModRefFactKey, LocalPointerModRefRow>,
     func: FuncId,
@@ -2807,6 +2927,7 @@ fn flush_local_pointer_access_rows(
     local_rows: &mut HashMap<CompactModRefFactKey, LocalPointerModRefRow>,
     local_accesses: &mut HashMap<LocalPointerAccessKey, LocalPointerAccessRow>,
     node_summaries: &[Option<ModRefNodeSummary<'_>>],
+    access_profile: &mut PointerAccessEmitterProfile,
 ) {
     for (key, row) in local_accesses.drain() {
         let Some(Some(summary)) = node_summaries.get(key.address_node as usize) else {
@@ -2817,6 +2938,14 @@ fn flush_local_pointer_access_rows(
             0 => Access::Ref,
             _ => Access::Mod,
         };
+        let fanout = summary
+            .pointee_global_ids
+            .iter()
+            .filter(|&&gid| {
+                !(key.suppress_direct_symbol && summary.direct_symbol_global == Some(gid))
+            })
+            .count();
+        access_profile.observe(key, summary, fanout, row.count);
         for &gid in &summary.pointee_global_ids {
             if key.suppress_direct_symbol && summary.direct_symbol_global == Some(gid) {
                 continue;
@@ -2903,13 +3032,19 @@ fn push_pointer_modrefs_from_pag(
     let mut missing_nodes = vec![false; pag.nodes.len()];
     let mut local_accesses = HashMap::<LocalPointerAccessKey, LocalPointerAccessRow>::new();
     let mut local_rows = HashMap::<CompactModRefFactKey, LocalPointerModRefRow>::new();
+    let mut access_profile = PointerAccessEmitterProfile::from_env();
     let mut active_func = None;
     for edge in &pag.edges {
         let Some((owner, func, accesses)) = edge_accesses(edge, func_lookup) else {
             continue;
         };
         if active_func != Some(func) {
-            flush_local_pointer_access_rows(&mut local_rows, &mut local_accesses, &node_summaries);
+            flush_local_pointer_access_rows(
+                &mut local_rows,
+                &mut local_accesses,
+                &node_summaries,
+                &mut access_profile,
+            );
             flush_local_pointer_modref_rows(modrefs, &mut local_rows);
             active_func = Some(func);
         }
@@ -2944,6 +3079,7 @@ fn push_pointer_modrefs_from_pag(
                     &mut local_rows,
                     &mut local_accesses,
                     &node_summaries,
+                    &mut access_profile,
                 );
                 flush_local_pointer_modref_rows(modrefs, &mut local_rows);
             }
@@ -3003,7 +3139,13 @@ fn push_pointer_modrefs_from_pag(
             }
         }
     }
-    flush_local_pointer_access_rows(&mut local_rows, &mut local_accesses, &node_summaries);
+    flush_local_pointer_access_rows(
+        &mut local_rows,
+        &mut local_accesses,
+        &node_summaries,
+        &mut access_profile,
+    );
+    access_profile.print("top-emitters-done");
     flush_local_pointer_modref_rows(modrefs, &mut local_rows);
 }
 
