@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 use std::time::Instant;
 
 use pangs_pag::{BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts};
@@ -2800,13 +2801,26 @@ struct PointerAccess {
 }
 
 #[derive(Debug, Clone)]
-struct ModRefNodeSummary<'a> {
-    label: &'a str,
+struct ModRefNodeSummaryData {
     external: bool,
     pointee_global_ids: Vec<GlobalId>,
-    diagnostic_pointee_globals: &'a [String],
+    pointee_global_count: usize,
     external_source_suffix: Option<String>,
     direct_symbol_global: Option<GlobalId>,
+}
+
+#[derive(Debug, Clone)]
+struct ModRefNodeSummary<'a> {
+    label: &'a str,
+    data: Rc<ModRefNodeSummaryData>,
+}
+
+impl std::ops::Deref for ModRefNodeSummary<'_> {
+    type Target = ModRefNodeSummaryData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
 }
 
 struct LocalPointerModRefRow {
@@ -3176,11 +3190,11 @@ fn flush_local_pointer_modref_rows(
     }
 }
 
-fn build_modref_node_summary<'a>(
-    label: &'a str,
-    resolution: &'a NodeResolution,
+fn build_modref_node_summary_data(
+    label: &str,
+    resolution: &NodeResolution,
     global_lookup: &HashMap<String, GlobalId>,
-) -> ModRefNodeSummary<'a> {
+) -> ModRefNodeSummaryData {
     let pointee_global_ids = resolution
         .pointee_globals
         .iter()
@@ -3189,11 +3203,10 @@ fn build_modref_node_summary<'a>(
     let direct_symbol_global = label
         .strip_prefix("sym:global:")
         .and_then(|global_key| global_lookup.get(global_key).copied());
-    ModRefNodeSummary {
-        label,
+    ModRefNodeSummaryData {
         external: resolution.external,
         pointee_global_ids,
-        diagnostic_pointee_globals: resolution.pointee_globals.as_ref(),
+        pointee_global_count: resolution.pointee_globals.len(),
         external_source_suffix: resolution
             .external
             .then(|| modref_external_source_suffix(&resolution.external_sources))
@@ -3212,6 +3225,7 @@ fn push_pointer_modrefs_from_pag(
 ) {
     let mut node_summaries = Vec::new();
     node_summaries.resize_with(pag.nodes.len(), || None);
+    let mut summary_data_by_label = HashMap::new();
     let mut missing_nodes = vec![false; pag.nodes.len()];
     let mut local_accesses = LocalPointerAccessRows::new(pag.nodes.len());
     let mut local_rows = LocalPointerModRefRows::new(global_lookup.len());
@@ -3245,15 +3259,25 @@ fn push_pointer_modrefs_from_pag(
                 let Some(node) = pag.nodes.get(node_idx) else {
                     continue;
                 };
-                let Some(resolution) = nodes.get(&node.label) else {
-                    missing_nodes[node_idx] = true;
-                    continue;
+                let data = if let Some(data) = summary_data_by_label.get(node.label.as_str()) {
+                    Rc::clone(data)
+                } else {
+                    let Some(resolution) = nodes.get(&node.label) else {
+                        missing_nodes[node_idx] = true;
+                        continue;
+                    };
+                    let data = Rc::new(build_modref_node_summary_data(
+                        &node.label,
+                        resolution,
+                        global_lookup,
+                    ));
+                    summary_data_by_label.insert(node.label.as_str(), Rc::clone(&data));
+                    data
                 };
-                node_summaries[node_idx] = Some(build_modref_node_summary(
-                    &node.label,
-                    resolution,
-                    global_lookup,
-                ));
+                node_summaries[node_idx] = Some(ModRefNodeSummary {
+                    label: &node.label,
+                    data,
+                });
             }
             let summary = node_summaries[node_idx].as_ref().unwrap();
             let phase = if pointer_access.detail.starts_with("edge:memcpy") {
@@ -3329,12 +3353,13 @@ fn push_pointer_modrefs_from_pag(
                         access: pointer_access.access,
                         via: Via::Unknown,
                         witness: witness.clone(),
-                        detail: Some(modref_detail_with_external_suffix(
+                        detail: Some(modref_detail_with_external_suffix_and_pointee_count(
                             pointer_access.detail,
                             summary.external_source_suffix.as_deref(),
+                            summary.pointee_global_count,
                         )),
                         address_node: Some(summary.label.to_string()),
-                        pointee_globals: summary.diagnostic_pointee_globals.to_vec(),
+                        pointee_globals: Vec::new(),
                     },
                     Some(phase),
                 );
@@ -3435,6 +3460,17 @@ fn modref_external_source_suffix(sources: &[String]) -> Option<String> {
 fn modref_detail_with_external_suffix(base: &str, suffix: Option<&str>) -> String {
     match suffix {
         Some(suffix) => format!("{base}|{suffix}"),
+        None => base.to_string(),
+    }
+}
+
+fn modref_detail_with_external_suffix_and_pointee_count(
+    base: &str,
+    suffix: Option<&str>,
+    pointee_count: usize,
+) -> String {
+    match suffix {
+        Some(suffix) => format!("{base}|{suffix}|pointee_count={pointee_count}"),
         None => base.to_string(),
     }
 }
