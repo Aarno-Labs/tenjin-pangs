@@ -279,6 +279,40 @@ pub struct Metrics {
     pub oversize_fallbacks: usize,
     pub oversize_fallback_max_size: usize,
     pub rounds: usize,
+    #[serde(default)]
+    pub steens_worklist_pops: u64,
+    #[serde(default)]
+    pub steens_process_class_calls: u64,
+    #[serde(default)]
+    pub steens_candidate_pairs: u64,
+    #[serde(default)]
+    pub steens_seen_pairs_new: u64,
+    #[serde(default)]
+    pub steens_seen_pairs_duplicate: u64,
+    #[serde(default)]
+    pub steens_fsa_compatible_pairs: u64,
+    #[serde(default)]
+    pub steens_fsa_rejected_pairs: u64,
+    #[serde(default)]
+    pub steens_indirect_bindings: u64,
+    #[serde(default)]
+    pub steens_external_call_requests: u64,
+    #[serde(default)]
+    pub steens_external_call_applications: u64,
+    #[serde(default)]
+    pub steens_escaped_function_applications: u64,
+    #[serde(default)]
+    pub steens_join_attempts: u64,
+    #[serde(default)]
+    pub steens_join_successes: u64,
+    #[serde(default)]
+    pub steens_pointee_classes_created: u64,
+    #[serde(default)]
+    pub steens_max_class_icall_sites: usize,
+    #[serde(default)]
+    pub steens_max_class_fn_objs: usize,
+    #[serde(default)]
+    pub steens_max_class_candidate_pairs: u64,
     /// Flat per-provenance icall attribution (M2.0, `DESIGN_lite.md` §2F). Counts indirect
     /// callsites whose resolved edges carry each tier; the ablation signal M2.7 reads.
     /// `icalls_unknown` counts sites with an Ω/unknown-callee edge. No certificate cascade.
@@ -1176,6 +1210,23 @@ impl Analysis {
             oversize_fallbacks: 0,
             oversize_fallback_max_size: 0,
             rounds: 0,
+            steens_worklist_pops: 0,
+            steens_process_class_calls: 0,
+            steens_candidate_pairs: 0,
+            steens_seen_pairs_new: 0,
+            steens_seen_pairs_duplicate: 0,
+            steens_fsa_compatible_pairs: 0,
+            steens_fsa_rejected_pairs: 0,
+            steens_indirect_bindings: 0,
+            steens_external_call_requests: 0,
+            steens_external_call_applications: 0,
+            steens_escaped_function_applications: 0,
+            steens_join_attempts: 0,
+            steens_join_successes: 0,
+            steens_pointee_classes_created: 0,
+            steens_max_class_icall_sites: 0,
+            steens_max_class_fn_objs: 0,
+            steens_max_class_candidate_pairs: 0,
             analysis_wall_us: 0,
             setup_scan_us,
             preanalysis_us,
@@ -1204,6 +1255,23 @@ impl Analysis {
                 oversize_fallbacks: solved.oversize_fallbacks,
                 oversize_fallback_max_size: solved.oversize_fallback_max_size,
                 rounds: solved.rounds,
+                steens_worklist_pops: solved.steens_worklist_pops,
+                steens_process_class_calls: solved.steens_process_class_calls,
+                steens_candidate_pairs: solved.steens_candidate_pairs,
+                steens_seen_pairs_new: solved.steens_seen_pairs_new,
+                steens_seen_pairs_duplicate: solved.steens_seen_pairs_duplicate,
+                steens_fsa_compatible_pairs: solved.steens_fsa_compatible_pairs,
+                steens_fsa_rejected_pairs: solved.steens_fsa_rejected_pairs,
+                steens_indirect_bindings: solved.steens_indirect_bindings,
+                steens_external_call_requests: solved.steens_external_call_requests,
+                steens_external_call_applications: solved.steens_external_call_applications,
+                steens_escaped_function_applications: solved.steens_escaped_function_applications,
+                steens_join_attempts: solved.steens_join_attempts,
+                steens_join_successes: solved.steens_join_successes,
+                steens_pointee_classes_created: solved.steens_pointee_classes_created,
+                steens_max_class_icall_sites: solved.steens_max_class_icall_sites,
+                steens_max_class_fn_objs: solved.steens_max_class_fn_objs,
+                steens_max_class_candidate_pairs: solved.steens_max_class_candidate_pairs,
                 ..metrics
             }
         } else {

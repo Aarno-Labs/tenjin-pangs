@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time::Instant;
 
 use pangs_pag::{BuildMode, CallKind, NodeId, NodeKind, OmegaSeedKind, Pag, SeedTarget};
 use pangs_pir::{fsa_compatible, Pir, Signature};
@@ -62,6 +63,40 @@ pub struct SolveMetrics {
     pub oversize_fallbacks: usize,
     pub oversize_fallback_max_size: usize,
     pub rounds: usize,
+    #[serde(default)]
+    pub steens_worklist_pops: u64,
+    #[serde(default)]
+    pub steens_process_class_calls: u64,
+    #[serde(default)]
+    pub steens_candidate_pairs: u64,
+    #[serde(default)]
+    pub steens_seen_pairs_new: u64,
+    #[serde(default)]
+    pub steens_seen_pairs_duplicate: u64,
+    #[serde(default)]
+    pub steens_fsa_compatible_pairs: u64,
+    #[serde(default)]
+    pub steens_fsa_rejected_pairs: u64,
+    #[serde(default)]
+    pub steens_indirect_bindings: u64,
+    #[serde(default)]
+    pub steens_external_call_requests: u64,
+    #[serde(default)]
+    pub steens_external_call_applications: u64,
+    #[serde(default)]
+    pub steens_escaped_function_applications: u64,
+    #[serde(default)]
+    pub steens_join_attempts: u64,
+    #[serde(default)]
+    pub steens_join_successes: u64,
+    #[serde(default)]
+    pub steens_pointee_classes_created: u64,
+    #[serde(default)]
+    pub steens_max_class_icall_sites: usize,
+    #[serde(default)]
+    pub steens_max_class_fn_objs: usize,
+    #[serde(default)]
+    pub steens_max_class_candidate_pairs: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -263,6 +298,11 @@ struct Solver<'a> {
     seen_pairs: SeenPairBits,
     external_applied: HashSet<usize>,
     escaped_fn_applied: HashSet<usize>,
+    metrics: SolveMetrics,
+    profile: bool,
+    profile_started: Instant,
+    profile_interval_candidate_pairs: u64,
+    next_profile_candidate_pairs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +443,11 @@ impl<'a> Solver<'a> {
             seen_pairs: SeenPairBits::new(pag.callsites.len(), function_count),
             external_applied: HashSet::new(),
             escaped_fn_applied: HashSet::new(),
+            metrics: SolveMetrics::default(),
+            profile: steens_profile_enabled(),
+            profile_started: Instant::now(),
+            profile_interval_candidate_pairs: steens_profile_interval_candidate_pairs(),
+            next_profile_candidate_pairs: steens_profile_interval_candidate_pairs(),
         }
     }
 
@@ -413,10 +458,12 @@ impl<'a> Solver<'a> {
         self.seed_main_entry_params();
 
         while let Some(class) = self.worklist.pop_front() {
+            self.metrics.steens_worklist_pops += 1;
             self.queued[class] = false;
             let root = self.find(class);
             self.process_class(root);
         }
+        self.print_steens_profile("done");
     }
 
     /// Snapshot the solved union-find for the Andersen pass. Must be called after
@@ -710,15 +757,14 @@ impl<'a> Solver<'a> {
             }
         }
         sizes.sort_unstable();
-        let metrics = SolveMetrics {
-            partition_count: sizes.len(),
-            partition_p50_size: percentile(&sizes, 50),
-            partition_p95_size: percentile(&sizes, 95),
-            partition_max_size: sizes.last().copied().unwrap_or(0),
-            oversize_fallbacks: 0,
-            oversize_fallback_max_size: 0,
-            rounds: 1,
-        };
+        self.metrics.partition_count = sizes.len();
+        self.metrics.partition_p50_size = percentile(&sizes, 50);
+        self.metrics.partition_p95_size = percentile(&sizes, 95);
+        self.metrics.partition_max_size = sizes.last().copied().unwrap_or(0);
+        self.metrics.oversize_fallbacks = 0;
+        self.metrics.oversize_fallback_max_size = 0;
+        self.metrics.rounds = 1;
+        let metrics = self.metrics.clone();
 
         SolveResult {
             indirect_calls,
@@ -730,6 +776,7 @@ impl<'a> Solver<'a> {
     }
 
     fn process_class(&mut self, class: usize) {
+        self.metrics.steens_process_class_calls += 1;
         let root = self.find(class);
         let ext = self.classes[root].ext;
         let esc = self.classes[root].esc;
@@ -751,6 +798,7 @@ impl<'a> Solver<'a> {
                 if !self.escaped_fn_applied.insert(func_index) {
                     continue;
                 }
+                self.metrics.steens_escaped_function_applications += 1;
                 let meta = &self.function_meta[func_index];
                 let params = meta.param_nodes.clone();
                 let ret_node = meta.ret_node;
@@ -778,25 +826,38 @@ impl<'a> Solver<'a> {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        let class_candidate_pairs = site_ids.len() as u64 * funcs.len() as u64;
+        if class_candidate_pairs > self.metrics.steens_max_class_candidate_pairs {
+            self.metrics.steens_max_class_candidate_pairs = class_candidate_pairs;
+            self.metrics.steens_max_class_icall_sites = site_ids.len();
+            self.metrics.steens_max_class_fn_objs = funcs.len();
+        }
         for site_index in site_ids {
             if ext {
                 self.apply_external_call(site_index);
             }
             for &func_index in &funcs {
+                self.metrics.steens_candidate_pairs += 1;
+                self.maybe_print_steens_profile();
                 if !self.seen_pairs.insert(site_index, func_index) {
+                    self.metrics.steens_seen_pairs_duplicate += 1;
                     continue;
                 }
+                self.metrics.steens_seen_pairs_new += 1;
                 let callsite = self.callsites_by_index[site_index];
                 let meta = &self.function_meta[func_index];
                 if !fsa_compatible(&callsite.sig, &meta.sig) {
+                    self.metrics.steens_fsa_rejected_pairs += 1;
                     continue;
                 }
+                self.metrics.steens_fsa_compatible_pairs += 1;
                 self.bind_indirect_call(site_index, func_index);
             }
         }
     }
 
     fn bind_indirect_call(&mut self, site_index: usize, func_index: usize) {
+        self.metrics.steens_indirect_bindings += 1;
         let callsite = self.callsites_by_index[site_index];
         let (external, param_nodes, ret_node) = {
             let meta = &self.function_meta[func_index];
@@ -821,9 +882,11 @@ impl<'a> Solver<'a> {
     }
 
     fn apply_external_call(&mut self, site_index: usize) {
+        self.metrics.steens_external_call_requests += 1;
         if !self.external_applied.insert(site_index) {
             return;
         }
+        self.metrics.steens_external_call_applications += 1;
         let callsite = self.callsites_by_index[site_index];
         for arg in &callsite.args {
             let arg = self.class_of(*arg);
@@ -881,6 +944,7 @@ impl<'a> Solver<'a> {
             return self.find(pointee);
         }
         let id = self.classes.len();
+        self.metrics.steens_pointee_classes_created += 1;
         self.classes.push(ClassData {
             parent: id,
             size: 1,
@@ -909,11 +973,13 @@ impl<'a> Solver<'a> {
     }
 
     fn join(&mut self, left: usize, right: usize) -> usize {
+        self.metrics.steens_join_attempts += 1;
         let mut a = self.find(left);
         let mut b = self.find(right);
         if a == b {
             return a;
         }
+        self.metrics.steens_join_successes += 1;
         if self.classes[a].size < self.classes[b].size {
             std::mem::swap(&mut a, &mut b);
         }
@@ -951,6 +1017,45 @@ impl<'a> Solver<'a> {
         self.worklist.push_back(class);
     }
 
+    fn maybe_print_steens_profile(&mut self) {
+        if !self.profile || self.metrics.steens_candidate_pairs < self.next_profile_candidate_pairs
+        {
+            return;
+        }
+        self.print_steens_profile("progress");
+        while self.next_profile_candidate_pairs <= self.metrics.steens_candidate_pairs {
+            self.next_profile_candidate_pairs += self.profile_interval_candidate_pairs;
+        }
+    }
+
+    fn print_steens_profile(&self, label: &str) {
+        if !self.profile {
+            return;
+        }
+        eprintln!(
+            "pangs steens profile {label}: elapsed_ms={} worklist_pops={} process_class_calls={} \
+             candidate_pairs={} seen_new={} seen_duplicate={} fsa_compatible={} \
+             fsa_rejected={} bindings={} joins={}/{} pointee_classes_created={} \
+             max_class_sites={} max_class_fns={} max_class_candidate_pairs={} worklist_len={}",
+            self.profile_started.elapsed().as_millis(),
+            self.metrics.steens_worklist_pops,
+            self.metrics.steens_process_class_calls,
+            self.metrics.steens_candidate_pairs,
+            self.metrics.steens_seen_pairs_new,
+            self.metrics.steens_seen_pairs_duplicate,
+            self.metrics.steens_fsa_compatible_pairs,
+            self.metrics.steens_fsa_rejected_pairs,
+            self.metrics.steens_indirect_bindings,
+            self.metrics.steens_join_successes,
+            self.metrics.steens_join_attempts,
+            self.metrics.steens_pointee_classes_created,
+            self.metrics.steens_max_class_icall_sites,
+            self.metrics.steens_max_class_fn_objs,
+            self.metrics.steens_max_class_candidate_pairs,
+            self.worklist.len(),
+        );
+    }
+
     fn find(&mut self, class: usize) -> usize {
         let parent = self.classes[class].parent;
         if parent == class {
@@ -960,6 +1065,18 @@ impl<'a> Solver<'a> {
         self.classes[class].parent = root;
         root
     }
+}
+
+fn steens_profile_enabled() -> bool {
+    std::env::var_os("PANGS_STEENS_PROFILE").is_some()
+}
+
+fn steens_profile_interval_candidate_pairs() -> u64 {
+    std::env::var("PANGS_STEENS_PROFILE_INTERVAL")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(10_000_000)
 }
 
 fn percentile(sorted: &[usize], pct: usize) -> usize {

@@ -18,6 +18,23 @@
     "oversize_fallbacks",
     "oversize_fallback_max_size",
     "rounds",
+    "steens_worklist_pops",
+    "steens_process_class_calls",
+    "steens_candidate_pairs",
+    "steens_seen_pairs_new",
+    "steens_seen_pairs_duplicate",
+    "steens_fsa_compatible_pairs",
+    "steens_fsa_rejected_pairs",
+    "steens_indirect_bindings",
+    "steens_external_call_requests",
+    "steens_external_call_applications",
+    "steens_escaped_function_applications",
+    "steens_join_attempts",
+    "steens_join_successes",
+    "steens_pointee_classes_created",
+    "steens_max_class_icall_sites",
+    "steens_max_class_fn_objs",
+    "steens_max_class_candidate_pairs",
     "icalls_simple",
     "icalls_andersen",
     "icalls_steens",
@@ -170,6 +187,74 @@
       "minimum": 0
     },
     "rounds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_worklist_pops": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_process_class_calls": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_candidate_pairs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_seen_pairs_new": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_seen_pairs_duplicate": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_fsa_compatible_pairs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_fsa_rejected_pairs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_indirect_bindings": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_external_call_requests": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_external_call_applications": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_escaped_function_applications": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_join_attempts": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_join_successes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_pointee_classes_created": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_max_class_icall_sites": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_max_class_fn_objs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_max_class_candidate_pairs": {
       "type": "integer",
       "minimum": 0
     },
