@@ -523,7 +523,7 @@ impl Analysis {
 
         let mut callsites = Vec::new();
         let mut call_edges = Vec::new();
-        let mut modrefs = Vec::new();
+        let mut modrefs = ModRefBuilder::new();
         let mut findings = Vec::new();
         let mut audit_taints = BTreeMap::<FuncId, Vec<Taint>>::new();
         let mut deferred_audits = Vec::<DeferredAudit>::new();
@@ -1033,7 +1033,7 @@ impl Analysis {
         call_edges.dedup_by_key(|edge| edge_sort_key(edge, &functions, &callsites));
         let callgraph_dedup_us = callgraph_dedup_started.elapsed().as_micros() as u64;
         let modref_dedup_started = Instant::now();
-        dedup_modrefs_by_fact(&mut modrefs);
+        let modrefs = modrefs.into_vec();
         let modref_dedup_us = modref_dedup_started.elapsed().as_micros() as u64;
 
         let stationarity_started = Instant::now();
@@ -2194,23 +2194,33 @@ impl ModRefFactInterners {
     }
 }
 
-fn dedup_modrefs_by_fact(modrefs: &mut Vec<ModRef>) {
-    let expected_unique = modrefs.len().min(262_144);
-    let mut interners = ModRefFactInterners::default();
-    let mut by_fact = HashMap::<ModRefFactHashKey, usize>::with_capacity(expected_unique);
-    let mut deduped = Vec::<ModRef>::with_capacity(expected_unique);
-    for mut row in modrefs.drain(..) {
-        let key = interners.key_for(&row);
-        if let Some(&idx) = by_fact.get(&key) {
-            let existing = &mut deduped[idx];
+#[derive(Debug, Default)]
+struct ModRefBuilder {
+    rows: Vec<ModRef>,
+    interners: ModRefFactInterners,
+    by_fact: HashMap<ModRefFactHashKey, usize>,
+}
+
+impl ModRefBuilder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, mut row: ModRef) {
+        let key = self.interners.key_for(&row);
+        if let Some(&idx) = self.by_fact.get(&key) {
+            let existing = &mut self.rows[idx];
             existing.witness =
                 preferred_modref_witness(existing.witness.take(), row.witness.take());
-            continue;
+            return;
         }
-        by_fact.insert(key, deduped.len());
-        deduped.push(row);
+        self.by_fact.insert(key, self.rows.len());
+        self.rows.push(row);
     }
-    *modrefs = deduped;
+
+    fn into_vec(self) -> Vec<ModRef> {
+        self.rows
+    }
 }
 
 fn modref_payload_cmp(
@@ -2284,7 +2294,7 @@ fn build_modref_node_summary<'a>(
 }
 
 fn push_pointer_modrefs_from_pag(
-    modrefs: &mut Vec<ModRef>,
+    modrefs: &mut ModRefBuilder,
     func_lookup: &HashMap<String, FuncId>,
     global_lookup: &HashMap<String, GlobalId>,
     pag: &Pag,
@@ -2358,7 +2368,7 @@ fn push_pointer_modrefs_from_pag(
 }
 
 fn push_pointer_memset_modrefs_from_pir(
-    modrefs: &mut Vec<ModRef>,
+    modrefs: &mut ModRefBuilder,
     module: &Pir,
     func_lookup: &HashMap<String, FuncId>,
     global_lookup: &HashMap<String, GlobalId>,
