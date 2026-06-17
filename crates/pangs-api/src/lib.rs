@@ -179,6 +179,8 @@ pub struct ModRef {
     pub access: Access,
     pub via: Via,
     pub witness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -711,6 +713,7 @@ impl Analysis {
                                 access: *access,
                                 via: Via::Direct,
                                 witness: witness_key(&func.key, loc, &mut noloc_ord, "global"),
+                                detail: None,
                             });
                         }
                     }
@@ -1561,11 +1564,11 @@ fn stationarity_verdicts_from_modrefs(
                 && !runtime_writers.contains_key(&global.key))
         {
             StationarityReason::IncompleteInitval
-        } else if global_info.escape == EscapeStatus::External {
-            StationarityReason::ExportedGlobal
         } else if !unknown_writers.is_empty() {
             writers.extend(unknown_writers.iter().cloned());
             StationarityReason::UnknownRuntimeWriter
+        } else if global_info.escape == EscapeStatus::External {
+            StationarityReason::ExportedGlobal
         } else if let Some(known_writers) = runtime_writers.get(&global.key) {
             writers.extend(known_writers.iter().cloned());
             StationarityReason::RuntimeWriter
@@ -2084,7 +2087,7 @@ fn modref_sort_key(
     mr: &ModRef,
     funcs: &[FuncInfo],
     globals: &[GlobalInfo],
-) -> (String, String, String, String, String) {
+) -> (String, String, String, String, String, String) {
     (
         funcs[mr.func.0 as usize].key.clone(),
         match mr.global {
@@ -2094,6 +2097,7 @@ fn modref_sort_key(
         format!("{:?}", mr.access),
         format!("{:?}", mr.via),
         mr.witness.clone().unwrap_or_default(),
+        mr.detail.clone().unwrap_or_default(),
     )
 }
 
@@ -2101,7 +2105,7 @@ fn modref_fact_sort_key(
     mr: &ModRef,
     funcs: &[FuncInfo],
     globals: &[GlobalInfo],
-) -> (String, String, String, String) {
+) -> (String, String, String, String, String) {
     (
         funcs[mr.func.0 as usize].key.clone(),
         match mr.global {
@@ -2110,6 +2114,7 @@ fn modref_fact_sort_key(
         },
         format!("{:?}", mr.access),
         format!("{:?}", mr.via),
+        mr.detail.clone().unwrap_or_default(),
     )
 }
 
@@ -2134,6 +2139,15 @@ fn same_modref_fact(left: &ModRef, right: &ModRef) -> bool {
         && left.global == right.global
         && left.access == right.access
         && left.via == right.via
+        && left.detail == right.detail
+}
+
+struct PointerAccess {
+    access: Access,
+    address_node: pangs_pag::NodeId,
+    unknown_reason: &'static str,
+    detail: &'static str,
+    suppress_direct_symbol: bool,
 }
 
 fn push_pointer_modrefs_from_pag(
@@ -2149,8 +2163,8 @@ fn push_pointer_modrefs_from_pag(
             continue;
         };
         let witness = witness_key(&owner, &edge.loc, noloc_ord, "global");
-        for (access, address_node, unknown_reason, suppress_direct_symbol) in accesses {
-            let Some(node) = pag.nodes.get(address_node.0 as usize) else {
+        for pointer_access in accesses {
+            let Some(node) = pag.nodes.get(pointer_access.address_node.0 as usize) else {
                 continue;
             };
             let Some(resolution) = nodes.get(&node.label) else {
@@ -2158,7 +2172,9 @@ fn push_pointer_modrefs_from_pag(
             };
 
             for global_key in &resolution.pointee_globals {
-                if suppress_direct_symbol && node.label == format!("sym:global:{global_key}") {
+                if pointer_access.suppress_direct_symbol
+                    && node.label == format!("sym:global:{global_key}")
+                {
                     continue;
                 }
                 let Some(&gid) = global_lookup.get(global_key) else {
@@ -2167,19 +2183,21 @@ fn push_pointer_modrefs_from_pag(
                 modrefs.push(ModRef {
                     func,
                     global: GlobalTarget::Name(gid),
-                    access,
+                    access: pointer_access.access,
                     via: Via::Aliased,
                     witness: witness.clone(),
+                    detail: None,
                 });
             }
 
             if resolution.external {
                 modrefs.push(ModRef {
                     func,
-                    global: GlobalTarget::Unknown(unknown_reason.to_string()),
-                    access,
+                    global: GlobalTarget::Unknown(pointer_access.unknown_reason.to_string()),
+                    access: pointer_access.access,
                     via: Via::Unknown,
                     witness: witness.clone(),
+                    detail: Some(pointer_access.detail.to_string()),
                 });
             }
         }
@@ -2209,6 +2227,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     access: Access::Mod,
                     via: Via::Aliased,
                     witness: witness_key(&func.key, loc, noloc_ord, "global"),
+                    detail: None,
                 });
                 continue;
             }
@@ -2227,6 +2246,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     access: Access::Mod,
                     via: Via::Aliased,
                     witness: witness.clone(),
+                    detail: None,
                 });
             }
             if resolution.external {
@@ -2236,6 +2256,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     access: Access::Mod,
                     via: Via::Unknown,
                     witness,
+                    detail: Some("stmt:memset_dst".to_string()),
                 });
             }
         }
@@ -2245,11 +2266,7 @@ fn push_pointer_memset_modrefs_from_pir(
 fn edge_accesses(
     edge: &Edge,
     func_lookup: &HashMap<String, FuncId>,
-) -> Option<(
-    String,
-    FuncId,
-    Vec<(Access, pangs_pag::NodeId, &'static str, bool)>,
-)> {
+) -> Option<(String, FuncId, Vec<PointerAccess>)> {
     let Owner::Function(owner) = &edge.owner else {
         return None;
     };
@@ -2258,19 +2275,43 @@ fn edge_accesses(
         EdgeKind::Load => Some((
             owner.clone(),
             func,
-            vec![(Access::Ref, edge.src, "omega_load", true)],
+            vec![PointerAccess {
+                access: Access::Ref,
+                address_node: edge.src,
+                unknown_reason: "omega_load",
+                detail: "edge:load",
+                suppress_direct_symbol: true,
+            }],
         )),
         EdgeKind::Store => Some((
             owner.clone(),
             func,
-            vec![(Access::Mod, edge.dst, "omega_store", true)],
+            vec![PointerAccess {
+                access: Access::Mod,
+                address_node: edge.dst,
+                unknown_reason: "omega_store",
+                detail: "edge:store",
+                suppress_direct_symbol: true,
+            }],
         )),
         EdgeKind::Memcpy { .. } => Some((
             owner.clone(),
             func,
             vec![
-                (Access::Ref, edge.src, "omega_load", false),
-                (Access::Mod, edge.dst, "omega_store", false),
+                PointerAccess {
+                    access: Access::Ref,
+                    address_node: edge.src,
+                    unknown_reason: "omega_load",
+                    detail: "edge:memcpy_src",
+                    suppress_direct_symbol: false,
+                },
+                PointerAccess {
+                    access: Access::Mod,
+                    address_node: edge.dst,
+                    unknown_reason: "omega_store",
+                    detail: "edge:memcpy_dst",
+                    suppress_direct_symbol: false,
+                },
             ],
         )),
         _ => None,
@@ -2397,6 +2438,7 @@ struct ModRefPayload {
     access: Access,
     via: Via,
     witness: Option<String>,
+    detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2404,6 +2446,7 @@ struct ModRefFactKey {
     global: GlobalTarget,
     access_rank: u8,
     via_rank: u8,
+    detail: Option<String>,
 }
 
 impl PartialOrd for ModRefPayload {
@@ -2426,7 +2469,11 @@ impl Ord for ModRefPayload {
             Ordering::Equal => {}
             order => return order,
         }
-        self.witness.cmp(&other.witness)
+        match self.witness.cmp(&other.witness) {
+            Ordering::Equal => {}
+            order => return order,
+        }
+        self.detail.cmp(&other.detail)
     }
 }
 
@@ -2482,11 +2529,13 @@ fn compute_transitive_modrefs(
             access: mr.access,
             via: mr.via,
             witness: mr.witness.clone(),
+            detail: mr.detail.clone(),
         };
         let key = ModRefFactKey {
             global: mr.global.clone(),
             access_rank: access_rank(mr.access),
             via_rank: via_rank(mr.via),
+            detail: mr.detail.clone(),
         };
         let id = if let Some(&id) = payload_ids.get(&key) {
             let existing = &mut payloads[id];
@@ -2540,6 +2589,7 @@ fn compute_transitive_modrefs(
                     access: payload.access,
                     via: payload.via,
                     witness: payload.witness.clone(),
+                    detail: payload.detail.clone(),
                 }
             })
             .collect::<Vec<_>>();

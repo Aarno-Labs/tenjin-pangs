@@ -639,6 +639,8 @@ struct ModRefRecord {
     access: pangs_pir::Access,
     via: pangs_api::Via,
     witness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 impl ModRefRecord {
@@ -656,6 +658,7 @@ impl ModRefRecord {
             access: mr.access,
             via: mr.via,
             witness: mr.witness.clone(),
+            detail: mr.detail.clone(),
         }
     }
 }

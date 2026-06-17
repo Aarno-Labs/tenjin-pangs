@@ -177,6 +177,71 @@ for dir in "$@"; do
 done
 
 echo
+echo "## Unknown Mod Sources"
+echo
+echo "| row | detail | rows |"
+echo "|---|---|---:|"
+for dir in "$@"; do
+  modrefs="$dir/modref.jsonl"
+  label="$(basename "$dir")"
+  label="${label%-andersen}"
+  jq -r \
+    --arg label "$label" '
+      select(.access == "mod" and .global.unknown == "omega_store")
+      | (.detail // "<none>")
+    ' "$modrefs" \
+    | sort \
+    | uniq -c \
+    | sort -nr \
+    | awk -v label="$label" '{ printf "| `%s` | `%s` | %s |\n", label, $2, $1 }'
+done
+
+echo
+echo "## Top Unknown Mod Sites"
+echo
+for dir in "$@"; do
+  modrefs="$dir/modref.jsonl"
+  label="$(basename "$dir")"
+  label="${label%-andersen}"
+  echo "### $label"
+  echo
+  site_count="$(
+    jq -r '
+      select(.access == "mod" and .global.unknown == "omega_store")
+      | [(.detail // "<none>"), .func, (.witness // "<none>")]
+      | @tsv
+    ' "$modrefs" | wc -l | tr -d ' '
+  )"
+  if [[ "$site_count" -eq 0 ]]; then
+    echo "- none"
+  else
+    echo "| detail | func | witness | rows |"
+    echo "|---|---|---|---:|"
+    jq -r '
+      select(.access == "mod" and .global.unknown == "omega_store")
+      | [(.detail // "<none>"), .func, (.witness // "<none>")]
+      | @tsv
+    ' "$modrefs" \
+      | sort \
+      | uniq -c \
+      | sort -nr \
+      | awk -F'\t' '{
+          if (printed >= 20) {
+            next
+          }
+          printed += 1
+          count=$1
+          sub(/^[[:space:]]+/, "", count)
+          split(count, parts, /[[:space:]]+/)
+          rows=parts[1]
+          detail=parts[2]
+          printf "| `%s` | `%s` | `%s` | %s |\n", detail, $2, $3, rows
+        }'
+  fi
+  echo
+done
+
+echo
 echo "## Frozen-Component Taints"
 echo
 for dir in "$@"; do

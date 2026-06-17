@@ -151,6 +151,11 @@ Implementation status:
   or unknown runtime writer for the global. This fixes a synthetic read-only-global false
   blocker, but the O1 corpus does not move because every row still has `omega_store`
   unknown mod rows; see the Runtime Mod Evidence section in `metrics/m5_0_gate_census.md`.
+- Unknown modref rows now carry source `detail` in `modref.jsonl`, and
+  `scripts/m5_gate_census.sh` reports source and top-site breakdowns. The comparable O1
+  decision set (`/tmp/pangs-m5-omega-detail`) has 724 `omega_store` rows after preserving
+  source detail in the fact key: 521 `edge:store`, 103 `edge:memcpy_dst`, and 100
+  `stmt:memset_dst`. The next precision slice should target ordinary store edges first.
 - M5b remains not green-lit because no current lite client consumes thread-confinement
   facts.
 

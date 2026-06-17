@@ -51,6 +51,10 @@
     "witness": {
       "type": ["string", "null"],
       "minLength": 1
+    },
+    "detail": {
+      "type": "string",
+      "minLength": 1
     }
   }
 }

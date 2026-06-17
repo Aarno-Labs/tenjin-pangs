@@ -1408,6 +1408,7 @@ fn analyze_steens_exports_pointer_aware_modref_and_freezes_unknown_global_compon
             && row["access"] == "ref"
             && row["via"] == "unknown"
             && row["witness"] == "main@m1_6.c:6:1#0"
+            && row["detail"] == "edge:load"
     }));
     assert!(modref.iter().any(|row| {
         row["func"] == "main"
@@ -1415,6 +1416,7 @@ fn analyze_steens_exports_pointer_aware_modref_and_freezes_unknown_global_compon
             && row["access"] == "mod"
             && row["via"] == "unknown"
             && row["witness"] == "main@m1_6.c:7:1#0"
+            && row["detail"] == "edge:store"
     }));
 
     let components: Value =
@@ -1479,6 +1481,7 @@ fn analyze_steens_exports_memcpy_pointer_modref_rows() {
             && row["access"] == "ref"
             && row["via"] == "unknown"
             && row["witness"] == "main@m1_6_memcpy.c:6:1#0"
+            && row["detail"] == "edge:memcpy_src"
     }));
     assert!(modref.iter().any(|row| {
         row["func"] == "main"
@@ -1486,6 +1489,7 @@ fn analyze_steens_exports_memcpy_pointer_modref_rows() {
             && row["access"] == "mod"
             && row["via"] == "unknown"
             && row["witness"] == "main@m1_6_memcpy.c:6:1#0"
+            && row["detail"] == "edge:memcpy_dst"
     }));
 
     let components: Value =
@@ -1552,6 +1556,7 @@ fn analyze_steens_keeps_pointer_modref_exports_local_while_callgraph_narrows_ind
             && row["access"] == "mod"
             && row["via"] == "unknown"
             && row["witness"] == "target@m1_6_icall.c:23:1#0"
+            && row["detail"] == "edge:store"
     }));
     assert!(modref.iter().any(|row| {
         row["func"] == "other"
@@ -1591,6 +1596,7 @@ fn analyze_steens_exports_memset_pointer_modref_rows() {
             && row["access"] == "mod"
             && row["via"] == "unknown"
             && row["witness"] == "main@m1_6_memset.c:4:1#0"
+            && row["detail"] == "stmt:memset_dst"
     }));
     assert!(modref.iter().any(|row| {
         row["func"] == "main"
