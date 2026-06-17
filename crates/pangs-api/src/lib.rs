@@ -2761,6 +2761,78 @@ struct LocalPointerModRefRow {
     count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LocalPointerAccessKey {
+    func: u32,
+    address_node: u32,
+    access_rank: u8,
+    suppress_direct_symbol: bool,
+}
+
+struct LocalPointerAccessRow {
+    witness: Option<String>,
+    count: u64,
+}
+
+fn push_local_pointer_modref_row(
+    local_rows: &mut HashMap<CompactModRefFactKey, LocalPointerModRefRow>,
+    func: FuncId,
+    global: GlobalId,
+    access: Access,
+    witness: Option<&str>,
+    count: u64,
+) {
+    if count == 0 {
+        return;
+    }
+    let key = CompactModRefFactKey {
+        func: func.0,
+        global: global.0,
+        access_rank: access_rank(access),
+        via_rank: via_rank(Via::Aliased),
+    };
+    local_rows
+        .entry(key)
+        .and_modify(|row| {
+            row.count += count;
+            prefer_modref_witness_ref(&mut row.witness, witness);
+        })
+        .or_insert_with(|| LocalPointerModRefRow {
+            witness: witness.map(str::to_owned),
+            count,
+        });
+}
+
+fn flush_local_pointer_access_rows(
+    local_rows: &mut HashMap<CompactModRefFactKey, LocalPointerModRefRow>,
+    local_accesses: &mut HashMap<LocalPointerAccessKey, LocalPointerAccessRow>,
+    node_summaries: &[Option<ModRefNodeSummary<'_>>],
+) {
+    for (key, row) in local_accesses.drain() {
+        let Some(Some(summary)) = node_summaries.get(key.address_node as usize) else {
+            continue;
+        };
+        let func = FuncId(key.func);
+        let access = match key.access_rank {
+            0 => Access::Ref,
+            _ => Access::Mod,
+        };
+        for &gid in &summary.pointee_global_ids {
+            if key.suppress_direct_symbol && summary.direct_symbol_global == Some(gid) {
+                continue;
+            }
+            push_local_pointer_modref_row(
+                local_rows,
+                func,
+                gid,
+                access,
+                row.witness.as_deref(),
+                row.count,
+            );
+        }
+    }
+}
+
 fn flush_local_pointer_modref_rows(
     modrefs: &mut ModRefBuilder,
     local_rows: &mut HashMap<CompactModRefFactKey, LocalPointerModRefRow>,
@@ -2829,6 +2901,7 @@ fn push_pointer_modrefs_from_pag(
     let mut node_summaries = Vec::new();
     node_summaries.resize_with(pag.nodes.len(), || None);
     let mut missing_nodes = vec![false; pag.nodes.len()];
+    let mut local_accesses = HashMap::<LocalPointerAccessKey, LocalPointerAccessRow>::new();
     let mut local_rows = HashMap::<CompactModRefFactKey, LocalPointerModRefRow>::new();
     let mut active_func = None;
     for edge in &pag.edges {
@@ -2836,6 +2909,7 @@ fn push_pointer_modrefs_from_pag(
             continue;
         };
         if active_func != Some(func) {
+            flush_local_pointer_access_rows(&mut local_rows, &mut local_accesses, &node_summaries);
             flush_local_pointer_modref_rows(modrefs, &mut local_rows);
             active_func = Some(func);
         }
@@ -2866,33 +2940,38 @@ fn push_pointer_modrefs_from_pag(
                 ModRefSourcePhase::PagPointer
             };
             if phase != ModRefSourcePhase::PagPointer {
+                flush_local_pointer_access_rows(
+                    &mut local_rows,
+                    &mut local_accesses,
+                    &node_summaries,
+                );
                 flush_local_pointer_modref_rows(modrefs, &mut local_rows);
             }
 
-            for &gid in &summary.pointee_global_ids {
-                if pointer_access.suppress_direct_symbol
-                    && summary.direct_symbol_global == Some(gid)
-                {
-                    continue;
-                }
-                if phase == ModRefSourcePhase::PagPointer {
-                    let key = CompactModRefFactKey {
-                        func: func.0,
-                        global: gid.0,
-                        access_rank: access_rank(pointer_access.access),
-                        via_rank: via_rank(Via::Aliased),
-                    };
-                    local_rows
-                        .entry(key)
-                        .and_modify(|row| {
-                            row.count += 1;
-                            prefer_modref_witness_ref(&mut row.witness, witness.as_deref());
-                        })
-                        .or_insert_with(|| LocalPointerModRefRow {
-                            witness: witness.clone(),
-                            count: 1,
-                        });
-                } else {
+            if phase == ModRefSourcePhase::PagPointer {
+                let key = LocalPointerAccessKey {
+                    func: func.0,
+                    address_node: pointer_access.address_node.0,
+                    access_rank: access_rank(pointer_access.access),
+                    suppress_direct_symbol: pointer_access.suppress_direct_symbol,
+                };
+                local_accesses
+                    .entry(key)
+                    .and_modify(|row| {
+                        row.count += 1;
+                        prefer_modref_witness_ref(&mut row.witness, witness.as_deref());
+                    })
+                    .or_insert_with(|| LocalPointerAccessRow {
+                        witness: witness.clone(),
+                        count: 1,
+                    });
+            } else {
+                for &gid in &summary.pointee_global_ids {
+                    if pointer_access.suppress_direct_symbol
+                        && summary.direct_symbol_global == Some(gid)
+                    {
+                        continue;
+                    }
                     modrefs.push_named_empty(
                         func,
                         gid,
@@ -2924,6 +3003,7 @@ fn push_pointer_modrefs_from_pag(
             }
         }
     }
+    flush_local_pointer_access_rows(&mut local_rows, &mut local_accesses, &node_summaries);
     flush_local_pointer_modref_rows(modrefs, &mut local_rows);
 }
 
