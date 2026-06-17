@@ -345,6 +345,10 @@ pub struct Metrics {
     pub pointer_modref_mem_max_fact_fanout: u64,
     #[serde(default)]
     pub pointer_modref_closure_max_fact_fanout: u64,
+    #[serde(default)]
+    pub pointer_modref_high_fanout_fallbacks: u64,
+    #[serde(default)]
+    pub pointer_modref_high_fanout_fallback_rows: u64,
     /// Flat per-provenance icall attribution (M2.0, `DESIGN_lite.md` §2F). Counts indirect
     /// callsites whose resolved edges carry each tier; the ablation signal M2.7 reads.
     /// `icalls_unknown` counts sites with an Ω/unknown-callee edge. No certificate cascade.
@@ -1280,6 +1284,9 @@ impl Analysis {
             pointer_modref_pag_max_fact_fanout: pointer_modref_metrics.pag.max_fact_fanout,
             pointer_modref_mem_max_fact_fanout: pointer_modref_metrics.mem.max_fact_fanout,
             pointer_modref_closure_max_fact_fanout: pointer_modref_metrics.closure.max_fact_fanout,
+            pointer_modref_high_fanout_fallbacks: pointer_modref_metrics.high_fanout_fallbacks,
+            pointer_modref_high_fanout_fallback_rows: pointer_modref_metrics
+                .high_fanout_fallback_rows,
             analysis_wall_us: 0,
             setup_scan_us,
             preanalysis_us,
@@ -2512,6 +2519,14 @@ impl ModRefBuilder {
         self.maybe_print_profile("progress");
     }
 
+    fn note_high_fanout_fallback(&mut self, collapsed_rows: u64) {
+        self.metrics.high_fanout_fallbacks += 1;
+        self.metrics.high_fanout_fallback_rows = self
+            .metrics
+            .high_fanout_fallback_rows
+            .saturating_add(collapsed_rows);
+    }
+
     fn maybe_print_profile(&mut self, label: &str) {
         self.profile
             .maybe_print_local(label, &self.metrics, self.rows.len());
@@ -2547,6 +2562,8 @@ struct ModRefEmissionMetrics {
     mem: ModRefPhaseMetrics,
     closure: ModRefPhaseMetrics,
     pointer_modref_max_fact_fanout: u64,
+    high_fanout_fallbacks: u64,
+    high_fanout_fallback_rows: u64,
 }
 
 impl ModRefEmissionMetrics {
@@ -2709,6 +2726,13 @@ fn pointer_modref_profile_top_emitters() -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(20)
+}
+
+fn pointer_modref_high_fanout_limit() -> usize {
+    std::env::var("PANGS_POINTER_MODREF_HIGH_FANOUT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4096)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2949,15 +2973,18 @@ fn push_local_pointer_modref_row(
 }
 
 fn flush_local_pointer_access_rows(
+    modrefs: &mut ModRefBuilder,
     local_rows: &mut LocalPointerModRefRows,
     local_accesses: &mut HashMap<LocalPointerAccessKey, LocalPointerAccessRow>,
     node_summaries: &[Option<ModRefNodeSummary<'_>>],
     access_profile: &mut PointerAccessEmitterProfile,
+    high_fanout_limit: usize,
 ) {
     for (key, row) in local_accesses.drain() {
         let Some(Some(summary)) = node_summaries.get(key.address_node as usize) else {
             continue;
         };
+        let func = FuncId(key.func);
         let access = match key.access_rank {
             0 => Access::Ref,
             _ => Access::Mod,
@@ -2970,6 +2997,20 @@ fn flush_local_pointer_access_rows(
             })
             .count();
         access_profile.observe(key, summary, fanout, row.count);
+        if high_fanout_limit > 0 && fanout > high_fanout_limit {
+            push_high_fanout_pointer_modref_fallback(
+                modrefs,
+                func,
+                access,
+                row.witness,
+                summary,
+                fanout,
+                row.count,
+                ModRefSourcePhase::PagPointer,
+                "pag_pointer",
+            );
+            continue;
+        }
         for &gid in &summary.pointee_global_ids {
             if key.suppress_direct_symbol && summary.direct_symbol_global == Some(gid) {
                 continue;
@@ -2983,6 +3024,41 @@ fn flush_local_pointer_access_rows(
             );
         }
     }
+}
+
+fn push_high_fanout_pointer_modref_fallback(
+    modrefs: &mut ModRefBuilder,
+    func: FuncId,
+    access: Access,
+    witness: Option<String>,
+    summary: &ModRefNodeSummary<'_>,
+    fanout: usize,
+    occurrences: u64,
+    phase: ModRefSourcePhase,
+    source: &str,
+) {
+    let collapsed_rows = occurrences.saturating_mul(fanout as u64);
+    modrefs.note_high_fanout_fallback(collapsed_rows);
+    let reason = match access {
+        Access::Ref => "omega_load",
+        Access::Mod => "omega_store",
+    };
+    modrefs.push_with_phase(
+        ModRef {
+            func,
+            global: GlobalTarget::Unknown(reason.to_string()),
+            access,
+            via: Via::Unknown,
+            witness,
+            detail: Some(format!(
+                "high_fanout_pointer_modref:source={source}:node={}:fanout={}:occurrences={occurrences}",
+                summary.label, fanout
+            )),
+            address_node: Some(summary.label.to_string()),
+            pointee_globals: Vec::new(),
+        },
+        Some(phase),
+    );
 }
 
 fn flush_local_pointer_modref_rows(
@@ -3059,6 +3135,7 @@ fn push_pointer_modrefs_from_pag(
     let mut local_accesses = HashMap::<LocalPointerAccessKey, LocalPointerAccessRow>::new();
     let mut local_rows = LocalPointerModRefRows::new(global_lookup.len());
     let mut access_profile = PointerAccessEmitterProfile::from_env();
+    let high_fanout_limit = pointer_modref_high_fanout_limit();
     let mut active_func = None;
     for edge in &pag.edges {
         let Some((owner, func, accesses)) = edge_accesses(edge, func_lookup) else {
@@ -3066,10 +3143,12 @@ fn push_pointer_modrefs_from_pag(
         };
         if active_func != Some(func) {
             flush_local_pointer_access_rows(
+                modrefs,
                 &mut local_rows,
                 &mut local_accesses,
                 &node_summaries,
                 &mut access_profile,
+                high_fanout_limit,
             );
             flush_local_pointer_modref_rows(modrefs, active_func, &mut local_rows);
             active_func = Some(func);
@@ -3102,10 +3181,12 @@ fn push_pointer_modrefs_from_pag(
             };
             if phase != ModRefSourcePhase::PagPointer {
                 flush_local_pointer_access_rows(
+                    modrefs,
                     &mut local_rows,
                     &mut local_accesses,
                     &node_summaries,
                     &mut access_profile,
+                    high_fanout_limit,
                 );
                 flush_local_pointer_modref_rows(modrefs, active_func, &mut local_rows);
             }
@@ -3128,6 +3209,28 @@ fn push_pointer_modrefs_from_pag(
                         count: 1,
                     });
             } else {
+                let fanout = summary
+                    .pointee_global_ids
+                    .iter()
+                    .filter(|&&gid| {
+                        !(pointer_access.suppress_direct_symbol
+                            && summary.direct_symbol_global == Some(gid))
+                    })
+                    .count();
+                if high_fanout_limit > 0 && fanout > high_fanout_limit {
+                    push_high_fanout_pointer_modref_fallback(
+                        modrefs,
+                        func,
+                        pointer_access.access,
+                        witness.clone(),
+                        summary,
+                        fanout,
+                        1,
+                        phase,
+                        pointer_access.detail,
+                    );
+                    continue;
+                }
                 for &gid in &summary.pointee_global_ids {
                     if pointer_access.suppress_direct_symbol
                         && summary.direct_symbol_global == Some(gid)
@@ -3166,10 +3269,12 @@ fn push_pointer_modrefs_from_pag(
         }
     }
     flush_local_pointer_access_rows(
+        modrefs,
         &mut local_rows,
         &mut local_accesses,
         &node_summaries,
         &mut access_profile,
+        high_fanout_limit,
     );
     access_profile.print("top-emitters-done");
     flush_local_pointer_modref_rows(modrefs, active_func, &mut local_rows);
