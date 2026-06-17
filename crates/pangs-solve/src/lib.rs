@@ -271,6 +271,8 @@ struct ClassData {
     esc: bool,
     icall_sites: HashSet<usize>,
     fn_objs: HashSet<usize>,
+    processed_icall_sites: HashSet<usize>,
+    processed_fn_objs: HashSet<usize>,
     global_objs: HashSet<usize>,
 }
 
@@ -826,34 +828,76 @@ impl<'a> Solver<'a> {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        let processed_site_ids = site_ids
+            .iter()
+            .copied()
+            .filter(|site| self.classes[root].processed_icall_sites.contains(site))
+            .collect::<Vec<_>>();
+        let new_site_ids = site_ids
+            .iter()
+            .copied()
+            .filter(|site| !self.classes[root].processed_icall_sites.contains(site))
+            .collect::<Vec<_>>();
+        let new_funcs = funcs
+            .iter()
+            .copied()
+            .filter(|func| !self.classes[root].processed_fn_objs.contains(func))
+            .collect::<Vec<_>>();
         let class_candidate_pairs = site_ids.len() as u64 * funcs.len() as u64;
         if class_candidate_pairs > self.metrics.steens_max_class_candidate_pairs {
             self.metrics.steens_max_class_candidate_pairs = class_candidate_pairs;
             self.metrics.steens_max_class_icall_sites = site_ids.len();
             self.metrics.steens_max_class_fn_objs = funcs.len();
         }
-        for site_index in site_ids {
+        for &site_index in &site_ids {
             if ext {
                 self.apply_external_call(site_index);
             }
+        }
+
+        let mut bindings = Vec::new();
+        for &site_index in &new_site_ids {
             for &func_index in &funcs {
-                self.metrics.steens_candidate_pairs += 1;
-                self.maybe_print_steens_profile();
-                if !self.seen_pairs.insert(site_index, func_index) {
-                    self.metrics.steens_seen_pairs_duplicate += 1;
-                    continue;
-                }
-                self.metrics.steens_seen_pairs_new += 1;
-                let callsite = self.callsites_by_index[site_index];
-                let meta = &self.function_meta[func_index];
-                if !fsa_compatible(&callsite.sig, &meta.sig) {
-                    self.metrics.steens_fsa_rejected_pairs += 1;
-                    continue;
-                }
-                self.metrics.steens_fsa_compatible_pairs += 1;
-                self.bind_indirect_call(site_index, func_index);
+                self.consider_indirect_pair(site_index, func_index, &mut bindings);
             }
         }
+        for &site_index in &processed_site_ids {
+            for &func_index in &new_funcs {
+                self.consider_indirect_pair(site_index, func_index, &mut bindings);
+            }
+        }
+
+        self.classes[root]
+            .processed_icall_sites
+            .extend(new_site_ids);
+        self.classes[root].processed_fn_objs.extend(new_funcs);
+
+        for (site_index, func_index) in bindings {
+            self.bind_indirect_call(site_index, func_index);
+        }
+    }
+
+    fn consider_indirect_pair(
+        &mut self,
+        site_index: usize,
+        func_index: usize,
+        bindings: &mut Vec<(usize, usize)>,
+    ) {
+        self.metrics.steens_candidate_pairs += 1;
+        self.maybe_print_steens_profile();
+        if !self.seen_pairs.insert(site_index, func_index) {
+            self.metrics.steens_seen_pairs_duplicate += 1;
+            return;
+        }
+        self.metrics.steens_seen_pairs_new += 1;
+        let callsite = self.callsites_by_index[site_index];
+        let meta = &self.function_meta[func_index];
+        if !fsa_compatible(&callsite.sig, &meta.sig) {
+            self.metrics.steens_fsa_rejected_pairs += 1;
+            return;
+        }
+        self.metrics.steens_fsa_compatible_pairs += 1;
+        bindings.push((site_index, func_index));
     }
 
     fn bind_indirect_call(&mut self, site_index: usize, func_index: usize) {
@@ -996,6 +1040,22 @@ impl<'a> Solver<'a> {
         self.classes[a].fn_objs.extend(other_fns);
         let other_globals = std::mem::take(&mut self.classes[b].global_objs);
         self.classes[a].global_objs.extend(other_globals);
+        let a_processed_pairs =
+            self.classes[a].processed_icall_sites.len() * self.classes[a].processed_fn_objs.len();
+        let b_processed_pairs =
+            self.classes[b].processed_icall_sites.len() * self.classes[b].processed_fn_objs.len();
+        // The processed frontier represents one already-visited site/function rectangle.
+        // Unioning both roots' frontiers would incorrectly mark the cross product between
+        // independently processed classes as done, so keep only the larger rectangle.
+        if b_processed_pairs > a_processed_pairs {
+            let processed_sites = std::mem::take(&mut self.classes[b].processed_icall_sites);
+            let processed_fns = std::mem::take(&mut self.classes[b].processed_fn_objs);
+            self.classes[a].processed_icall_sites = processed_sites;
+            self.classes[a].processed_fn_objs = processed_fns;
+        } else {
+            self.classes[b].processed_icall_sites.clear();
+            self.classes[b].processed_fn_objs.clear();
+        }
 
         let pointee = match (self.classes[a].pointee, self.classes[b].pointee) {
             (Some(pa), Some(pb)) => Some(self.join(pa, pb)),
@@ -1091,7 +1151,8 @@ fn percentile(sorted: &[usize], pct: usize) -> usize {
 mod tests {
     use std::path::Path;
 
-    use pangs_pag::{Pag, PagOpts};
+    use pangs_pag::{CallKind, Callsite, CallsiteId, Node, NodeId, NodeKind, Pag, PagOpts, Scope};
+    use pangs_pir::{AbiClass, Func};
 
     use super::*;
 
@@ -1126,6 +1187,105 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/synthetic/m1_5")
             .join(name)
+    }
+
+    fn void_sig() -> Signature {
+        Signature {
+            ret: AbiClass::Void,
+            params: Vec::new(),
+            vararg: false,
+            cc: "ccc".to_string(),
+        }
+    }
+
+    fn frontier_test_func(key: &str) -> Func {
+        Func {
+            key: key.to_string(),
+            sig: void_sig(),
+            param_names: Vec::new(),
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: true,
+            body: Vec::new(),
+        }
+    }
+
+    fn frontier_test_callsite(index: usize) -> Callsite {
+        Callsite {
+            id: CallsiteId(index as u32),
+            key: format!("caller@frontier#{index}"),
+            caller: "caller".to_string(),
+            kind: CallKind::Indirect,
+            callee: None,
+            operand: None,
+            args: Vec::new(),
+            result: None,
+            sig: void_sig(),
+            external_boundary: false,
+            loc: None,
+        }
+    }
+
+    #[test]
+    fn steens_frontier_processes_cross_pairs_after_joining_processed_classes() {
+        let pir = Pir {
+            module: "frontier_merge".to_string(),
+            source: None,
+            lowering: Default::default(),
+            functions: vec![frontier_test_func("f0"), frontier_test_func("f1")],
+            globals: Vec::new(),
+            global_init: Vec::new(),
+        };
+        let pag = Pag {
+            module: pir.module.clone(),
+            source: None,
+            metrics: Default::default(),
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    label: "%left".to_string(),
+                    kind: NodeKind::Value {
+                        scope: Scope::Module,
+                    },
+                },
+                Node {
+                    id: NodeId(1),
+                    label: "%right".to_string(),
+                    kind: NodeKind::Value {
+                        scope: Scope::Module,
+                    },
+                },
+            ],
+            edges: Vec::new(),
+            callsites: vec![frontier_test_callsite(0), frontier_test_callsite(1)],
+            omega_seeds: Vec::new(),
+        };
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Library);
+        solver.classes[0].icall_sites.insert(0);
+        solver.classes[0].fn_objs.insert(0);
+        solver.process_class(0);
+        solver.classes[1].icall_sites.insert(1);
+        solver.classes[1].fn_objs.insert(1);
+        solver.process_class(1);
+
+        assert_eq!(solver.metrics.steens_candidate_pairs, 2);
+        assert_eq!(solver.metrics.steens_seen_pairs_new, 2);
+        assert_eq!(solver.metrics.steens_indirect_bindings, 2);
+
+        let root = solver.join(0, 1);
+        solver.process_class(root);
+
+        assert_eq!(solver.metrics.steens_seen_pairs_new, 4);
+        assert_eq!(solver.metrics.steens_indirect_bindings, 4);
+        assert_eq!(solver.metrics.steens_seen_pairs_duplicate, 1);
+        assert_eq!(solver.metrics.steens_candidate_pairs, 5);
+
+        let root = solver.find(root);
+        solver.process_class(root);
+        assert_eq!(solver.metrics.steens_candidate_pairs, 5);
+        assert_eq!(solver.metrics.steens_seen_pairs_duplicate, 1);
     }
 
     #[test]
