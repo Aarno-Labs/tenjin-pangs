@@ -450,7 +450,7 @@ pub struct Analysis {
     modrefs: Vec<ModRef>,
     stationarity: Vec<StationarityVerdict>,
     #[serde(skip)]
-    transitive_modrefs: Vec<Vec<ModRef>>,
+    transitive_modrefs: TransitiveModRefs,
     components: Vec<ComponentInfo>,
     findings: Vec<Finding>,
     metrics: Metrics,
@@ -1254,8 +1254,8 @@ impl Analysis {
             .map(|edge| &edge.caller)
     }
 
-    pub fn modref(&self, func: FuncId) -> impl Iterator<Item = &ModRef> {
-        self.transitive_modrefs[func.0 as usize].iter()
+    pub fn modref(&self, func: FuncId) -> impl Iterator<Item = ModRef> + '_ {
+        self.transitive_modrefs.iter(func)
     }
 
     pub fn component_of(&self, func: FuncId) -> ComponentId {
@@ -2118,6 +2118,25 @@ fn modref_sort_key(
     )
 }
 
+fn modref_payload_sort_key(
+    payload: &ModRefPayload,
+    _funcs: &[FuncInfo],
+    globals: &[GlobalInfo],
+) -> (String, String, String, String, String, String, String) {
+    (
+        match payload.global {
+            GlobalTarget::Name(id) => globals[id.0 as usize].key.clone(),
+            GlobalTarget::Unknown(ref reason) => reason.clone(),
+        },
+        format!("{:?}", payload.access),
+        format!("{:?}", payload.via),
+        payload.witness.clone().unwrap_or_default(),
+        payload.detail.clone().unwrap_or_default(),
+        payload.address_node.clone().unwrap_or_default(),
+        payload.pointee_globals.join("\0"),
+    )
+}
+
 fn modref_fact_sort_key(
     mr: &ModRef,
     funcs: &[FuncInfo],
@@ -2490,6 +2509,33 @@ struct ModRefPayload {
     pointee_globals: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct TransitiveModRefs {
+    payloads: Vec<ModRefPayload>,
+    by_func: Vec<Vec<usize>>,
+}
+
+impl TransitiveModRefs {
+    fn iter(&self, func: FuncId) -> impl Iterator<Item = ModRef> + '_ {
+        let root = func;
+        self.by_func[func.0 as usize]
+            .iter()
+            .map(move |&payload_id| {
+                let payload = &self.payloads[payload_id];
+                ModRef {
+                    func: root,
+                    global: payload.global.clone(),
+                    access: payload.access,
+                    via: payload.via,
+                    witness: payload.witness.clone(),
+                    detail: payload.detail.clone(),
+                    address_node: payload.address_node.clone(),
+                    pointee_globals: payload.pointee_globals.clone(),
+                }
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ModRefFactKey {
     global: GlobalTarget,
@@ -2566,7 +2612,7 @@ fn compute_transitive_modrefs(
     globals: &[GlobalInfo],
     edges: &[CallEdge],
     local_modrefs: &[ModRef],
-) -> Vec<Vec<ModRef>> {
+) -> TransitiveModRefs {
     let mut callees_by_func = vec![Vec::<usize>::new(); func_count];
     for edge in edges {
         if let (Caller::Func(caller), Callee::Func(callee)) = (&edge.caller, &edge.callee) {
@@ -2639,29 +2685,20 @@ fn compute_transitive_modrefs(
 
     let mut transitive = Vec::with_capacity(func_count);
     for root_idx in 0..func_count {
-        let root = FuncId(root_idx as u32);
-        let mut rows = memo[scc_of_func[root_idx]]
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|&payload_id| {
-                let payload = &payloads[payload_id];
-                ModRef {
-                    func: root,
-                    global: payload.global.clone(),
-                    access: payload.access,
-                    via: payload.via,
-                    witness: payload.witness.clone(),
-                    detail: payload.detail.clone(),
-                    address_node: payload.address_node.clone(),
-                    pointee_globals: payload.pointee_globals.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by_key(|mr| modref_sort_key(mr, funcs, globals));
+        let mut rows = memo[scc_of_func[root_idx]].as_ref().unwrap().clone();
+        rows.sort_by(|&left, &right| {
+            modref_payload_sort_key(&payloads[left], funcs, globals).cmp(&modref_payload_sort_key(
+                &payloads[right],
+                funcs,
+                globals,
+            ))
+        });
         transitive.push(rows);
     }
-    transitive
+    TransitiveModRefs {
+        payloads,
+        by_func: transitive,
+    }
 }
 
 fn collect_scc_payload_ids(
