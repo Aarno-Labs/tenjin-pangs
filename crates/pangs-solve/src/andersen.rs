@@ -78,10 +78,11 @@ pub fn solve_andersen_with_overrides(
     // Override only the refined facts; keep global escape/unknown-caller facts from
     // Steensgaard. Unrefined/oversize node partitions retain their Steensgaard node rows.
     base.indirect_calls = refined.indirect_calls;
-    for (label, external, pointee_globals) in refined.nodes {
+    for (label, external, pointee_globals, external_sources) in refined.nodes {
         if let Some(node) = base.nodes.get_mut(&label) {
             node.external = external;
             node.pointee_globals = pointee_globals;
+            node.external_sources = external_sources;
         }
     }
     base.metrics.rounds = refined.rounds;
@@ -92,7 +93,7 @@ pub fn solve_andersen_with_overrides(
 
 struct RefinerOutput {
     indirect_calls: Vec<IndirectCallResolution>,
-    nodes: Vec<(String, bool, Vec<String>)>,
+    nodes: Vec<(String, bool, Vec<String>, Vec<String>)>,
     rounds: usize,
     oversize_fallbacks: usize,
     oversize_fallback_max_size: usize,
@@ -430,7 +431,11 @@ impl<'a> Refiner<'a> {
                 EdgeKind::AddrOf => solve.add_pts(edge.dst.0, edge.src.0),
                 EdgeKind::Assign => solve.add_copy(edge.src.0, edge.dst.0),
                 EdgeKind::Load => solve.loads.entry(edge.src.0).or_default().push(edge.dst.0),
-                EdgeKind::Store => solve.stores.entry(edge.dst.0).or_default().push(edge.src.0),
+                EdgeKind::Store => solve
+                    .stores
+                    .entry(edge.dst.0)
+                    .or_default()
+                    .push((edge.src.0, None)),
                 EdgeKind::Gep { byte_off } => {
                     if let Some(byte_off) = byte_off {
                         solve.known_offsets.insert(byte_off);
@@ -503,11 +508,11 @@ impl<'a> Refiner<'a> {
                 (
                     OmegaSeedKind::IntToPtr | OmegaSeedKind::UnknownResultExternal,
                     SeedTarget::Node(id),
-                ) => self.seed_points_to_omega(solve, id),
+                ) => self.seed_points_to_omega(solve, id, omega_seed_source(seed.kind)),
                 (
                     OmegaSeedKind::PtrToInt | OmegaSeedKind::UnknownOperandEscape,
                     SeedTarget::Node(id),
-                ) => self.seed_unknown_store_through(solve, id),
+                ) => self.seed_unknown_store_through(solve, id, omega_seed_source(seed.kind)),
                 (
                     OmegaSeedKind::ExportedSymbol | OmegaSeedKind::ImportedSymbol,
                     SeedTarget::Node(id),
@@ -519,7 +524,7 @@ impl<'a> Refiner<'a> {
                             ..
                         })
                     ) {
-                        self.seed_points_to_omega(solve, id);
+                        self.seed_points_to_omega(solve, id, omega_seed_source(seed.kind));
                     }
                 }
                 (OmegaSeedKind::ExternalCallBoundary, SeedTarget::Callsite(id)) => {
@@ -541,16 +546,16 @@ impl<'a> Refiner<'a> {
 
     fn apply_external_call_effects(&self, solve: &mut Solve, callsite: &pangs_pag::Callsite) {
         for &arg in &callsite.args {
-            self.seed_unknown_store_through(solve, arg);
+            self.seed_unknown_store_through(solve, arg, "omega:external_call_arg");
         }
         if let Some(result) = callsite.result {
-            self.seed_points_to_omega(solve, result);
+            self.seed_points_to_omega(solve, result, "omega:external_call_result");
         }
     }
 
     fn apply_vararg_call_effects(&self, solve: &mut Solve, callsite: &pangs_pag::Callsite) {
         for &arg in callsite.args.iter().skip(callsite.sig.params.len()) {
-            self.seed_unknown_store_through(solve, arg);
+            self.seed_unknown_store_through(solve, arg, "omega:vararg_call_arg");
         }
     }
 
@@ -573,7 +578,7 @@ impl<'a> Refiner<'a> {
             };
             for param_index in 0..self.pir.functions[func_index].sig.params.len() {
                 if let Some(&param) = self.param_nodes.get(&(func_index, param_index)) {
-                    self.seed_points_to_omega(solve, param);
+                    self.seed_points_to_omega(solve, param, "omega:escaped_function_param");
                 }
             }
         }
@@ -588,20 +593,24 @@ impl<'a> Refiner<'a> {
         };
         for param_index in 1..self.pir.functions[main_index].sig.params.len() {
             if let Some(&param) = self.param_nodes.get(&(main_index, param_index)) {
-                self.seed_points_to_omega(solve, param);
+                self.seed_points_to_omega(solve, param, "omega:main_entry_param");
             }
         }
     }
 
-    fn seed_points_to_omega(&self, solve: &mut Solve, node: NodeId) {
+    fn seed_points_to_omega(&self, solve: &mut Solve, node: NodeId, source: &str) {
         if self.in_scope.get(node.0 as usize).copied().unwrap_or(false) {
-            solve.add_pts(node.0, self.omega);
+            solve.add_pts_with_source(node.0, self.omega, Some(source));
         }
     }
 
-    fn seed_unknown_store_through(&self, solve: &mut Solve, node: NodeId) {
+    fn seed_unknown_store_through(&self, solve: &mut Solve, node: NodeId, source: &str) {
         if self.in_scope.get(node.0 as usize).copied().unwrap_or(false) {
-            solve.stores.entry(node.0).or_default().push(self.omega);
+            solve
+                .stores
+                .entry(node.0)
+                .or_default()
+                .push((self.omega, Some(source.to_string())));
         }
     }
 
@@ -735,7 +744,7 @@ impl<'a> Refiner<'a> {
         out
     }
 
-    fn emit_node_resolutions(&self, pts: &Solve) -> Vec<(String, bool, Vec<String>)> {
+    fn emit_node_resolutions(&self, pts: &Solve) -> Vec<(String, bool, Vec<String>, Vec<String>)> {
         let mut out = Vec::new();
         for node in &self.pag.nodes {
             if !node.kind.is_value_like_public() || !self.in_scope[node.id.0 as usize] {
@@ -756,9 +765,30 @@ impl<'a> Refiner<'a> {
                 .collect();
             globals.sort();
             globals.dedup();
-            out.push((node.label.clone(), external, globals));
+            let external_sources = if external {
+                pts.omega_sources
+                    .get(&node.id.0)
+                    .map(|sources| sources.iter().cloned().collect())
+                    .unwrap_or_else(|| vec!["omega:unknown".to_string()])
+            } else {
+                Vec::new()
+            };
+            out.push((node.label.clone(), external, globals, external_sources));
         }
         out
+    }
+}
+
+fn omega_seed_source(kind: OmegaSeedKind) -> &'static str {
+    match kind {
+        OmegaSeedKind::ExportedSymbol => "omega:exported_symbol",
+        OmegaSeedKind::ImportedSymbol => "omega:imported_symbol",
+        OmegaSeedKind::PtrToInt => "omega:ptrtoint_escape",
+        OmegaSeedKind::IntToPtr => "omega:inttoptr",
+        OmegaSeedKind::UnknownOperandEscape => "omega:unknown_operand_escape",
+        OmegaSeedKind::UnknownResultExternal => "omega:unknown_result",
+        OmegaSeedKind::ExternalCallBoundary => "omega:external_call",
+        OmegaSeedKind::VarargCallBoundary => "omega:vararg_call",
     }
 }
 
@@ -777,9 +807,10 @@ struct Solve {
     omega: Cell,
     next_field: Cell,
     pts: HashMap<Cell, HashSet<Cell>>,
+    omega_sources: HashMap<Cell, BTreeSet<String>>,
     succ: HashMap<Cell, HashSet<Cell>>,
     loads: HashMap<Cell, Vec<Cell>>,
-    stores: HashMap<Cell, Vec<Cell>>,
+    stores: HashMap<Cell, Vec<(Cell, Option<String>)>>,
     geps: HashMap<Cell, Vec<(Option<i64>, Cell)>>,
     memcpys: Vec<(Cell, Cell)>,
     fields: HashMap<(Cell, i64), Cell>,
@@ -809,6 +840,7 @@ impl Solve {
             omega,
             next_field: omega + 1,
             pts: HashMap::new(),
+            omega_sources: HashMap::new(),
             succ: HashMap::new(),
             loads: HashMap::new(),
             stores: HashMap::new(),
@@ -838,10 +870,24 @@ impl Solve {
     }
 
     fn add_pts(&mut self, cell: Cell, obj: Cell) {
+        self.add_pts_with_source(cell, obj, None);
+    }
+
+    fn add_pts_with_source(&mut self, cell: Cell, obj: Cell, source: Option<&str>) {
         if cell == self.omega {
             return; // Ω stays {Ω}
         }
-        if self.pts.entry(cell).or_default().insert(obj) {
+        let mut changed = self.pts.entry(cell).or_default().insert(obj);
+        if obj == self.omega {
+            if let Some(source) = source {
+                changed |= self
+                    .omega_sources
+                    .entry(cell)
+                    .or_default()
+                    .insert(source.to_string());
+            }
+        }
+        if changed {
             self.enqueue(cell);
         }
     }
@@ -858,11 +904,30 @@ impl Solve {
                 for o in src {
                     changed |= dst.insert(o);
                 }
+                changed |= self.propagate_omega_sources(from, to);
                 if changed {
                     self.enqueue(to);
                 }
             }
         }
+    }
+
+    fn propagate_omega_sources(&mut self, from: Cell, to: Cell) -> bool {
+        if from == self.omega || to == self.omega {
+            return false;
+        }
+        let Some(sources) = self.omega_sources.get(&from).cloned() else {
+            return false;
+        };
+        if sources.is_empty() {
+            return false;
+        }
+        let dst = self.omega_sources.entry(to).or_default();
+        let mut changed = false;
+        for source in sources {
+            changed |= dst.insert(source);
+        }
+        changed
     }
 
     /// Field/subobject identity for `base + off` (M2.1, `PLAN-M2_lite_delta.md` §1 M2.1).
@@ -1011,9 +1076,13 @@ impl Solve {
             // n as a store base: *n = q  ⇒  pts(q) ⊆ pts(o)  for o ∈ pts(n)
             if let Some(qs) = self.stores.get(&n).cloned() {
                 self.report_large_product("store", n, qs.len(), objs.len());
-                for q in qs {
+                for (q, omega_source) in qs {
                     for &o in &objs {
-                        self.add_copy(q, o);
+                        if q == self.omega {
+                            self.add_pts_with_source(o, self.omega, omega_source.as_deref());
+                        } else {
+                            self.add_copy(q, o);
+                        }
                     }
                 }
             }
@@ -1066,6 +1135,7 @@ impl Solve {
                     for &o in &src {
                         changed |= dst.insert(o);
                     }
+                    changed |= self.propagate_omega_sources(n, s);
                     if changed {
                         self.enqueue(s);
                     }
@@ -1242,6 +1312,10 @@ mod tests {
         let gp = &andersen.nodes["val:driver:%gp"];
         assert!(!gp.external);
         assert_eq!(gp.pointee_globals, vec!["@Table".to_string()]);
+
+        let unknown_ptr = &andersen.nodes["val:driver:%unknown_ptr"];
+        assert!(unknown_ptr.external);
+        assert_eq!(unknown_ptr.external_sources, vec!["omega:inttoptr"]);
     }
 
     #[test]

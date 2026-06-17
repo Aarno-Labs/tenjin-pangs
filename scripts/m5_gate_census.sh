@@ -197,6 +197,29 @@ for dir in "$@"; do
 done
 
 echo
+echo "## Unknown Mod Omega Sources"
+echo
+echo "| row | omega source | rows |"
+echo "|---|---|---:|"
+for dir in "$@"; do
+  modrefs="$dir/modref.jsonl"
+  label="$(basename "$dir")"
+  label="${label%-andersen}"
+  jq -r \
+    --arg label "$label" '
+      select(.access == "mod" and .global.unknown == "omega_store")
+      | (.detail // "<none>")
+      | split("|")
+      | if length > 1 then .[1] else "<unclassified>" end
+      | split("+")[]
+    ' "$modrefs" \
+    | sort \
+    | uniq -c \
+    | sort -nr \
+    | awk -v label="$label" '{ printf "| `%s` | `%s` | %s |\n", label, $2, $1 }'
+done
+
+echo
 echo "## Top Unknown Mod Sites"
 echo
 for dir in "$@"; do

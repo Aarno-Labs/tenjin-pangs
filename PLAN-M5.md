@@ -165,6 +165,16 @@ Implementation status:
   `stmt:memset_dst`), because the more explicit boundary seeding exposes a few additional
   store-unknown effects. The next slice should classify residual `edge:store` rows by Ω
   source, not just by statement kind.
+- Residual unknown mod rows now carry Ω-source detail when available. The O1 decision set
+  (`/tmp/pangs-m5-omega-source-classified`) has 739 source-preserved `omega_store` rows:
+  705 `omega:steens_external`, 27 `omega:external_call_result`, and 7 `omega:unknown`.
+  By statement/source pair, the dominant class is 503
+  `edge:store|omega:steens_external`, followed by 103
+  `edge:memcpy_dst|omega:steens_external` and 99
+  `stmt:memset_dst|omega:steens_external`. The next useful slice is therefore not another
+  direct boundary model; it is reducing Steensgaard external overmerge for store-address
+  nodes or deciding that M5.0 should stop here and defer this precision to a later
+  field/object-sensitive pass.
 - M5b remains not green-lit because no current lite client consumes thread-confinement
   facts.
 

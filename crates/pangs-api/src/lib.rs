@@ -2197,7 +2197,10 @@ fn push_pointer_modrefs_from_pag(
                     access: pointer_access.access,
                     via: Via::Unknown,
                     witness: witness.clone(),
-                    detail: Some(pointer_access.detail.to_string()),
+                    detail: Some(modref_detail_with_external_sources(
+                        pointer_access.detail,
+                        &resolution.external_sources,
+                    )),
                 });
             }
         }
@@ -2256,11 +2259,24 @@ fn push_pointer_memset_modrefs_from_pir(
                     access: Access::Mod,
                     via: Via::Unknown,
                     witness,
-                    detail: Some("stmt:memset_dst".to_string()),
+                    detail: Some(modref_detail_with_external_sources(
+                        "stmt:memset_dst",
+                        &resolution.external_sources,
+                    )),
                 });
             }
         }
     }
+}
+
+fn modref_detail_with_external_sources(base: &str, sources: &[String]) -> String {
+    if sources.is_empty() {
+        return base.to_string();
+    }
+    let mut sources = sources.to_vec();
+    sources.sort();
+    sources.dedup();
+    format!("{base}|{}", sources.join("+"))
 }
 
 fn edge_accesses(

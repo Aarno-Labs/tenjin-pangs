@@ -104,6 +104,8 @@ pub struct NodeResolution {
     pub external: bool,
     #[serde(default)]
     pub pointee_globals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_sources: Vec<String>,
 }
 
 pub fn solve_steensgaard(pir: &Pir, pag: &Pag, build_mode: BuildMode) -> SolveResult {
@@ -555,6 +557,11 @@ impl<'a> Solver<'a> {
                     reaches_function_pointer,
                     external,
                     pointee_globals,
+                    external_sources: if external {
+                        vec!["omega:steens_external".to_string()]
+                    } else {
+                        Vec::new()
+                    },
                 },
             );
         }

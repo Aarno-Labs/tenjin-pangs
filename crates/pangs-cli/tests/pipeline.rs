@@ -295,6 +295,18 @@ fn analyze_exports_m2_5_stationarity_unknown_writer_evidence() {
                 && writer["global"]["unknown"] == "omega_store"
                 && writer["access"] == "mod"
         }));
+
+    let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(modref.iter().any(|row| {
+        row["func"] == "driver"
+            && row["global"]["unknown"] == "omega_store"
+            && row["access"] == "mod"
+            && row["detail"] == "edge:store|omega:inttoptr"
+    }));
 }
 
 #[test]
@@ -1414,7 +1426,7 @@ fn analyze_steens_exports_pointer_aware_modref_and_freezes_unknown_global_compon
             && row["access"] == "ref"
             && row["via"] == "unknown"
             && row["witness"] == "main@m1_6.c:6:1#0"
-            && row["detail"] == "edge:load"
+            && row["detail"] == "edge:load|omega:steens_external"
     }));
     assert!(modref.iter().any(|row| {
         row["func"] == "main"
@@ -1422,7 +1434,7 @@ fn analyze_steens_exports_pointer_aware_modref_and_freezes_unknown_global_compon
             && row["access"] == "mod"
             && row["via"] == "unknown"
             && row["witness"] == "main@m1_6.c:7:1#0"
-            && row["detail"] == "edge:store"
+            && row["detail"] == "edge:store|omega:steens_external"
     }));
 
     let components: Value =
@@ -1487,7 +1499,7 @@ fn analyze_steens_exports_memcpy_pointer_modref_rows() {
             && row["access"] == "ref"
             && row["via"] == "unknown"
             && row["witness"] == "main@m1_6_memcpy.c:6:1#0"
-            && row["detail"] == "edge:memcpy_src"
+            && row["detail"] == "edge:memcpy_src|omega:steens_external"
     }));
     assert!(modref.iter().any(|row| {
         row["func"] == "main"
@@ -1495,7 +1507,7 @@ fn analyze_steens_exports_memcpy_pointer_modref_rows() {
             && row["access"] == "mod"
             && row["via"] == "unknown"
             && row["witness"] == "main@m1_6_memcpy.c:6:1#0"
-            && row["detail"] == "edge:memcpy_dst"
+            && row["detail"] == "edge:memcpy_dst|omega:steens_external"
     }));
 
     let components: Value =
@@ -1562,7 +1574,7 @@ fn analyze_steens_keeps_pointer_modref_exports_local_while_callgraph_narrows_ind
             && row["access"] == "mod"
             && row["via"] == "unknown"
             && row["witness"] == "target@m1_6_icall.c:23:1#0"
-            && row["detail"] == "edge:store"
+            && row["detail"] == "edge:store|omega:steens_external"
     }));
     assert!(modref.iter().any(|row| {
         row["func"] == "other"
@@ -1602,7 +1614,7 @@ fn analyze_steens_exports_memset_pointer_modref_rows() {
             && row["access"] == "mod"
             && row["via"] == "unknown"
             && row["witness"] == "main@m1_6_memset.c:4:1#0"
-            && row["detail"] == "stmt:memset_dst"
+            && row["detail"] == "stmt:memset_dst|omega:steens_external"
     }));
     assert!(modref.iter().any(|row| {
         row["func"] == "main"

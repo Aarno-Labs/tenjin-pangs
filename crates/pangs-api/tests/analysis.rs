@@ -561,7 +561,9 @@ fn m2_4_unknown_runtime_mod_blocks_stationarity() {
     assert_eq!(analysis.metrics().stationary_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);
     assert!(analysis.modrefs().iter().any(|mr| {
-        mr.access == Access::Mod && matches!(mr.global, pangs_api::GlobalTarget::Unknown(_))
+        mr.access == Access::Mod
+            && matches!(mr.global, pangs_api::GlobalTarget::Unknown(_))
+            && mr.detail.as_deref() == Some("edge:store|omega:inttoptr")
     }));
 }
 
@@ -2301,7 +2303,7 @@ fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
             && mr.access == Access::Ref
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("main@m1_6.c:6:1#0")
-            && mr.detail.as_deref() == Some("edge:load")
+            && mr.detail.as_deref() == Some("edge:load|omega:steens_external")
     }));
     assert!(raw_modrefs.iter().any(|mr| {
         mr.func == main
@@ -2309,7 +2311,7 @@ fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("main@m1_6.c:7:1#0")
-            && mr.detail.as_deref() == Some("edge:store")
+            && mr.detail.as_deref() == Some("edge:store|omega:steens_external")
     }));
 
     let component = steens
@@ -2377,7 +2379,7 @@ fn steens_memcpy_modref_exports_aliased_direct_symbol_and_unknown_rows() {
             && mr.access == Access::Ref
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:6:1#0")
-            && mr.detail.as_deref() == Some("edge:memcpy_src")
+            && mr.detail.as_deref() == Some("edge:memcpy_src|omega:steens_external")
     }));
     assert!(raw_modrefs.iter().any(|mr| {
         mr.func == main
@@ -2385,7 +2387,7 @@ fn steens_memcpy_modref_exports_aliased_direct_symbol_and_unknown_rows() {
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:6:1#0")
-            && mr.detail.as_deref() == Some("edge:memcpy_dst")
+            && mr.detail.as_deref() == Some("edge:memcpy_dst|omega:steens_external")
     }));
 
     let component = analysis
@@ -2448,7 +2450,7 @@ fn steens_modref_closure_carries_pointer_rows_through_direct_and_indirect_calls(
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("target@m1_6_icall.c:23:1#0")
-            && mr.detail.as_deref() == Some("edge:store")
+            && mr.detail.as_deref() == Some("edge:store|omega:steens_external")
     }));
     assert!(raw_modrefs.iter().any(|mr| {
         mr.func == other
@@ -2472,7 +2474,7 @@ fn steens_modref_closure_carries_pointer_rows_through_direct_and_indirect_calls(
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("target@m1_6_icall.c:23:1#0")
-            && mr.detail.as_deref() == Some("edge:store")
+            && mr.detail.as_deref() == Some("edge:store|omega:steens_external")
     }));
     assert!(!setup_modrefs.iter().any(|mr| {
         mr.global == pangs_api::GlobalTarget::Name(noise)
@@ -2493,7 +2495,7 @@ fn steens_modref_closure_carries_pointer_rows_through_direct_and_indirect_calls(
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("target@m1_6_icall.c:23:1#0")
-            && mr.detail.as_deref() == Some("edge:store")
+            && mr.detail.as_deref() == Some("edge:store|omega:steens_external")
     }));
     assert!(!main_modrefs.iter().any(|mr| {
         mr.global == pangs_api::GlobalTarget::Name(noise)
@@ -2532,7 +2534,7 @@ fn steens_memset_modref_exports_direct_aliased_and_unknown_store_rows() {
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("main@m1_6_memset.c:4:1#0")
-            && mr.detail.as_deref() == Some("stmt:memset_dst")
+            && mr.detail.as_deref() == Some("stmt:memset_dst|omega:steens_external")
     }));
     assert!(raw_modrefs.iter().any(|mr| {
         mr.func == main
@@ -2583,7 +2585,7 @@ fn andersen_refines_spurious_external_store_address_modref() {
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("driver@m5_store.c:8:1#0")
-            && mr.detail.as_deref() == Some("edge:store")
+            && mr.detail.as_deref() == Some("edge:store|omega:steens_external")
     }));
     assert!(andersen.modrefs().iter().any(|mr| {
         mr.global == pangs_api::GlobalTarget::Name(table)
