@@ -349,6 +349,10 @@ pub struct Metrics {
     pub pointer_modref_high_fanout_fallbacks: u64,
     #[serde(default)]
     pub pointer_modref_high_fanout_fallback_rows: u64,
+    #[serde(default)]
+    pub pointer_modref_closure_high_fanout_fallbacks: u64,
+    #[serde(default)]
+    pub pointer_modref_closure_high_fanout_fallback_rows: u64,
     /// Flat per-provenance icall attribution (M2.0, `DESIGN_lite.md` §2F). Counts indirect
     /// callsites whose resolved edges carry each tier; the ablation signal M2.7 reads.
     /// `icalls_unknown` counts sites with an Ω/unknown-callee edge. No certificate cascade.
@@ -1287,6 +1291,10 @@ impl Analysis {
             pointer_modref_high_fanout_fallbacks: pointer_modref_metrics.high_fanout_fallbacks,
             pointer_modref_high_fanout_fallback_rows: pointer_modref_metrics
                 .high_fanout_fallback_rows,
+            pointer_modref_closure_high_fanout_fallbacks: pointer_modref_metrics
+                .closure_high_fanout_fallbacks,
+            pointer_modref_closure_high_fanout_fallback_rows: pointer_modref_metrics
+                .closure_high_fanout_fallback_rows,
             analysis_wall_us: 0,
             setup_scan_us,
             preanalysis_us,
@@ -2554,6 +2562,8 @@ struct ModRefPhaseMetrics {
     unique: u64,
     duplicate: u64,
     max_fact_fanout: u64,
+    high_fanout_fallbacks: u64,
+    high_fanout_fallback_rows: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2564,6 +2574,8 @@ struct ModRefEmissionMetrics {
     pointer_modref_max_fact_fanout: u64,
     high_fanout_fallbacks: u64,
     high_fanout_fallback_rows: u64,
+    closure_high_fanout_fallbacks: u64,
+    closure_high_fanout_fallback_rows: u64,
 }
 
 impl ModRefEmissionMetrics {
@@ -2575,6 +2587,8 @@ impl ModRefEmissionMetrics {
     }
 
     fn merge_closure(&mut self, closure: ModRefPhaseMetrics) {
+        self.closure_high_fanout_fallbacks = closure.high_fanout_fallbacks;
+        self.closure_high_fanout_fallback_rows = closure.high_fanout_fallback_rows;
         self.closure = closure;
         self.pointer_modref_max_fact_fanout = self
             .pointer_modref_max_fact_fanout
@@ -2733,6 +2747,13 @@ fn pointer_modref_high_fanout_limit() -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(4096)
+}
+
+fn transitive_modref_high_fanout_limit() -> usize {
+    std::env::var("PANGS_TRANSITIVE_MODREF_HIGH_FANOUT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(65_536)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3587,6 +3608,35 @@ struct ModRefFactKey {
     pointee_globals: Vec<String>,
 }
 
+fn modref_payload_key(payload: &ModRefPayload) -> ModRefFactKey {
+    ModRefFactKey {
+        global: payload.global.clone(),
+        access_rank: access_rank(payload.access),
+        via_rank: via_rank(payload.via),
+        detail: payload.detail.clone(),
+        address_node: payload.address_node.clone(),
+        pointee_globals: payload.pointee_globals.clone(),
+    }
+}
+
+fn intern_modref_payload(
+    payload_ids: &mut BTreeMap<ModRefFactKey, usize>,
+    payloads: &mut Vec<ModRefPayload>,
+    payload: ModRefPayload,
+) -> usize {
+    let key = modref_payload_key(&payload);
+    if let Some(&id) = payload_ids.get(&key) {
+        let existing = &mut payloads[id];
+        existing.witness = preferred_modref_witness(existing.witness.take(), payload.witness);
+        id
+    } else {
+        let id = payloads.len();
+        payload_ids.insert(key, id);
+        payloads.push(payload);
+        id
+    }
+}
+
 impl PartialOrd for ModRefPayload {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -3689,24 +3739,7 @@ fn compute_transitive_modrefs(
             address_node: mr.address_node.clone(),
             pointee_globals: mr.pointee_globals.clone(),
         };
-        let key = ModRefFactKey {
-            global: mr.global.clone(),
-            access_rank: access_rank(mr.access),
-            via_rank: via_rank(mr.via),
-            detail: mr.detail.clone(),
-            address_node: mr.address_node.clone(),
-            pointee_globals: mr.pointee_globals.clone(),
-        };
-        let id = if let Some(&id) = payload_ids.get(&key) {
-            let existing = &mut payloads[id];
-            existing.witness = preferred_modref_witness(existing.witness.take(), payload.witness);
-            id
-        } else {
-            let id = payloads.len();
-            payload_ids.insert(key, id);
-            payloads.push(payload);
-            id
-        };
+        let id = intern_modref_payload(&mut payload_ids, &mut payloads, payload);
         local_by_scc[scc_of_func[mr.func.0 as usize]].push(id);
     }
     for rows in &mut local_by_scc {
@@ -3734,6 +3767,8 @@ fn compute_transitive_modrefs(
         collect_scc_payload_ids(scc, &local_by_scc, &scc_succs, &mut memo);
     }
 
+    let mut metrics = ModRefPhaseMetrics::default();
+    let high_fanout_limit = transitive_modref_high_fanout_limit();
     let mut row_sets = Vec::with_capacity(scc_members.len());
     let mut max_fanout_by_scc = Vec::with_capacity(scc_members.len());
     for scc in 0..scc_members.len() {
@@ -3741,12 +3776,18 @@ fn compute_transitive_modrefs(
         rows.sort_by(|&left, &right| {
             modref_payload_cmp(&payloads[left], &payloads[right], globals)
         });
+        collapse_high_fanout_transitive_rows(
+            &mut rows,
+            &mut payload_ids,
+            &mut payloads,
+            &mut metrics,
+            high_fanout_limit,
+        );
         max_fanout_by_scc.push(max_modref_payload_fanout(&rows, &payloads));
         row_sets.push(rows);
     }
 
     let mut row_set_by_func = Vec::with_capacity(func_count);
-    let mut metrics = ModRefPhaseMetrics::default();
     let mut profile = PointerModRefProfile::from_env();
     profile.print_closure("closure-start", &metrics, 0, payloads.len());
     for root_idx in 0..func_count {
@@ -3790,6 +3831,67 @@ fn max_modref_payload_fanout(sorted_rows: &[usize], payloads: &[ModRefPayload]) 
 
 fn same_modref_fanout_fact(left: &ModRefPayload, right: &ModRefPayload) -> bool {
     left.global == right.global && left.access == right.access && left.via == right.via
+}
+
+fn collapse_high_fanout_transitive_rows(
+    rows: &mut Vec<usize>,
+    payload_ids: &mut BTreeMap<ModRefFactKey, usize>,
+    payloads: &mut Vec<ModRefPayload>,
+    metrics: &mut ModRefPhaseMetrics,
+    high_fanout_limit: usize,
+) {
+    if high_fanout_limit == 0 || rows.len() <= high_fanout_limit {
+        return;
+    }
+
+    let precise_rows = rows.len() as u64;
+    let has_ref = rows
+        .iter()
+        .any(|&payload_id| payloads[payload_id].access == Access::Ref);
+    let has_mod = rows
+        .iter()
+        .any(|&payload_id| payloads[payload_id].access == Access::Mod);
+    let detail = Some(format!(
+        "high_fanout_transitive_modref:rows={precise_rows}:limit={high_fanout_limit}"
+    ));
+    let mut fallback_rows = Vec::with_capacity(2);
+    if has_ref {
+        fallback_rows.push(intern_modref_payload(
+            payload_ids,
+            payloads,
+            high_fanout_transitive_payload(Access::Ref, detail.clone()),
+        ));
+    }
+    if has_mod {
+        fallback_rows.push(intern_modref_payload(
+            payload_ids,
+            payloads,
+            high_fanout_transitive_payload(Access::Mod, detail),
+        ));
+    }
+    fallback_rows.sort_unstable();
+    fallback_rows.dedup();
+    *rows = fallback_rows;
+    metrics.high_fanout_fallbacks += 1;
+    metrics.high_fanout_fallback_rows = metrics
+        .high_fanout_fallback_rows
+        .saturating_add(precise_rows);
+}
+
+fn high_fanout_transitive_payload(access: Access, detail: Option<String>) -> ModRefPayload {
+    let reason = match access {
+        Access::Ref => "omega_load",
+        Access::Mod => "omega_store",
+    };
+    ModRefPayload {
+        global: GlobalTarget::Unknown(reason.to_string()),
+        access,
+        via: Via::Unknown,
+        witness: None,
+        detail,
+        address_node: None,
+        pointee_globals: Vec::new(),
+    }
 }
 
 fn collect_scc_payload_ids(

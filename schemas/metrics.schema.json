@@ -53,6 +53,8 @@
     "pointer_modref_closure_max_fact_fanout",
     "pointer_modref_high_fanout_fallbacks",
     "pointer_modref_high_fanout_fallback_rows",
+    "pointer_modref_closure_high_fanout_fallbacks",
+    "pointer_modref_closure_high_fanout_fallback_rows",
     "icalls_simple",
     "icalls_andersen",
     "icalls_steens",
@@ -345,6 +347,14 @@
       "minimum": 0
     },
     "pointer_modref_high_fanout_fallback_rows": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_closure_high_fanout_fallbacks": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_closure_high_fanout_fallback_rows": {
       "type": "integer",
       "minimum": 0
     },
