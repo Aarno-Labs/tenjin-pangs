@@ -1074,6 +1074,7 @@ impl Analysis {
                 solver_postprocess_us = solver_postprocess_started.elapsed().as_micros() as u64;
 
                 let pointer_modref_started = Instant::now();
+                modrefs.print_profile("local-start");
                 push_pointer_modrefs_from_pag(
                     &mut modrefs,
                     &func_lookup,
@@ -1082,6 +1083,7 @@ impl Analysis {
                     &solved.nodes,
                     &mut noloc_ord,
                 );
+                modrefs.print_profile("after-pag");
                 push_pointer_memset_modrefs_from_pir(
                     &mut modrefs,
                     module,
@@ -1090,6 +1092,7 @@ impl Analysis {
                     &solved.nodes,
                     &mut noloc_ord,
                 );
+                modrefs.print_profile("after-mem");
                 pointer_modref_us = pointer_modref_started.elapsed().as_micros() as u64;
             }
         }
@@ -2343,11 +2346,15 @@ struct ModRefBuilder {
     metrics: ModRefEmissionMetrics,
     fanout_by_fact: HashMap<ModRefFanoutKey, u64>,
     fanout_by_phase: HashMap<(ModRefSourcePhase, ModRefFanoutKey), u64>,
+    profile: PointerModRefProfile,
 }
 
 impl ModRefBuilder {
     fn new() -> Self {
-        Self::default()
+        Self {
+            profile: PointerModRefProfile::from_env(),
+            ..Self::default()
+        }
     }
 
     fn push(&mut self, row: ModRef) {
@@ -2479,6 +2486,7 @@ impl ModRefBuilder {
         } else {
             phase_metrics.duplicate += 1;
         }
+        self.maybe_print_profile("progress");
     }
 
     fn note_named_empty_prefiltered_duplicates(
@@ -2501,6 +2509,17 @@ impl ModRefBuilder {
         };
         self.note_modref_fanout_count(fanout_key, Some(phase), duplicate_count);
         self.metrics.phase_mut(phase).duplicate += duplicate_count;
+        self.maybe_print_profile("progress");
+    }
+
+    fn maybe_print_profile(&mut self, label: &str) {
+        self.profile
+            .maybe_print_local(label, &self.metrics, self.rows.len());
+    }
+
+    fn print_profile(&self, label: &str) {
+        self.profile
+            .print_local(label, &self.metrics, self.rows.len());
     }
 
     fn into_vec(self) -> Vec<ModRef> {
@@ -2556,6 +2575,133 @@ impl ModRefEmissionMetrics {
     fn duplicate(&self) -> u64 {
         self.pag.duplicate + self.mem.duplicate + self.closure.duplicate
     }
+}
+
+#[derive(Debug)]
+struct PointerModRefProfile {
+    enabled: bool,
+    started: Instant,
+    interval_attempted: u64,
+    next_attempted: u64,
+}
+
+impl Default for PointerModRefProfile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            started: Instant::now(),
+            interval_attempted: pointer_modref_profile_interval_attempts(),
+            next_attempted: pointer_modref_profile_interval_attempts(),
+        }
+    }
+}
+
+impl PointerModRefProfile {
+    fn from_env() -> Self {
+        let interval_attempted = pointer_modref_profile_interval_attempts();
+        Self {
+            enabled: pointer_modref_profile_enabled(),
+            started: Instant::now(),
+            interval_attempted,
+            next_attempted: interval_attempted,
+        }
+    }
+
+    fn maybe_print_local(
+        &mut self,
+        label: &str,
+        metrics: &ModRefEmissionMetrics,
+        local_rows: usize,
+    ) {
+        if !self.enabled || metrics.attempted() < self.next_attempted {
+            return;
+        }
+        self.print_local(label, metrics, local_rows);
+        while self.next_attempted <= metrics.attempted() {
+            self.next_attempted += self.interval_attempted;
+        }
+    }
+
+    fn print_local(&self, label: &str, metrics: &ModRefEmissionMetrics, local_rows: usize) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "pangs pointer modref profile {label}: elapsed_ms={} local_rows={} \
+             attempted={} unique={} duplicate={} \
+             pag={}/{}/{} mem={}/{}/{} closure={}/{}/{} \
+             max_fanout={} pag_max_fanout={} mem_max_fanout={} closure_max_fanout={}",
+            self.started.elapsed().as_millis(),
+            local_rows,
+            metrics.attempted(),
+            metrics.unique(),
+            metrics.duplicate(),
+            metrics.pag.attempted,
+            metrics.pag.unique,
+            metrics.pag.duplicate,
+            metrics.mem.attempted,
+            metrics.mem.unique,
+            metrics.mem.duplicate,
+            metrics.closure.attempted,
+            metrics.closure.unique,
+            metrics.closure.duplicate,
+            metrics.pointer_modref_max_fact_fanout,
+            metrics.pag.max_fact_fanout,
+            metrics.mem.max_fact_fanout,
+            metrics.closure.max_fact_fanout,
+        );
+    }
+
+    fn maybe_print_closure(
+        &mut self,
+        label: &str,
+        metrics: &ModRefPhaseMetrics,
+        funcs_done: usize,
+        payloads: usize,
+    ) {
+        if !self.enabled || metrics.attempted < self.next_attempted {
+            return;
+        }
+        self.print_closure(label, metrics, funcs_done, payloads);
+        while self.next_attempted <= metrics.attempted {
+            self.next_attempted += self.interval_attempted;
+        }
+    }
+
+    fn print_closure(
+        &self,
+        label: &str,
+        metrics: &ModRefPhaseMetrics,
+        funcs_done: usize,
+        payloads: usize,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "pangs pointer modref profile {label}: elapsed_ms={} funcs_done={} payloads={} \
+             attempted={} unique={} duplicate={} max_fanout={}",
+            self.started.elapsed().as_millis(),
+            funcs_done,
+            payloads,
+            metrics.attempted,
+            metrics.unique,
+            metrics.duplicate,
+            metrics.max_fact_fanout,
+        );
+    }
+}
+
+fn pointer_modref_profile_enabled() -> bool {
+    std::env::var_os("PANGS_POINTER_MODREF_PROFILE").is_some()
+}
+
+fn pointer_modref_profile_interval_attempts() -> u64 {
+    std::env::var("PANGS_POINTER_MODREF_PROFILE_INTERVAL")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(10_000_000)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3237,6 +3383,8 @@ fn compute_transitive_modrefs(
     let mut transitive = Vec::with_capacity(func_count);
     let mut metrics = ModRefPhaseMetrics::default();
     let mut fanout_by_fact = HashMap::<ModRefFanoutKey, u64>::new();
+    let mut profile = PointerModRefProfile::from_env();
+    profile.print_closure("closure-start", &metrics, 0, payloads.len());
     for root_idx in 0..func_count {
         let mut rows = memo[scc_of_func[root_idx]].as_ref().unwrap().clone();
         rows.sort_by(|&left, &right| {
@@ -3257,7 +3405,9 @@ fn compute_transitive_modrefs(
             metrics.max_fact_fanout = metrics.max_fact_fanout.max(*count);
         }
         transitive.push(rows);
+        profile.maybe_print_closure("closure-progress", &metrics, root_idx + 1, payloads.len());
     }
+    profile.print_closure("closure-done", &metrics, func_count, payloads.len());
     (
         TransitiveModRefs {
             payloads,
