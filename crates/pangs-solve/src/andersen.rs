@@ -81,7 +81,7 @@ pub fn solve_andersen_with_overrides(
     for (label, external, pointee_globals, external_sources) in refined.nodes {
         if let Some(node) = base.nodes.get_mut(&label) {
             node.external = external;
-            node.pointee_globals = pointee_globals;
+            node.pointee_globals = pointee_globals.into();
             node.external_sources = external_sources;
         }
     }

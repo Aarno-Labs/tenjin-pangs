@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::ops::Deref;
+use std::sync::Arc;
 
 use pangs_pag::{BuildMode, CallKind, NodeId, NodeKind, OmegaSeedKind, Pag, SeedTarget};
 use pangs_pir::{fsa_compatible, Pir, Signature};
@@ -103,9 +105,72 @@ pub struct NodeResolution {
     #[serde(default)]
     pub external: bool,
     #[serde(default)]
-    pub pointee_globals: Vec<String>,
+    pub pointee_globals: SharedStringList,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct SharedStringList(Arc<[String]>);
+
+impl SharedStringList {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn to_vec(&self) -> Vec<String> {
+        self.0.to_vec()
+    }
+}
+
+impl Deref for SharedStringList {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<[String]> for SharedStringList {
+    fn as_ref(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl From<Vec<String>> for SharedStringList {
+    fn from(values: Vec<String>) -> Self {
+        Self(values.into())
+    }
+}
+
+impl From<SharedStringList> for Vec<String> {
+    fn from(values: SharedStringList) -> Self {
+        values.0.to_vec()
+    }
+}
+
+impl PartialEq<Vec<String>> for SharedStringList {
+    fn eq(&self, other: &Vec<String>) -> bool {
+        self.0.as_ref() == other.as_slice()
+    }
+}
+
+impl Serialize for SharedStringList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedStringList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer).map(Self::from)
+    }
 }
 
 pub fn solve_steensgaard(pir: &Pir, pag: &Pag, build_mode: BuildMode) -> SolveResult {
@@ -526,7 +591,8 @@ impl<'a> Solver<'a> {
             );
         }
 
-        let mut pointee_globals_by_root: Vec<Option<Vec<String>>> = vec![None; self.classes.len()];
+        let mut pointee_globals_by_root: Vec<Option<SharedStringList>> =
+            vec![None; self.classes.len()];
         let mut reaches_function_pointer_by_root: Vec<Option<bool>> =
             vec![None; self.classes.len()];
         let mut node_summary_by_root: Vec<Option<CachedRootNodeSummary>> =
@@ -578,6 +644,7 @@ impl<'a> Solver<'a> {
                             .map(|&global_index| self.global_keys[global_index].clone())
                             .collect::<Vec<_>>();
                         globals.sort();
+                        let globals = SharedStringList::from(globals);
                         pointee_globals_by_root[pointee] = Some(globals.clone());
                         globals
                     }

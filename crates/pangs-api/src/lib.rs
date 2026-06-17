@@ -2350,7 +2350,7 @@ fn build_modref_node_summary<'a>(
         label,
         external: resolution.external,
         pointee_global_ids,
-        diagnostic_pointee_globals: &resolution.pointee_globals,
+        diagnostic_pointee_globals: resolution.pointee_globals.as_ref(),
         external_source_suffix: resolution
             .external
             .then(|| modref_external_source_suffix(&resolution.external_sources))
@@ -2462,7 +2462,7 @@ fn push_pointer_memset_modrefs_from_pir(
                 continue;
             };
             let witness = witness_key(&func.key, loc, noloc_ord, "global");
-            for global_key in &resolution.pointee_globals {
+            for global_key in resolution.pointee_globals.iter() {
                 let Some(&gid) = global_lookup.get(global_key) else {
                     continue;
                 };
@@ -2486,7 +2486,7 @@ fn push_pointer_memset_modrefs_from_pir(
                         &resolution.external_sources,
                     )),
                     address_node: Some(label.clone()),
-                    pointee_globals: resolution.pointee_globals.clone(),
+                    pointee_globals: resolution.pointee_globals.to_vec(),
                 });
             }
         }
