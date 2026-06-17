@@ -313,6 +313,38 @@ pub struct Metrics {
     pub steens_max_class_fn_objs: usize,
     #[serde(default)]
     pub steens_max_class_candidate_pairs: u64,
+    #[serde(default)]
+    pub pointer_modref_rows_attempted: u64,
+    #[serde(default)]
+    pub pointer_modref_rows_unique: u64,
+    #[serde(default)]
+    pub pointer_modref_rows_duplicate: u64,
+    #[serde(default)]
+    pub pointer_modref_pag_rows_attempted: u64,
+    #[serde(default)]
+    pub pointer_modref_pag_rows_unique: u64,
+    #[serde(default)]
+    pub pointer_modref_pag_rows_duplicate: u64,
+    #[serde(default)]
+    pub pointer_modref_mem_rows_attempted: u64,
+    #[serde(default)]
+    pub pointer_modref_mem_rows_unique: u64,
+    #[serde(default)]
+    pub pointer_modref_mem_rows_duplicate: u64,
+    #[serde(default)]
+    pub pointer_modref_closure_rows_attempted: u64,
+    #[serde(default)]
+    pub pointer_modref_closure_rows_unique: u64,
+    #[serde(default)]
+    pub pointer_modref_closure_rows_duplicate: u64,
+    #[serde(default)]
+    pub pointer_modref_max_fact_fanout: u64,
+    #[serde(default)]
+    pub pointer_modref_pag_max_fact_fanout: u64,
+    #[serde(default)]
+    pub pointer_modref_mem_max_fact_fanout: u64,
+    #[serde(default)]
+    pub pointer_modref_closure_max_fact_fanout: u64,
     /// Flat per-provenance icall attribution (M2.0, `DESIGN_lite.md` §2F). Counts indirect
     /// callsites whose resolved edges carry each tier; the ablation signal M2.7 reads.
     /// `icalls_unknown` counts sites with an Ω/unknown-callee edge. No certificate cascade.
@@ -1067,6 +1099,7 @@ impl Analysis {
         call_edges.dedup_by_key(|edge| edge_sort_key(edge, &functions, &callsites));
         let callgraph_dedup_us = callgraph_dedup_started.elapsed().as_micros() as u64;
         let modref_dedup_started = Instant::now();
+        let mut pointer_modref_metrics = modrefs.metrics();
         let modrefs = modrefs.into_vec();
         let modref_dedup_us = modref_dedup_started.elapsed().as_micros() as u64;
 
@@ -1106,7 +1139,7 @@ impl Analysis {
         let initval_reapply_us = initval_reapply_started.elapsed().as_micros() as u64;
 
         let transitive_started = Instant::now();
-        let transitive_modrefs = compute_transitive_modrefs(
+        let (transitive_modrefs, closure_modref_metrics) = compute_transitive_modrefs(
             functions.len(),
             &functions,
             &globals,
@@ -1114,6 +1147,7 @@ impl Analysis {
             &modrefs,
         );
         let transitive_modref_us = transitive_started.elapsed().as_micros() as u64;
+        pointer_modref_metrics.merge_closure(closure_modref_metrics);
         let findings_dedup_started = Instant::now();
         findings.sort_by_key(|finding| {
             (
@@ -1227,6 +1261,22 @@ impl Analysis {
             steens_max_class_icall_sites: 0,
             steens_max_class_fn_objs: 0,
             steens_max_class_candidate_pairs: 0,
+            pointer_modref_rows_attempted: pointer_modref_metrics.attempted(),
+            pointer_modref_rows_unique: pointer_modref_metrics.unique(),
+            pointer_modref_rows_duplicate: pointer_modref_metrics.duplicate(),
+            pointer_modref_pag_rows_attempted: pointer_modref_metrics.pag.attempted,
+            pointer_modref_pag_rows_unique: pointer_modref_metrics.pag.unique,
+            pointer_modref_pag_rows_duplicate: pointer_modref_metrics.pag.duplicate,
+            pointer_modref_mem_rows_attempted: pointer_modref_metrics.mem.attempted,
+            pointer_modref_mem_rows_unique: pointer_modref_metrics.mem.unique,
+            pointer_modref_mem_rows_duplicate: pointer_modref_metrics.mem.duplicate,
+            pointer_modref_closure_rows_attempted: pointer_modref_metrics.closure.attempted,
+            pointer_modref_closure_rows_unique: pointer_modref_metrics.closure.unique,
+            pointer_modref_closure_rows_duplicate: pointer_modref_metrics.closure.duplicate,
+            pointer_modref_max_fact_fanout: pointer_modref_metrics.pointer_modref_max_fact_fanout,
+            pointer_modref_pag_max_fact_fanout: pointer_modref_metrics.pag.max_fact_fanout,
+            pointer_modref_mem_max_fact_fanout: pointer_modref_metrics.mem.max_fact_fanout,
+            pointer_modref_closure_max_fact_fanout: pointer_modref_metrics.closure.max_fact_fanout,
             analysis_wall_us: 0,
             setup_scan_us,
             preanalysis_us,
@@ -2290,6 +2340,9 @@ struct ModRefBuilder {
     interners: ModRefFactInterners,
     compact_by_fact: HashMap<CompactModRefFactKey, usize>,
     by_fact: HashMap<ModRefFactHashKey, usize>,
+    metrics: ModRefEmissionMetrics,
+    fanout_by_fact: HashMap<ModRefFanoutKey, u64>,
+    fanout_by_phase: HashMap<(ModRefSourcePhase, ModRefFanoutKey), u64>,
 }
 
 impl ModRefBuilder {
@@ -2297,16 +2350,23 @@ impl ModRefBuilder {
         Self::default()
     }
 
-    fn push(&mut self, mut row: ModRef) {
+    fn push(&mut self, row: ModRef) {
+        self.push_with_phase(row, None);
+    }
+
+    fn push_with_phase(&mut self, mut row: ModRef, phase: Option<ModRefSourcePhase>) {
+        self.note_modref_attempt(&row, phase);
         if let Some(key) = compact_modref_key(&row) {
             if let Some(&idx) = self.compact_by_fact.get(&key) {
                 let existing = &mut self.rows[idx];
                 existing.witness =
                     preferred_modref_witness(existing.witness.take(), row.witness.take());
+                self.note_modref_result(phase, false);
                 return;
             }
             self.compact_by_fact.insert(key, self.rows.len());
             self.rows.push(row);
+            self.note_modref_result(phase, true);
             return;
         }
 
@@ -2315,10 +2375,12 @@ impl ModRefBuilder {
             let existing = &mut self.rows[idx];
             existing.witness =
                 preferred_modref_witness(existing.witness.take(), row.witness.take());
+            self.note_modref_result(phase, false);
             return;
         }
         self.by_fact.insert(key, self.rows.len());
         self.rows.push(row);
+        self.note_modref_result(phase, true);
     }
 
     fn push_named_empty(
@@ -2328,7 +2390,15 @@ impl ModRefBuilder {
         access: Access,
         via: Via,
         witness: Option<&str>,
+        phase: Option<ModRefSourcePhase>,
     ) {
+        let fanout_key = ModRefFanoutKey {
+            func,
+            global: GlobalTarget::Name(global),
+            access_rank: access_rank(access),
+            via_rank: via_rank(via),
+        };
+        self.note_modref_fanout(fanout_key, phase);
         let key = CompactModRefFactKey {
             func: func.0,
             global: global.0,
@@ -2337,6 +2407,7 @@ impl ModRefBuilder {
         };
         if let Some(&idx) = self.compact_by_fact.get(&key) {
             prefer_modref_witness_ref(&mut self.rows[idx].witness, witness);
+            self.note_modref_result(phase, false);
             return;
         }
         self.compact_by_fact.insert(key, self.rows.len());
@@ -2350,11 +2421,115 @@ impl ModRefBuilder {
             address_node: None,
             pointee_globals: Vec::new(),
         });
+        self.note_modref_result(phase, true);
+    }
+
+    fn metrics(&self) -> ModRefEmissionMetrics {
+        self.metrics.clone()
+    }
+
+    fn note_modref_attempt(&mut self, row: &ModRef, phase: Option<ModRefSourcePhase>) {
+        let fanout_key = ModRefFanoutKey {
+            func: row.func,
+            global: row.global.clone(),
+            access_rank: access_rank(row.access),
+            via_rank: via_rank(row.via),
+        };
+        self.note_modref_fanout(fanout_key, phase);
+    }
+
+    fn note_modref_fanout(
+        &mut self,
+        fanout_key: ModRefFanoutKey,
+        phase: Option<ModRefSourcePhase>,
+    ) {
+        let count = self.fanout_by_fact.entry(fanout_key.clone()).or_default();
+        *count += 1;
+        self.metrics.pointer_modref_max_fact_fanout =
+            self.metrics.pointer_modref_max_fact_fanout.max(*count);
+        let Some(phase) = phase else {
+            return;
+        };
+        self.metrics.phase_mut(phase).attempted += 1;
+        let phase_count = self.fanout_by_phase.entry((phase, fanout_key)).or_default();
+        *phase_count += 1;
+        let phase_metrics = self.metrics.phase_mut(phase);
+        phase_metrics.max_fact_fanout = phase_metrics.max_fact_fanout.max(*phase_count);
+    }
+
+    fn note_modref_result(&mut self, phase: Option<ModRefSourcePhase>, unique: bool) {
+        let Some(phase) = phase else {
+            return;
+        };
+        let phase_metrics = self.metrics.phase_mut(phase);
+        if unique {
+            phase_metrics.unique += 1;
+        } else {
+            phase_metrics.duplicate += 1;
+        }
     }
 
     fn into_vec(self) -> Vec<ModRef> {
         self.rows
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ModRefSourcePhase {
+    PagPointer,
+    MemsetMemcpy,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModRefPhaseMetrics {
+    attempted: u64,
+    unique: u64,
+    duplicate: u64,
+    max_fact_fanout: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModRefEmissionMetrics {
+    pag: ModRefPhaseMetrics,
+    mem: ModRefPhaseMetrics,
+    closure: ModRefPhaseMetrics,
+    pointer_modref_max_fact_fanout: u64,
+}
+
+impl ModRefEmissionMetrics {
+    fn phase_mut(&mut self, phase: ModRefSourcePhase) -> &mut ModRefPhaseMetrics {
+        match phase {
+            ModRefSourcePhase::PagPointer => &mut self.pag,
+            ModRefSourcePhase::MemsetMemcpy => &mut self.mem,
+        }
+    }
+
+    fn merge_closure(&mut self, closure: ModRefPhaseMetrics) {
+        self.closure = closure;
+        self.pointer_modref_max_fact_fanout = self
+            .pointer_modref_max_fact_fanout
+            .max(self.closure.max_fact_fanout);
+    }
+
+    fn attempted(&self) -> u64 {
+        self.pag.attempted + self.mem.attempted + self.closure.attempted
+    }
+
+    fn unique(&self) -> u64 {
+        self.pag.unique + self.mem.unique + self.closure.unique
+    }
+
+    fn duplicate(&self) -> u64 {
+        self.pag.duplicate + self.mem.duplicate + self.closure.duplicate
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ModRefFanoutKey {
+    func: FuncId,
+    global: GlobalTarget,
+    access_rank: u8,
+    via_rank: u8,
 }
 
 fn modref_payload_cmp(
@@ -2463,6 +2638,11 @@ fn push_pointer_modrefs_from_pag(
                 ));
             }
             let summary = node_summaries[node_idx].as_ref().unwrap();
+            let phase = if pointer_access.detail.starts_with("edge:memcpy") {
+                ModRefSourcePhase::MemsetMemcpy
+            } else {
+                ModRefSourcePhase::PagPointer
+            };
 
             for &gid in &summary.pointee_global_ids {
                 if pointer_access.suppress_direct_symbol
@@ -2476,23 +2656,27 @@ fn push_pointer_modrefs_from_pag(
                     pointer_access.access,
                     Via::Aliased,
                     witness.as_deref(),
+                    Some(phase),
                 );
             }
 
             if summary.external {
-                modrefs.push(ModRef {
-                    func,
-                    global: GlobalTarget::Unknown(pointer_access.unknown_reason.to_string()),
-                    access: pointer_access.access,
-                    via: Via::Unknown,
-                    witness: witness.clone(),
-                    detail: Some(modref_detail_with_external_suffix(
-                        pointer_access.detail,
-                        summary.external_source_suffix.as_deref(),
-                    )),
-                    address_node: Some(summary.label.to_string()),
-                    pointee_globals: summary.diagnostic_pointee_globals.to_vec(),
-                });
+                modrefs.push_with_phase(
+                    ModRef {
+                        func,
+                        global: GlobalTarget::Unknown(pointer_access.unknown_reason.to_string()),
+                        access: pointer_access.access,
+                        via: Via::Unknown,
+                        witness: witness.clone(),
+                        detail: Some(modref_detail_with_external_suffix(
+                            pointer_access.detail,
+                            summary.external_source_suffix.as_deref(),
+                        )),
+                        address_node: Some(summary.label.to_string()),
+                        pointee_globals: summary.diagnostic_pointee_globals.to_vec(),
+                    },
+                    Some(phase),
+                );
             }
         }
     }
@@ -2522,6 +2706,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     Access::Mod,
                     Via::Aliased,
                     witness.as_deref(),
+                    Some(ModRefSourcePhase::MemsetMemcpy),
                 );
                 continue;
             }
@@ -2540,22 +2725,26 @@ fn push_pointer_memset_modrefs_from_pir(
                     Access::Mod,
                     Via::Aliased,
                     witness.as_deref(),
+                    Some(ModRefSourcePhase::MemsetMemcpy),
                 );
             }
             if resolution.external {
-                modrefs.push(ModRef {
-                    func: func_id,
-                    global: GlobalTarget::Unknown("omega_store".to_string()),
-                    access: Access::Mod,
-                    via: Via::Unknown,
-                    witness,
-                    detail: Some(modref_detail_with_external_sources(
-                        "stmt:memset_dst",
-                        &resolution.external_sources,
-                    )),
-                    address_node: Some(label.clone()),
-                    pointee_globals: resolution.pointee_globals.to_vec(),
-                });
+                modrefs.push_with_phase(
+                    ModRef {
+                        func: func_id,
+                        global: GlobalTarget::Unknown("omega_store".to_string()),
+                        access: Access::Mod,
+                        via: Via::Unknown,
+                        witness,
+                        detail: Some(modref_detail_with_external_sources(
+                            "stmt:memset_dst",
+                            &resolution.external_sources,
+                        )),
+                        address_node: Some(label.clone()),
+                        pointee_globals: resolution.pointee_globals.to_vec(),
+                    },
+                    Some(ModRefSourcePhase::MemsetMemcpy),
+                );
             }
         }
     }
@@ -2875,7 +3064,7 @@ fn compute_transitive_modrefs(
     globals: &[GlobalInfo],
     edges: &[CallEdge],
     local_modrefs: &[ModRef],
-) -> TransitiveModRefs {
+) -> (TransitiveModRefs, ModRefPhaseMetrics) {
     let mut callees_by_func = vec![Vec::<usize>::new(); func_count];
     for edge in edges {
         if let (Caller::Func(caller), Callee::Func(callee)) = (&edge.caller, &edge.callee) {
@@ -2947,17 +3136,36 @@ fn compute_transitive_modrefs(
     }
 
     let mut transitive = Vec::with_capacity(func_count);
+    let mut metrics = ModRefPhaseMetrics::default();
+    let mut fanout_by_fact = HashMap::<ModRefFanoutKey, u64>::new();
     for root_idx in 0..func_count {
         let mut rows = memo[scc_of_func[root_idx]].as_ref().unwrap().clone();
         rows.sort_by(|&left, &right| {
             modref_payload_cmp(&payloads[left], &payloads[right], globals)
         });
+        metrics.attempted += rows.len() as u64;
+        metrics.unique += rows.len() as u64;
+        for &payload_id in &rows {
+            let payload = &payloads[payload_id];
+            let key = ModRefFanoutKey {
+                func: FuncId(root_idx as u32),
+                global: payload.global.clone(),
+                access_rank: access_rank(payload.access),
+                via_rank: via_rank(payload.via),
+            };
+            let count = fanout_by_fact.entry(key).or_default();
+            *count += 1;
+            metrics.max_fact_fanout = metrics.max_fact_fanout.max(*count);
+        }
         transitive.push(rows);
     }
-    TransitiveModRefs {
-        payloads,
-        by_func: transitive,
-    }
+    (
+        TransitiveModRefs {
+            payloads,
+            by_func: transitive,
+        },
+        metrics,
+    )
 }
 
 fn collect_scc_payload_ids(

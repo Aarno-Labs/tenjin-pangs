@@ -35,6 +35,22 @@
     "steens_max_class_icall_sites",
     "steens_max_class_fn_objs",
     "steens_max_class_candidate_pairs",
+    "pointer_modref_rows_attempted",
+    "pointer_modref_rows_unique",
+    "pointer_modref_rows_duplicate",
+    "pointer_modref_pag_rows_attempted",
+    "pointer_modref_pag_rows_unique",
+    "pointer_modref_pag_rows_duplicate",
+    "pointer_modref_mem_rows_attempted",
+    "pointer_modref_mem_rows_unique",
+    "pointer_modref_mem_rows_duplicate",
+    "pointer_modref_closure_rows_attempted",
+    "pointer_modref_closure_rows_unique",
+    "pointer_modref_closure_rows_duplicate",
+    "pointer_modref_max_fact_fanout",
+    "pointer_modref_pag_max_fact_fanout",
+    "pointer_modref_mem_max_fact_fanout",
+    "pointer_modref_closure_max_fact_fanout",
     "icalls_simple",
     "icalls_andersen",
     "icalls_steens",
@@ -255,6 +271,70 @@
       "minimum": 0
     },
     "steens_max_class_candidate_pairs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_rows_attempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_rows_unique": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_rows_duplicate": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_pag_rows_attempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_pag_rows_unique": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_pag_rows_duplicate": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_mem_rows_attempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_mem_rows_unique": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_mem_rows_duplicate": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_closure_rows_attempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_closure_rows_unique": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_closure_rows_duplicate": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_max_fact_fanout": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_pag_max_fact_fanout": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_mem_max_fact_fanout": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_closure_max_fact_fanout": {
       "type": "integer",
       "minimum": 0
     },
