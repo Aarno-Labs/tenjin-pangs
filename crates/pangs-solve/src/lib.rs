@@ -260,9 +260,45 @@ struct Solver<'a> {
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
     worklist: VecDeque<usize>,
     queued: Vec<bool>,
-    seen_pairs: HashSet<(usize, usize)>,
+    seen_pairs: SeenPairBits,
     external_applied: HashSet<usize>,
     escaped_fn_applied: HashSet<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct SeenPairBits {
+    words_per_site: usize,
+    sites: Vec<Vec<u64>>,
+}
+
+impl SeenPairBits {
+    fn new(site_count: usize, func_count: usize) -> Self {
+        Self {
+            words_per_site: func_count.div_ceil(64),
+            sites: vec![Vec::new(); site_count],
+        }
+    }
+
+    fn insert(&mut self, site_index: usize, func_index: usize) -> bool {
+        let word = func_index / 64;
+        let bit = 1u64 << (func_index % 64);
+        let Some(site_words) = self.sites.get_mut(site_index) else {
+            debug_assert!(false, "invalid callsite index {site_index}");
+            return false;
+        };
+        if site_words.is_empty() {
+            site_words.resize(self.words_per_site, 0);
+        }
+        let Some(slot) = site_words.get_mut(word) else {
+            debug_assert!(false, "invalid function index {func_index}");
+            return false;
+        };
+        if *slot & bit != 0 {
+            return false;
+        }
+        *slot |= bit;
+        true
+    }
 }
 
 impl<'a> Solver<'a> {
@@ -346,6 +382,7 @@ impl<'a> Solver<'a> {
             classes.push(data);
         }
 
+        let function_count = function_keys.len();
         let callsites_by_index = pag.callsites.iter().collect();
         let queued = vec![false; classes.len()];
 
@@ -363,7 +400,7 @@ impl<'a> Solver<'a> {
             callsites_by_index,
             worklist: VecDeque::new(),
             queued,
-            seen_pairs: HashSet::new(),
+            seen_pairs: SeenPairBits::new(pag.callsites.len(), function_count),
             external_applied: HashSet::new(),
             escaped_fn_applied: HashSet::new(),
         }
@@ -746,7 +783,7 @@ impl<'a> Solver<'a> {
                 self.apply_external_call(site_index);
             }
             for &func_index in &funcs {
-                if !self.seen_pairs.insert((site_index, func_index)) {
+                if !self.seen_pairs.insert(site_index, func_index) {
                     continue;
                 }
                 let callsite = self.callsites_by_index[site_index];
