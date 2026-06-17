@@ -187,7 +187,7 @@ pub struct ModRef {
     pub pointee_globals: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum GlobalTarget {
     Name(GlobalId),
     Unknown(String),
@@ -1033,7 +1033,7 @@ impl Analysis {
         call_edges.dedup_by_key(|edge| edge_sort_key(edge, &functions, &callsites));
         let callgraph_dedup_us = callgraph_dedup_started.elapsed().as_micros() as u64;
         let modref_dedup_started = Instant::now();
-        dedup_modrefs_by_fact(&mut modrefs, &functions, &globals);
+        dedup_modrefs_by_fact(&mut modrefs);
         let modref_dedup_us = modref_dedup_started.elapsed().as_micros() as u64;
 
         let stationarity_started = Instant::now();
@@ -2132,61 +2132,85 @@ fn push_audit_finding_with_detail(
     });
 }
 
-fn dedup_modrefs_by_fact(modrefs: &mut Vec<ModRef>, funcs: &[FuncInfo], globals: &[GlobalInfo]) {
-    modrefs.sort_by(|left, right| modref_fact_cmp(left, right, funcs, globals));
-    let mut deduped = Vec::<ModRef>::with_capacity(modrefs.len());
-    for mut row in modrefs.drain(..) {
-        if let Some(last) = deduped.last_mut() {
-            if same_modref_fact(last, &row) {
-                last.witness = preferred_modref_witness(last.witness.take(), row.witness.take());
-                continue;
-            }
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ModRefFactHashKey {
+    func: u32,
+    global_kind: u8,
+    global_value: u32,
+    access_rank: u8,
+    via_rank: u8,
+    detail: u32,
+    address_node: u32,
+    pointee_globals: u32,
+}
+
+#[derive(Debug, Default)]
+struct ModRefFactInterners {
+    strings: HashMap<String, u32>,
+    pointee_globals: HashMap<Vec<String>, u32>,
+}
+
+impl ModRefFactInterners {
+    fn key_for(&mut self, mr: &ModRef) -> ModRefFactHashKey {
+        let (global_kind, global_value) = match &mr.global {
+            GlobalTarget::Name(id) => (0, id.0),
+            GlobalTarget::Unknown(reason) => (1, self.intern_str(reason)),
+        };
+        ModRefFactHashKey {
+            func: mr.func.0,
+            global_kind,
+            global_value,
+            access_rank: access_rank(mr.access),
+            via_rank: via_rank(mr.via),
+            detail: self.intern_option_str(&mr.detail),
+            address_node: self.intern_option_str(&mr.address_node),
+            pointee_globals: self.intern_pointee_globals(&mr.pointee_globals),
         }
+    }
+
+    fn intern_option_str(&mut self, value: &Option<String>) -> u32 {
+        value.as_deref().map_or(0, |value| self.intern_str(value))
+    }
+
+    fn intern_str(&mut self, value: &str) -> u32 {
+        if let Some(&id) = self.strings.get(value) {
+            return id;
+        }
+        let id = self.strings.len() as u32 + 1;
+        self.strings.insert(value.to_owned(), id);
+        id
+    }
+
+    fn intern_pointee_globals(&mut self, values: &[String]) -> u32 {
+        if values.is_empty() {
+            return 0;
+        }
+        if let Some(&id) = self.pointee_globals.get(values) {
+            return id;
+        }
+        let id = self.pointee_globals.len() as u32 + 1;
+        self.pointee_globals.insert(values.to_vec(), id);
+        id
+    }
+}
+
+fn dedup_modrefs_by_fact(modrefs: &mut Vec<ModRef>) {
+    let expected_unique = modrefs.len().min(262_144);
+    let mut interners = ModRefFactInterners::default();
+    let mut by_fact = HashMap::<ModRefFactHashKey, usize>::with_capacity(expected_unique);
+    let mut deduped = Vec::<ModRef>::with_capacity(expected_unique);
+    for mut row in modrefs.drain(..) {
+        let key = interners.key_for(&row);
+        if let Some(&idx) = by_fact.get(&key) {
+            let existing = &mut deduped[idx];
+            existing.witness =
+                preferred_modref_witness(existing.witness.take(), row.witness.take());
+            continue;
+        }
+        by_fact.insert(key, deduped.len());
         deduped.push(row);
     }
-    deduped.sort_by(|left, right| modref_cmp(left, right, funcs, globals));
     *modrefs = deduped;
-}
-
-fn modref_cmp(
-    left: &ModRef,
-    right: &ModRef,
-    funcs: &[FuncInfo],
-    globals: &[GlobalInfo],
-) -> Ordering {
-    funcs[left.func.0 as usize]
-        .key
-        .cmp(&funcs[right.func.0 as usize].key)
-        .then_with(|| {
-            global_target_label(&left.global, globals)
-                .cmp(global_target_label(&right.global, globals))
-        })
-        .then_with(|| access_rank(left.access).cmp(&access_rank(right.access)))
-        .then_with(|| via_rank(left.via).cmp(&via_rank(right.via)))
-        .then_with(|| option_str(&left.witness).cmp(option_str(&right.witness)))
-        .then_with(|| option_str(&left.detail).cmp(option_str(&right.detail)))
-        .then_with(|| option_str(&left.address_node).cmp(option_str(&right.address_node)))
-        .then_with(|| left.pointee_globals.cmp(&right.pointee_globals))
-}
-
-fn modref_fact_cmp(
-    left: &ModRef,
-    right: &ModRef,
-    funcs: &[FuncInfo],
-    globals: &[GlobalInfo],
-) -> Ordering {
-    funcs[left.func.0 as usize]
-        .key
-        .cmp(&funcs[right.func.0 as usize].key)
-        .then_with(|| {
-            global_target_label(&left.global, globals)
-                .cmp(global_target_label(&right.global, globals))
-        })
-        .then_with(|| access_rank(left.access).cmp(&access_rank(right.access)))
-        .then_with(|| via_rank(left.via).cmp(&via_rank(right.via)))
-        .then_with(|| option_str(&left.detail).cmp(option_str(&right.detail)))
-        .then_with(|| option_str(&left.address_node).cmp(option_str(&right.address_node)))
-        .then_with(|| left.pointee_globals.cmp(&right.pointee_globals))
 }
 
 fn modref_payload_cmp(
@@ -2213,16 +2237,6 @@ fn global_target_label<'a>(target: &'a GlobalTarget, globals: &'a [GlobalInfo]) 
 
 fn option_str(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("")
-}
-
-fn same_modref_fact(left: &ModRef, right: &ModRef) -> bool {
-    left.func == right.func
-        && left.global == right.global
-        && left.access == right.access
-        && left.via == right.via
-        && left.detail == right.detail
-        && left.address_node == right.address_node
-        && left.pointee_globals == right.pointee_globals
 }
 
 struct PointerAccess {
