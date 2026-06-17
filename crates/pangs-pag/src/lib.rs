@@ -9,6 +9,8 @@ pub struct PagOpts {
     pub build_mode: BuildMode,
     #[serde(default)]
     pub exports: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub safe_indirect_vararg_callsites: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1078,7 +1080,7 @@ impl<'a> Builder<'a> {
                     false,
                     loc.clone(),
                 );
-                if sig.vararg {
+                if sig.vararg && self.indirect_vararg_call_requires_boundary(callsite) {
                     self.add_seed(
                         OmegaSeedKind::VarargCallBoundary,
                         SeedTarget::Callsite(callsite),
@@ -1114,6 +1116,11 @@ impl<'a> Builder<'a> {
             return true;
         };
         func.external || func.body.iter().any(stmt_consumes_varargs)
+    }
+
+    fn indirect_vararg_call_requires_boundary(&self, callsite: CallsiteId) -> bool {
+        let key = &self.callsites[callsite.0 as usize].key;
+        !self.opts.safe_indirect_vararg_callsites.contains(key)
     }
 
     fn add_edge(

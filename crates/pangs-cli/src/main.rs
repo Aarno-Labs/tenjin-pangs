@@ -233,6 +233,7 @@ fn run() -> Result<()> {
             let opts = PagOpts {
                 build_mode: build_mode.into(),
                 exports: read_exports(exports)?,
+                ..PagOpts::default()
             };
             let pag = Pag::from_pir(&pir, &opts);
             let pag = if let Some(func_key) = func {
@@ -251,6 +252,7 @@ fn run() -> Result<()> {
             let opts = PagOpts {
                 build_mode: build_mode.into(),
                 exports: read_exports(exports)?,
+                ..PagOpts::default()
             };
             let pag = Pag::from_pir(&pir, &opts);
             if let Err(issues) = pag.validate() {
@@ -282,6 +284,7 @@ fn run() -> Result<()> {
                 let opts = PagOpts {
                     build_mode: pag_build_mode,
                     exports: read_exports(exports)?,
+                    ..PagOpts::default()
                 };
                 let pag = Pag::from_pir(&pir, &opts);
                 let signatures = function_signatures(&pir);

@@ -1782,6 +1782,198 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
 }
 
 #[test]
+fn indirect_vararg_filtering_uses_complete_safe_target_sets() {
+    let vararg_sig = Signature {
+        ret: AbiClass::Void,
+        params: vec![Param::Integer],
+        vararg: true,
+        cc: "ccc".to_string(),
+    };
+    let cb = Func {
+        key: "cb".to_string(),
+        sig: sig(AbiClass::Void, vec![]),
+        param_names: vec![],
+        file: None,
+        line: None,
+        external: false,
+        exported: false,
+        address_taken: true,
+        body: vec![],
+    };
+    let safe_a = Func {
+        key: "safe_a".to_string(),
+        sig: vararg_sig.clone(),
+        param_names: vec![],
+        file: None,
+        line: None,
+        external: false,
+        exported: false,
+        address_taken: true,
+        body: vec![],
+    };
+    let safe_b = Func {
+        key: "safe_b".to_string(),
+        sig: vararg_sig.clone(),
+        param_names: vec![],
+        file: None,
+        line: None,
+        external: false,
+        exported: false,
+        address_taken: true,
+        body: vec![],
+    };
+    let unsafe_target = Func {
+        key: "unsafe_target".to_string(),
+        sig: vararg_sig.clone(),
+        param_names: vec![],
+        file: None,
+        line: None,
+        external: false,
+        exported: false,
+        address_taken: true,
+        body: vec![Stmt::Unknown {
+            op: "va_arg".to_string(),
+            operands: vec!["%ap".to_string()],
+            results: vec!["%next".to_string()],
+            reason: "va_arg".to_string(),
+            loc: None,
+        }],
+    };
+    let driver_with_targets = |name: &str, targets: Vec<&str>| Func {
+        key: name.to_string(),
+        sig: sig(AbiClass::Void, vec![]),
+        param_names: vec![],
+        file: None,
+        line: None,
+        external: false,
+        exported: false,
+        address_taken: false,
+        body: vec![
+            Stmt::Assign {
+                dest: "%callee".to_string(),
+                sources: targets.into_iter().map(ToOwned::to_owned).collect(),
+                loc: None,
+            },
+            Stmt::CallIndirect {
+                operand: "%callee".to_string(),
+                sig: vararg_sig.clone(),
+                args: vec!["%tag".to_string(), "cb".to_string()],
+                dest: None,
+                loc: None,
+            },
+        ],
+    };
+
+    let safe = Pir {
+        module: "m4_4_safe_indirect_vararg".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            safe_a.clone(),
+            safe_b.clone(),
+            unsafe_target.clone(),
+            cb.clone(),
+            driver_with_targets("driver", vec!["safe_a", "safe_b"]),
+        ],
+        globals: vec![],
+        global_init: vec![],
+    };
+    let safe_analysis = Analysis::run(
+        &safe,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    assert!(!safe_analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "fnptr_varargs_indirect"));
+    assert!(!safe_analysis
+        .callers(safe_analysis.lookup_func("cb").unwrap())
+        .any(unknown_caller));
+
+    let unsafe_mix = Pir {
+        module: "m4_4_unsafe_indirect_vararg".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            safe_a.clone(),
+            safe_b.clone(),
+            unsafe_target,
+            cb.clone(),
+            driver_with_targets("driver", vec!["safe_a", "unsafe_target"]),
+        ],
+        globals: vec![],
+        global_init: vec![],
+    };
+    let unsafe_analysis = Analysis::run(
+        &unsafe_mix,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    assert!(unsafe_analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "fnptr_varargs_indirect"));
+    assert!(unsafe_analysis
+        .callers(unsafe_analysis.lookup_func("cb").unwrap())
+        .any(unknown_caller));
+
+    let unknown = Pir {
+        module: "m4_4_unknown_indirect_vararg".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![
+            safe_a,
+            safe_b,
+            cb,
+            Func {
+                key: "driver".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::CallIndirect {
+                    operand: "%callee".to_string(),
+                    sig: vararg_sig,
+                    args: vec!["%tag".to_string(), "cb".to_string()],
+                    dest: None,
+                    loc: None,
+                }],
+            },
+        ],
+        globals: vec![],
+        global_init: vec![],
+    };
+    let unknown_analysis = Analysis::run(
+        &unknown,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    assert!(unknown_analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "fnptr_varargs_indirect"));
+    assert!(unknown_analysis
+        .callers(unknown_analysis.lookup_func("cb").unwrap())
+        .any(unknown_caller));
+}
+
+#[test]
 fn steens_only_audits_int_punning_when_it_reaches_function_pointers() {
     let ptr_only = Pir::from_path(m1_4_fixture("ptrtoint_escape.pir.json")).unwrap();
     let ptr_only_analysis = Analysis::run(

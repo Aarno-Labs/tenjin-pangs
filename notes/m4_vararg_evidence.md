@@ -20,6 +20,8 @@ Outputs:
 - M4.1 taxonomy-only run: `/tmp/pangs-m4-vararg/`
 - M4.2 direct-internal safe-vararg suppression run: `/tmp/pangs-m4-vararg-m42/`
 - M4.3 focused summary rerun for curl/tmux: `/tmp/pangs-m4-vararg-m43/`
+- M4.4 focused indirect-vararg rerun for gifsicle:
+  `/tmp/pangs-m4-vararg-m44/exe-gifsicle-O1-andersen/`
 
 ## Result
 
@@ -149,3 +151,27 @@ M4.3 substantially reduces audit noise and component taint detail, but it does n
 rewritable coverage in the focused rows. The remaining curl blockers are real callback/output
 vararg APIs, and tmux is still frozen by other taints plus a small residue of vararg
 boundaries.
+
+## M4.4 Indirect Vararg Filtering
+
+M4.4 adds a two-pass filter for indirect vararg calls. The first pass keeps the old opaque
+boundary, computes solved indirect targets, and admits a callsite only when the target set is
+nonempty, has no unknown callee, and every target is an internal modeled-safe vararg
+function. A second pass then omits the vararg boundary only for those admitted callsites.
+
+Synthetic coverage shows:
+
+- two safe internal vararg targets narrow and do not create an unknown caller for the extra
+  function-pointer argument;
+- a mixed target set with one `va_arg`-consuming target remains tainted;
+- an unknown indirect callee remains tainted.
+
+Focused `exe-gifsicle-O1` rerun after M4.4:
+
+| row | vararg findings | external | internal unmodeled | indirect | rewritable |
+|---|---:|---:|---:|---:|---:|
+| `exe-gifsicle-O1` | 50 | 20 | 28 | 2 | 1/93 |
+
+The two gifsicle indirect vararg findings remain conservative under the M4.4 rule. That
+means the filter is covered and sound for the narrowable shape, but this corpus row does not
+currently contain a fully modeled-safe indirect vararg target set.

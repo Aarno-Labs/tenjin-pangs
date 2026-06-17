@@ -5,7 +5,8 @@ use std::time::Instant;
 use pangs_pag::{BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts};
 use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, Stmt};
 use pangs_solve::{
-    debug_assert_narrows, solve_andersen_with_overrides, solve_steensgaard, NodeResolution,
+    debug_assert_narrows, solve_andersen_with_overrides, solve_steensgaard, IndirectCallResolution,
+    NodeResolution,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -589,16 +590,18 @@ impl Analysis {
                             loc,
                         );
                         let callsite_key = callsites[cs.0 as usize].key.clone();
-                        detect_indirect_call_audits(
-                            &mut findings,
-                            &mut audit_taints,
-                            module,
-                            caller,
-                            stmt,
-                            sig,
-                            loc,
-                            &callsite_key,
-                        );
+                        if opts.stage == Stage::Conservative {
+                            detect_indirect_call_audits(
+                                &mut findings,
+                                &mut audit_taints,
+                                module,
+                                caller,
+                                stmt,
+                                sig,
+                                loc,
+                                &callsite_key,
+                            );
+                        }
                         record_vararg_deferred_audit(
                             &mut deferred_audits,
                             caller,
@@ -784,16 +787,23 @@ impl Analysis {
             }
             Stage::Steens | Stage::Andersen => {
                 let pag_started = Instant::now();
-                let pag = Pag::from_pir(
+                let indirect_vararg_keys = indirect_callsites
+                    .iter()
+                    .filter_map(|(cs, _, sig)| {
+                        sig.vararg.then(|| callsites[cs.0 as usize].key.clone())
+                    })
+                    .collect::<BTreeSet<_>>();
+                let mut pag = Pag::from_pir(
                     module,
                     &PagOpts {
                         build_mode: opts.build_mode.into(),
                         exports: opts.exports.clone(),
+                        ..PagOpts::default()
                     },
                 );
                 pag_build_us = pag_started.elapsed().as_micros() as u64;
                 let solve_started = Instant::now();
-                let solved = match opts.stage {
+                let mut solved = match opts.stage {
                     Stage::Andersen => solve_andersen_with_overrides(
                         module,
                         &pag,
@@ -805,6 +815,35 @@ impl Analysis {
                     _ => solve_steensgaard(module, &pag, opts.build_mode.into()),
                 };
                 solve_us = solve_started.elapsed().as_micros() as u64;
+                let safe_indirect_varargs =
+                    safe_indirect_vararg_callsites(module, &indirect_vararg_keys, &solved);
+                if !safe_indirect_varargs.is_empty() {
+                    let pag_started = Instant::now();
+                    pag = Pag::from_pir(
+                        module,
+                        &PagOpts {
+                            build_mode: opts.build_mode.into(),
+                            exports: opts.exports.clone(),
+                            safe_indirect_vararg_callsites: safe_indirect_varargs.clone(),
+                        },
+                    );
+                    pag_build_us += pag_started.elapsed().as_micros() as u64;
+                    let solve_started = Instant::now();
+                    solved = match opts.stage {
+                        Stage::Andersen => solve_andersen_with_overrides(
+                            module,
+                            &pag,
+                            opts.build_mode.into(),
+                            opts.partition_budget,
+                            &simple_exact_targets,
+                            confined_functions,
+                        ),
+                        _ => solve_steensgaard(module, &pag, opts.build_mode.into()),
+                    };
+                    solve_us += solve_started.elapsed().as_micros() as u64;
+                }
+                let safe_indirect_varargs =
+                    safe_indirect_vararg_callsites(module, &indirect_vararg_keys, &solved);
                 solver_metrics = Some(solved.metrics.clone());
                 emit_deferred_steens_audits(
                     &mut findings,
@@ -812,6 +851,7 @@ impl Analysis {
                     module,
                     &solved.nodes,
                     deferred_audits,
+                    &safe_indirect_varargs,
                 );
                 let callsite_by_key: HashMap<_, _> = callsites
                     .iter()
@@ -1259,6 +1299,7 @@ fn emit_deferred_steens_audits(
     module: &Pir,
     node_summaries: &BTreeMap<String, NodeResolution>,
     deferred: Vec<DeferredAudit>,
+    safe_indirect_varargs: &BTreeSet<String>,
 ) {
     for item in deferred {
         match item {
@@ -1317,6 +1358,9 @@ fn emit_deferred_steens_audits(
                 loc,
                 witness,
             } => {
+                if kind == "fnptr_varargs_indirect" && safe_indirect_varargs.contains(&witness) {
+                    continue;
+                }
                 let affected = values
                     .into_iter()
                     .filter(|value| {
@@ -1839,6 +1883,44 @@ fn direct_vararg_audit_kind(module: &Pir, callee: &str) -> Option<&'static str> 
         Some(func) if !func.external => Some("fnptr_varargs_internal_unmodeled"),
         _ => Some("fnptr_varargs_external"),
     }
+}
+
+fn safe_indirect_vararg_callsites(
+    module: &Pir,
+    indirect_vararg_keys: &BTreeSet<String>,
+    solved: &pangs_solve::SolveResult,
+) -> BTreeSet<String> {
+    solved
+        .indirect_calls
+        .iter()
+        .filter(|site| indirect_vararg_site_is_safe(module, indirect_vararg_keys, site))
+        .map(|site| site.callsite_key.clone())
+        .collect()
+}
+
+fn indirect_vararg_site_is_safe(
+    module: &Pir,
+    indirect_vararg_keys: &BTreeSet<String>,
+    site: &IndirectCallResolution,
+) -> bool {
+    if !indirect_vararg_keys.contains(&site.callsite_key)
+        || site.unknown_callee
+        || site.targets.is_empty()
+    {
+        return false;
+    }
+    site.targets.iter().all(|target| {
+        module
+            .functions
+            .iter()
+            .find(|func| func.key == *target)
+            .map(|func| {
+                func.sig.vararg
+                    && !func.external
+                    && direct_vararg_audit_kind(module, target).is_none()
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn is_known_benign_vararg_callee(callee: &str) -> bool {

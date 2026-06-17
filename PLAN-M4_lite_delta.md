@@ -208,6 +208,20 @@ Acceptance:
 - fixture with one unsafe target remains tainted;
 - fixture with unknown callee remains tainted.
 
+Implementation status:
+
+- PAG construction accepts an explicit set of `safe_indirect_vararg_callsites`; only those
+  indirect vararg callsites omit the opaque vararg boundary seed.
+- `analyze` now runs a conservative first pass, computes safe indirect-vararg callsites from
+  solved target sets, and reruns the PAG/solver only when a site is proven safe.
+- A site is safe only when its solved target set is nonempty, has no unknown callee, and every
+  target is an internal vararg function that is modeled-safe under the direct M4.2 rule.
+- Deferred audit emission suppresses `fnptr_varargs_indirect` only for those proven-safe
+  sites.
+- Synthetic tests cover all-safe targets, one unsafe target, and unknown-callee fallback.
+- A focused `exe-gifsicle-O1` smoke still reports two indirect vararg findings, so the corpus
+  instances remain conservative under this rule.
+
 ### M4.5 — Corpus Rerun and Decision
 
 Rerun the M3 decision corpus:
