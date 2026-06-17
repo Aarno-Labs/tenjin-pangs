@@ -2247,6 +2247,42 @@ struct PointerAccess {
     suppress_direct_symbol: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ModRefNodeSummary<'a> {
+    label: &'a str,
+    external: bool,
+    pointee_global_ids: Vec<GlobalId>,
+    diagnostic_pointee_globals: &'a [String],
+    external_source_suffix: Option<String>,
+    direct_symbol_global: Option<GlobalId>,
+}
+
+fn build_modref_node_summary<'a>(
+    label: &'a str,
+    resolution: &'a NodeResolution,
+    global_lookup: &HashMap<String, GlobalId>,
+) -> ModRefNodeSummary<'a> {
+    let pointee_global_ids = resolution
+        .pointee_globals
+        .iter()
+        .filter_map(|global_key| global_lookup.get(global_key).copied())
+        .collect();
+    let direct_symbol_global = label
+        .strip_prefix("sym:global:")
+        .and_then(|global_key| global_lookup.get(global_key).copied());
+    ModRefNodeSummary {
+        label,
+        external: resolution.external,
+        pointee_global_ids,
+        diagnostic_pointee_globals: &resolution.pointee_globals,
+        external_source_suffix: resolution
+            .external
+            .then(|| modref_external_source_suffix(&resolution.external_sources))
+            .flatten(),
+        direct_symbol_global,
+    }
+}
+
 fn push_pointer_modrefs_from_pag(
     modrefs: &mut Vec<ModRef>,
     func_lookup: &HashMap<String, FuncId>,
@@ -2255,28 +2291,41 @@ fn push_pointer_modrefs_from_pag(
     nodes: &BTreeMap<String, NodeResolution>,
     noloc_ord: &mut BTreeMap<(String, String), u32>,
 ) {
+    let mut node_summaries = Vec::new();
+    node_summaries.resize_with(pag.nodes.len(), || None);
+    let mut missing_nodes = vec![false; pag.nodes.len()];
     for edge in &pag.edges {
         let Some((owner, func, accesses)) = edge_accesses(edge, func_lookup) else {
             continue;
         };
         let witness = witness_key(&owner, &edge.loc, noloc_ord, "global");
         for pointer_access in accesses {
-            let Some(node) = pag.nodes.get(pointer_access.address_node.0 as usize) else {
+            let node_idx = pointer_access.address_node.0 as usize;
+            if missing_nodes.get(node_idx).copied().unwrap_or(true) {
                 continue;
-            };
-            let Some(resolution) = nodes.get(&node.label) else {
-                continue;
-            };
+            }
+            if node_summaries[node_idx].is_none() {
+                let Some(node) = pag.nodes.get(node_idx) else {
+                    continue;
+                };
+                let Some(resolution) = nodes.get(&node.label) else {
+                    missing_nodes[node_idx] = true;
+                    continue;
+                };
+                node_summaries[node_idx] = Some(build_modref_node_summary(
+                    &node.label,
+                    resolution,
+                    global_lookup,
+                ));
+            }
+            let summary = node_summaries[node_idx].as_ref().unwrap();
 
-            for global_key in &resolution.pointee_globals {
+            for &gid in &summary.pointee_global_ids {
                 if pointer_access.suppress_direct_symbol
-                    && node.label == format!("sym:global:{global_key}")
+                    && summary.direct_symbol_global == Some(gid)
                 {
                     continue;
                 }
-                let Some(&gid) = global_lookup.get(global_key) else {
-                    continue;
-                };
                 modrefs.push(ModRef {
                     func,
                     global: GlobalTarget::Name(gid),
@@ -2289,19 +2338,19 @@ fn push_pointer_modrefs_from_pag(
                 });
             }
 
-            if resolution.external {
+            if summary.external {
                 modrefs.push(ModRef {
                     func,
                     global: GlobalTarget::Unknown(pointer_access.unknown_reason.to_string()),
                     access: pointer_access.access,
                     via: Via::Unknown,
                     witness: witness.clone(),
-                    detail: Some(modref_detail_with_external_sources(
+                    detail: Some(modref_detail_with_external_suffix(
                         pointer_access.detail,
-                        &resolution.external_sources,
+                        summary.external_source_suffix.as_deref(),
                     )),
-                    address_node: Some(node.label.clone()),
-                    pointee_globals: resolution.pointee_globals.clone(),
+                    address_node: Some(summary.label.to_string()),
+                    pointee_globals: summary.diagnostic_pointee_globals.to_vec(),
                 });
             }
         }
@@ -2376,14 +2425,25 @@ fn push_pointer_memset_modrefs_from_pir(
     }
 }
 
-fn modref_detail_with_external_sources(base: &str, sources: &[String]) -> String {
+fn modref_external_source_suffix(sources: &[String]) -> Option<String> {
     if sources.is_empty() {
-        return base.to_string();
+        return None;
     }
     let mut sources = sources.to_vec();
     sources.sort();
     sources.dedup();
-    format!("{base}|{}", sources.join("+"))
+    Some(sources.join("+"))
+}
+
+fn modref_detail_with_external_suffix(base: &str, suffix: Option<&str>) -> String {
+    match suffix {
+        Some(suffix) => format!("{base}|{suffix}"),
+        None => base.to_string(),
+    }
+}
+
+fn modref_detail_with_external_sources(base: &str, sources: &[String]) -> String {
+    modref_detail_with_external_suffix(base, modref_external_source_suffix(sources).as_deref())
 }
 
 fn edge_accesses(
