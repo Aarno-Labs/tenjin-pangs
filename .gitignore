@@ -1,6 +1,7 @@
 .git
 ju_*
-.swp
-.swo
+.*.swp
+.*.swo
+libcurl-*-*/
 target/
 pdfs/
