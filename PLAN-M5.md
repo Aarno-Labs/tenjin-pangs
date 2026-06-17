@@ -133,6 +133,19 @@ Tabulate unsettled mutability ledger entries by the §0 symptom taxonomy (the au
 from M2.5/M3.5/M4 are the raw data; extend the audit sample if thin). Written go/no-go
 per sub-milestone with numbers, filed in `metrics/`.
 
+Implementation status:
+
+- Added `scripts/m5_gate_census.sh` to summarize M5.0 gate signals from existing
+  `pangs analyze` export directories.
+- Recorded the first M5.0 census in `metrics/m5_0_gate_census.md` from the M4.5 O1
+  decision-corpus exports.
+- The current corpus has zero mutable globals blocked by known `runtime_writer` rows, so
+  M5a flow-sensitive summaries are not green-lit by the available evidence.
+- Every mutable global in the census is blocked first by `incomplete_initval`, so the next
+  precision slice should audit/improve B1 initval completeness before building M5a.
+- M5b remains not green-lit because no current lite client consumes thread-confinement
+  facts.
+
 ### M5a.1 — Auxiliary-formal transformation & summary domain (3–5 days)
 The §1.2 formal-derived-cell naming, depth-k expansion, summary data model, substitution
 at call sites, havoc fallback. Fixtures: out-parameter init (`init(&x)` patterns —
