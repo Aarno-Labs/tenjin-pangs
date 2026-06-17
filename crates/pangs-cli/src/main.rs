@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use pangs_api::{Analysis, BuildMode, Opts, Stage};
+use pangs_api::{Analysis, BuildMode, FuncId, Opts, Stage};
 use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
 use pangs_pir::Pir;
 
@@ -38,6 +38,18 @@ enum Command {
     },
     Stats {
         module: PathBuf,
+    },
+    /// Run analysis and print mod/ref row counts without writing exports.
+    ModrefSummary {
+        module: PathBuf,
+        #[arg(long, default_value = "andersen")]
+        stage: StageArg,
+        #[arg(long, default_value = "library")]
+        build_mode: BuildModeArg,
+        #[arg(long)]
+        exports: Option<PathBuf>,
+        #[arg(long, default_value_t = 1_000, hide = true)]
+        partition_budget: u64,
     },
     DumpPir {
         module: PathBuf,
@@ -215,6 +227,35 @@ fn run() -> Result<()> {
             let opts = Opts::default();
             let analysis = Analysis::run(&pir, &opts)?;
             println!("{}", serde_json::to_string_pretty(analysis.metrics())?);
+        }
+        Command::ModrefSummary {
+            module,
+            stage,
+            build_mode,
+            exports,
+            partition_budget,
+        } => {
+            let pir = Pir::from_path(&module)?;
+            let opts = Opts {
+                stage: stage.into(),
+                build_mode: build_mode.into(),
+                exports: read_exports(exports)?,
+                partition_budget,
+                ..Opts::default()
+            };
+            let analysis = Analysis::run(&pir, &opts)?;
+            let transitive_rows: usize = (0..analysis.functions().len())
+                .map(|idx| analysis.modref(FuncId(idx as u32)).count())
+                .sum();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "functions": analysis.functions().len(),
+                    "local_modref_rows": analysis.modrefs().len(),
+                    "transitive_modref_rows": transitive_rows,
+                    "metrics": analysis.metrics(),
+                }))?
+            );
         }
         Command::DumpPir { module, func } => {
             let mut pir = Pir::from_path(&module)?;
