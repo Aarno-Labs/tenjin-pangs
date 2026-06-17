@@ -27,10 +27,20 @@
     "globals_with_complete_initval",
     "stationary_globals",
     "analysis_wall_us",
+    "setup_scan_us",
+    "preanalysis_us",
     "pag_build_us",
     "solve_us",
+    "solver_postprocess_us",
+    "pointer_modref_us",
+    "callgraph_dedup_us",
+    "modref_dedup_us",
+    "stationarity_us",
+    "initval_reapply_us",
     "transitive_modref_us",
-    "components_us"
+    "findings_dedup_us",
+    "components_us",
+    "metrics_bookkeeping_us"
   ],
   "$defs": {
     "counter_map": {
@@ -199,6 +209,14 @@
       "type": "integer",
       "minimum": 0
     },
+    "setup_scan_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "preanalysis_us": {
+      "type": "integer",
+      "minimum": 0
+    },
     "pag_build_us": {
       "type": "integer",
       "minimum": 0
@@ -207,11 +225,43 @@
       "type": "integer",
       "minimum": 0
     },
+    "solver_postprocess_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointer_modref_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "callgraph_dedup_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "modref_dedup_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "stationarity_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "initval_reapply_us": {
+      "type": "integer",
+      "minimum": 0
+    },
     "transitive_modref_us": {
       "type": "integer",
       "minimum": 0
     },
+    "findings_dedup_us": {
+      "type": "integer",
+      "minimum": 0
+    },
     "components_us": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "metrics_bookkeeping_us": {
       "type": "integer",
       "minimum": 0
     },

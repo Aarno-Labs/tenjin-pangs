@@ -75,10 +75,20 @@ fn scrub_timing_fields(mut metrics: Value) -> Value {
     let object = metrics.as_object_mut().unwrap();
     for key in [
         "analysis_wall_us",
+        "setup_scan_us",
+        "preanalysis_us",
         "pag_build_us",
         "solve_us",
+        "solver_postprocess_us",
+        "pointer_modref_us",
+        "callgraph_dedup_us",
+        "modref_dedup_us",
+        "stationarity_us",
+        "initval_reapply_us",
         "transitive_modref_us",
+        "findings_dedup_us",
         "components_us",
+        "metrics_bookkeeping_us",
     ] {
         object.remove(key);
     }
@@ -644,10 +654,20 @@ fn analyze_steens_stress_fixture_is_stable_except_for_timing_fields() {
         serde_json::from_str(&fs::read_to_string(out_b.join("metrics.json")).unwrap()).unwrap();
     for key in [
         "analysis_wall_us",
+        "setup_scan_us",
+        "preanalysis_us",
         "pag_build_us",
         "solve_us",
+        "solver_postprocess_us",
+        "pointer_modref_us",
+        "callgraph_dedup_us",
+        "modref_dedup_us",
+        "stationarity_us",
+        "initval_reapply_us",
         "transitive_modref_us",
+        "findings_dedup_us",
         "components_us",
+        "metrics_bookkeeping_us",
     ] {
         assert!(
             metrics_a[key].as_u64().is_some(),

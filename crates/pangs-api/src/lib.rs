@@ -291,10 +291,20 @@ pub struct Metrics {
     pub globals_with_complete_initval: usize,
     pub stationary_globals: usize,
     pub analysis_wall_us: u64,
+    pub setup_scan_us: u64,
+    pub preanalysis_us: u64,
     pub pag_build_us: u64,
     pub solve_us: u64,
+    pub solver_postprocess_us: u64,
+    pub pointer_modref_us: u64,
+    pub callgraph_dedup_us: u64,
+    pub modref_dedup_us: u64,
+    pub stationarity_us: u64,
+    pub initval_reapply_us: u64,
     pub transitive_modref_us: u64,
+    pub findings_dedup_us: u64,
     pub components_us: u64,
+    pub metrics_bookkeeping_us: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lowering: Option<LoweringStats>,
 }
@@ -463,6 +473,7 @@ pub struct Analysis {
 impl Analysis {
     pub fn run(module: &Pir, opts: &Opts) -> Result<Self, AnalysisError> {
         let analysis_started = Instant::now();
+        let setup_scan_started = Instant::now();
         let mut func_lookup = HashMap::new();
         let mut functions = Vec::new();
         for (idx, func) in module.functions.iter().enumerate() {
@@ -739,6 +750,8 @@ impl Analysis {
                 }
             }
         }
+        let setup_scan_us = setup_scan_started.elapsed().as_micros() as u64;
+        let preanalysis_started = Instant::now();
         let mut simple_report = if opts.enable_b2_simple {
             resolve_simple_icalls(module, &simple_icall_queries, opts.b2_context_depth)
         } else {
@@ -766,7 +779,10 @@ impl Analysis {
                     .map(|query| (query.callsite_key.clone(), resolution.targets.clone()))
             })
             .collect();
+        let preanalysis_us = preanalysis_started.elapsed().as_micros() as u64;
 
+        let mut solver_postprocess_us = 0;
+        let mut pointer_modref_us = 0;
         match opts.stage {
             Stage::Conservative => {
                 for (cs, caller, sig) in &indirect_callsites {
@@ -861,6 +877,7 @@ impl Analysis {
                 let safe_indirect_varargs =
                     safe_indirect_vararg_callsites(module, &indirect_vararg_keys, &solved);
                 solver_metrics = Some(solved.metrics.clone());
+                let solver_postprocess_started = Instant::now();
                 emit_deferred_steens_audits(
                     &mut findings,
                     &mut audit_taints,
@@ -988,7 +1005,9 @@ impl Analysis {
                         global.never_written = state.never_written;
                     }
                 }
+                solver_postprocess_us = solver_postprocess_started.elapsed().as_micros() as u64;
 
+                let pointer_modref_started = Instant::now();
                 push_pointer_modrefs_from_pag(
                     &mut modrefs,
                     &func_lookup,
@@ -1005,13 +1024,19 @@ impl Analysis {
                     &solved.nodes,
                     &mut noloc_ord,
                 );
+                pointer_modref_us = pointer_modref_started.elapsed().as_micros() as u64;
             }
         }
 
+        let callgraph_dedup_started = Instant::now();
         call_edges.sort_by_key(|edge| edge_sort_key(edge, &functions, &callsites));
         call_edges.dedup_by_key(|edge| edge_sort_key(edge, &functions, &callsites));
+        let callgraph_dedup_us = callgraph_dedup_started.elapsed().as_micros() as u64;
+        let modref_dedup_started = Instant::now();
         dedup_modrefs_by_fact(&mut modrefs, &functions, &globals);
+        let modref_dedup_us = modref_dedup_started.elapsed().as_micros() as u64;
 
+        let stationarity_started = Instant::now();
         let (stationary_globals, stationarity) = if opts.stage == Stage::Conservative {
             conservative_stationarity_verdicts(module, &global_lookup)
         } else {
@@ -1024,6 +1049,8 @@ impl Analysis {
                 &modrefs,
             )
         };
+        let stationarity_us = stationarity_started.elapsed().as_micros() as u64;
+        let initval_reapply_started = Instant::now();
         let initval_report = if opts.enable_b1_initval {
             resolve_initval_icalls(module, &simple_icall_queries, &stationary_globals)
         } else {
@@ -1042,6 +1069,7 @@ impl Analysis {
             simple_icalls,
             &initval_report.resolutions,
         );
+        let initval_reapply_us = initval_reapply_started.elapsed().as_micros() as u64;
 
         let transitive_started = Instant::now();
         let transitive_modrefs = compute_transitive_modrefs(
@@ -1052,6 +1080,7 @@ impl Analysis {
             &modrefs,
         );
         let transitive_modref_us = transitive_started.elapsed().as_micros() as u64;
+        let findings_dedup_started = Instant::now();
         findings.sort_by_key(|finding| {
             (
                 finding.kind.clone(),
@@ -1070,6 +1099,7 @@ impl Analysis {
                 finding.detail.clone(),
             )
         });
+        let findings_dedup_us = findings_dedup_started.elapsed().as_micros() as u64;
 
         let components_started = Instant::now();
         let components = compute_components(
@@ -1092,6 +1122,7 @@ impl Analysis {
             .collect::<BTreeSet<_>>()
             .len();
 
+        let metrics_bookkeeping_started = Instant::now();
         // M2.0 flat per-provenance icall attribution: one verdict per indirect callsite
         // (all of a site's edges share its `tier`), plus a count of sites carrying an
         // Ω/unknown-callee edge. This is bookkeeping, not a certificate cascade.
@@ -1146,12 +1177,23 @@ impl Analysis {
             oversize_fallback_max_size: 0,
             rounds: 0,
             analysis_wall_us: 0,
+            setup_scan_us,
+            preanalysis_us,
             pag_build_us,
             solve_us,
+            solver_postprocess_us,
+            pointer_modref_us,
+            callgraph_dedup_us,
+            modref_dedup_us,
+            stationarity_us,
+            initval_reapply_us,
             transitive_modref_us,
+            findings_dedup_us,
             components_us,
+            metrics_bookkeeping_us: 0,
             lowering: (!module.lowering.is_empty()).then(|| module.lowering.clone()),
         };
+        let metrics_bookkeeping_us = metrics_bookkeeping_started.elapsed().as_micros() as u64;
 
         let metrics = if let Some(solved) = solver_metrics {
             Metrics {
@@ -1169,6 +1211,7 @@ impl Analysis {
         };
         let metrics = Metrics {
             analysis_wall_us: analysis_started.elapsed().as_micros() as u64,
+            metrics_bookkeeping_us,
             ..metrics
         };
 

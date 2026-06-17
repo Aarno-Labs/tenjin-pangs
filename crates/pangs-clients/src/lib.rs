@@ -188,7 +188,7 @@ pub fn report(outdir: &Path) -> Result<String> {
     let audit_kind_summary = jsonl_histogram(outdir, "audit.jsonl", &["kind"])?;
     let audit_effect_summary = jsonl_histogram(outdir, "audit.jsonl", &["effect"])?;
     Ok(format!(
-        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\ncall edges by tier: {}\nconfined functions: {}\ninitval complete globals: {}\nstationary globals: {}\nstationarity reasons: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\naudit kinds: {}\naudit effects: {}\nmutable globals rewritable: {}/{}\ncomponent sizes: {}\nlargest frozen components: {}\ncomponent taints: {}\ncomponent blockers: {}\npipeline wall: {} ms\nanalysis wall: {} us\npag build: {} us\nsolve: {} us\ntransitive modref: {} us\ncomponents: {} us\n",
+        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\ncall edges by tier: {}\nconfined functions: {}\ninitval complete globals: {}\nstationary globals: {}\nstationarity reasons: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\naudit kinds: {}\naudit effects: {}\nmutable globals rewritable: {}/{}\ncomponent sizes: {}\nlargest frozen components: {}\ncomponent taints: {}\ncomponent blockers: {}\npipeline wall: {} ms\nanalysis wall: {} us\nsetup scan: {} us\npreanalysis: {} us\npag build: {} us\nsolve: {} us\nsolver postprocess: {} us\npointer modref: {} us\ncallgraph dedup: {} us\nmodref dedup: {} us\nstationarity: {} us\ninitval reapply: {} us\ntransitive modref: {} us\nfindings dedup: {} us\ncomponents: {} us\nmetrics bookkeeping: {} us\n",
         metrics.functions,
         metrics.globals,
         metrics.call_edges,
@@ -215,10 +215,20 @@ pub fn report(outdir: &Path) -> Result<String> {
         component_summary.blockers,
         wall_ms,
         metrics.analysis_wall_us,
+        metrics.setup_scan_us,
+        metrics.preanalysis_us,
         metrics.pag_build_us,
         metrics.solve_us,
+        metrics.solver_postprocess_us,
+        metrics.pointer_modref_us,
+        metrics.callgraph_dedup_us,
+        metrics.modref_dedup_us,
+        metrics.stationarity_us,
+        metrics.initval_reapply_us,
         metrics.transitive_modref_us,
+        metrics.findings_dedup_us,
         metrics.components_us,
+        metrics.metrics_bookkeeping_us,
     ))
 }
 
@@ -931,7 +941,7 @@ mod tests {
         .unwrap();
         fs::write(
             outdir.path().join("metrics.json"),
-            "{\"functions\":\"bad\",\"globals\":0,\"callsites\":0,\"call_edges\":0,\"audit_findings\":0,\"mutable_globals_total\":0,\"in_rewritable_components\":0,\"partition_count\":0,\"partition_p50_size\":0,\"partition_p95_size\":0,\"partition_max_size\":0,\"oversize_fallbacks\":0,\"rounds\":0,\"analysis_wall_us\":0,\"pag_build_us\":0,\"solve_us\":0,\"transitive_modref_us\":0,\"components_us\":0}\n",
+            "{\"functions\":\"bad\",\"globals\":0,\"callsites\":0,\"call_edges\":0,\"audit_findings\":0,\"mutable_globals_total\":0,\"in_rewritable_components\":0,\"partition_count\":0,\"partition_p50_size\":0,\"partition_p95_size\":0,\"partition_max_size\":0,\"oversize_fallbacks\":0,\"oversize_fallback_max_size\":0,\"rounds\":0,\"analysis_wall_us\":0,\"setup_scan_us\":0,\"preanalysis_us\":0,\"pag_build_us\":0,\"solve_us\":0,\"solver_postprocess_us\":0,\"pointer_modref_us\":0,\"callgraph_dedup_us\":0,\"modref_dedup_us\":0,\"stationarity_us\":0,\"initval_reapply_us\":0,\"transitive_modref_us\":0,\"findings_dedup_us\":0,\"components_us\":0,\"metrics_bookkeeping_us\":0}\n",
         )
         .unwrap();
 
@@ -960,10 +970,20 @@ mod tests {
         let text = report(outdir.path()).unwrap();
         assert!(text.contains("pipeline wall: "));
         assert!(text.contains("analysis wall: "));
+        assert!(text.contains("setup scan: "));
+        assert!(text.contains("preanalysis: "));
         assert!(text.contains("pag build: "));
         assert!(text.contains("solve: "));
+        assert!(text.contains("solver postprocess: "));
+        assert!(text.contains("pointer modref: "));
+        assert!(text.contains("callgraph dedup: "));
+        assert!(text.contains("modref dedup: "));
+        assert!(text.contains("stationarity: "));
+        assert!(text.contains("initval reapply: "));
         assert!(text.contains("transitive modref: "));
+        assert!(text.contains("findings dedup: "));
         assert!(text.contains("components: "));
+        assert!(text.contains("metrics bookkeeping: "));
         assert!(text.contains("icalls by tier: "));
         assert!(text.contains("call edges by tier: "));
         assert!(text.contains("confined functions: "));

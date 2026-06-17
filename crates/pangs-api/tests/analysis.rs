@@ -2820,9 +2820,23 @@ fn steens_metrics_expose_phase_timings_on_stress_fixture() {
     .unwrap();
 
     let metrics = analysis.metrics();
-    assert!(metrics.analysis_wall_us >= metrics.pag_build_us);
-    assert!(metrics.analysis_wall_us >= metrics.solve_us);
-    assert!(metrics.analysis_wall_us >= metrics.transitive_modref_us);
-    assert!(metrics.analysis_wall_us >= metrics.components_us);
+    for phase_us in [
+        metrics.setup_scan_us,
+        metrics.preanalysis_us,
+        metrics.pag_build_us,
+        metrics.solve_us,
+        metrics.solver_postprocess_us,
+        metrics.pointer_modref_us,
+        metrics.callgraph_dedup_us,
+        metrics.modref_dedup_us,
+        metrics.stationarity_us,
+        metrics.initval_reapply_us,
+        metrics.transitive_modref_us,
+        metrics.findings_dedup_us,
+        metrics.components_us,
+        metrics.metrics_bookkeeping_us,
+    ] {
+        assert!(metrics.analysis_wall_us >= phase_us);
+    }
     assert!(metrics.partition_count > 0);
 }
