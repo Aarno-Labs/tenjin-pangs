@@ -1574,11 +1574,11 @@ fn stationarity_verdicts_from_modrefs(
         }
     }
     for writers in runtime_writers.values_mut() {
-        writers.sort_by_key(stationarity_writer_sort_key);
-        writers.dedup_by_key(|writer| stationarity_writer_sort_key(writer));
+        writers.sort_by(stationarity_writer_cmp);
+        writers.dedup_by(|left, right| stationarity_writer_cmp(left, right) == Ordering::Equal);
     }
-    unknown_writers.sort_by_key(stationarity_writer_sort_key);
-    unknown_writers.dedup_by_key(|writer| stationarity_writer_sort_key(writer));
+    unknown_writers.sort_by(stationarity_writer_cmp);
+    unknown_writers.dedup_by(|left, right| stationarity_writer_cmp(left, right) == Ordering::Equal);
 
     let mut stationary_globals = BTreeSet::new();
     let mut verdicts = Vec::new();
@@ -1602,8 +1602,9 @@ fn stationarity_verdicts_from_modrefs(
                     }]
                 })
         };
-        initval_diagnostics.sort_by_key(initval_diagnostic_sort_key);
-        initval_diagnostics.dedup_by_key(|diagnostic| initval_diagnostic_sort_key(diagnostic));
+        initval_diagnostics.sort_by(initval_diagnostic_cmp);
+        initval_diagnostics
+            .dedup_by(|left, right| initval_diagnostic_cmp(left, right) == Ordering::Equal);
         let absence_only_initval = initval_is_absence_only(&initval_diagnostics);
         let mut writers = Vec::new();
         let reason = if !complete_initval
@@ -1634,7 +1635,11 @@ fn stationarity_verdicts_from_modrefs(
             initval_diagnostics,
         });
     }
-    verdicts.sort_by_key(|verdict| module.globals[verdict.global.0 as usize].key.clone());
+    verdicts.sort_by(|left, right| {
+        module.globals[left.global.0 as usize]
+            .key
+            .cmp(&module.globals[right.global.0 as usize].key)
+    });
     (stationary_globals, verdicts)
 }
 
@@ -1648,26 +1653,20 @@ fn stationarity_writer_from_modref(mr: &ModRef) -> StationarityWriter {
     }
 }
 
-fn stationarity_writer_sort_key(
-    writer: &StationarityWriter,
-) -> (Option<u32>, String, String, String, String) {
-    (
-        writer.func.map(|id| id.0),
-        match &writer.global {
-            GlobalTarget::Name(id) => format!("name:{}", id.0),
-            GlobalTarget::Unknown(reason) => format!("unknown:{reason}"),
-        },
-        format!("{:?}", writer.access),
-        format!("{:?}", writer.via),
-        writer.witness.clone().unwrap_or_default(),
-    )
+fn stationarity_writer_cmp(left: &StationarityWriter, right: &StationarityWriter) -> Ordering {
+    left.func
+        .map(|id| id.0)
+        .cmp(&right.func.map(|id| id.0))
+        .then_with(|| left.global.cmp(&right.global))
+        .then_with(|| access_rank(left.access).cmp(&access_rank(right.access)))
+        .then_with(|| via_rank(left.via).cmp(&via_rank(right.via)))
+        .then_with(|| option_str(&left.witness).cmp(option_str(&right.witness)))
 }
 
-fn initval_diagnostic_sort_key(diagnostic: &InitValDiagnostic) -> (String, String) {
-    (
-        diagnostic.reason.clone(),
-        diagnostic.witness.clone().unwrap_or_default(),
-    )
+fn initval_diagnostic_cmp(left: &InitValDiagnostic, right: &InitValDiagnostic) -> Ordering {
+    left.reason
+        .cmp(&right.reason)
+        .then_with(|| option_str(&left.witness).cmp(option_str(&right.witness)))
 }
 
 fn initval_is_absence_only(diagnostics: &[InitValDiagnostic]) -> bool {
