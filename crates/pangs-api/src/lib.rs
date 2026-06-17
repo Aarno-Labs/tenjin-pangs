@@ -2750,6 +2750,7 @@ fn modref_payload_cmp(
 ) -> Ordering {
     global_target_label(&left.global, globals)
         .cmp(global_target_label(&right.global, globals))
+        .then_with(|| left.global.cmp(&right.global))
         .then_with(|| access_rank(left.access).cmp(&access_rank(right.access)))
         .then_with(|| via_rank(left.via).cmp(&via_rank(right.via)))
         .then_with(|| option_str(&left.witness).cmp(option_str(&right.witness)))
@@ -3552,27 +3553,27 @@ struct ModRefPayload {
 #[derive(Debug, Clone, Default)]
 struct TransitiveModRefs {
     payloads: Vec<ModRefPayload>,
-    by_func: Vec<Vec<usize>>,
+    row_sets: Vec<Vec<usize>>,
+    row_set_by_func: Vec<usize>,
 }
 
 impl TransitiveModRefs {
     fn iter(&self, func: FuncId) -> impl Iterator<Item = ModRef> + '_ {
         let root = func;
-        self.by_func[func.0 as usize]
-            .iter()
-            .map(move |&payload_id| {
-                let payload = &self.payloads[payload_id];
-                ModRef {
-                    func: root,
-                    global: payload.global.clone(),
-                    access: payload.access,
-                    via: payload.via,
-                    witness: payload.witness.clone(),
-                    detail: payload.detail.clone(),
-                    address_node: payload.address_node.clone(),
-                    pointee_globals: payload.pointee_globals.clone(),
-                }
-            })
+        let row_set = self.row_set_by_func[func.0 as usize];
+        self.row_sets[row_set].iter().map(move |&payload_id| {
+            let payload = &self.payloads[payload_id];
+            ModRef {
+                func: root,
+                global: payload.global.clone(),
+                access: payload.access,
+                via: payload.via,
+                witness: payload.witness.clone(),
+                detail: payload.detail.clone(),
+                address_node: payload.address_node.clone(),
+                pointee_globals: payload.pointee_globals.clone(),
+            }
+        })
     }
 }
 
@@ -3733,41 +3734,62 @@ fn compute_transitive_modrefs(
         collect_scc_payload_ids(scc, &local_by_scc, &scc_succs, &mut memo);
     }
 
-    let mut transitive = Vec::with_capacity(func_count);
-    let mut metrics = ModRefPhaseMetrics::default();
-    let mut fanout_by_fact = HashMap::<ModRefFanoutKey, u64>::new();
-    let mut profile = PointerModRefProfile::from_env();
-    profile.print_closure("closure-start", &metrics, 0, payloads.len());
-    for root_idx in 0..func_count {
-        let mut rows = memo[scc_of_func[root_idx]].as_ref().unwrap().clone();
+    let mut row_sets = Vec::with_capacity(scc_members.len());
+    let mut max_fanout_by_scc = Vec::with_capacity(scc_members.len());
+    for scc in 0..scc_members.len() {
+        let mut rows = memo[scc].take().unwrap_or_default();
         rows.sort_by(|&left, &right| {
             modref_payload_cmp(&payloads[left], &payloads[right], globals)
         });
+        max_fanout_by_scc.push(max_modref_payload_fanout(&rows, &payloads));
+        row_sets.push(rows);
+    }
+
+    let mut row_set_by_func = Vec::with_capacity(func_count);
+    let mut metrics = ModRefPhaseMetrics::default();
+    let mut profile = PointerModRefProfile::from_env();
+    profile.print_closure("closure-start", &metrics, 0, payloads.len());
+    for root_idx in 0..func_count {
+        let scc = scc_of_func[root_idx];
+        let rows = &row_sets[scc];
         metrics.attempted += rows.len() as u64;
         metrics.unique += rows.len() as u64;
-        for &payload_id in &rows {
-            let payload = &payloads[payload_id];
-            let key = ModRefFanoutKey {
-                func: FuncId(root_idx as u32),
-                global: payload.global.clone(),
-                access_rank: access_rank(payload.access),
-                via_rank: via_rank(payload.via),
-            };
-            let count = fanout_by_fact.entry(key).or_default();
-            *count += 1;
-            metrics.max_fact_fanout = metrics.max_fact_fanout.max(*count);
-        }
-        transitive.push(rows);
+        metrics.max_fact_fanout = metrics.max_fact_fanout.max(max_fanout_by_scc[scc]);
+        row_set_by_func.push(scc);
         profile.maybe_print_closure("closure-progress", &metrics, root_idx + 1, payloads.len());
     }
     profile.print_closure("closure-done", &metrics, func_count, payloads.len());
     (
         TransitiveModRefs {
             payloads,
-            by_func: transitive,
+            row_sets,
+            row_set_by_func,
         },
         metrics,
     )
+}
+
+fn max_modref_payload_fanout(sorted_rows: &[usize], payloads: &[ModRefPayload]) -> u64 {
+    let Some((&first, rest)) = sorted_rows.split_first() else {
+        return 0;
+    };
+    let mut max = 1;
+    let mut current = 1;
+    let mut previous = first;
+    for &payload_id in rest {
+        if same_modref_fanout_fact(&payloads[previous], &payloads[payload_id]) {
+            current += 1;
+        } else {
+            max = max.max(current);
+            current = 1;
+        }
+        previous = payload_id;
+    }
+    max.max(current)
+}
+
+fn same_modref_fanout_fact(left: &ModRefPayload, right: &ModRefPayload) -> bool {
+    left.global == right.global && left.access == right.access && left.via == right.via
 }
 
 fn collect_scc_payload_ids(
