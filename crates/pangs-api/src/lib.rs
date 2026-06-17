@@ -2443,16 +2443,28 @@ impl ModRefBuilder {
         fanout_key: ModRefFanoutKey,
         phase: Option<ModRefSourcePhase>,
     ) {
+        self.note_modref_fanout_count(fanout_key, phase, 1);
+    }
+
+    fn note_modref_fanout_count(
+        &mut self,
+        fanout_key: ModRefFanoutKey,
+        phase: Option<ModRefSourcePhase>,
+        delta: u64,
+    ) {
+        if delta == 0 {
+            return;
+        }
         let count = self.fanout_by_fact.entry(fanout_key.clone()).or_default();
-        *count += 1;
+        *count += delta;
         self.metrics.pointer_modref_max_fact_fanout =
             self.metrics.pointer_modref_max_fact_fanout.max(*count);
         let Some(phase) = phase else {
             return;
         };
-        self.metrics.phase_mut(phase).attempted += 1;
+        self.metrics.phase_mut(phase).attempted += delta;
         let phase_count = self.fanout_by_phase.entry((phase, fanout_key)).or_default();
-        *phase_count += 1;
+        *phase_count += delta;
         let phase_metrics = self.metrics.phase_mut(phase);
         phase_metrics.max_fact_fanout = phase_metrics.max_fact_fanout.max(*phase_count);
     }
@@ -2467,6 +2479,28 @@ impl ModRefBuilder {
         } else {
             phase_metrics.duplicate += 1;
         }
+    }
+
+    fn note_named_empty_prefiltered_duplicates(
+        &mut self,
+        func: FuncId,
+        global: GlobalId,
+        access: Access,
+        via: Via,
+        phase: ModRefSourcePhase,
+        duplicate_count: u64,
+    ) {
+        if duplicate_count == 0 {
+            return;
+        }
+        let fanout_key = ModRefFanoutKey {
+            func,
+            global: GlobalTarget::Name(global),
+            access_rank: access_rank(access),
+            via_rank: via_rank(via),
+        };
+        self.note_modref_fanout_count(fanout_key, Some(phase), duplicate_count);
+        self.metrics.phase_mut(phase).duplicate += duplicate_count;
     }
 
     fn into_vec(self) -> Vec<ModRef> {
@@ -2576,6 +2610,42 @@ struct ModRefNodeSummary<'a> {
     direct_symbol_global: Option<GlobalId>,
 }
 
+struct LocalPointerModRefRow {
+    witness: Option<String>,
+    count: u64,
+}
+
+fn flush_local_pointer_modref_rows(
+    modrefs: &mut ModRefBuilder,
+    local_rows: &mut HashMap<CompactModRefFactKey, LocalPointerModRefRow>,
+) {
+    for (key, row) in local_rows.drain() {
+        let func = FuncId(key.func);
+        let global = GlobalId(key.global);
+        let access = match key.access_rank {
+            0 => Access::Ref,
+            _ => Access::Mod,
+        };
+        let via = Via::Aliased;
+        modrefs.push_named_empty(
+            func,
+            global,
+            access,
+            via,
+            row.witness.as_deref(),
+            Some(ModRefSourcePhase::PagPointer),
+        );
+        modrefs.note_named_empty_prefiltered_duplicates(
+            func,
+            global,
+            access,
+            via,
+            ModRefSourcePhase::PagPointer,
+            row.count.saturating_sub(1),
+        );
+    }
+}
+
 fn build_modref_node_summary<'a>(
     label: &'a str,
     resolution: &'a NodeResolution,
@@ -2613,10 +2683,16 @@ fn push_pointer_modrefs_from_pag(
     let mut node_summaries = Vec::new();
     node_summaries.resize_with(pag.nodes.len(), || None);
     let mut missing_nodes = vec![false; pag.nodes.len()];
+    let mut local_rows = HashMap::<CompactModRefFactKey, LocalPointerModRefRow>::new();
+    let mut active_func = None;
     for edge in &pag.edges {
         let Some((owner, func, accesses)) = edge_accesses(edge, func_lookup) else {
             continue;
         };
+        if active_func != Some(func) {
+            flush_local_pointer_modref_rows(modrefs, &mut local_rows);
+            active_func = Some(func);
+        }
         let witness = witness_key(&owner, &edge.loc, noloc_ord, "global");
         for pointer_access in accesses {
             let node_idx = pointer_access.address_node.0 as usize;
@@ -2643,6 +2719,9 @@ fn push_pointer_modrefs_from_pag(
             } else {
                 ModRefSourcePhase::PagPointer
             };
+            if phase != ModRefSourcePhase::PagPointer {
+                flush_local_pointer_modref_rows(modrefs, &mut local_rows);
+            }
 
             for &gid in &summary.pointee_global_ids {
                 if pointer_access.suppress_direct_symbol
@@ -2650,14 +2729,33 @@ fn push_pointer_modrefs_from_pag(
                 {
                     continue;
                 }
-                modrefs.push_named_empty(
-                    func,
-                    gid,
-                    pointer_access.access,
-                    Via::Aliased,
-                    witness.as_deref(),
-                    Some(phase),
-                );
+                if phase == ModRefSourcePhase::PagPointer {
+                    let key = CompactModRefFactKey {
+                        func: func.0,
+                        global: gid.0,
+                        access_rank: access_rank(pointer_access.access),
+                        via_rank: via_rank(Via::Aliased),
+                    };
+                    local_rows
+                        .entry(key)
+                        .and_modify(|row| {
+                            row.count += 1;
+                            prefer_modref_witness_ref(&mut row.witness, witness.as_deref());
+                        })
+                        .or_insert_with(|| LocalPointerModRefRow {
+                            witness: witness.clone(),
+                            count: 1,
+                        });
+                } else {
+                    modrefs.push_named_empty(
+                        func,
+                        gid,
+                        pointer_access.access,
+                        Via::Aliased,
+                        witness.as_deref(),
+                        Some(phase),
+                    );
+                }
             }
 
             if summary.external {
@@ -2680,6 +2778,7 @@ fn push_pointer_modrefs_from_pag(
             }
         }
     }
+    flush_local_pointer_modref_rows(modrefs, &mut local_rows);
 }
 
 fn push_pointer_memset_modrefs_from_pir(
