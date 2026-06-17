@@ -66,6 +66,12 @@ fn m2_4_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn m5_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m5")
+        .join(name)
+}
+
 fn assert_single_simple_target(analysis: &Analysis, target: &str) {
     let target_id = analysis.lookup_func(target).unwrap();
     let concrete_edges = analysis
@@ -2546,6 +2552,48 @@ fn steens_memset_modref_exports_direct_aliased_and_unknown_store_rows() {
     assert!(component.taint.iter().any(|taint| {
         taint.kind == "unknown_global"
             && taint.witness.as_deref() == Some("main@m1_6_memset.c:4:1#0")
+    }));
+}
+
+#[test]
+fn andersen_refines_spurious_external_store_address_modref() {
+    let fixture = m5_fixture("andersen_refines_store_external.pir.json");
+    let steens = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let andersen = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let table = andersen.lookup_global("@Table").unwrap();
+    assert!(steens.modrefs().iter().any(|mr| {
+        mr.global == pangs_api::GlobalTarget::Unknown("omega_store".to_string())
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Unknown
+            && mr.witness.as_deref() == Some("driver@m5_store.c:8:1#0")
+            && mr.detail.as_deref() == Some("edge:store")
+    }));
+    assert!(andersen.modrefs().iter().any(|mr| {
+        mr.global == pangs_api::GlobalTarget::Name(table)
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("driver@m5_store.c:8:1#0")
+    }));
+    assert!(!andersen.modrefs().iter().any(|mr| {
+        mr.global == pangs_api::GlobalTarget::Unknown("omega_store".to_string())
+            && mr.witness.as_deref() == Some("driver@m5_store.c:8:1#0")
     }));
 }
 

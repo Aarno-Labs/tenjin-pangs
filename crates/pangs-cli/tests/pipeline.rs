@@ -65,6 +65,12 @@ fn m3_3_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn m5_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m5")
+        .join(name)
+}
+
 fn scrub_timing_fields(mut metrics: Value) -> Value {
     let object = metrics.as_object_mut().unwrap();
     for key in [
@@ -1621,6 +1627,33 @@ fn analyze_steens_exports_memset_pointer_modref_rows() {
                         && taint["witness"] == "main@m1_6_memset.c:4:1#0"
                 })
         }));
+}
+
+#[test]
+fn analyze_andersen_refines_spurious_external_store_address_modref() {
+    let fixture = m5_fixture("andersen_refines_store_external.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "andersen");
+
+    let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(modref.iter().any(|row| {
+        row["func"] == "driver"
+            && row["global"]["name"] == "@Table"
+            && row["access"] == "mod"
+            && row["via"] == "aliased"
+            && row["witness"] == "driver@m5_store.c:8:1#0"
+    }));
+    assert!(!modref.iter().any(|row| {
+        row["func"] == "driver"
+            && row["global"]["unknown"] == "omega_store"
+            && row["witness"] == "driver@m5_store.c:8:1#0"
+    }));
 }
 
 #[test]

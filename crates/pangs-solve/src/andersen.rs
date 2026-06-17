@@ -2,10 +2,11 @@
 //! real solver (`DESIGN_lite.md` §2 D', `PLAN-M1_lite_delta.md` §M1.4b).
 //!
 //! It runs *on top of* Steensgaard: `solve_steensgaard_with_classes` provides the union-find
-//! classes (Kahlon partitions) and the authoritative Ω/escape facts. Andersen then refines
-//! the **points-to sets only** within interesting, within-budget partitions, which sharpens
-//! two outputs — indirect-call concrete targets and per-node `pointee_globals` (mod/ref) —
-//! while every escape/unknown-caller verdict stays exactly as Steensgaard computed it.
+//! classes (Kahlon partitions) and the authoritative global escape facts. Andersen then
+//! refines the **points-to sets** within interesting, within-budget partitions, which
+//! sharpens three outputs — indirect-call concrete targets and per-node `external` /
+//! `pointee_globals` (mod/ref) — while global escape and unknown-caller verdicts stay
+//! exactly as Steensgaard computed them.
 //!
 //! Soundness rests on three facts:
 //! * Steensgaard unification is a sound over-approximation of Andersen, so refined targets
@@ -13,12 +14,14 @@
 //! * Constraints never cross a partition: assign/load/store/gep all *join* in Steensgaard,
 //!   and an `&o` object lives in the pointer's pointee class, which we fold into the same
 //!   Andersen partition — so a partition is a self-contained subproblem.
-//! * Anything reachable only through Ω stays Ω (absorbing), and the escape/unknown outputs
-//!   that drive component freezing are taken verbatim from Steensgaard.
+//! * Anything reachable only through Ω stays Ω (absorbing), and the global escape/unknown
+//!   outputs that drive component freezing are taken verbatim from Steensgaard.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use pangs_pag::{CallKind, EdgeKind, NodeId, NodeKind, ObjectKind, Pag};
+use pangs_pag::{
+    BuildMode, CallKind, EdgeKind, NodeId, NodeKind, ObjectKind, OmegaSeedKind, Pag, SeedTarget,
+};
 use pangs_pir::{fsa_compatible, Pir};
 
 use crate::{IndirectCallResolution, SolveResult, SteensClasses};
@@ -32,7 +35,7 @@ const MAX_ROUNDS: usize = 8;
 pub fn solve_andersen(
     pir: &Pir,
     pag: &Pag,
-    build_mode: pangs_pag::BuildMode,
+    build_mode: BuildMode,
     partition_budget: u64,
 ) -> SolveResult {
     solve_andersen_with_overrides(
@@ -54,7 +57,7 @@ pub fn solve_andersen(
 pub fn solve_andersen_with_overrides(
     pir: &Pir,
     pag: &Pag,
-    build_mode: pangs_pag::BuildMode,
+    build_mode: BuildMode,
     partition_budget: u64,
     exact_targets: &BTreeMap<String, Vec<String>>,
     confined_targets: &BTreeSet<String>,
@@ -65,17 +68,20 @@ pub fn solve_andersen_with_overrides(
         pag,
         &classes,
         &base,
+        build_mode,
         partition_budget,
         exact_targets,
         confined_targets,
     )
     .run();
 
-    // Override only the refined facts; keep escape/unknown/globals from Steensgaard.
+    // Override only the refined facts; keep global escape/unknown-caller facts from
+    // Steensgaard. Unrefined/oversize node partitions retain their Steensgaard node rows.
     base.indirect_calls = refined.indirect_calls;
-    for (label, globals) in refined.pointee_globals {
+    for (label, external, pointee_globals) in refined.nodes {
         if let Some(node) = base.nodes.get_mut(&label) {
-            node.pointee_globals = globals;
+            node.external = external;
+            node.pointee_globals = pointee_globals;
         }
     }
     base.metrics.rounds = refined.rounds;
@@ -86,7 +92,7 @@ pub fn solve_andersen_with_overrides(
 
 struct RefinerOutput {
     indirect_calls: Vec<IndirectCallResolution>,
-    pointee_globals: Vec<(String, Vec<String>)>,
+    nodes: Vec<(String, bool, Vec<String>)>,
     rounds: usize,
     oversize_fallbacks: usize,
     oversize_fallback_max_size: usize,
@@ -111,6 +117,7 @@ struct Refiner<'a> {
     pag: &'a Pag,
     classes: &'a SteensClasses,
     base: &'a SolveResult,
+    build_mode: BuildMode,
     budget: u64,
     exact_targets: &'a BTreeMap<String, Vec<String>>,
     confined_targets: &'a BTreeSet<String>,
@@ -143,6 +150,7 @@ impl<'a> Refiner<'a> {
         pag: &'a Pag,
         classes: &'a SteensClasses,
         base: &'a SolveResult,
+        build_mode: BuildMode,
         budget: u64,
         exact_targets: &'a BTreeMap<String, Vec<String>>,
         confined_targets: &'a BTreeSet<String>,
@@ -206,6 +214,7 @@ impl<'a> Refiner<'a> {
             pag,
             classes,
             base,
+            build_mode,
             budget,
             exact_targets,
             confined_targets,
@@ -394,10 +403,10 @@ impl<'a> Refiner<'a> {
         }
 
         let indirect_calls = self.emit_indirect_calls(&in_scope_sites, &pts);
-        let pointee_globals = self.emit_pointee_globals(&pts);
+        let nodes = self.emit_node_resolutions(&pts);
         RefinerOutput {
             indirect_calls,
-            pointee_globals,
+            nodes,
             rounds,
             oversize_fallbacks: self.oversize_fallbacks,
             oversize_fallback_max_size: self.oversize_fallback_max_size,
@@ -436,18 +445,16 @@ impl<'a> Refiner<'a> {
             }
         }
 
-        // Ω seeding: in-scope cells whose Steensgaard class is EXT may point to Ω.
-        for i in 0..self.n_base {
-            if self.in_scope[i] && self.classes.ext[self.classes.class_of(NodeId(i as u32))] {
-                solve.add_pts(i as Cell, self.omega);
-            }
-        }
+        self.apply_boundary_omega_seeds(&mut solve);
 
         // Indirect-call bindings for the fixed call graph (direct calls are already PAG
         // Assign edges; only icalls are bound dynamically).
         for (&site, funcs) in target_map {
             let cs = &self.pag.callsites[site];
             for &f in funcs {
+                if self.pir.functions[f].external {
+                    self.apply_external_call_effects(&mut solve, cs);
+                }
                 for (i, &arg) in cs.args.iter().enumerate() {
                     if let Some(&param) = self.param_nodes.get(&(f, i)) {
                         solve.add_copy(arg.0, param.0);
@@ -488,6 +495,114 @@ impl<'a> Refiner<'a> {
             );
         }
         solve
+    }
+
+    fn apply_boundary_omega_seeds(&self, solve: &mut Solve) {
+        for seed in &self.pag.omega_seeds {
+            match (seed.kind, seed.target) {
+                (
+                    OmegaSeedKind::IntToPtr | OmegaSeedKind::UnknownResultExternal,
+                    SeedTarget::Node(id),
+                ) => self.seed_points_to_omega(solve, id),
+                (
+                    OmegaSeedKind::PtrToInt | OmegaSeedKind::UnknownOperandEscape,
+                    SeedTarget::Node(id),
+                ) => self.seed_unknown_store_through(solve, id),
+                (
+                    OmegaSeedKind::ExportedSymbol | OmegaSeedKind::ImportedSymbol,
+                    SeedTarget::Node(id),
+                ) => {
+                    if matches!(
+                        self.pag.nodes.get(id.0 as usize).map(|node| &node.kind),
+                        Some(NodeKind::Object {
+                            object: ObjectKind::Global,
+                            ..
+                        })
+                    ) {
+                        self.seed_points_to_omega(solve, id);
+                    }
+                }
+                (OmegaSeedKind::ExternalCallBoundary, SeedTarget::Callsite(id)) => {
+                    if let Some(callsite) = self.pag.callsites.get(id.0 as usize) {
+                        self.apply_external_call_effects(solve, callsite);
+                    }
+                }
+                (OmegaSeedKind::VarargCallBoundary, SeedTarget::Callsite(id)) => {
+                    if let Some(callsite) = self.pag.callsites.get(id.0 as usize) {
+                        self.apply_vararg_call_effects(solve, callsite);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.seed_escaped_function_params(solve);
+        self.seed_main_entry_params(solve);
+    }
+
+    fn apply_external_call_effects(&self, solve: &mut Solve, callsite: &pangs_pag::Callsite) {
+        for &arg in &callsite.args {
+            self.seed_unknown_store_through(solve, arg);
+        }
+        if let Some(result) = callsite.result {
+            self.seed_points_to_omega(solve, result);
+        }
+    }
+
+    fn apply_vararg_call_effects(&self, solve: &mut Solve, callsite: &pangs_pag::Callsite) {
+        for &arg in callsite.args.iter().skip(callsite.sig.params.len()) {
+            self.seed_unknown_store_through(solve, arg);
+        }
+    }
+
+    fn seed_escaped_function_params(&self, solve: &mut Solve) {
+        for node in &self.pag.nodes {
+            let NodeKind::Object {
+                object: ObjectKind::Function,
+                key,
+                ..
+            } = &node.kind
+            else {
+                continue;
+            };
+            let class = self.classes.class_of(node.id);
+            if !self.classes.esc[class] {
+                continue;
+            }
+            let Some(&func_index) = self.func_index.get(key) else {
+                continue;
+            };
+            for param_index in 0..self.pir.functions[func_index].sig.params.len() {
+                if let Some(&param) = self.param_nodes.get(&(func_index, param_index)) {
+                    self.seed_points_to_omega(solve, param);
+                }
+            }
+        }
+    }
+
+    fn seed_main_entry_params(&self, solve: &mut Solve) {
+        if self.build_mode != BuildMode::Executable {
+            return;
+        }
+        let Some(&main_index) = self.func_index.get("main") else {
+            return;
+        };
+        for param_index in 1..self.pir.functions[main_index].sig.params.len() {
+            if let Some(&param) = self.param_nodes.get(&(main_index, param_index)) {
+                self.seed_points_to_omega(solve, param);
+            }
+        }
+    }
+
+    fn seed_points_to_omega(&self, solve: &mut Solve, node: NodeId) {
+        if self.in_scope.get(node.0 as usize).copied().unwrap_or(false) {
+            solve.add_pts(node.0, self.omega);
+        }
+    }
+
+    fn seed_unknown_store_through(&self, solve: &mut Solve, node: NodeId) {
+        if self.in_scope.get(node.0 as usize).copied().unwrap_or(false) {
+            solve.stores.entry(node.0).or_default().push(self.omega);
+        }
     }
 
     fn scope_profile(&self) -> ScopeProfile {
@@ -620,17 +735,19 @@ impl<'a> Refiner<'a> {
         out
     }
 
-    fn emit_pointee_globals(&self, pts: &Solve) -> Vec<(String, Vec<String>)> {
+    fn emit_node_resolutions(&self, pts: &Solve) -> Vec<(String, bool, Vec<String>)> {
         let mut out = Vec::new();
         for node in &self.pag.nodes {
             if !node.kind.is_value_like_public() || !self.in_scope[node.id.0 as usize] {
                 continue;
             }
-            let Some(set) = pts.pts.get(&node.id.0) else {
-                continue;
-            };
+            let set = pts.pts.get(&node.id.0);
+            let external = set
+                .map(|set| set.iter().any(|cell| *cell == self.omega))
+                .unwrap_or(false);
             let mut globals: Vec<String> = set
-                .iter()
+                .into_iter()
+                .flat_map(|set| set.iter())
                 .filter_map(|cell| {
                     let root = pts.field_base.get(cell).unwrap_or(cell);
                     self.global_of_cell.get(root)
@@ -639,7 +756,7 @@ impl<'a> Refiner<'a> {
                 .collect();
             globals.sort();
             globals.dedup();
-            out.push((node.label.clone(), globals));
+            out.push((node.label.clone(), external, globals));
         }
         out
     }
@@ -1021,6 +1138,15 @@ mod tests {
         (pir, pag)
     }
 
+    fn load_m5(name: &str) -> (Pir, Pag) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/m5")
+            .join(name);
+        let pir = Pir::from_path(path).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        (pir, pag)
+    }
+
     #[test]
     fn m2_1_dynamic_store_is_seen_by_constant_load() {
         // The (o,⊤) generalization: a value written through a non-constant-offset GEP must
@@ -1103,6 +1229,19 @@ mod tests {
             .iter()
             .all(|t| steens.indirect_calls[0].targets.contains(t)));
         assert!(andersen.metrics.rounds >= 1);
+    }
+
+    #[test]
+    fn andersen_refines_node_external_for_field_sensitive_store_addresses() {
+        let (pir, pag) = load_m5("andersen_refines_store_external.pir.json");
+
+        let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert!(steens.nodes["val:driver:%gp"].external);
+
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
+        let gp = &andersen.nodes["val:driver:%gp"];
+        assert!(!gp.external);
+        assert_eq!(gp.pointee_globals, vec!["@Table".to_string()]);
     }
 
     #[test]

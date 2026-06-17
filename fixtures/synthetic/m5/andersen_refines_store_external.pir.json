@@ -1,0 +1,71 @@
+{
+  "module": "m5.andersen_refines_store_external",
+  "functions": [
+    {
+      "key": "driver",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "alloca",
+          "dest": "%box",
+          "ty": "struct.Box",
+          "loc": { "file": "m5_store.c", "line": 1, "col": 1 }
+        },
+        {
+          "kind": "int_to_ptr",
+          "dest": "%unknown_ptr",
+          "source": "%bits",
+          "loc": { "file": "m5_store.c", "line": 2, "col": 1 }
+        },
+        {
+          "kind": "gep",
+          "dest": "%field0",
+          "base": "%box",
+          "byte_off": 0,
+          "loc": { "file": "m5_store.c", "line": 3, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%field0",
+          "value": "%unknown_ptr",
+          "loc": { "file": "m5_store.c", "line": 4, "col": 1 }
+        },
+        {
+          "kind": "gep",
+          "dest": "%field8",
+          "base": "%box",
+          "byte_off": 8,
+          "loc": { "file": "m5_store.c", "line": 5, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%field8",
+          "value": "@Table",
+          "loc": { "file": "m5_store.c", "line": 6, "col": 1 }
+        },
+        {
+          "kind": "load",
+          "dest": "%gp",
+          "address": "%field8",
+          "loc": { "file": "m5_store.c", "line": 7, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%gp",
+          "value": "%value",
+          "loc": { "file": "m5_store.c", "line": 8, "col": 1 }
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@Table",
+      "mutable": true
+    }
+  ]
+}

@@ -46,12 +46,12 @@ block stationarity and should be addressed before M5a flow summaries.
 | row | unknown mod rows | mutable globals with known mod rows | absence-only initval globals | absence-only without known mod |
 |---|---:|---:|---:|---:|
 | `exe-chibicc-O1` | 49 | 81 | 133 | 52 |
-| `exe-curl-O1` | 33 | 51 | 80 | 29 |
-| `exe-gifsicle-O1` | 75 | 90 | 93 | 3 |
+| `exe-curl-O1` | 35 | 51 | 80 | 29 |
+| `exe-gifsicle-O1` | 77 | 90 | 93 | 3 |
 | `exe-jpegoptim-O1` | 10 | 46 | 48 | 2 |
 | `exe-jq-O1` | 137 | 8 | 14 | 6 |
 | `exe-lua-O1` | 127 | 5 | 5 | 0 |
-| `exe-tmux-O1` | 250 | 79 | 107 | 28 |
+| `exe-tmux-O1` | 252 | 79 | 107 | 28 |
 | `lib-parson-O1` | 43 | 5 | 5 | 0 |
 
 ## Unknown Mod Sources
@@ -61,14 +61,14 @@ block stationarity and should be addressed before M5a flow summaries.
 | `exe-chibicc-O1` | `edge:store` | 21 |
 | `exe-chibicc-O1` | `stmt:memset_dst` | 14 |
 | `exe-chibicc-O1` | `edge:memcpy_dst` | 14 |
-| `exe-curl-O1` | `edge:store` | 18 |
+| `exe-curl-O1` | `edge:store` | 20 |
 | `exe-curl-O1` | `edge:memcpy_dst` | 11 |
 | `exe-curl-O1` | `stmt:memset_dst` | 4 |
-| `exe-gifsicle-O1` | `edge:store` | 40 |
+| `exe-gifsicle-O1` | `edge:store` | 41 |
 | `exe-gifsicle-O1` | `edge:memcpy_dst` | 21 |
-| `exe-gifsicle-O1` | `stmt:memset_dst` | 14 |
-| `exe-jpegoptim-O1` | `edge:store` | 7 |
-| `exe-jpegoptim-O1` | `stmt:memset_dst` | 2 |
+| `exe-gifsicle-O1` | `stmt:memset_dst` | 15 |
+| `exe-jpegoptim-O1` | `edge:store` | 8 |
+| `exe-jpegoptim-O1` | `stmt:memset_dst` | 1 |
 | `exe-jpegoptim-O1` | `edge:memcpy_dst` | 1 |
 | `exe-jq-O1` | `edge:store` | 89 |
 | `exe-jq-O1` | `stmt:memset_dst` | 46 |
@@ -76,7 +76,7 @@ block stationarity and should be addressed before M5a flow summaries.
 | `exe-lua-O1` | `edge:store` | 116 |
 | `exe-lua-O1` | `edge:memcpy_dst` | 8 |
 | `exe-lua-O1` | `stmt:memset_dst` | 3 |
-| `exe-tmux-O1` | `edge:store` | 206 |
+| `exe-tmux-O1` | `edge:store` | 208 |
 | `exe-tmux-O1` | `edge:memcpy_dst` | 28 |
 | `exe-tmux-O1` | `stmt:memset_dst` | 16 |
 | `lib-parson-O1` | `edge:store` | 24 |
@@ -119,7 +119,9 @@ block stationarity and should be addressed before M5a flow summaries.
 | `stmt:memset_dst` | `create_transfer` | `create_transfer@!noloc#285` | 1 |
 | `stmt:memset_dst` | `config_init` | `config_init@!noloc#10` | 1 |
 | `edge:store` | `tool_ssls_load` | `tool_ssls_load@!noloc#7` | 1 |
+| `edge:store` | `tool_readbusy_cb` | `tool_readbusy_cb@!noloc#25` | 1 |
 | `edge:store` | `tool_read_cb` | `tool_read_cb@!noloc#14` | 1 |
+| `edge:store` | `tool_mime_stdin_seek` | `tool_mime_stdin_seek@!noloc#5` | 1 |
 | `edge:store` | `tool_header_cb` | `tool_header_cb@!noloc#38` | 1 |
 | `edge:store` | `proto2num` | `proto2num@!noloc#12` | 1 |
 | `edge:store` | `parseconfig` | `parseconfig@!noloc#12` | 1 |
@@ -132,8 +134,6 @@ block stationarity and should be addressed before M5a flow summaries.
 | `edge:store` | `get_param_word` | `get_param_word@!noloc#8` | 1 |
 | `edge:store` | `get_param_part` | `get_param_part@!noloc#101` | 1 |
 | `edge:store` | `formparse` | `formparse@!noloc#1` | 1 |
-| `edge:store` | `create_transfer` | `create_transfer@!noloc#125` | 1 |
-| `edge:store` | `checkpasswd` | `checkpasswd@!noloc#2` | 1 |
 
 ### exe-gifsicle-O1
 
@@ -153,19 +153,19 @@ block stationarity and should be addressed before M5a flow summaries.
 | `stmt:memset_dst` | `Gif_CopyStreamSkeleton` | `Gif_CopyStreamSkeleton@!noloc#15` | 1 |
 | `stmt:memset_dst` | `Gif_CopyStreamImages` | `Gif_CopyStreamImages@!noloc#30` | 1 |
 | `stmt:memset_dst` | `Gif_CopyImage` | `Gif_CopyImage@!noloc#79` | 1 |
+| `stmt:memset_dst` | `Clp_NewParserState` | `Clp_NewParserState@!noloc#5` | 1 |
 | `edge:store` | `uncompress_image` | `uncompress_image@!noloc#36` | 1 |
 | `edge:store` | `scale_image_complete` | `scale_image_complete@!noloc#22` | 1 |
 | `edge:store` | `rotate_image` | `rotate_image@!noloc#5` | 1 |
 | `edge:store` | `resize_stream` | `resize_stream@!noloc#205` | 1 |
 | `edge:store` | `read_gif` | `read_gif@!noloc#134` | 1 |
-| `edge:store` | `prepare_colormap_map` | `prepare_colormap_map@!noloc#22` | 1 |
 
 ### exe-jpegoptim-O1
 
 | detail | func | witness | rows |
 |---|---|---|---:|
-| `stmt:memset_dst` | `main` | `main@/home/brk/pangs-corpus/jpegoptim/jpegoptim.c:1368:18#0` | 1 |
 | `stmt:memset_dst` | `jpeg_custom_src` | `jpeg_custom_src@/home/brk/pangs-corpus/jpegoptim/jpegsrc.c:183:27#0` | 1 |
+| `edge:store` | `parse_markers` | `parse_markers@/home/brk/pangs-corpus/jpegoptim/jpegoptim.c:614:17#0` | 1 |
 | `edge:store` | `optimize` | `optimize@!noloc#23` | 1 |
 | `edge:store` | `jpeg_memory_term_destination` | `jpeg_memory_term_destination@/home/brk/pangs-corpus/jpegoptim/jpegdest.c:94:17#0` | 1 |
 | `edge:store` | `jpeg_memory_empty_output_buffer` | `jpeg_memory_empty_output_buffer@/home/brk/pangs-corpus/jpegoptim/jpegdest.c:80:17#0` | 1 |
@@ -281,7 +281,7 @@ block stationarity and should be addressed before M5a flow summaries.
 ### exe-chibicc-O1
 
 - `fnptr_varargs_internal_unmodeled`: 91
-- `unknown_global`: 77
+- `unknown_global`: 78
 - `fnptr_ptrtoint`: 14
 - `fnptr_varargs_external`: 9
 - `unknown_caller`: 2
@@ -291,7 +291,7 @@ block stationarity and should be addressed before M5a flow summaries.
 
 ### exe-curl-O1
 
-- `unknown_global`: 96
+- `unknown_global`: 106
 - `fnptr_varargs_internal_unmodeled`: 91
 - `fnptr_varargs_external`: 35
 - `fnptr_ptrtoint`: 14
@@ -302,7 +302,7 @@ block stationarity and should be addressed before M5a flow summaries.
 ### exe-gifsicle-O1
 
 - `unknown_callee`: 203
-- `unknown_global`: 148
+- `unknown_global`: 153
 - `fnptr_varargs_internal_unmodeled`: 30
 - `fnptr_varargs_external`: 22
 - `fnptr_ptrtoint`: 19
@@ -315,7 +315,7 @@ block stationarity and should be addressed before M5a flow summaries.
 
 - `fnptr_varargs_internal_unmodeled`: 29
 - `fnptr_varargs_external`: 24
-- `unknown_global`: 17
+- `unknown_global`: 18
 - `unknown_callee`: 14
 - `unknown_caller`: 1
 - `setjmp_longjmp`: 1
@@ -342,7 +342,7 @@ block stationarity and should be addressed before M5a flow summaries.
 
 ### exe-tmux-O1
 
-- `unknown_global`: 591
+- `unknown_global`: 597
 - `fnptr_varargs_internal_unmodeled`: 70
 - `unknown_callee`: 49
 - `fnptr_ptrtoint`: 37

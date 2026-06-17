@@ -152,10 +152,19 @@ Implementation status:
   blocker, but the O1 corpus does not move because every row still has `omega_store`
   unknown mod rows; see the Runtime Mod Evidence section in `metrics/m5_0_gate_census.md`.
 - Unknown modref rows now carry source `detail` in `modref.jsonl`, and
-  `scripts/m5_gate_census.sh` reports source and top-site breakdowns. The comparable O1
-  decision set (`/tmp/pangs-m5-omega-detail`) has 724 `omega_store` rows after preserving
-  source detail in the fact key: 521 `edge:store`, 103 `edge:memcpy_dst`, and 100
-  `stmt:memset_dst`. The next precision slice should target ordinary store edges first.
+  `scripts/m5_gate_census.sh` reports source and top-site breakdowns. The first comparable
+  O1 decision set (`/tmp/pangs-m5-omega-detail`) had 724 `omega_store` rows after
+  preserving source detail in the fact key: 521 `edge:store`, 103 `edge:memcpy_dst`, and
+  100 `stmt:memset_dst`.
+- Andersen now refines per-node `external` for mod/ref from its own points-to sets instead
+  of copying Steensgaard's node `ext` bit wholesale. The synthetic
+  `fixtures/synthetic/m5/andersen_refines_store_external.pir.json` case drops a spurious
+  `edge:store` `omega_store` row while keeping the concrete `@Table` mod row. The O1
+  decision set (`/tmp/pangs-m5-andersen-external-refine`) did **not** improve yet: it has
+  730 `omega_store` rows (527 `edge:store`, 103 `edge:memcpy_dst`, 100
+  `stmt:memset_dst`), because the more explicit boundary seeding exposes a few additional
+  store-unknown effects. The next slice should classify residual `edge:store` rows by Ω
+  source, not just by statement kind.
 - M5b remains not green-lit because no current lite client consumes thread-confinement
   facts.
 
