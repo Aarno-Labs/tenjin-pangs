@@ -29,6 +29,11 @@
     },
     "effect": {
       "const": "omega_taint"
+    },
+    "detail": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional detector-specific detail, for example callee:fatalx."
     }
   }
 }

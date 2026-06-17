@@ -102,6 +102,8 @@ Their current trigger conditions are:
     class reaches function-pointer space
   - visible internal vararg callees with no modeled vararg consumption do not emit this
     audit kind
+  - name-specific M4.3 summaries suppress this audit only for inspected formatting/logging
+    wrappers whose vararg payload is formatted as text rather than retained as pointers
 - `fnptr_varargs_indirect`
   - all stages: indirect vararg callsites where a direct function symbol is passed
     through varargs
@@ -118,6 +120,10 @@ Their current trigger conditions are:
     function-pointer field
 - `memset_fnptr_aggregate`
   - `memset` over the same locally tracked aggregate class
+
+Vararg audit findings may include optional `detail` metadata such as `callee:log_debug`.
+This is evidence for review/reporting, not a separate taint kind. Unknown or unlisted
+vararg callees remain conservative by default.
 
 Every emitted finding is exported in `audit.jsonl`, counted in `metrics.audit_findings`,
 and mirrored into the owning component’s taint set so the component freezes.

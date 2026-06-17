@@ -1103,6 +1103,9 @@ impl<'a> Builder<'a> {
     }
 
     fn direct_vararg_call_requires_boundary(&self, callee: &str) -> bool {
+        if is_known_benign_vararg_callee(callee) {
+            return false;
+        }
         let Some(func) = self
             .functions
             .get(callee)
@@ -1314,6 +1317,32 @@ fn stmt_consumes_varargs(stmt: &Stmt) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_known_benign_vararg_callee(callee: &str) -> bool {
+    matches!(
+        callee,
+        // tmux formatting/logging wrappers inspected for M4.3.
+        "log_debug"
+            | "cmdq_error"
+            | "cmdq_print"
+            | "fatalx"
+            | "xasprintf"
+            | "xsnprintf"
+            | "format_add"
+            | "cfg_add_cause"
+            // curl formatting/message wrappers inspected for M4.3.
+            | "warnf"
+            | "errorf"
+            | "notef"
+            | "helpf"
+            | "easysrc_addf"
+            | "curl_mprintf"
+            | "curl_mfprintf"
+            | "curl_msnprintf"
+            | "curl_maprintf"
+            | "curlx_dyn_addf"
+    )
 }
 
 fn is_exported_func(marked: bool, key: &str, opts: &PagOpts) -> bool {

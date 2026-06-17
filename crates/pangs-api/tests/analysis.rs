@@ -1672,6 +1672,23 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                 }],
             },
             Func {
+                key: "log_debug".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::Unknown {
+                    op: "va_arg".to_string(),
+                    operands: vec!["%ap".to_string()],
+                    results: vec!["%next".to_string()],
+                    reason: "va_arg".to_string(),
+                    loc: None,
+                }],
+            },
+            Func {
                 key: "cb".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
                 param_names: vec![],
@@ -1708,6 +1725,13 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                     },
                     Stmt::CallDirect {
                         callee: "unsafe_internal_sink".to_string(),
+                        sig: vararg_sig.clone(),
+                        args: vec!["%tag".to_string(), "cb".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                    Stmt::CallDirect {
+                        callee: "log_debug".to_string(),
                         sig: vararg_sig.clone(),
                         args: vec!["%tag".to_string(), "cb".to_string()],
                         dest: None,

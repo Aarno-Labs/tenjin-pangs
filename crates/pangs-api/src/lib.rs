@@ -216,6 +216,8 @@ pub struct Finding {
     pub line: Option<u32>,
     pub affected: Vec<String>,
     pub effect: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +336,7 @@ enum DeferredAudit {
         caller: FuncId,
         owner: String,
         kind: String,
+        detail: Option<String>,
         values: Vec<String>,
         loc: Option<pangs_pir::Loc>,
         witness: String,
@@ -548,6 +551,7 @@ impl Analysis {
                                     caller,
                                     &func.key,
                                     kind,
+                                    Some(format!("callee:{callee}")),
                                     stmt,
                                     sig,
                                     loc,
@@ -600,6 +604,7 @@ impl Analysis {
                             caller,
                             &func.key,
                             "fnptr_varargs_indirect",
+                            Some("callee:<indirect>".to_string()),
                             stmt,
                             sig,
                             loc,
@@ -995,6 +1000,7 @@ impl Analysis {
                 finding.file.clone(),
                 finding.line.unwrap_or(0),
                 finding.affected.join("|"),
+                finding.detail.clone(),
             )
         });
         findings.dedup_by_key(|finding| {
@@ -1003,6 +1009,7 @@ impl Analysis {
                 finding.file.clone(),
                 finding.line.unwrap_or(0),
                 finding.affected.join("|"),
+                finding.detail.clone(),
             )
         });
 
@@ -1305,6 +1312,7 @@ fn emit_deferred_steens_audits(
                 caller,
                 owner,
                 kind,
+                detail,
                 values,
                 loc,
                 witness,
@@ -1321,7 +1329,7 @@ fn emit_deferred_steens_audits(
                     .map(|value| format!("value:{value}"))
                     .collect::<Vec<_>>();
                 if !affected.is_empty() {
-                    push_audit_finding(
+                    push_audit_finding_with_detail(
                         findings,
                         audit_taints,
                         caller,
@@ -1329,6 +1337,7 @@ fn emit_deferred_steens_audits(
                         &loc,
                         affected,
                         Some(witness),
+                        detail,
                     );
                 }
             }
@@ -1684,6 +1693,7 @@ fn detect_direct_call_audits(
             module,
             caller,
             direct_vararg_audit_kind(module, callee),
+            Some(format!("callee:{callee}")),
             sig,
             args,
             loc,
@@ -1709,6 +1719,7 @@ fn detect_indirect_call_audits(
             module,
             caller,
             Some("fnptr_varargs_indirect"),
+            Some("callee:<indirect>".to_string()),
             sig,
             args,
             loc,
@@ -1723,6 +1734,7 @@ fn detect_vararg_fnptr_audit(
     module: &Pir,
     caller: FuncId,
     kind: Option<&str>,
+    detail: Option<String>,
     sig: &pangs_pir::Signature,
     args: &[String],
     loc: &Option<pangs_pir::Loc>,
@@ -1746,7 +1758,7 @@ fn detect_vararg_fnptr_audit(
     if affected.is_empty() {
         return;
     }
-    push_audit_finding(
+    push_audit_finding_with_detail(
         findings,
         audit_taints,
         caller,
@@ -1754,6 +1766,7 @@ fn detect_vararg_fnptr_audit(
         loc,
         affected,
         Some(callsite_key.to_string()),
+        detail,
     );
 }
 
@@ -1785,6 +1798,7 @@ fn record_vararg_deferred_audit(
     caller: FuncId,
     owner: &str,
     kind: &str,
+    detail: Option<String>,
     stmt: &Stmt,
     sig: &pangs_pir::Signature,
     loc: &Option<pangs_pir::Loc>,
@@ -1809,6 +1823,7 @@ fn record_vararg_deferred_audit(
         caller,
         owner: owner.to_string(),
         kind: kind.to_string(),
+        detail,
         values,
         loc: loc.clone(),
         witness: callsite_key.to_string(),
@@ -1816,11 +1831,40 @@ fn record_vararg_deferred_audit(
 }
 
 fn direct_vararg_audit_kind(module: &Pir, callee: &str) -> Option<&'static str> {
+    if is_known_benign_vararg_callee(callee) {
+        return None;
+    }
     match module.functions.iter().find(|func| func.key == callee) {
         Some(func) if !func.external && !func.body.iter().any(stmt_consumes_varargs) => None,
         Some(func) if !func.external => Some("fnptr_varargs_internal_unmodeled"),
         _ => Some("fnptr_varargs_external"),
     }
+}
+
+fn is_known_benign_vararg_callee(callee: &str) -> bool {
+    matches!(
+        callee,
+        // tmux formatting/logging wrappers inspected for M4.3.
+        "log_debug"
+            | "cmdq_error"
+            | "cmdq_print"
+            | "fatalx"
+            | "xasprintf"
+            | "xsnprintf"
+            | "format_add"
+            | "cfg_add_cause"
+            // curl formatting/message wrappers inspected for M4.3.
+            | "warnf"
+            | "errorf"
+            | "notef"
+            | "helpf"
+            | "easysrc_addf"
+            | "curl_mprintf"
+            | "curl_mfprintf"
+            | "curl_msnprintf"
+            | "curl_maprintf"
+            | "curlx_dyn_addf"
+    )
 }
 
 fn stmt_consumes_varargs(stmt: &Stmt) -> bool {
@@ -1868,12 +1912,35 @@ fn push_audit_finding(
     affected: Vec<String>,
     witness: Option<String>,
 ) {
+    push_audit_finding_with_detail(
+        findings,
+        audit_taints,
+        caller,
+        kind,
+        loc,
+        affected,
+        witness,
+        None,
+    );
+}
+
+fn push_audit_finding_with_detail(
+    findings: &mut Vec<Finding>,
+    audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
+    caller: FuncId,
+    kind: &str,
+    loc: &Option<pangs_pir::Loc>,
+    affected: Vec<String>,
+    witness: Option<String>,
+    detail: Option<String>,
+) {
     findings.push(Finding {
         kind: kind.to_string(),
         file: loc.as_ref().map(|loc| loc.file.clone()),
         line: loc.as_ref().map(|loc| loc.line),
         affected,
         effect: "omega_taint".to_string(),
+        detail,
     });
     audit_taints.entry(caller).or_default().push(Taint {
         kind: kind.to_string(),

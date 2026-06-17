@@ -180,6 +180,15 @@ Acceptance:
 - unknown external vararg functions remain conservative by default;
 - report output distinguishes "summary-modeled" from "opaque-boundary".
 
+Implementation status:
+
+- Added a narrow name-specific summary table for inspected tmux/curl formatting and logging
+  wrappers; see `notes/m4_vararg_evidence.md`.
+- Vararg audit rows now include optional `detail` metadata such as `callee:log_debug`.
+- Focused curl/tmux rerun reduced vararg findings from `254 -> 117` on curl and
+  `637 -> 101` on tmux, with no rewritable-coverage change.
+- `tool_setopt`, `curl_easy_setopt`, and `curl_easy_getinfo` remain conservative.
+
 ### M4.4 — Indirect Vararg Target Filtering
 
 For indirect vararg calls, consider reducing taint only when all concrete targets are known

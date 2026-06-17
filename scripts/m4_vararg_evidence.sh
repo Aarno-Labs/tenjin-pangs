@@ -58,6 +58,17 @@ for dir in "$@"; do
   fi
   echo
 
+  echo "### Callee Details"
+  if [[ "$vararg_count" -eq 0 ]]; then
+    echo "- none"
+  else
+    jq -r '
+      select(.kind | startswith("fnptr_varargs"))
+      | .detail // "callee:<missing>"
+    ' "$audit" | histogram
+  fi
+  echo
+
   echo "### Affected Prefixes"
   if [[ "$vararg_count" -eq 0 ]]; then
     echo "- none"

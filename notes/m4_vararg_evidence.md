@@ -19,6 +19,7 @@ Outputs:
 
 - M4.1 taxonomy-only run: `/tmp/pangs-m4-vararg/`
 - M4.2 direct-internal safe-vararg suppression run: `/tmp/pangs-m4-vararg-m42/`
+- M4.3 focused summary rerun for curl/tmux: `/tmp/pangs-m4-vararg-m43/`
 
 ## Result
 
@@ -92,3 +93,59 @@ vararg callees whose ABI behavior is understood. Tmux's top witnesses include al
 and error/reporting wrappers such as `xmalloc`, `xcalloc`, `xrealloc`, and
 `xreallocarray`; curl has many `tool_setopt*` and tracing/configuration wrappers. Those
 should be investigated from source before any summary is admitted.
+
+## M4.3 Callee Detail Evidence
+
+`audit.jsonl` now carries an optional detector-specific `detail` field. For vararg audit
+findings this records the direct callee, which makes summary candidates mechanical instead
+of inferred from caller witnesses.
+
+Focused detail rerun before summaries:
+
+| row | top callee details |
+|---|---|
+| `exe-curl-O1` | `tool_setopt=84`, `warnf=38`, `curl_mfprintf=27`, `curl_msnprintf=19`, `curl_easy_getinfo=19`, `curl_easy_setopt=14`, `errorf=13`, `easysrc_addf=12`, `curl_maprintf=11` |
+| `exe-tmux-O1` | `log_debug=230`, `cmdq_error=84`, `xasprintf=76`, `format_add=47`, `xsnprintf=36`, `cmdq_print=28`, `fatalx=26` |
+
+The first summary table admits only inspected formatting/logging wrappers:
+
+- tmux: `log_debug`, `cmdq_error`, `cmdq_print`, `fatalx`, `xasprintf`, `xsnprintf`,
+  `format_add`, `cfg_add_cause`
+- curl: `warnf`, `errorf`, `notef`, `helpf`, `easysrc_addf`, `curl_mprintf`,
+  `curl_mfprintf`, `curl_msnprintf`, `curl_maprintf`, `curlx_dyn_addf`
+
+Source rationale:
+
+- tmux `log_debug`/`fatalx` forward to `log_vwrite`, which formats into strings with
+  `vasprintf` and writes text to the log.
+- tmux `cmdq_error`/`cmdq_print` format messages for command output/error paths.
+- tmux `xasprintf`/`xsnprintf` forward to bounded string-formatting wrappers.
+- curl `warnf`/`errorf`/`notef`/`helpf` forward to `voutf`/`vfprintf`.
+- curl `curl_m*printf`, `easysrc_addf`, and `curlx_dyn_addf` format into streams,
+  strings, or dynamic string buffers.
+
+Explicit non-summary cases:
+
+- `tool_setopt` and `curl_easy_setopt` remain conservative. Curl's setopt path has
+  option-specific cases that store callback function pointers.
+- `curl_easy_getinfo` remains conservative pending source-specific modeling of output
+  pointer writes.
+
+Focused M4.3 result:
+
+| row | before summaries | after summaries | rewritable before | rewritable after |
+|---|---:|---:|---:|---:|
+| `exe-curl-O1` | 254 | 117 | 16/80 | 16/80 |
+| `exe-tmux-O1` | 637 | 101 | 0/107 | 0/107 |
+
+Remaining callee details after summaries:
+
+| row | remaining dominant details |
+|---|---|
+| `exe-curl-O1` | `tool_setopt=84`, `curl_easy_getinfo=19`, `curl_easy_setopt=14` |
+| `exe-tmux-O1` | `environ_set=11`, `control_write=11`, `cmdq_format=7`, screen-write formatting helpers, external libc/libevent varargs |
+
+M4.3 substantially reduces audit noise and component taint detail, but it does not change
+rewritable coverage in the focused rows. The remaining curl blockers are real callback/output
+vararg APIs, and tmux is still frozen by other taints plus a small residue of vararg
+boundaries.
