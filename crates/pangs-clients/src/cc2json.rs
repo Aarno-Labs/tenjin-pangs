@@ -14,15 +14,13 @@
 //! `lib-small` golden: `mutated_globals`, `global_initializer_references`, `mutable_global_tissue`,
 //! `unique_filenames`, `call_graph_components`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use pangs_api::{
-    Analysis, BuildMode, Callee, Caller, CallKind, FuncId, GlobalTarget, Opts, Stage,
-};
-use pangs_pir::{Access, Func, Loc, Pir, Stmt};
+use pangs_api::{Analysis, BuildMode, CallKind, Callee, Caller, FuncId, GlobalTarget, Opts, Stage};
 use pangs_pag::{Pag, PagOpts};
+use pangs_pir::{Access, Func, Loc, Pir, Stmt};
 use pangs_solve::{solve_steensgaard_with_points_to, SolveResult};
 
 /// Options for the `cc2json` subcommand. `entrypoints`/`build_mode` follow pangs naming
@@ -132,7 +130,7 @@ fn defined_globals(pir: &Pir) -> BTreeSet<&str> {
 fn mutated_via_call_args(pir: &Pir, global_names: &BTreeSet<&str>) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for func in &pir.functions {
-        let map = operand_def_map(func);
+        let mut resolver = BaseGlobalResolver::new(func);
         for stmt in &func.body {
             let Stmt::CallDirect { callee, args, .. } = stmt else {
                 continue;
@@ -141,7 +139,7 @@ fn mutated_via_call_args(pir: &Pir, global_names: &BTreeSet<&str>) -> BTreeSet<S
                 if known_readonly_arg(callee, index) {
                     continue;
                 }
-                if let Some(base) = resolve_arg_global(&map, arg) {
+                if let Some(base) = resolver.resolve_arg_global(arg) {
                     if global_names.contains(base.as_str()) {
                         out.insert(base);
                     }
@@ -150,16 +148,6 @@ fn mutated_via_call_args(pir: &Pir, global_names: &BTreeSet<&str>) -> BTreeSet<S
         }
     }
     out
-}
-
-/// Resolve a call argument to the global whose address it denotes: a temp gep/bitcast chain or a
-/// literal `@g` (`resolve_base_global`), else the first global symbol inside a constant-expr
-/// operand string such as `i8* getelementptr inbounds (... @g, ...)` / `i8* bitcast (... @g ...)`.
-fn resolve_arg_global(map: &BTreeMap<&str, &Stmt>, operand: &str) -> Option<String> {
-    if let Some(base) = resolve_base_global(map, operand) {
-        return Some(base);
-    }
-    first_global_symbol(operand)
 }
 
 /// Extract the first `@symbol` name from an operand string (used for inline constant-expr args).
@@ -292,15 +280,14 @@ fn escaped_globals(pir: &Pir, solved: &SolveResult, internalize_globals: bool) -
 
     // Return-escape: a pointer to a global value returned from a function escapes (covers returned
     // `static` buffers). Resolved syntactically through gep/bitcast chains.
-    let func_maps: Vec<BTreeMap<&str, &Stmt>> =
-        pir.functions.iter().map(operand_def_map).collect();
-    for (func, map) in pir.functions.iter().zip(&func_maps) {
+    for func in &pir.functions {
+        let mut resolver = BaseGlobalResolver::new(func);
         for stmt in &func.body {
             if let Stmt::Return {
                 value: Some(value), ..
             } = stmt
             {
-                if let Some(base) = resolve_base_global(map, value) {
+                if let Some(base) = resolver.resolve_base_global(value) {
                     if is_known(&base) {
                         escaped.insert(base);
                     }
@@ -330,8 +317,8 @@ fn escaped_globals(pir: &Pir, solved: &SolveResult, internalize_globals: bool) -
 }
 
 /// Map each SSA result name in a function body to its defining statement.
-fn operand_def_map(func: &Func) -> BTreeMap<&str, &Stmt> {
-    let mut map = BTreeMap::new();
+fn operand_def_map(func: &Func) -> HashMap<&str, &Stmt> {
+    let mut map = HashMap::new();
     for stmt in &func.body {
         let dest = match stmt {
             Stmt::Alloca { dest, .. }
@@ -349,26 +336,100 @@ fn operand_def_map(func: &Func) -> BTreeMap<&str, &Stmt> {
     map
 }
 
-/// Resolve an operand to the base global value it refers to, tracing only address-preserving
-/// chains: a literal `@name`, or a temp defined by a gep/bitcast/select (`Assign`) over a base
-/// that resolves. Never traces through a `Load` (that would be a dereference, not the address).
-fn resolve_base_global(map: &BTreeMap<&str, &Stmt>, operand: &str) -> Option<String> {
-    fn go(map: &BTreeMap<&str, &Stmt>, operand: &str, depth: usize) -> Option<String> {
-        if depth > 64 {
-            return None;
-        }
-        if let Some(name) = operand.strip_prefix('@') {
-            return Some(name.to_string());
-        }
-        match map.get(operand)? {
-            Stmt::Gep { base, .. } => go(map, base, depth + 1),
-            Stmt::Assign { sources, .. } => {
-                sources.iter().find_map(|s| go(map, s, depth + 1))
-            }
-            _ => None,
+struct BaseGlobalResolver<'a> {
+    defs: HashMap<&'a str, &'a Stmt>,
+    memo: HashMap<&'a str, Option<String>>,
+    visiting: HashSet<&'a str>,
+}
+
+enum BaseGlobalResolution {
+    Found(String),
+    NotFound,
+    Cycle,
+}
+
+impl<'a> BaseGlobalResolver<'a> {
+    fn new(func: &'a Func) -> Self {
+        Self {
+            defs: operand_def_map(func),
+            memo: HashMap::new(),
+            visiting: HashSet::new(),
         }
     }
-    go(map, operand, 0)
+
+    /// Resolve a call argument to the global whose address it denotes: a temp gep/bitcast chain or
+    /// a literal `@g`, else the first global symbol inside a constant-expr operand string such as
+    /// `i8* getelementptr inbounds (... @g, ...)` / `i8* bitcast (... @g ...)`.
+    fn resolve_arg_global(&mut self, operand: &'a str) -> Option<String> {
+        self.resolve_base_global(operand)
+            .or_else(|| first_global_symbol(operand))
+    }
+
+    /// Resolve an operand to the base global value it refers to, tracing only address-preserving
+    /// chains: a literal `@name`, or a temp defined by a gep/bitcast/select (`Assign`) over a base
+    /// that resolves. Never traces through a `Load` (that would be a dereference, not the address).
+    fn resolve_base_global(&mut self, operand: &'a str) -> Option<String> {
+        match self.resolve_base_global_inner(operand) {
+            BaseGlobalResolution::Found(name) => Some(name),
+            BaseGlobalResolution::NotFound | BaseGlobalResolution::Cycle => None,
+        }
+    }
+
+    fn resolve_base_global_inner(&mut self, operand: &'a str) -> BaseGlobalResolution {
+        if let Some(name) = operand.strip_prefix('@') {
+            return BaseGlobalResolution::Found(name.to_string());
+        }
+
+        if matches!(operand, "null" | "undef" | "poison") {
+            return BaseGlobalResolution::NotFound;
+        }
+
+        if let Some(cached) = self.memo.get(operand) {
+            return match cached {
+                Some(name) => BaseGlobalResolution::Found(name.clone()),
+                None => BaseGlobalResolution::NotFound,
+            };
+        }
+        if !self.visiting.insert(operand) {
+            return BaseGlobalResolution::Cycle;
+        }
+
+        let resolved = match self.defs.get(operand).copied() {
+            Some(Stmt::Gep { base, .. }) => self.resolve_base_global_inner(base),
+            Some(Stmt::Assign { sources, .. }) => {
+                let mut saw_cycle = false;
+                let mut found = None;
+                for source in sources {
+                    match self.resolve_base_global_inner(source) {
+                        BaseGlobalResolution::Found(name) => {
+                            found = Some(name);
+                            break;
+                        }
+                        BaseGlobalResolution::NotFound => {}
+                        BaseGlobalResolution::Cycle => saw_cycle = true,
+                    }
+                }
+                match found {
+                    Some(name) => BaseGlobalResolution::Found(name),
+                    None if saw_cycle => BaseGlobalResolution::Cycle,
+                    None => BaseGlobalResolution::NotFound,
+                }
+            }
+            _ => BaseGlobalResolution::NotFound,
+        };
+
+        self.visiting.remove(operand);
+        match &resolved {
+            BaseGlobalResolution::Found(name) => {
+                self.memo.insert(operand, Some(name.clone()));
+            }
+            BaseGlobalResolution::NotFound => {
+                self.memo.insert(operand, None);
+            }
+            BaseGlobalResolution::Cycle => {}
+        }
+        resolved
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -508,11 +569,11 @@ fn site_renders(pir: &Pir, analysis: &Analysis) -> BTreeMap<String, SiteKind> {
         let kind = match (&cs.loc, pir_locs.get(cs.key.as_str())) {
             (Some(loc), pir_loc) => {
                 // Prefer the raw DWARF (dir, filename); fall back to splitting the joined path.
-                let (dir, file) = match pir_loc.and_then(|l| l.dir.as_ref().zip(l.filename.as_ref()))
-                {
-                    Some((dir, filename)) => (dir.clone(), filename.clone()),
-                    None => split_dir_file(&loc.file),
-                };
+                let (dir, file) =
+                    match pir_loc.and_then(|l| l.dir.as_ref().zip(l.filename.as_ref())) {
+                        Some((dir, filename)) => (dir.clone(), filename.clone()),
+                        None => split_dir_file(&loc.file),
+                    };
                 SiteKind::Loc {
                     line: loc.line,
                     col: loc.col,
@@ -655,7 +716,8 @@ fn mutable_global_tissue(
 /// Whether `func`'s body references any `interesting` global through a constant — a `@g` symbol in
 /// any operand string, or a `GlobalRef` target.
 fn func_references_interesting(func: &Func, interesting: &BTreeSet<&str>) -> bool {
-    let hits = |operand: &str| all_global_symbols(operand).any(|g| interesting.contains(g.as_str()));
+    let hits =
+        |operand: &str| all_global_symbols(operand).any(|g| interesting.contains(g.as_str()));
     for stmt in &func.body {
         let found = match stmt {
             Stmt::GlobalRef { global, .. } => interesting.contains(global.as_str()),
@@ -668,7 +730,9 @@ fn func_references_interesting(func: &Func, interesting: &BTreeSet<&str>) -> boo
             Stmt::Memset { dst, .. } => hits(dst),
             Stmt::Return { value: Some(v), .. } => hits(v),
             Stmt::CallDirect { args, .. } => args.iter().any(|a| hits(a)),
-            Stmt::CallIndirect { operand, args, .. } => hits(operand) || args.iter().any(|a| hits(a)),
+            Stmt::CallIndirect { operand, args, .. } => {
+                hits(operand) || args.iter().any(|a| hits(a))
+            }
             _ => false,
         };
         if found {
@@ -1028,10 +1092,60 @@ impl JsonBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pangs_pir::{AbiClass, Signature};
     use std::path::PathBuf;
 
     fn workspace_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn test_func(body: Vec<Stmt>) -> Func {
+        Func {
+            key: "f".to_string(),
+            sig: Signature {
+                ret: AbiClass::Void,
+                params: Vec::new(),
+                vararg: false,
+                cc: "ccc".to_string(),
+            },
+            param_names: Vec::new(),
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: false,
+            body,
+        }
+    }
+
+    #[test]
+    fn base_global_resolver_memoizes_branching_assigns_and_breaks_cycles() {
+        let func = test_func(vec![
+            Stmt::Assign {
+                dest: "%a".to_string(),
+                sources: vec!["%b".to_string(), "%c".to_string()],
+                loc: None,
+            },
+            Stmt::Assign {
+                dest: "%b".to_string(),
+                sources: vec!["%a".to_string()],
+                loc: None,
+            },
+            Stmt::Gep {
+                dest: "%c".to_string(),
+                base: "@G".to_string(),
+                byte_off: Some(8),
+                loc: None,
+            },
+        ]);
+
+        let mut resolver = BaseGlobalResolver::new(&func);
+        assert_eq!(resolver.resolve_base_global("%a"), Some("G".to_string()));
+        assert_eq!(resolver.resolve_base_global("%b"), Some("G".to_string()));
+        assert_eq!(
+            resolver.resolve_arg_global("i8* bitcast (@H to i8*)"),
+            Some("H".to_string())
+        );
     }
 
     /// The `lib-small` library golden was produced by cclyzer's unification analysis; pangs'
