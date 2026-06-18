@@ -6,6 +6,10 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use jsonschema::JSONSchema;
+
+mod cc2json;
+pub use cc2json::{run_cc2json, Cc2jsonOpts};
+
 use pangs_api::{
     Analysis, CallEdge, Callee, Caller, ComponentInfo, FuncId, GlobalId, GlobalTarget, ModRef,
     Opts, StationarityVerdict, StationarityWriter,

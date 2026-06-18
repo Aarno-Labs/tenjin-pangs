@@ -109,6 +109,12 @@ pub struct Global {
     pub mutable: bool,
     #[serde(default)]
     pub exported: bool,
+    /// Names of other global values (functions and global variables) referenced by this
+    /// global's constant initializer, walked recursively through struct/array/expr
+    /// constants. Mirrors cclyzer's `global_initializer_references` (constant-init.dl) and
+    /// feeds the `cc2json` client. Names are bare (no leading `@`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub init_refs: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -309,9 +315,19 @@ pub enum Access {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Loc {
+    /// Joined display path: the DWARF directory and filename combined (the historical behavior,
+    /// used by witness strings).
     pub file: String,
     pub line: u32,
     pub col: u32,
+    /// Raw DWARF directory (`DIScope::getDirectory`), preserved separately so consumers can
+    /// reconstruct the (directory, filename) pair without guessing where the boundary falls (the
+    /// filename itself may contain `/`). `None` for PIR loaded from JSON without these fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// Raw DWARF filename (`DIScope::getFilename`), which may include directory separators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

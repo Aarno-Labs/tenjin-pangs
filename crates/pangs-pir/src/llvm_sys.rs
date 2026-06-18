@@ -254,6 +254,7 @@ unsafe fn lower_module(module: LLVMModuleRef) -> Pir {
                     LLVMGetVisibility(*global),
                     LLVMGetDLLStorageClass(*global),
                 ),
+                init_refs: collect_global_init_refs(*global),
             }
         })
         .collect::<Vec<_>>();
@@ -1448,6 +1449,85 @@ unsafe fn collect_constant_func_refs(
     }
 }
 
+/// Collect the bare names of the global values (functions and global variables) directly
+/// referenced by `global`'s constant initializer. Mirrors cclyzer's `constant_in_initializer`
+/// (constant-init.dl), which recurses only through struct/array/vector *elements* — NOT
+/// through `ConstantExpr` operands. So a direct element `@f` or `bitcast(@f)` is captured, but
+/// a `getelementptr(@g, …)` element is not (the GEP expr is not itself a global-value
+/// constant). Names preserve initializer (element) order, deduped; the owning global is
+/// excluded. The `cc2json` client filters `.`-prefixed (string-constant) names downstream.
+unsafe fn collect_global_init_refs(global: LLVMValueRef) -> Vec<String> {
+    let initializer = LLVMGetInitializer(global);
+    if initializer.is_null() {
+        return Vec::new();
+    }
+    let owner = value_name(global);
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    collect_init_refs_rec(initializer, &owner, &mut out, &mut seen);
+    out
+}
+
+unsafe fn collect_init_refs_rec(
+    value: LLVMValueRef,
+    owner: &str,
+    out: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+) {
+    if value.is_null() {
+        return;
+    }
+    // A direct global-value reference (peeking only through bitcast/addrspacecast, like
+    // `direct_symbol_name`) is a leaf — record it and stop.
+    if let Some(name) = direct_global_value_name(value) {
+        if !name.is_empty() && name != owner && seen.insert(name.clone()) {
+            out.push(name);
+        }
+        return;
+    }
+    // Otherwise recurse only into aggregate elements (struct/array/vector), never into
+    // ConstantExpr operands (matching cclyzer's struct/array-only recursion).
+    if !LLVMIsAConstantStruct(value).is_null()
+        || !LLVMIsAConstantArray(value).is_null()
+        || !LLVMIsAConstantVector(value).is_null()
+    {
+        let count = LLVMGetNumOperands(value);
+        for index in 0..count {
+            collect_init_refs_rec(LLVMGetOperand(value, index as u32), owner, out, seen);
+        }
+    }
+}
+
+/// Name of the global value (function, global variable, alias, or ifunc) a constant directly
+/// denotes, seeing through `bitcast`/`addrspacecast` constant exprs only (not GEP). Extends
+/// `direct_symbol_name`, which omits plain global variables.
+unsafe fn direct_global_value_name(value: LLVMValueRef) -> Option<String> {
+    let mut value = value;
+    let mut visited = BTreeSet::new();
+    loop {
+        if value.is_null() || !visited.insert(value as usize) {
+            return None;
+        }
+        if !LLVMIsAFunction(value).is_null()
+            || !LLVMIsAGlobalVariable(value).is_null()
+            || !LLVMIsAGlobalAlias(value).is_null()
+            || !LLVMIsAGlobalIFunc(value).is_null()
+        {
+            return Some(value_name(value));
+        }
+        if !LLVMIsAConstantExpr(value).is_null() {
+            match LLVMGetConstOpcode(value) {
+                LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast => {
+                    value = LLVMGetOperand(value, 0);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return None;
+    }
+}
+
 unsafe fn lower_personality_function(
     ctx: &ModuleCtx,
     function: LLVMValueRef,
@@ -1993,25 +2073,37 @@ unsafe fn loc(value: LLVMValueRef) -> Option<Loc> {
     if line == 0 {
         return None;
     }
-    let file = debug_loc_file(value);
+    let (dir, filename) = debug_loc_dir_filename(value);
+    let file = join_dir_filename(&dir, &filename);
     Some(Loc {
         file,
         line,
         col: LLVMGetDebugLocColumn(value),
+        dir: Some(dir),
+        filename: Some(filename),
     })
 }
 
-unsafe fn debug_loc_file(value: LLVMValueRef) -> String {
+/// Raw DWARF `(directory, filename)` for a debug location, exactly as cclyzer reads them via
+/// `DIScope::getDirectory`/`getFilename`. The filename may itself contain `/`.
+unsafe fn debug_loc_dir_filename(value: LLVMValueRef) -> (String, String) {
     let mut file_len = 0_u32;
     let file = LLVMGetDebugLocFilename(value, &mut file_len);
     let mut dir_len = 0_u32;
     let dir = LLVMGetDebugLocDirectory(value, &mut dir_len);
-    let file = bytes_to_string(file.cast(), file_len as usize);
-    let dir = bytes_to_string(dir.cast(), dir_len as usize);
-    if !dir.is_empty() && !file.starts_with('/') {
-        format!("{}/{}", dir.trim_end_matches('/'), file)
+    (
+        bytes_to_string(dir.cast(), dir_len as usize),
+        bytes_to_string(file.cast(), file_len as usize),
+    )
+}
+
+/// Join a DWARF directory and (relative) filename into a display path, matching the historical
+/// `Loc::file` value.
+fn join_dir_filename(dir: &str, filename: &str) -> String {
+    if !dir.is_empty() && !filename.starts_with('/') {
+        format!("{}/{}", dir.trim_end_matches('/'), filename)
     } else {
-        file
+        filename.to_string()
     }
 }
 
