@@ -45,7 +45,7 @@ pub fn run_cc2json(pir: &Pir, _input_path: &Path, opts: &Cc2jsonOpts) -> Result<
 
     let source = pir.source.clone().unwrap_or_default();
 
-    let mutated = mutated_globals(&analysis);
+    let mutated = mutated_globals(pir, &analysis);
     let escaped = escaped_globals(pir, opts.internalize_globals);
 
     let mut json = JsonBuilder::new();
@@ -57,19 +57,23 @@ pub fn run_cc2json(pir: &Pir, _input_path: &Path, opts: &Cc2jsonOpts) -> Result<
 // Section 1: mutated_globals
 // ---------------------------------------------------------------------------
 
-/// Named globals written at runtime (an `access:mod` modref row), in PIR/global-definition order,
-/// with `.`-prefixed (string-constant) names dropped. This is the store-target half of cclyzer's
-/// `mutated_global` (escape-analysis.dl). pangs' `globals().mutable`/`never_written` is *not* used
-/// (it folds in static-initializer writes); the modref Mod set matches the golden on lib-small.
+/// Named globals considered *mutated* by cclyzer (escape-analysis.dl), in PIR/global-definition
+/// order with `.`-prefixed (string-constant) names dropped. Two sources:
 ///
-/// DIVERGENCE: cclyzer's second mutation source — a global whose address is passed to a
-/// non-readonly call-argument position (e.g. `__func__`/`__PRETTY_FUNCTION__` arrays passed to
-/// `__assert_fail`) — is NOT reproduced. pangs renders constant-expr call arguments as opaque
-/// strings and exposes no argument points-to, so such globals cannot be resolved faithfully; a
-/// syntactic approximation added spurious entries without recovering the real ones. Affected
-/// executables therefore under-report `mutated_globals` (e.g. hashmap's 14 `__func__.*`).
-fn mutated_globals(analysis: &Analysis) -> Vec<String> {
-    let mod_targets: BTreeSet<&str> = analysis
+/// * Store target: a global written by a store instruction — pangs' `access:mod` modref rows.
+///   (Not `globals().mutable`/`never_written`, which fold in static-initializer writes.)
+/// * Non-readonly argument: a global whose address is passed to a call-argument position that is
+///   not known-readonly. With no per-callee readonly knowledge for user functions, any
+///   by-address global argument counts (e.g. hashmap's `__func__.*` arrays passed to a printf),
+///   except positions in the ported libc readonly table — which includes `__assert_fail` (so the
+///   `__PRETTY_FUNCTION__.*` arrays it receives are not flagged).
+///
+/// DIVERGENCE: the argument rule resolves only globals whose address an argument *directly*
+/// denotes (a `@g`, a temp gep/bitcast chain, or a constant-expr `getelementptr`/`bitcast` over a
+/// global). It cannot follow values that flow through memory/loads, so executables relying on
+/// aliased arguments may still under-report relative to cclyzer's full points-to.
+fn mutated_globals(pir: &Pir, analysis: &Analysis) -> Vec<String> {
+    let mut mutated: BTreeSet<&str> = analysis
         .modrefs()
         .iter()
         .filter(|mr| matches!(mr.access, Access::Mod))
@@ -78,12 +82,110 @@ fn mutated_globals(analysis: &Analysis) -> Vec<String> {
             GlobalTarget::Unknown(_) => None,
         })
         .collect();
+
+    let global_names: BTreeSet<&str> = pir.globals.iter().map(|g| g.key.as_str()).collect();
+    let arg_mutated = mutated_via_call_args(pir, &global_names);
+    mutated.extend(arg_mutated.iter().map(String::as_str));
+
     analysis
         .globals()
         .iter()
-        .filter(|g| mod_targets.contains(g.key.as_str()))
+        .filter(|g| mutated.contains(g.key.as_str()))
         .filter_map(|g| process_global_name(&g.key))
         .collect()
+}
+
+/// Globals whose address is passed to a non-readonly call-argument position (cclyzer's
+/// mutation-via-(external-)function rule). Only direct calls are scanned. Returns full global
+/// names; the caller drops `.`-prefixed ones.
+fn mutated_via_call_args(pir: &Pir, global_names: &BTreeSet<&str>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for func in &pir.functions {
+        let map = operand_def_map(func);
+        for stmt in &func.body {
+            let Stmt::CallDirect { callee, args, .. } = stmt else {
+                continue;
+            };
+            for (index, arg) in args.iter().enumerate() {
+                if known_readonly_arg(callee, index) {
+                    continue;
+                }
+                if let Some(base) = resolve_arg_global(&map, arg) {
+                    if global_names.contains(base.as_str()) {
+                        out.insert(base);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a call argument to the global whose address it denotes: a temp gep/bitcast chain or a
+/// literal `@g` (`resolve_base_global`), else the first global symbol inside a constant-expr
+/// operand string such as `i8* getelementptr inbounds (... @g, ...)` / `i8* bitcast (... @g ...)`.
+fn resolve_arg_global(map: &BTreeMap<&str, &Stmt>, operand: &str) -> Option<String> {
+    if let Some(base) = resolve_base_global(map, operand) {
+        return Some(base);
+    }
+    first_global_symbol(operand)
+}
+
+/// Extract the first `@symbol` name from an operand string (used for inline constant-expr args).
+fn first_global_symbol(operand: &str) -> Option<String> {
+    let at = operand.find('@')?;
+    let name: String = operand[at + 1..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '-'))
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether argument `index` of `callee` is a known read-only pointer position. Ported from the
+/// `known_readonly_arg` rules in escape-analysis.dl (substring matches on the callee name), plus
+/// `__assert_fail` (all positions read-only) so the `__PRETTY_FUNCTION__`/`__func__` strings it
+/// receives are not treated as mutated.
+fn known_readonly_arg(callee: &str, index: usize) -> bool {
+    let c = |needle: &str| callee.contains(needle);
+    // assert helpers: all arguments are read-only.
+    if c("__assert_fail") || c("__assert_perror_fail") || c("__assert_rtn") {
+        return true;
+    }
+    // memcpy/memmove source (arg 1), incl. LLVM intrinsics.
+    if (c("memcpy") || c("memmove") || c("llvm.memcpy.p0") || c("llvm.memmove.p0")) && index == 1 {
+        return true;
+    }
+    // strcpy/strncpy source (arg 1).
+    if (c("strcpy") || c("strncpy")) && index == 1 {
+        return true;
+    }
+    // string search/compare: args 0,1,2 read-only.
+    if (c("strlen")
+        || c("strcmp")
+        || c("strncmp")
+        || c("strchr")
+        || c("strrchr")
+        || c("strstr")
+        || c("strcspn")
+        || c("strspn")
+        || c("strpbrk"))
+        && index <= 2
+    {
+        return true;
+    }
+    // memory search: memchr/memcmp args 0,1,2.
+    if (c("memchr") || c("memcmp")) && index <= 2 {
+        return true;
+    }
+    // bsearch: key/array (args 0,1).
+    if c("bsearch") && index <= 1 {
+        return true;
+    }
+    // llvm.objectsize: arg 0.
+    if c("llvm.objectsize.") && index == 0 {
+        return true;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -472,16 +574,15 @@ fn mutable_global_tissue(
         .filter(|name| !is_string_constant(name))
         .collect();
 
-    // directly_accesses: functions with a *direct* modref to an interesting global.
+    // directly_accesses: functions that reference an interesting global via *any* constant in
+    // their body (cclyzer's `constant_in_func` + `constant_points_to`). A reference is a `@g`
+    // symbol appearing in any operand — loads/stores/geps/calls, including inline constant-expr
+    // call arguments (e.g. `__func__.*` passed to a printf) — or a direct `GlobalRef` target. The
+    // defining statement of any temp is itself scanned, so we need not chase temps here.
     let mut direct: BTreeSet<FuncId> = BTreeSet::new();
-    for mr in analysis.modrefs() {
-        if !matches!(mr.via, pangs_api::Via::Direct) {
-            continue;
-        }
-        if let GlobalTarget::Name(id) = &mr.global {
-            if interesting.contains(analysis.globals()[*id].key.as_str()) {
-                direct.insert(mr.func);
-            }
+    for (idx, func) in pir.functions.iter().enumerate() {
+        if func_references_interesting(func, &interesting) {
+            direct.insert(FuncId(idx as u32));
         }
     }
 
@@ -508,6 +609,43 @@ fn mutable_global_tissue(
             .collect()
     };
     (order(&direct), order(&tissue))
+}
+
+/// Whether `func`'s body references any `interesting` global through a constant — a `@g` symbol in
+/// any operand string, or a `GlobalRef` target.
+fn func_references_interesting(func: &Func, interesting: &BTreeSet<&str>) -> bool {
+    let hits = |operand: &str| all_global_symbols(operand).any(|g| interesting.contains(g.as_str()));
+    for stmt in &func.body {
+        let found = match stmt {
+            Stmt::GlobalRef { global, .. } => interesting.contains(global.as_str()),
+            Stmt::Store { address, value, .. } => hits(address) || hits(value),
+            Stmt::Load { address, .. } => hits(address),
+            Stmt::Gep { base, .. } => hits(base),
+            Stmt::Assign { sources, .. } => sources.iter().any(|s| hits(s)),
+            Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => hits(source),
+            Stmt::Memcpy { dst, src, .. } => hits(dst) || hits(src),
+            Stmt::Memset { dst, .. } => hits(dst),
+            Stmt::Return { value: Some(v), .. } => hits(v),
+            Stmt::CallDirect { args, .. } => args.iter().any(|a| hits(a)),
+            Stmt::CallIndirect { operand, args, .. } => hits(operand) || args.iter().any(|a| hits(a)),
+            _ => false,
+        };
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every `@symbol` name appearing in an operand string (direct refs and inline constant-exprs).
+fn all_global_symbols(operand: &str) -> impl Iterator<Item = String> + '_ {
+    operand.match_indices('@').filter_map(|(at, _)| {
+        let name: String = operand[at + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '-'))
+            .collect();
+        (!name.is_empty()).then_some(name)
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -678,6 +678,7 @@ fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
                 line: None,
                 is_const: true,
                 mutable: false,
+                init_refs: Vec::new(),
                 exported: false,
             },
             Global {
@@ -686,6 +687,7 @@ fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
                 line: None,
                 is_const: true,
                 mutable: false,
+                init_refs: Vec::new(),
                 exported: false,
             },
             Global {
@@ -694,6 +696,7 @@ fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
                 line: None,
                 is_const: true,
                 mutable: false,
+                init_refs: Vec::new(),
                 exported: false,
             },
             Global {
@@ -702,6 +705,7 @@ fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
                 line: None,
                 is_const: false,
                 mutable: true,
+                init_refs: Vec::new(),
                 exported: false,
             },
         ],

@@ -41,17 +41,19 @@ support it (neither touches the pointer-analysis core):
 ## Fidelity
 
 `lib-small-g-O0` (the library showcase) is reproduced **byte-for-byte** under `--stage steens`
-(regression test: `cc2json::tests::lib_small_matches_golden_byte_for_byte`). For the larger
-executables, `unique_filenames`, `global_initializer_references`, and (where the golden is empty)
-`escaped_globals` match exactly; `call_graph_components` match as sets for hashmap (47/47) and
-overlap heavily for the others. The remaining divergences, with cause:
+(regression test: `cc2json::tests::lib_small_matches_golden_byte_for_byte`). `exe-b2-hashmap_tree-O0`
+matches **every section's contents** (only component array *order* differs). For all executables,
+`unique_filenames`, `global_initializer_references`, `mutable_global_tissue` (hashmap, sbase), and
+empty `escaped_globals` match. The remaining divergences, with cause:
 
-* **`mutated_globals` (under-reports on executables).** Reproduced: the store-target rule. NOT
-  reproduced: cclyzer's second source — a global whose address is passed to a non-readonly call
-  argument (e.g. hashmap's 14 `__func__.*` arrays passed to `__assert_fail`). pangs renders
-  constant-expr call arguments as opaque strings and exposes no argument points-to, so those
-  globals can't be resolved; a syntactic approximation added spurious entries without recovering
-  the real ones, so it was dropped.
+* **`mutated_globals`.** Both cclyzer sources are reproduced: the store-target rule (`access:mod`
+  modrefs) and the non-readonly-argument rule. The latter resolves a global whose address is
+  passed to a call argument — including inline constant-expr `getelementptr`/`bitcast` arguments
+  (e.g. hashmap's `__func__.*` passed to a printf) — and honors a ported libc readonly table,
+  which includes `__assert_fail` (so the `__PRETTY_FUNCTION__.*` arrays it receives are not
+  flagged). hashmap's 14 `__func__.*` now match exactly. It resolves only *directly*-denoted
+  globals (not values flowing through loads/memory), so sbase/OMP still differ by a few entries
+  (e.g. sbase's `stdout`, an external FILE\* declaration) where cclyzer's full points-to differs.
 * **`escaped_globals` (over/under on executables).** Reproduced via a PIR dataflow escape
   (global value stored into / returned alongside an externally-visible global, to a fixpoint),
   which is exact on lib-small (`transform_apply`). cclyzer's full result depends on its
