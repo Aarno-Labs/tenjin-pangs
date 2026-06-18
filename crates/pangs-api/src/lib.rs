@@ -572,11 +572,12 @@ impl Analysis {
 
         let mut global_lookup = HashMap::new();
         let mut globals = Vec::new();
-        for (idx, global) in module.globals.iter().enumerate() {
-            if global_lookup
-                .insert(global.key.clone(), GlobalId(idx as u32))
-                .is_some()
-            {
+        for global in &module.globals {
+            if is_ignored_client_global(&global.key) {
+                continue;
+            }
+            let gid = GlobalId(globals.len() as u32);
+            if global_lookup.insert(global.key.clone(), gid).is_some() {
                 return Err(AnalysisError::DuplicateGlobal(global.key.clone()));
             }
             let exported = is_exported_global(global.exported, &global.key, opts);
@@ -1708,11 +1709,8 @@ fn stationarity_verdicts_from_modrefs(
         }
         match &mr.global {
             GlobalTarget::Name(gid) => {
-                let Some(global) = module.globals.get(gid.0 as usize) else {
-                    continue;
-                };
                 runtime_writers
-                    .entry(global.key.clone())
+                    .entry(globals[gid.0 as usize].key.clone())
                     .or_default()
                     .push(stationarity_writer_from_modref(mr));
             }
@@ -1873,6 +1871,11 @@ fn is_exported_func(marked: bool, key: &str, opts: &Opts) -> bool {
 
 fn is_exported_global(marked: bool, key: &str, opts: &Opts) -> bool {
     opts.exports.contains(key) || (opts.build_mode == BuildMode::Library && marked)
+}
+
+fn is_ignored_client_global(key: &str) -> bool {
+    let key = key.strip_prefix('@').unwrap_or(key);
+    key.starts_with(".str") || key.starts_with("__PRETTY_FUNCTION__") || key.starts_with("__const")
 }
 
 fn signature_text(sig: &pangs_pir::Signature) -> String {

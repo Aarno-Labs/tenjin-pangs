@@ -633,6 +633,110 @@ fn absence_only_initval_is_stationary_without_runtime_writers() {
 }
 
 #[test]
+fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
+    let pir = Pir {
+        module: "m".to_string(),
+        source: None,
+        lowering: Default::default(),
+        functions: vec![Func {
+            key: "reader".to_string(),
+            sig: sig(AbiClass::Void, vec![]),
+            param_names: vec![],
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: false,
+            body: vec![
+                Stmt::GlobalRef {
+                    global: ".str.1".to_string(),
+                    access: Access::Ref,
+                    loc: None,
+                },
+                Stmt::GlobalRef {
+                    global: "__PRETTY_FUNCTION__.reader".to_string(),
+                    access: Access::Ref,
+                    loc: None,
+                },
+                Stmt::GlobalRef {
+                    global: "__const.reader.table".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                },
+                Stmt::GlobalRef {
+                    global: "@Tracked".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                },
+            ],
+        }],
+        globals: vec![
+            Global {
+                key: ".str.1".to_string(),
+                file: None,
+                line: None,
+                is_const: true,
+                mutable: false,
+                exported: false,
+            },
+            Global {
+                key: "__PRETTY_FUNCTION__.reader".to_string(),
+                file: None,
+                line: None,
+                is_const: true,
+                mutable: false,
+                exported: false,
+            },
+            Global {
+                key: "__const.reader.table".to_string(),
+                file: None,
+                line: None,
+                is_const: true,
+                mutable: false,
+                exported: false,
+            },
+            Global {
+                key: "@Tracked".to_string(),
+                file: None,
+                line: None,
+                is_const: false,
+                mutable: true,
+                exported: false,
+            },
+        ],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Conservative,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert!(analysis.lookup_global(".str.1").is_none());
+    assert!(analysis
+        .lookup_global("__PRETTY_FUNCTION__.reader")
+        .is_none());
+    assert!(analysis.lookup_global("__const.reader.table").is_none());
+    assert_eq!(analysis.metrics().globals, 1);
+
+    let tracked = analysis.lookup_global("@Tracked").unwrap();
+    assert_eq!(tracked.0, 0);
+    assert_eq!(analysis.globals()[tracked].key, "@Tracked");
+    assert_eq!(analysis.modrefs().len(), 1);
+    assert!(matches!(
+        analysis.modrefs()[0].global,
+        pangs_api::GlobalTarget::Name(id) if id == tracked
+    ));
+    assert_eq!(analysis.stationarity_verdicts().len(), 1);
+    assert_eq!(analysis.stationarity_verdicts()[0].global, tracked);
+}
+
+#[test]
 fn m2_7_ablation_toggles_isolate_b2_and_b1_effects() {
     let b2_pir = Pir::from_path(m2_2_fixture("simple_local_assign.pir.json")).unwrap();
     let b2_report = run_m2_ablation(
