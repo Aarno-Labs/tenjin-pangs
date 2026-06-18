@@ -278,6 +278,7 @@ struct ClassData {
     fn_objs: HashSet<usize>,
     processed_icall_sites: HashSet<usize>,
     processed_fn_objs: HashSet<usize>,
+    processed_external_icall_sites: HashSet<usize>,
     global_objs: HashSet<usize>,
 }
 
@@ -823,6 +824,42 @@ impl<'a> Solver<'a> {
             }
         }
 
+        let site_count = self.classes[root].icall_sites.len();
+        let func_count = self.classes[root].fn_objs.len();
+        let class_candidate_pairs = site_count as u64 * func_count as u64;
+        if class_candidate_pairs > self.metrics.steens_max_class_candidate_pairs {
+            self.metrics.steens_max_class_candidate_pairs = class_candidate_pairs;
+            self.metrics.steens_max_class_icall_sites = site_count;
+            self.metrics.steens_max_class_fn_objs = func_count;
+        }
+
+        if ext && self.classes[root].processed_external_icall_sites.len() < site_count {
+            let external_site_ids = self.classes[root]
+                .icall_sites
+                .iter()
+                .copied()
+                .filter(|site| {
+                    !self.classes[root]
+                        .processed_external_icall_sites
+                        .contains(site)
+                })
+                .collect::<Vec<_>>();
+            self.classes[root]
+                .processed_external_icall_sites
+                .extend(external_site_ids.iter().copied());
+            for site_index in external_site_ids {
+                self.apply_external_call(site_index);
+            }
+        }
+
+        if site_count == 0
+            || func_count == 0
+            || (self.classes[root].processed_icall_sites.len() == site_count
+                && self.classes[root].processed_fn_objs.len() == func_count)
+        {
+            return;
+        }
+
         let site_ids = self.classes[root]
             .icall_sites
             .iter()
@@ -848,17 +885,6 @@ impl<'a> Solver<'a> {
             .copied()
             .filter(|func| !self.classes[root].processed_fn_objs.contains(func))
             .collect::<Vec<_>>();
-        let class_candidate_pairs = site_ids.len() as u64 * funcs.len() as u64;
-        if class_candidate_pairs > self.metrics.steens_max_class_candidate_pairs {
-            self.metrics.steens_max_class_candidate_pairs = class_candidate_pairs;
-            self.metrics.steens_max_class_icall_sites = site_ids.len();
-            self.metrics.steens_max_class_fn_objs = funcs.len();
-        }
-        for &site_index in &site_ids {
-            if ext {
-                self.apply_external_call(site_index);
-            }
-        }
 
         let mut bindings = Vec::new();
         for &site_index in &new_site_ids {
@@ -1045,6 +1071,11 @@ impl<'a> Solver<'a> {
         self.classes[a].fn_objs.extend(other_fns);
         let other_globals = std::mem::take(&mut self.classes[b].global_objs);
         self.classes[a].global_objs.extend(other_globals);
+        let other_external_sites =
+            std::mem::take(&mut self.classes[b].processed_external_icall_sites);
+        self.classes[a]
+            .processed_external_icall_sites
+            .extend(other_external_sites);
         let a_processed_pairs =
             self.classes[a].processed_icall_sites.len() * self.classes[a].processed_fn_objs.len();
         let b_processed_pairs =
@@ -1291,6 +1322,58 @@ mod tests {
         solver.process_class(root);
         assert_eq!(solver.metrics.steens_candidate_pairs, 5);
         assert_eq!(solver.metrics.steens_seen_pairs_duplicate, 1);
+    }
+
+    #[test]
+    fn steens_external_frontier_processes_only_new_sites_after_join() {
+        let pir = Pir {
+            module: "external_frontier_merge".to_string(),
+            source: None,
+            lowering: Default::default(),
+            functions: Vec::new(),
+            globals: Vec::new(),
+            global_init: Vec::new(),
+        };
+        let pag = Pag {
+            module: pir.module.clone(),
+            source: None,
+            metrics: Default::default(),
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    label: "%left".to_string(),
+                    kind: NodeKind::Value {
+                        scope: Scope::Module,
+                    },
+                },
+                Node {
+                    id: NodeId(1),
+                    label: "%right".to_string(),
+                    kind: NodeKind::Value {
+                        scope: Scope::Module,
+                    },
+                },
+            ],
+            edges: Vec::new(),
+            callsites: vec![frontier_test_callsite(0), frontier_test_callsite(1)],
+            omega_seeds: Vec::new(),
+        };
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Library);
+        solver.classes[0].ext = true;
+        solver.classes[0].icall_sites.insert(0);
+        solver.process_class(0);
+        solver.process_class(0);
+
+        assert_eq!(solver.metrics.steens_external_call_requests, 1);
+        assert_eq!(solver.metrics.steens_external_call_applications, 1);
+
+        solver.classes[1].icall_sites.insert(1);
+        let root = solver.join(0, 1);
+        solver.process_class(root);
+        solver.process_class(root);
+
+        assert_eq!(solver.metrics.steens_external_call_requests, 2);
+        assert_eq!(solver.metrics.steens_external_call_applications, 2);
     }
 
     #[test]
