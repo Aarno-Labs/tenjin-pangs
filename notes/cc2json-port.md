@@ -42,32 +42,32 @@ support it (neither touches the pointer-analysis core):
 
 `lib-small-g-O0` (the library showcase) is reproduced **byte-for-byte** under `--stage steens`
 (regression test: `cc2json::tests::lib_small_matches_golden_byte_for_byte`). `exe-b2-hashmap_tree-O0`
-matches **every section's contents** (only component array *order* differs). For all executables,
-`unique_filenames`, `global_initializer_references`, `mutable_global_tissue` (hashmap, sbase), and
-empty `escaped_globals` match. The remaining divergences, with cause:
+matches **every section's contents** (only component array *order* differs). `exe-sbase_cal-O0`
+matches `mutated_globals`, `escaped_globals`, `mutable_global_tissue`, `unique_filenames`, and
+`global_initializer_references` (only some components/order differ). `unique_filenames` and
+`global_initializer_references` match on all four. Remaining divergences, with cause:
 
 * **`mutated_globals`.** Both cclyzer sources are reproduced: the store-target rule (`access:mod`
   modrefs) and the non-readonly-argument rule. The latter resolves a global whose address is
   passed to a call argument — including inline constant-expr `getelementptr`/`bitcast` arguments
-  (e.g. hashmap's `__func__.*` passed to a printf) — and honors a ported libc readonly table,
-  which includes `__assert_fail` (so the `__PRETTY_FUNCTION__.*` arrays it receives are not
-  flagged). hashmap's 14 `__func__.*` now match exactly. It resolves only *directly*-denoted
-  globals (not values flowing through loads/memory), so sbase/OMP still differ by a few entries
-  (e.g. sbase's `stdout`, an external FILE\* declaration) where cclyzer's full points-to differs.
-* **`escaped_globals` (over/under on executables).** Reproduced via a PIR dataflow escape
-  (global value stored into / returned alongside an externally-visible global, to a fixpoint),
-  which is exact on lib-small (`transform_apply`). cclyzer's full result depends on its
-  context-sensitive points-to and reachability: it does **not** escape function pointers
-  reassigned at runtime through externally-visible fnptr globals in executables (e.g. OMP's
-  `basesort = versort` in `main`), which our syntactic rule does; and it escapes some returned
-  static buffers (OMP's `pathconcat.buf_xjtr_2`) our rule misses. These are inherent to the
-  different solver.
-* **`call_graph_components` ordering.** Contents match (as sets) far more often than order does.
-  We order components by their smallest call-site key, which reproduces cclyzer's
-  representative-based order exactly on lib-small but not always on the larger modules (cclyzer
-  orders by instruction/function refmode strings pangs does not reproduce). A handful of
-  components also differ in content on sbase/OMP because pangs' call graph resolves a few
-  edges differently.
+  (hashmap's `__func__.*` passed to a printf) — and honors a ported libc readonly table including
+  `__assert_fail` (so `__PRETTY_FUNCTION__.*` is not flagged). Results are restricted to globals
+  *defined* in the module (cclyzer only allocates those), which drops field-insensitive aliased
+  false-positives that land on external declarations (sbase's `stdout`). OMP still differs by a
+  handful: pangs' field-insensitive Steensgaard produces spurious aliased writes onto defined
+  aggregates that cclyzer's field-sensitive points-to avoids.
+* **`escaped_globals`.** Computed over real allocation-level points-to
+  (`solve_steensgaard_with_points_to`): an allocation pointed to by an externally-visible global
+  escapes (transitively), plus a syntactic return-escape. A **collapse guard** ignores pointee
+  sets that contain a string constant — the hallmark of pangs' field-insensitive merging of an
+  aggregate's fields (e.g. OMP's `struct sorts {char*; fnptr;}`), which would otherwise escape a
+  ~40-element blob. lib-small/hashmap/sbase match exactly. OMP still over-reports a few function
+  pointers reachable through a clean fnptr global (`getfulltree`) that cclyzer, for reasons not
+  derivable from the published rules, does not escape, and misses one returned static buffer.
+* **`call_graph_components`.** Contents match (as sets) far more often than order does. We order
+  by smallest call-site key — exact on lib-small, not always on larger modules (cclyzer orders by
+  instruction/function refmode strings pangs does not emit). A few components also differ in
+  content on sbase/OMP because pangs' call graph resolves some edges differently (reachability).
 
 These are exactly the "differs for good reasons (different/sometimes-more-precise analysis)"
 cases — acceptable per the project decision, documented here and inline in `cc2json.rs`.

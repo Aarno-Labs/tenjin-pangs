@@ -109,6 +109,12 @@ pub struct SolveResult {
     pub globals: BTreeMap<String, GlobalResolution>,
     #[serde(default)]
     pub nodes: BTreeMap<String, NodeResolution>,
+    /// Allocation-level points-to: PAG node label → the named allocations (global and function
+    /// keys) the node's class points to. Populated only by `solve_steensgaard_with_points_to`
+    /// (the cc2json client); empty otherwise. This is cclyzer's `operand_points_to` /
+    /// `var_points_to` over named allocations, and — for object nodes — `ptr_points_to`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_points_to: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub metrics: SolveMetrics,
 }
@@ -219,6 +225,16 @@ pub fn solve_steensgaard(pir: &Pir, pag: &Pag, build_mode: BuildMode) -> SolveRe
     solver.finish()
 }
 
+/// Like [`solve_steensgaard`] but also materializes `SolveResult::node_points_to` (allocation-level
+/// points-to). Used by the cc2json client; the normal pipeline uses `solve_steensgaard` and pays
+/// nothing for this.
+pub fn solve_steensgaard_with_points_to(pir: &Pir, pag: &Pag, build_mode: BuildMode) -> SolveResult {
+    let mut solver = Solver::new(pir, pag, build_mode);
+    solver.want_points_to = true;
+    solver.run();
+    solver.finish()
+}
+
 /// Run Steensgaard and also export the final union-find class structure, which the
 /// Andersen pass (`andersen::solve_andersen`) consumes as Kahlon partitions plus the
 /// round-0 escape/pointee facts. The two are produced from one solve so the partition
@@ -311,6 +327,9 @@ struct Solver<'a> {
     profile_started: Instant,
     profile_interval_candidate_pairs: u64,
     next_profile_candidate_pairs: u64,
+    /// When set, `finish` materializes `SolveResult::node_points_to` (the cc2json client needs
+    /// allocation-level points-to). Off for the normal `analyze` pipeline so it pays nothing.
+    want_points_to: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -456,6 +475,7 @@ impl<'a> Solver<'a> {
             profile_started: Instant::now(),
             profile_interval_candidate_pairs: steens_profile_interval_candidate_pairs(),
             next_profile_candidate_pairs: steens_profile_interval_candidate_pairs(),
+            want_points_to: false,
         }
     }
 
@@ -774,13 +794,53 @@ impl<'a> Solver<'a> {
         self.metrics.rounds = 1;
         let metrics = self.metrics.clone();
 
+        let node_points_to = if self.want_points_to {
+            self.materialize_points_to()
+        } else {
+            BTreeMap::new()
+        };
+
         SolveResult {
             indirect_calls,
             unknown_callers,
             globals,
             nodes,
+            node_points_to,
             metrics,
         }
+    }
+
+    /// For every PAG node, the named allocations (global + function keys) its class points to —
+    /// `global_objs ∪ fn_objs` of `find(pointee(class_of(node)))`. Object nodes thus expose
+    /// `ptr_points_to` (what a memory cell holds); value/param/return nodes expose
+    /// `operand_points_to`. Memoized per pointee-class root, so this is O(#nodes).
+    fn materialize_points_to(&mut self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut by_pointee_root: Vec<Option<BTreeSet<String>>> = vec![None; self.classes.len()];
+        let mut out = BTreeMap::new();
+        for node in &self.pag.nodes {
+            let root = self.find(node.id.0 as usize);
+            let Some(pointee) = self.classes[root].pointee else {
+                continue;
+            };
+            let pointee = self.find(pointee);
+            let allocs = if let Some(cached) = &by_pointee_root[pointee] {
+                cached.clone()
+            } else {
+                let mut allocs = BTreeSet::new();
+                for &g in &self.classes[pointee].global_objs {
+                    allocs.insert(self.global_keys[g].clone());
+                }
+                for &f in &self.classes[pointee].fn_objs {
+                    allocs.insert(self.function_keys[f].clone());
+                }
+                by_pointee_root[pointee] = Some(allocs.clone());
+                allocs
+            };
+            if !allocs.is_empty() {
+                out.insert(node.label.clone(), allocs);
+            }
+        }
+        out
     }
 
     fn process_class(&mut self, class: usize) {
@@ -1411,6 +1471,37 @@ mod tests {
         assert!(result.unknown_callers.is_empty());
         assert!(result.globals["@G"].escape_external);
         assert!(!result.globals["@G"].never_written);
+    }
+
+    #[test]
+    fn points_to_accessor_is_gated_and_lists_known_allocations() {
+        let pir = Pir::from_path(fixture("steens_escape_icall.pir.json")).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        // Off by default: the `analyze` pipeline pays nothing for points-to materialization.
+        assert!(solve_steensgaard(&pir, &pag, BuildMode::Library)
+            .node_points_to
+            .is_empty());
+
+        // On demand it materializes allocation-level points-to, and every listed allocation is a
+        // real global/function key. The icall operand points to the `cb` callback.
+        let with_pt = solve_steensgaard_with_points_to(&pir, &pag, BuildMode::Library);
+        assert!(!with_pt.node_points_to.is_empty());
+        let known: BTreeSet<&str> = pir
+            .globals
+            .iter()
+            .map(|g| g.key.as_str())
+            .chain(pir.functions.iter().map(|f| f.key.as_str()))
+            .collect();
+        for allocs in with_pt.node_points_to.values() {
+            for alloc in allocs {
+                assert!(known.contains(alloc.as_str()), "unknown alloc {alloc}");
+            }
+        }
+        assert!(with_pt
+            .node_points_to
+            .values()
+            .any(|allocs| allocs.contains("cb")));
     }
 
     #[test]

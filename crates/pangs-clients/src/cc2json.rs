@@ -22,6 +22,8 @@ use pangs_api::{
     Analysis, BuildMode, Callee, Caller, CallKind, FuncId, GlobalTarget, Opts, Stage,
 };
 use pangs_pir::{Access, Func, Loc, Pir, Stmt};
+use pangs_pag::{Pag, PagOpts};
+use pangs_solve::{solve_steensgaard_with_points_to, SolveResult};
 
 /// Options for the `cc2json` subcommand. `entrypoints`/`build_mode` follow pangs naming
 /// (library = all functions reachable; executable = reachable from `main`). `internalize_globals`
@@ -43,10 +45,21 @@ pub fn run_cc2json(pir: &Pir, _input_path: &Path, opts: &Cc2jsonOpts) -> Result<
     };
     let analysis = Analysis::run(pir, &api_opts).context("run pangs analysis")?;
 
+    // Allocation-level points-to (cclyzer ran unification, so escape/mutation use a steens solve
+    // regardless of the call-graph stage).
+    let pag = Pag::from_pir(
+        pir,
+        &PagOpts {
+            build_mode: opts.build_mode.into(),
+            ..PagOpts::default()
+        },
+    );
+    let solved = solve_steensgaard_with_points_to(pir, &pag, opts.build_mode.into());
+
     let source = pir.source.clone().unwrap_or_default();
 
     let mutated = mutated_globals(pir, &analysis);
-    let escaped = escaped_globals(pir, opts.internalize_globals);
+    let escaped = escaped_globals(pir, &solved, opts.internalize_globals);
 
     let mut json = JsonBuilder::new();
     write_cc2json(&mut json, pir, &analysis, &source, &mutated, &escaped);
@@ -87,11 +100,29 @@ fn mutated_globals(pir: &Pir, analysis: &Analysis) -> Vec<String> {
     let arg_mutated = mutated_via_call_args(pir, &global_names);
     mutated.extend(arg_mutated.iter().map(String::as_str));
 
+    // cclyzer only forms a global_allocation for globals *defined* in the module, so external
+    // declarations (e.g. libc's `stdout`) are never mutated. pangs records a `GlobalRef` mod in
+    // `global_init` for exactly the defined globals (those with an initializer), so restrict to
+    // that set. This drops field-insensitive aliased false-positives that land on extern decls
+    // (sbase's `stdout`) without losing defined aggregates like `g_buffer`.
+    let defined = defined_globals(pir);
     analysis
         .globals()
         .iter()
-        .filter(|g| mutated.contains(g.key.as_str()))
+        .filter(|g| mutated.contains(g.key.as_str()) && defined.contains(g.key.as_str()))
         .filter_map(|g| process_global_name(&g.key))
+        .collect()
+}
+
+/// Globals *defined* in this module (those with a constant initializer). pangs' PIR lowering emits
+/// a `GlobalRef` mod into `global_init` for each such global; external declarations are absent.
+fn defined_globals(pir: &Pir) -> BTreeSet<&str> {
+    pir.global_init
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::GlobalRef { global, .. } => Some(global.as_str()),
+            _ => None,
+        })
         .collect()
 }
 
@@ -210,69 +241,79 @@ fn known_readonly_arg(callee: &str, index: usize) -> bool {
 /// DIVERGENCE: escape that flows only through *aliased* (memory-indirect) stores or through
 /// escaping external-call arguments is not modeled — pangs may under-report there relative to
 /// cclyzer's points-to-based analysis. Names are `.`-filtered, ordered global-then-function.
-fn escaped_globals(pir: &Pir, internalize_globals: bool) -> Vec<String> {
+fn escaped_globals(pir: &Pir, solved: &SolveResult, internalize_globals: bool) -> Vec<String> {
     let global_names: BTreeSet<&str> = pir.globals.iter().map(|g| g.key.as_str()).collect();
     let func_names: BTreeSet<&str> = pir.functions.iter().map(|f| f.key.as_str()).collect();
     let is_known = |n: &str| global_names.contains(n) || func_names.contains(n);
+    let defined = defined_globals(pir);
 
-    // Externally-accessible base globals (external-linkage). With internalize, none.
-    let externally_visible: BTreeSet<&str> = if internalize_globals {
-        BTreeSet::new()
+    // Externally-accessible base globals (external-linkage, defined here). With internalize, none.
+    let externally_visible: Vec<&str> = if internalize_globals {
+        Vec::new()
     } else {
         pir.globals
             .iter()
-            .filter(|g| g.exported)
+            .filter(|g| g.exported && defined.contains(g.key.as_str()))
             .map(|g| g.key.as_str())
             .collect()
     };
 
-    // Per-function operand->defining-statement maps, for syntactic resolution.
-    let func_maps: Vec<BTreeMap<&str, &Stmt>> =
-        pir.functions.iter().map(operand_def_map).collect();
-
     let mut escaped: BTreeSet<String> = BTreeSet::new();
-    loop {
-        let before = escaped.len();
-        for (func, map) in pir.functions.iter().zip(&func_maps) {
-            for stmt in &func.body {
-                match stmt {
-                    Stmt::Store { address, value, .. } => {
-                        let Some(addr_base) = resolve_base_global(map, address) else {
-                            continue;
-                        };
-                        let into_escaped = externally_visible.contains(addr_base.as_str())
-                            || escaped.contains(&addr_base);
-                        if !into_escaped {
-                            continue;
-                        }
-                        if let Some(val_base) = resolve_base_global(map, value) {
-                            if is_known(&val_base) {
-                                escaped.insert(val_base);
-                            }
-                        }
-                    }
-                    Stmt::Return {
-                        value: Some(value), ..
-                    } => {
-                        if let Some(base) = resolve_base_global(map, value) {
-                            if is_known(&base) {
-                                escaped.insert(base);
-                            }
-                        }
-                    }
-                    _ => {}
+
+    // escape-analysis.dl rule 1 + transitive (rule 5): an allocation pointed to by externally-
+    // accessible memory escapes, and the pointees of an escaped allocation escape in turn. This
+    // is `ptr_points_to(alloc, mem)` read off the solver's allocation-level points-to for the
+    // memory object node `obj:global:<mem>`. Using real points-to (rather than syntactic stores)
+    // avoids escaping function pointers that field-insensitive over-merging never resolves onto
+    // a global object (e.g. OMP's runtime-reassigned `basesort`), matching cclyzer far better.
+    let mut worklist: Vec<String> = externally_visible.iter().map(|s| s.to_string()).collect();
+    let mut visited_mem: BTreeSet<String> = BTreeSet::new();
+    while let Some(mem) = worklist.pop() {
+        if !visited_mem.insert(mem.clone()) {
+            continue;
+        }
+        if let Some(pointees) = solved.node_points_to.get(&format!("obj:global:{mem}")) {
+            // Collapse guard: pangs' field-insensitive unification can merge an aggregate's fields
+            // into one giant class (e.g. OMP's `struct sorts {char*; fnptr;}` table), so a single
+            // global object appears to point at dozens of unrelated allocations. A precise
+            // function-pointer / data-pointer global never points to a string constant, so a
+            // pointee set containing a `.`-prefixed name signals such a collapse — skip it rather
+            // than escape the whole blob. cclyzer's field-sensitive points-to keeps these apart.
+            if pointees.iter().any(|p| p.starts_with('.')) {
+                continue;
+            }
+            for pointee in pointees {
+                if is_known(pointee) && escaped.insert(pointee.clone()) {
+                    worklist.push(pointee.clone());
                 }
             }
         }
-        if escaped.len() == before {
-            break;
+    }
+
+    // Return-escape: a pointer to a global value returned from a function escapes (covers returned
+    // `static` buffers). Resolved syntactically through gep/bitcast chains.
+    let func_maps: Vec<BTreeMap<&str, &Stmt>> =
+        pir.functions.iter().map(operand_def_map).collect();
+    for (func, map) in pir.functions.iter().zip(&func_maps) {
+        for stmt in &func.body {
+            if let Stmt::Return {
+                value: Some(value), ..
+            } = stmt
+            {
+                if let Some(base) = resolve_base_global(map, value) {
+                    if is_known(&base) {
+                        escaped.insert(base);
+                    }
+                }
+            }
         }
     }
 
-    // Render in global-definition order, then function-definition order, dropping `.`-prefixed.
+    // Keep escaped *functions* and escaped *defined* data globals (cclyzer allocates only defined
+    // globals). Render in global- then function-definition order, dropping `.`-prefixed names.
     let mut out = Vec::new();
     for g in &pir.globals {
-        if escaped.contains(&g.key) {
+        if escaped.contains(&g.key) && defined.contains(g.key.as_str()) {
             if let Some(name) = process_global_name(&g.key) {
                 out.push(name);
             }
