@@ -153,6 +153,11 @@ impl SharedStringList {
         self.0.is_empty()
     }
 
+    /// Stable identity for process-local caches while this shared list is alive.
+    pub fn cache_key(&self) -> (usize, usize) {
+        (self.0.as_ptr() as usize, self.0.len())
+    }
+
     pub fn to_vec(&self) -> Vec<String> {
         self.0.to_vec()
     }

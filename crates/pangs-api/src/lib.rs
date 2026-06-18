@@ -2803,7 +2803,7 @@ struct PointerAccess {
 #[derive(Debug, Clone)]
 struct ModRefNodeSummaryData {
     external: bool,
-    pointee_global_ids: Vec<GlobalId>,
+    pointee_global_ids: Rc<[GlobalId]>,
     pointee_global_count: usize,
     external_source_suffix: Option<String>,
     direct_symbol_global: Option<GlobalId>,
@@ -3106,7 +3106,7 @@ fn flush_local_pointer_access_rows(
             );
             continue;
         }
-        for &gid in &summary.pointee_global_ids {
+        for &gid in summary.pointee_global_ids.iter() {
             if key.suppress_direct_symbol && summary.direct_symbol_global == Some(gid) {
                 continue;
             }
@@ -3194,12 +3194,22 @@ fn build_modref_node_summary_data(
     label: &str,
     resolution: &NodeResolution,
     global_lookup: &HashMap<String, GlobalId>,
+    pointee_global_id_cache: &mut HashMap<(usize, usize), Rc<[GlobalId]>>,
 ) -> ModRefNodeSummaryData {
-    let pointee_global_ids = resolution
-        .pointee_globals
-        .iter()
-        .filter_map(|global_key| global_lookup.get(global_key).copied())
-        .collect();
+    let pointee_global_ids =
+        if let Some(ids) = pointee_global_id_cache.get(&resolution.pointee_globals.cache_key()) {
+            Rc::clone(ids)
+        } else {
+            let ids = Rc::<[GlobalId]>::from(
+                resolution
+                    .pointee_globals
+                    .iter()
+                    .filter_map(|global_key| global_lookup.get(global_key).copied())
+                    .collect::<Vec<_>>(),
+            );
+            pointee_global_id_cache.insert(resolution.pointee_globals.cache_key(), Rc::clone(&ids));
+            ids
+        };
     let direct_symbol_global = label
         .strip_prefix("sym:global:")
         .and_then(|global_key| global_lookup.get(global_key).copied());
@@ -3226,6 +3236,7 @@ fn push_pointer_modrefs_from_pag(
     let mut node_summaries = Vec::new();
     node_summaries.resize_with(pag.nodes.len(), || None);
     let mut summary_data_by_label = HashMap::new();
+    let mut pointee_global_id_cache = HashMap::new();
     let mut missing_nodes = vec![false; pag.nodes.len()];
     let mut local_accesses = LocalPointerAccessRows::new(pag.nodes.len());
     let mut local_rows = LocalPointerModRefRows::new(global_lookup.len());
@@ -3270,6 +3281,7 @@ fn push_pointer_modrefs_from_pag(
                         &node.label,
                         resolution,
                         global_lookup,
+                        &mut pointee_global_id_cache,
                     ));
                     summary_data_by_label.insert(node.label.as_str(), Rc::clone(&data));
                     data
@@ -3328,7 +3340,7 @@ fn push_pointer_modrefs_from_pag(
                     );
                     continue;
                 }
-                for &gid in &summary.pointee_global_ids {
+                for &gid in summary.pointee_global_ids.iter() {
                     if pointer_access.suppress_direct_symbol
                         && summary.direct_symbol_global == Some(gid)
                     {
