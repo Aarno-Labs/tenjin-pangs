@@ -1107,8 +1107,9 @@ impl Analysis {
         }
 
         let callgraph_dedup_started = Instant::now();
-        call_edges.sort_by_key(|edge| edge_sort_key(edge, &functions, &callsites));
-        call_edges.dedup_by_key(|edge| edge_sort_key(edge, &functions, &callsites));
+        call_edges.sort_by(|left, right| call_edge_cmp(left, right, &functions, &callsites));
+        call_edges
+            .dedup_by(|left, right| call_edge_cmp(left, right, &functions, &callsites).is_eq());
         let callgraph_dedup_us = callgraph_dedup_started.elapsed().as_micros() as u64;
         let modref_dedup_started = Instant::now();
         let mut pointer_modref_metrics = modrefs.metrics();
@@ -1932,19 +1933,224 @@ fn next_noloc(noloc_ord: &mut BTreeMap<(String, String), u32>, func: &str, kind:
     value
 }
 
-fn edge_sort_key(
-    edge: &CallEdge,
+fn call_edge_cmp(
+    left: &CallEdge,
+    right: &CallEdge,
     funcs: &[FuncInfo],
     callsites: &[CallsiteInfo],
-) -> (String, String, String, String) {
-    (
-        caller_key(&edge.caller, funcs),
-        edge.callsite
-            .map(|id| callsites[id.0 as usize].key.clone())
-            .unwrap_or_default(),
-        callee_key(&edge.callee, funcs),
-        format!("{:?}{:?}", edge.kind, edge.tier),
-    )
+) -> Ordering {
+    caller_label_cmp(&left.caller, &right.caller, funcs)
+        .then_with(|| callsite_label_cmp(left.callsite, right.callsite, callsites))
+        .then_with(|| callee_label_cmp(&left.callee, &right.callee, funcs))
+        .then_with(|| call_kind_label(left.kind).cmp(call_kind_label(right.kind)))
+        .then_with(|| tier_label(left.tier).cmp(tier_label(right.tier)))
+}
+
+fn caller_label_cmp(left: &Caller, right: &Caller, funcs: &[FuncInfo]) -> Ordering {
+    match (left, right) {
+        (Caller::Func(left), Caller::Func(right)) => {
+            funcs[left.0 as usize].key.cmp(&funcs[right.0 as usize].key)
+        }
+        (Caller::Unknown(left), Caller::Unknown(right)) => left.cmp(right),
+        (Caller::Func(left), Caller::Unknown(right)) => {
+            str_cmp_chunks(&[funcs[left.0 as usize].key.as_str()], &["unknown:", right])
+        }
+        (Caller::Unknown(left), Caller::Func(right)) => {
+            str_cmp_chunks(&["unknown:", left], &[funcs[right.0 as usize].key.as_str()])
+        }
+    }
+}
+
+fn callee_label_cmp(left: &Callee, right: &Callee, funcs: &[FuncInfo]) -> Ordering {
+    match (left, right) {
+        (Callee::Func(left), Callee::Func(right)) => {
+            funcs[left.0 as usize].key.cmp(&funcs[right.0 as usize].key)
+        }
+        (Callee::Unknown(left), Callee::Unknown(right)) => left.cmp(right),
+        (Callee::Func(left), Callee::Unknown(right)) => {
+            str_cmp_chunks(&[funcs[left.0 as usize].key.as_str()], &["unknown:", right])
+        }
+        (Callee::Unknown(left), Callee::Func(right)) => {
+            str_cmp_chunks(&["unknown:", left], &[funcs[right.0 as usize].key.as_str()])
+        }
+    }
+}
+
+fn callsite_label_cmp(
+    left: Option<CallsiteId>,
+    right: Option<CallsiteId>,
+    callsites: &[CallsiteInfo],
+) -> Ordering {
+    let left = left
+        .map(|id| callsites[id.0 as usize].key.as_str())
+        .unwrap_or_default();
+    let right = right
+        .map(|id| callsites[id.0 as usize].key.as_str())
+        .unwrap_or_default();
+    left.cmp(right)
+}
+
+fn call_kind_label(kind: CallKind) -> &'static str {
+    match kind {
+        CallKind::Direct => "Direct",
+        CallKind::Indirect => "Indirect",
+    }
+}
+
+fn tier_label(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Direct => "Direct",
+        Tier::Fsa => "Fsa",
+        Tier::Steens => "Steens",
+        Tier::Andersen => "Andersen",
+        Tier::Simple => "Simple",
+    }
+}
+
+fn str_cmp_chunks(left: &[&str], right: &[&str]) -> Ordering {
+    // Allocation-free equivalent of `left.concat().cmp(&right.concat())`.
+    let mut left_chunks = left.iter();
+    let mut right_chunks = right.iter();
+    let mut left_bytes = left_chunks.next().map(|chunk| chunk.as_bytes());
+    let mut right_bytes = right_chunks.next().map(|chunk| chunk.as_bytes());
+    let mut left_index = 0;
+    let mut right_index = 0;
+
+    loop {
+        match (left_bytes, right_bytes) {
+            (Some(left), Some(right)) => {
+                let left_remaining = &left[left_index..];
+                let right_remaining = &right[right_index..];
+                let shared_len = left_remaining.len().min(right_remaining.len());
+                let cmp = left_remaining[..shared_len].cmp(&right_remaining[..shared_len]);
+                if !cmp.is_eq() {
+                    return cmp;
+                }
+                left_index += shared_len;
+                right_index += shared_len;
+                if left_index == left.len() {
+                    left_bytes = left_chunks.next().map(|chunk| chunk.as_bytes());
+                    left_index = 0;
+                }
+                if right_index == right.len() {
+                    right_bytes = right_chunks.next().map(|chunk| chunk.as_bytes());
+                    right_index = 0;
+                }
+            }
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
+#[cfg(test)]
+mod callgraph_sort_tests {
+    use super::*;
+
+    #[test]
+    fn call_edge_cmp_matches_allocated_sort_key_order() {
+        let funcs = vec![
+            FuncInfo {
+                key: "alpha".to_string(),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                vararg: false,
+                sig: "void()".to_string(),
+            },
+            FuncInfo {
+                key: "unknown:zeta".to_string(),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                vararg: false,
+                sig: "void()".to_string(),
+            },
+        ];
+        let callsites = vec![
+            CallsiteInfo {
+                key: "alpha@!noloc#0".to_string(),
+                caller: FuncId(0),
+                kind: CallKind::Direct,
+                loc: None,
+                synthetic: true,
+            },
+            CallsiteInfo {
+                key: "alpha@!noloc#1".to_string(),
+                caller: FuncId(0),
+                kind: CallKind::Indirect,
+                loc: None,
+                synthetic: true,
+            },
+        ];
+        let edges = vec![
+            CallEdge {
+                caller: Caller::Func(FuncId(0)),
+                callsite: Some(CallsiteId(1)),
+                callee: Callee::Unknown("omega_fnptr".to_string()),
+                kind: CallKind::Indirect,
+                tier: Tier::Steens,
+            },
+            CallEdge {
+                caller: Caller::Unknown("address_escapes_to_external".to_string()),
+                callsite: None,
+                callee: Callee::Func(FuncId(1)),
+                kind: CallKind::Direct,
+                tier: Tier::Fsa,
+            },
+            CallEdge {
+                caller: Caller::Func(FuncId(1)),
+                callsite: Some(CallsiteId(0)),
+                callee: Callee::Func(FuncId(0)),
+                kind: CallKind::Direct,
+                tier: Tier::Direct,
+            },
+            CallEdge {
+                caller: Caller::Func(FuncId(0)),
+                callsite: Some(CallsiteId(0)),
+                callee: Callee::Func(FuncId(1)),
+                kind: CallKind::Direct,
+                tier: Tier::Direct,
+            },
+        ];
+
+        let mut allocated_key_order = edges.clone();
+        allocated_key_order.sort_by_key(|edge| {
+            (
+                match &edge.caller {
+                    Caller::Func(id) => funcs[id.0 as usize].key.clone(),
+                    Caller::Unknown(reason) => format!("unknown:{reason}"),
+                },
+                edge.callsite
+                    .map(|id| callsites[id.0 as usize].key.clone())
+                    .unwrap_or_default(),
+                match &edge.callee {
+                    Callee::Func(id) => funcs[id.0 as usize].key.clone(),
+                    Callee::Unknown(reason) => format!("unknown:{reason}"),
+                },
+                format!("{:?}{:?}", edge.kind, edge.tier),
+            )
+        });
+
+        let mut borrowed_cmp_order = edges;
+        borrowed_cmp_order.sort_by(|left, right| call_edge_cmp(left, right, &funcs, &callsites));
+
+        assert_eq!(
+            allocated_key_order
+                .iter()
+                .map(|edge| format!("{edge:?}"))
+                .collect::<Vec<_>>(),
+            borrowed_cmp_order
+                .iter()
+                .map(|edge| format!("{edge:?}"))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 fn detect_direct_call_audits(
@@ -3543,20 +3749,6 @@ fn edge_accesses(
             ],
         )),
         _ => None,
-    }
-}
-
-fn caller_key(caller: &Caller, funcs: &[FuncInfo]) -> String {
-    match caller {
-        Caller::Func(id) => funcs[id.0 as usize].key.clone(),
-        Caller::Unknown(reason) => format!("unknown:{reason}"),
-    }
-}
-
-fn callee_key(callee: &Callee, funcs: &[FuncInfo]) -> String {
-    match callee {
-        Callee::Func(id) => funcs[id.0 as usize].key.clone(),
-        Callee::Unknown(reason) => format!("unknown:{reason}"),
     }
 }
 
