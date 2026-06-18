@@ -52,6 +52,7 @@ struct InitValResolver<'a> {
     functions: HashMap<&'a str, usize>,
     globals: HashSet<&'a str>,
     definitions: Vec<HashMap<&'a str, usize>>,
+    global_init_definitions: HashMap<&'a str, Vec<usize>>,
     init_slots: BTreeMap<SubObj, SlotValue>,
     poisoned_globals: BTreeSet<String>,
     diagnostics: BTreeMap<String, Vec<InitValDiagnostic>>,
@@ -83,11 +84,18 @@ impl<'a> InitValResolver<'a> {
                 defs
             })
             .collect();
+        let mut global_init_definitions: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, stmt) in module.global_init.iter().enumerate() {
+            if let Some(dest) = stmt_dest(stmt) {
+                global_init_definitions.entry(dest).or_default().push(index);
+            }
+        }
         Self {
             module,
             functions,
             globals,
             definitions,
+            global_init_definitions,
             init_slots: BTreeMap::new(),
             poisoned_globals: BTreeSet::new(),
             diagnostics: BTreeMap::new(),
@@ -239,22 +247,14 @@ impl<'a> InitValResolver<'a> {
                 .insert(format!("function:{}@global_init", target.key));
             return Some(out);
         }
-        for stmt_index in (0..before_stmt).rev() {
-            let Some(dest) = stmt_dest(&self.module.global_init[stmt_index]) else {
-                continue;
-            };
-            if dest != value {
-                continue;
+        let stmt_index = self.global_init_definition_before(before_stmt, value)?;
+        match &self.module.global_init[stmt_index] {
+            Stmt::Assign { sources, .. } => {
+                self.resolve_all_global_init_sources(stmt_index, sources)
             }
-            return match &self.module.global_init[stmt_index] {
-                Stmt::Assign { sources, .. } => {
-                    self.resolve_all_global_init_sources(stmt_index, sources)
-                }
-                Stmt::Gep { base, .. } => self.resolve_global_init_value(stmt_index, base),
-                _ => None,
-            };
+            Stmt::Gep { base, .. } => self.resolve_global_init_value(stmt_index, base),
+            _ => None,
         }
-        None
     }
 
     fn resolve_all_global_init_sources(
@@ -309,30 +309,28 @@ impl<'a> InitValResolver<'a> {
                 byte_off: 0,
             });
         }
-        for stmt_index in (0..before_stmt).rev() {
-            let Some(dest) = stmt_dest(&self.module.global_init[stmt_index]) else {
-                continue;
-            };
-            if dest != value {
-                continue;
+        let stmt_index = self.global_init_definition_before(before_stmt, value)?;
+        match &self.module.global_init[stmt_index] {
+            Stmt::Gep {
+                base,
+                byte_off: Some(byte_off),
+                ..
+            } => {
+                let mut base = self.global_init_place(stmt_index, base)?;
+                base.byte_off = base.byte_off.checked_add(*byte_off)?;
+                Some(base)
             }
-            return match &self.module.global_init[stmt_index] {
-                Stmt::Gep {
-                    base,
-                    byte_off: Some(byte_off),
-                    ..
-                } => {
-                    let mut base = self.global_init_place(stmt_index, base)?;
-                    base.byte_off = base.byte_off.checked_add(*byte_off)?;
-                    Some(base)
-                }
-                Stmt::Assign { sources, .. } if sources.len() == 1 => {
-                    self.global_init_place(stmt_index, &sources[0])
-                }
-                _ => None,
-            };
+            Stmt::Assign { sources, .. } if sources.len() == 1 => {
+                self.global_init_place(stmt_index, &sources[0])
+            }
+            _ => None,
         }
-        None
+    }
+
+    fn global_init_definition_before(&self, before_stmt: usize, value: &str) -> Option<usize> {
+        let definitions = self.global_init_definitions.get(value)?;
+        let index = definitions.partition_point(|&stmt_index| stmt_index < before_stmt);
+        index.checked_sub(1).map(|index| definitions[index])
     }
 
     fn poison_mentioned_globals(&mut self, stmt: &Stmt, reason: &str, stmt_index: usize) {
