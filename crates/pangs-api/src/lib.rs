@@ -2871,6 +2871,55 @@ struct LocalPointerAccessRow {
     count: u64,
 }
 
+struct LocalPointerAccessRows {
+    rows: Vec<Option<LocalPointerAccessRow>>,
+    touched: Vec<usize>,
+}
+
+impl LocalPointerAccessRows {
+    fn new(node_count: usize) -> Self {
+        let row_count = node_count.saturating_mul(4);
+        Self {
+            rows: (0..row_count).map(|_| None).collect(),
+            touched: Vec::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        address_node: pangs_pag::NodeId,
+        access: Access,
+        suppress_direct_symbol: bool,
+        witness: Option<&str>,
+    ) {
+        let idx = address_node.0 as usize * 4
+            + access_rank(access) as usize * 2
+            + usize::from(suppress_direct_symbol);
+        let Some(slot) = self.rows.get_mut(idx) else {
+            return;
+        };
+        match slot {
+            Some(row) => {
+                row.count += 1;
+                prefer_modref_witness_ref(&mut row.witness, witness);
+            }
+            None => {
+                *slot = Some(LocalPointerAccessRow {
+                    witness: witness.map(str::to_owned),
+                    count: 1,
+                });
+                self.touched.push(idx);
+            }
+        }
+    }
+
+    fn drain_touched(&mut self) -> impl Iterator<Item = (usize, LocalPointerAccessRow)> + '_ {
+        self.touched
+            .drain(..)
+            .filter_map(|idx| self.rows[idx].take().map(|row| (idx, row)))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PointerAccessEmitterEntry {
     expanded_rows: u64,
@@ -2996,17 +3045,27 @@ fn push_local_pointer_modref_row(
 
 fn flush_local_pointer_access_rows(
     modrefs: &mut ModRefBuilder,
+    func: Option<FuncId>,
     local_rows: &mut LocalPointerModRefRows,
-    local_accesses: &mut HashMap<LocalPointerAccessKey, LocalPointerAccessRow>,
+    local_accesses: &mut LocalPointerAccessRows,
     node_summaries: &[Option<ModRefNodeSummary<'_>>],
     access_profile: &mut PointerAccessEmitterProfile,
     high_fanout_limit: usize,
 ) {
-    for (key, row) in local_accesses.drain() {
+    let Some(func) = func else {
+        return;
+    };
+    for (idx, row) in local_accesses.drain_touched() {
+        let address_node = (idx / 4) as u32;
+        let key = LocalPointerAccessKey {
+            func: func.0,
+            address_node,
+            access_rank: ((idx % 4) / 2) as u8,
+            suppress_direct_symbol: idx % 2 == 1,
+        };
         let Some(Some(summary)) = node_summaries.get(key.address_node as usize) else {
             continue;
         };
-        let func = FuncId(key.func);
         let access = match key.access_rank {
             0 => Access::Ref,
             _ => Access::Mod,
@@ -3154,7 +3213,7 @@ fn push_pointer_modrefs_from_pag(
     let mut node_summaries = Vec::new();
     node_summaries.resize_with(pag.nodes.len(), || None);
     let mut missing_nodes = vec![false; pag.nodes.len()];
-    let mut local_accesses = HashMap::<LocalPointerAccessKey, LocalPointerAccessRow>::new();
+    let mut local_accesses = LocalPointerAccessRows::new(pag.nodes.len());
     let mut local_rows = LocalPointerModRefRows::new(global_lookup.len());
     let mut access_profile = PointerAccessEmitterProfile::from_env();
     let high_fanout_limit = pointer_modref_high_fanout_limit();
@@ -3166,6 +3225,7 @@ fn push_pointer_modrefs_from_pag(
         if active_func != Some(func) {
             flush_local_pointer_access_rows(
                 modrefs,
+                active_func,
                 &mut local_rows,
                 &mut local_accesses,
                 &node_summaries,
@@ -3204,6 +3264,7 @@ fn push_pointer_modrefs_from_pag(
             if phase != ModRefSourcePhase::PagPointer {
                 flush_local_pointer_access_rows(
                     modrefs,
+                    active_func,
                     &mut local_rows,
                     &mut local_accesses,
                     &node_summaries,
@@ -3214,22 +3275,12 @@ fn push_pointer_modrefs_from_pag(
             }
 
             if phase == ModRefSourcePhase::PagPointer {
-                let key = LocalPointerAccessKey {
-                    func: func.0,
-                    address_node: pointer_access.address_node.0,
-                    access_rank: access_rank(pointer_access.access),
-                    suppress_direct_symbol: pointer_access.suppress_direct_symbol,
-                };
-                local_accesses
-                    .entry(key)
-                    .and_modify(|row| {
-                        row.count += 1;
-                        prefer_modref_witness_ref(&mut row.witness, witness.as_deref());
-                    })
-                    .or_insert_with(|| LocalPointerAccessRow {
-                        witness: witness.clone(),
-                        count: 1,
-                    });
+                local_accesses.push(
+                    pointer_access.address_node,
+                    pointer_access.access,
+                    pointer_access.suppress_direct_symbol,
+                    witness.as_deref(),
+                );
             } else {
                 let fanout = summary
                     .pointee_global_ids
@@ -3292,6 +3343,7 @@ fn push_pointer_modrefs_from_pag(
     }
     flush_local_pointer_access_rows(
         modrefs,
+        active_func,
         &mut local_rows,
         &mut local_accesses,
         &node_summaries,
