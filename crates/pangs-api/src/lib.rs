@@ -1439,6 +1439,14 @@ impl Analysis {
         self.transitive_modrefs.iter(func)
     }
 
+    pub fn modref_count(&self, func: FuncId) -> usize {
+        self.transitive_modrefs.row_count(func)
+    }
+
+    pub fn transitive_modref_count(&self) -> usize {
+        self.transitive_modrefs.total_row_count()
+    }
+
     pub fn component_of(&self, func: FuncId) -> ComponentId {
         for (idx, component) in self.components.iter().enumerate() {
             if component.members.contains(&func) {
@@ -3870,6 +3878,18 @@ struct TransitiveModRefs {
 }
 
 impl TransitiveModRefs {
+    fn row_count(&self, func: FuncId) -> usize {
+        let row_set = self.row_set_by_func[func.0 as usize];
+        self.row_sets[row_set].len()
+    }
+
+    fn total_row_count(&self) -> usize {
+        self.row_set_by_func
+            .iter()
+            .map(|&row_set| self.row_sets[row_set].len())
+            .sum()
+    }
+
     fn iter(&self, func: FuncId) -> impl Iterator<Item = ModRef> + '_ {
         let root = func;
         let row_set = self.row_set_by_func[func.0 as usize];

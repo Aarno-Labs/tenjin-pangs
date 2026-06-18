@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use pangs_api::{Analysis, BuildMode, FuncId, Opts, Stage};
+use pangs_api::{Analysis, BuildMode, Opts, Stage};
 use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
 use pangs_pir::Pir;
 
@@ -244,9 +244,7 @@ fn run() -> Result<()> {
                 ..Opts::default()
             };
             let analysis = Analysis::run(&pir, &opts)?;
-            let transitive_rows: usize = (0..analysis.functions().len())
-                .map(|idx| analysis.modref(FuncId(idx as u32)).count())
-                .sum();
+            let transitive_rows = analysis.transitive_modref_count();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
