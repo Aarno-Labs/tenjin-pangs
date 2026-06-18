@@ -2502,6 +2502,22 @@ struct CompactModRefFactKey {
     via_rank: u8,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct CompactModRefFanoutCounts {
+    total: u64,
+    pag: u64,
+    mem: u64,
+}
+
+impl CompactModRefFanoutCounts {
+    fn phase_mut(&mut self, phase: ModRefSourcePhase) -> &mut u64 {
+        match phase {
+            ModRefSourcePhase::PagPointer => &mut self.pag,
+            ModRefSourcePhase::MemsetMemcpy => &mut self.mem,
+        }
+    }
+}
+
 fn compact_modref_key(row: &ModRef) -> Option<CompactModRefFactKey> {
     if row.detail.is_some() || row.address_node.is_some() || !row.pointee_globals.is_empty() {
         return None;
@@ -2574,6 +2590,7 @@ struct ModRefBuilder {
     compact_by_fact: HashMap<CompactModRefFactKey, usize>,
     by_fact: HashMap<ModRefFactHashKey, usize>,
     metrics: ModRefEmissionMetrics,
+    compact_fanout_by_fact: HashMap<CompactModRefFactKey, CompactModRefFanoutCounts>,
     fanout_by_fact: HashMap<ModRefFanoutKey, u64>,
     fanout_by_phase: HashMap<(ModRefSourcePhase, ModRefFanoutKey), u64>,
     profile: PointerModRefProfile,
@@ -2629,19 +2646,13 @@ impl ModRefBuilder {
         witness: Option<&str>,
         phase: Option<ModRefSourcePhase>,
     ) {
-        let fanout_key = ModRefFanoutKey {
-            func,
-            global: GlobalTarget::Name(global),
-            access_rank: access_rank(access),
-            via_rank: via_rank(via),
-        };
-        self.note_modref_fanout(fanout_key, phase);
         let key = CompactModRefFactKey {
             func: func.0,
             global: global.0,
             access_rank: access_rank(access),
             via_rank: via_rank(via),
         };
+        self.note_compact_modref_fanout(key, phase);
         if let Some(&idx) = self.compact_by_fact.get(&key) {
             prefer_modref_witness_ref(&mut self.rows[idx].witness, witness);
             self.note_modref_result(phase, false);
@@ -2666,6 +2677,10 @@ impl ModRefBuilder {
     }
 
     fn note_modref_attempt(&mut self, row: &ModRef, phase: Option<ModRefSourcePhase>) {
+        if let Some(key) = compact_modref_key(row) {
+            self.note_compact_modref_fanout(key, phase);
+            return;
+        }
         let fanout_key = ModRefFanoutKey {
             func: row.func,
             global: row.global.clone(),
@@ -2681,6 +2696,39 @@ impl ModRefBuilder {
         phase: Option<ModRefSourcePhase>,
     ) {
         self.note_modref_fanout_count(fanout_key, phase, 1);
+    }
+
+    fn note_compact_modref_fanout(
+        &mut self,
+        fanout_key: CompactModRefFactKey,
+        phase: Option<ModRefSourcePhase>,
+    ) {
+        self.note_compact_modref_fanout_count(fanout_key, phase, 1);
+    }
+
+    fn note_compact_modref_fanout_count(
+        &mut self,
+        fanout_key: CompactModRefFactKey,
+        phase: Option<ModRefSourcePhase>,
+        delta: u64,
+    ) {
+        if delta == 0 {
+            return;
+        }
+        let counts = self.compact_fanout_by_fact.entry(fanout_key).or_default();
+        counts.total += delta;
+        self.metrics.pointer_modref_max_fact_fanout = self
+            .metrics
+            .pointer_modref_max_fact_fanout
+            .max(counts.total);
+        let Some(phase) = phase else {
+            return;
+        };
+        self.metrics.phase_mut(phase).attempted += delta;
+        let phase_count = counts.phase_mut(phase);
+        *phase_count += delta;
+        let phase_metrics = self.metrics.phase_mut(phase);
+        phase_metrics.max_fact_fanout = phase_metrics.max_fact_fanout.max(*phase_count);
     }
 
     fn note_modref_fanout_count(
@@ -2731,13 +2779,13 @@ impl ModRefBuilder {
         if duplicate_count == 0 {
             return;
         }
-        let fanout_key = ModRefFanoutKey {
-            func,
-            global: GlobalTarget::Name(global),
+        let fanout_key = CompactModRefFactKey {
+            func: func.0,
+            global: global.0,
             access_rank: access_rank(access),
             via_rank: via_rank(via),
         };
-        self.note_modref_fanout_count(fanout_key, Some(phase), duplicate_count);
+        self.note_compact_modref_fanout_count(fanout_key, Some(phase), duplicate_count);
         self.metrics.phase_mut(phase).duplicate += duplicate_count;
         self.maybe_print_profile("progress");
     }
