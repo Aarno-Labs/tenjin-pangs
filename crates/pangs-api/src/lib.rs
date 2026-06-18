@@ -2928,6 +2928,28 @@ impl PointerModRefProfile {
             metrics.max_fact_fanout,
         );
     }
+
+    fn print_closure_finalization(
+        &self,
+        label: &str,
+        sccs: usize,
+        payloads: usize,
+        total_rows: usize,
+        max_rows: usize,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "pangs pointer modref profile {label}: elapsed_ms={} sccs={} payloads={} \
+             total_rows={} max_rows={}",
+            self.started.elapsed().as_millis(),
+            sccs,
+            payloads,
+            total_rows,
+            max_rows,
+        );
+    }
 }
 
 fn pointer_modref_profile_enabled() -> bool {
@@ -2969,29 +2991,6 @@ struct ModRefFanoutKey {
     global: GlobalTarget,
     access_rank: u8,
     via_rank: u8,
-}
-
-fn modref_payload_cmp(
-    left: &ModRefPayload,
-    right: &ModRefPayload,
-    globals: &[GlobalInfo],
-) -> Ordering {
-    global_target_label(&left.global, globals)
-        .cmp(global_target_label(&right.global, globals))
-        .then_with(|| left.global.cmp(&right.global))
-        .then_with(|| access_rank(left.access).cmp(&access_rank(right.access)))
-        .then_with(|| via_rank(left.via).cmp(&via_rank(right.via)))
-        .then_with(|| option_str(&left.witness).cmp(option_str(&right.witness)))
-        .then_with(|| option_str(&left.detail).cmp(option_str(&right.detail)))
-        .then_with(|| option_str(&left.address_node).cmp(option_str(&right.address_node)))
-        .then_with(|| left.pointee_globals.cmp(&right.pointee_globals))
-}
-
-fn global_target_label<'a>(target: &'a GlobalTarget, globals: &'a [GlobalInfo]) -> &'a str {
-    match target {
-        GlobalTarget::Name(id) => &globals[id.0 as usize].key,
-        GlobalTarget::Unknown(reason) => reason,
-    }
 }
 
 fn option_str(value: &Option<String>) -> &str {
@@ -4002,7 +4001,7 @@ fn prefer_modref_witness_ref(existing: &mut Option<String>, candidate: Option<&s
 fn compute_transitive_modrefs(
     func_count: usize,
     _funcs: &[FuncInfo],
-    globals: &[GlobalInfo],
+    _globals: &[GlobalInfo],
     edges: &[CallEdge],
     local_modrefs: &[ModRef],
 ) -> (TransitiveModRefs, ModRefPhaseMetrics) {
@@ -4057,6 +4056,14 @@ fn compute_transitive_modrefs(
     let mut metrics = ModRefPhaseMetrics::default();
     let high_fanout_limit = transitive_modref_high_fanout_limit();
     let mut memo = vec![None; scc_members.len()];
+    let mut profile = PointerModRefProfile::from_env();
+    profile.print_closure_finalization(
+        "closure-collect-start",
+        scc_members.len(),
+        payloads.len(),
+        0,
+        0,
+    );
     for scc in 0..scc_members.len() {
         collect_scc_payload_ids(
             scc,
@@ -4069,20 +4076,60 @@ fn compute_transitive_modrefs(
             high_fanout_limit,
         );
     }
+    let (total_closure_rows, max_closure_rows) = scc_row_count_summary(&memo);
+    profile.print_closure_finalization(
+        "closure-collect-done",
+        scc_members.len(),
+        payloads.len(),
+        total_closure_rows,
+        max_closure_rows,
+    );
+    profile.print_closure_finalization(
+        "closure-rank-start",
+        scc_members.len(),
+        payloads.len(),
+        total_closure_rows,
+        max_closure_rows,
+    );
+    let (payload_fanout_ranks, fanout_rank_count) = modref_payload_fanout_ranks(&payloads);
+    profile.print_closure_finalization(
+        "closure-rank-done",
+        scc_members.len(),
+        payloads.len(),
+        total_closure_rows,
+        max_closure_rows,
+    );
 
     let mut row_sets = Vec::with_capacity(scc_members.len());
     let mut max_fanout_by_scc = Vec::with_capacity(scc_members.len());
+    let mut fanout_counts = vec![0u32; fanout_rank_count];
+    let mut touched_fanout_ranks = Vec::new();
+    profile.print_closure_finalization(
+        "closure-fanout-start",
+        scc_members.len(),
+        payloads.len(),
+        total_closure_rows,
+        max_closure_rows,
+    );
     for scc in 0..scc_members.len() {
-        let mut rows = memo[scc].take().unwrap_or_default().rows;
-        rows.sort_by(|&left, &right| {
-            modref_payload_cmp(&payloads[left], &payloads[right], globals)
-        });
-        max_fanout_by_scc.push(max_modref_payload_fanout(&rows, &payloads));
+        let rows = memo[scc].take().unwrap_or_default().rows;
+        max_fanout_by_scc.push(max_modref_payload_fanout_by_rank(
+            &rows,
+            &payload_fanout_ranks,
+            &mut fanout_counts,
+            &mut touched_fanout_ranks,
+        ));
         row_sets.push(rows);
     }
+    profile.print_closure_finalization(
+        "closure-fanout-done",
+        scc_members.len(),
+        payloads.len(),
+        total_closure_rows,
+        max_closure_rows,
+    );
 
     let mut row_set_by_func = Vec::with_capacity(func_count);
-    let mut profile = PointerModRefProfile::from_env();
     profile.print_closure("closure-start", &metrics, 0, payloads.len());
     for root_idx in 0..func_count {
         let scc = scc_of_func[root_idx];
@@ -4104,27 +4151,60 @@ fn compute_transitive_modrefs(
     )
 }
 
-fn max_modref_payload_fanout(sorted_rows: &[usize], payloads: &[ModRefPayload]) -> u64 {
-    let Some((&first, rest)) = sorted_rows.split_first() else {
-        return 0;
-    };
-    let mut max = 1;
-    let mut current = 1;
-    let mut previous = first;
-    for &payload_id in rest {
-        if same_modref_fanout_fact(&payloads[previous], &payloads[payload_id]) {
-            current += 1;
-        } else {
-            max = max.max(current);
-            current = 1;
-        }
-        previous = payload_id;
-    }
-    max.max(current)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ModRefPayloadFanoutKey {
+    global: GlobalTarget,
+    access_rank: u8,
+    via_rank: u8,
 }
 
-fn same_modref_fanout_fact(left: &ModRefPayload, right: &ModRefPayload) -> bool {
-    left.global == right.global && left.access == right.access && left.via == right.via
+fn modref_payload_fanout_ranks(payloads: &[ModRefPayload]) -> (Vec<usize>, usize) {
+    let mut ranks = Vec::with_capacity(payloads.len());
+    let mut by_key = BTreeMap::<ModRefPayloadFanoutKey, usize>::new();
+    for payload in payloads {
+        let next_rank = by_key.len();
+        let rank = *by_key
+            .entry(ModRefPayloadFanoutKey {
+                global: payload.global.clone(),
+                access_rank: access_rank(payload.access),
+                via_rank: via_rank(payload.via),
+            })
+            .or_insert(next_rank);
+        ranks.push(rank);
+    }
+    (ranks, by_key.len())
+}
+
+fn scc_row_count_summary(memo: &[Option<SccPayloadIds>]) -> (usize, usize) {
+    let mut total_rows = 0usize;
+    let mut max_rows = 0usize;
+    for rows in memo.iter().filter_map(|rows| rows.as_ref()) {
+        total_rows = total_rows.saturating_add(rows.rows.len());
+        max_rows = max_rows.max(rows.rows.len());
+    }
+    (total_rows, max_rows)
+}
+
+fn max_modref_payload_fanout_by_rank(
+    rows: &[usize],
+    payload_fanout_ranks: &[usize],
+    counts: &mut [u32],
+    touched: &mut Vec<usize>,
+) -> u64 {
+    let mut max = 0;
+    for &payload_id in rows {
+        let rank = payload_fanout_ranks[payload_id];
+        let count = &mut counts[rank];
+        if *count == 0 {
+            touched.push(rank);
+        }
+        *count += 1;
+        max = max.max(*count as u64);
+    }
+    for rank in touched.drain(..) {
+        counts[rank] = 0;
+    }
+    max
 }
 
 #[derive(Debug, Clone, Default)]
