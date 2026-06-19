@@ -10,9 +10,9 @@ resolution):
   *address-of* a global syntactically, but cclyzer mutates the argument's *pointee*. `stdout`
   passed to `fprintf` is a loaded `FILE*`; its pointee is the FILE object, not the `stdout`
   global.
-* `escaped_globals` — OMP over-escapes functions reassigned to externally-visible fnptr globals
-  at runtime and misses returned static buffers. The PIR-syntactic escape doesn't match
-  cclyzer's points-to-based `escaped_alloc`.
+* `escaped_globals` — OMP precision depends on matching cclyzer's points-to-based
+  `escaped_alloc`; direct returned globals are rendered, but inline constant-expression returns
+  alone are not escape roots.
 * `call_graph_components` — content gaps on sbase/OMP come from call-graph **reachability**
   differences (a separate axis), plus ordering (cclyzer refmode strings pangs doesn't emit).
 
@@ -68,9 +68,9 @@ unification points-to genuinely differs; measure and document.
     `stdout` exactly; lib-small/hashmap unchanged.
   * `escaped_globals`: recompute over `node_points_to` (allocation-level points-to) with a
     collapse guard that ignores pointee sets containing a string constant (the signature of
-    field-insensitive aggregate merging). lib-small/hashmap/sbase now match exactly; OMP's escape
-    over-report shrank from ~40 (raw points-to) / 7 (syntactic) to 5.
-* **Not resolvable here:** OMP's remaining escape over-report (clean fnptr global `getfulltree`'s
-  pointees, which cclyzer does not escape for reasons not derivable from the published datalog)
-  and the component reachability/order differences. Both would need either field-sensitivity or a
-  precise model of cclyzer's exact escape/reachability conditioning.
+    field-insensitive aggregate merging). Inline constant-expression returns are not escape roots
+    by themselves, but a returned inline global is rendered when the call result flows into an
+    internal callee. On OMP this keeps `prot.buf_xjtr_0`/`do_date.buf_xjtr_1` local while rendering
+    `stat2info.info_xjtr_0` and `pathconcat.buf_xjtr_2`.
+* **Not resolvable here:** remaining component reachability/order differences. Those need a more
+  precise model of cclyzer's exact reachability conditioning.

@@ -339,8 +339,11 @@ fn normalized_callee_name(callee: &str) -> &str {
 ///   the store-derived `ptr_points_to`, not `constant_ptr_points_to`). So `transform_apply`
 ///   escapes via `transform_init`'s `g_transform_fn = transform_apply`, while a function merely
 ///   named in a static initializer (e.g. OMP's `basesort = alnumsort`) does NOT.
-/// * Return-escape: a pointer to a global value returned from a (reachable) function escapes
-///   (covers returned `static` buffers like OMP's `stat2info.info_xjtr_0`).
+/// * Return-escape: a directly returned global value escapes (covers OMP's
+///   `stat2info.info_xjtr_0`). Inline constant-expression returns are not escape roots by
+///   themselves, but an inline returned global escapes when a caller passes that returned value
+///   into another internal function call (covers OMP's `pathconcat.buf_xjtr_2` flowing into
+///   `new_ignorefile` while keeping formatting-only uses like `prot()`/`do_date()` local).
 ///
 /// Closed to a fixpoint (an escaped global becomes escaped memory). Operands are resolved
 /// syntactically through gep/bitcast/select chains (not through loads).
@@ -356,6 +359,12 @@ fn escaped_globals(
 ) -> Vec<String> {
     let global_names: BTreeSet<&str> = pir.globals.iter().map(|g| g.key.as_str()).collect();
     let func_names: BTreeSet<&str> = pir.functions.iter().map(|f| f.key.as_str()).collect();
+    let internal_func_names: BTreeSet<&str> = pir
+        .functions
+        .iter()
+        .filter(|f| !f.external)
+        .map(|f| f.key.as_str())
+        .collect();
     let is_known = |n: &str| global_names.contains(n) || func_names.contains(n);
     let defined = defined_globals(pir);
 
@@ -403,9 +412,10 @@ fn escaped_globals(
         }
     }
 
-    // Return-escape: a pointer to a global value returned from a function escapes (covers returned
-    // `static` buffers). Resolved syntactically through gep/bitcast chains and inline constant
-    // expressions emitted directly in `ret` operands.
+    // Return-escape: match cclyzer's cc2json relation, which includes direct returned globals but
+    // does not turn every inline constant-expression return into an escape root. This keeps
+    // formatting helpers like OMP's prot()/do_date() local while retaining direct returns such as
+    // stat2info().
     for func in &pir.functions {
         let mut resolver = BaseGlobalResolver::new(func);
         for stmt in &func.body {
@@ -413,7 +423,7 @@ fn escaped_globals(
                 value: Some(value), ..
             } = stmt
             {
-                if let Some(base) = resolver.resolve_arg_global(value) {
+                if let Some(base) = resolver.resolve_base_global(value) {
                     if is_known(&base) {
                         escaped.insert(base);
                     }
@@ -421,6 +431,12 @@ fn escaped_globals(
             }
         }
     }
+    escaped.extend(inline_returned_globals_passed_to_internal_calls(
+        pir,
+        &global_names,
+        &func_names,
+        &internal_func_names,
+    ));
 
     // Keep escaped *functions* and escaped *defined* data globals (cclyzer allocates only defined
     // globals). Render in global- then function-definition order, dropping `.`-prefixed names.
@@ -440,6 +456,87 @@ fn escaped_globals(
         }
     }
     out
+}
+
+fn inline_returned_globals_passed_to_internal_calls(
+    pir: &Pir,
+    global_names: &BTreeSet<&str>,
+    func_names: &BTreeSet<&str>,
+    internal_func_names: &BTreeSet<&str>,
+) -> BTreeSet<String> {
+    let returned_globals = returned_globals_by_func(pir, global_names, func_names);
+    let mut escaped = BTreeSet::new();
+
+    for func in &pir.functions {
+        let mut value_globals: HashMap<&str, BTreeSet<String>> = HashMap::new();
+        for stmt in &func.body {
+            match stmt {
+                Stmt::CallDirect {
+                    callee, args, dest, ..
+                } => {
+                    if internal_func_names.contains(callee.as_str()) {
+                        for arg in args {
+                            if let Some(globals) = value_globals.get(arg.as_str()) {
+                                escaped.extend(globals.iter().cloned());
+                            }
+                        }
+                    }
+                    if let Some(dest) = dest {
+                        if let Some(globals) = returned_globals.get(callee.as_str()) {
+                            value_globals.insert(dest.as_str(), globals.clone());
+                        }
+                    }
+                }
+                Stmt::Gep { dest, base, .. } => {
+                    if let Some(globals) = value_globals.get(base.as_str()).cloned() {
+                        value_globals.insert(dest.as_str(), globals);
+                    }
+                }
+                Stmt::Assign { dest, sources, .. } => {
+                    let mut globals = BTreeSet::new();
+                    for source in sources {
+                        if let Some(source_globals) = value_globals.get(source.as_str()) {
+                            globals.extend(source_globals.iter().cloned());
+                        }
+                    }
+                    if !globals.is_empty() {
+                        value_globals.insert(dest.as_str(), globals);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    escaped
+}
+
+fn returned_globals_by_func(
+    pir: &Pir,
+    global_names: &BTreeSet<&str>,
+    func_names: &BTreeSet<&str>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut returned_globals = BTreeMap::new();
+    for func in &pir.functions {
+        let mut resolver = BaseGlobalResolver::new(func);
+        let mut globals = BTreeSet::new();
+        for stmt in &func.body {
+            if let Stmt::Return {
+                value: Some(value), ..
+            } = stmt
+            {
+                if let Some(base) = resolver.resolve_arg_global(value) {
+                    if global_names.contains(base.as_str()) || func_names.contains(base.as_str()) {
+                        globals.insert(base);
+                    }
+                }
+            }
+        }
+        if !globals.is_empty() {
+            returned_globals.insert(func.key.clone(), globals);
+        }
+    }
+    returned_globals
 }
 
 struct BaseGlobalResolver<'a> {
@@ -1340,7 +1437,7 @@ impl JsonBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pangs_pir::{AbiClass, Global, Signature};
+    use pangs_pir::{AbiClass, Global, Param, Signature};
     use std::path::PathBuf;
 
     fn workspace_root() -> PathBuf {
@@ -1449,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn cc2json_returned_inline_constexpr_global_escapes() {
+    fn cc2json_inline_constexpr_return_alone_does_not_escape() {
         let pir = Pir {
             module: "returned_inline_constexpr".to_string(),
             source: None,
@@ -1487,6 +1584,242 @@ mod tests {
         let rendered = run_cc2json(
             &pir,
             Path::new("returned_inline_constexpr.pir.json"),
+            &cc2json_test_opts(),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(json["escaped_globals"], serde_json::json!([]), "{rendered}");
+    }
+
+    #[test]
+    fn cc2json_inline_constexpr_return_passed_to_internal_call_escapes() {
+        let ptr_sig = Signature {
+            ret: AbiClass::Integer,
+            params: Vec::new(),
+            vararg: false,
+            cc: "ccc".to_string(),
+        };
+        let pir = Pir {
+            module: "returned_inline_constexpr_internal_use".to_string(),
+            source: None,
+            lowering: Default::default(),
+            functions: vec![
+                Func {
+                    key: "producer".to_string(),
+                    sig: ptr_sig.clone(),
+                    param_names: Vec::new(),
+                    file: None,
+                    line: None,
+                    external: false,
+                    exported: false,
+                    address_taken: false,
+                    body: vec![Stmt::Return {
+                        value: Some(
+                            "i8* getelementptr inbounds ([8 x i8], [8 x i8]* @ReturnedBuf, i64 0, i64 0)"
+                                .to_string(),
+                        ),
+                        loc: None,
+                    }],
+                },
+                Func {
+                    key: "sink".to_string(),
+                    sig: void_sig(),
+                    param_names: vec!["%sink::p".to_string()],
+                    file: None,
+                    line: None,
+                    external: false,
+                    exported: false,
+                    address_taken: false,
+                    body: Vec::new(),
+                },
+                Func {
+                    key: "main".to_string(),
+                    sig: void_sig(),
+                    param_names: Vec::new(),
+                    file: None,
+                    line: None,
+                    external: false,
+                    exported: true,
+                    address_taken: false,
+                    body: vec![
+                        Stmt::CallDirect {
+                            callee: "producer".to_string(),
+                            sig: ptr_sig,
+                            args: Vec::new(),
+                            dest: Some("%p".to_string()),
+                            loc: None,
+                        },
+                        Stmt::CallDirect {
+                            callee: "sink".to_string(),
+                            sig: void_sig(),
+                            args: vec!["%p".to_string()],
+                            dest: None,
+                            loc: None,
+                        },
+                    ],
+                },
+            ],
+            globals: vec![test_global("ReturnedBuf")],
+            global_init: vec![Stmt::GlobalRef {
+                global: "ReturnedBuf".to_string(),
+                access: Access::Mod,
+                loc: None,
+            }],
+        };
+
+        let rendered = run_cc2json(
+            &pir,
+            Path::new("returned_inline_constexpr_internal_use.pir.json"),
+            &cc2json_test_opts(),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            json["escaped_globals"],
+            serde_json::json!(["ReturnedBuf"]),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn cc2json_inline_constexpr_return_passed_to_external_call_does_not_escape() {
+        let ptr_sig = Signature {
+            ret: AbiClass::Integer,
+            params: Vec::new(),
+            vararg: false,
+            cc: "ccc".to_string(),
+        };
+        let format_sig = Signature {
+            ret: AbiClass::Integer,
+            params: vec![Param::Integer, Param::Integer],
+            vararg: true,
+            cc: "ccc".to_string(),
+        };
+        let pir = Pir {
+            module: "returned_inline_constexpr_external_use".to_string(),
+            source: None,
+            lowering: Default::default(),
+            functions: vec![
+                Func {
+                    key: "producer".to_string(),
+                    sig: ptr_sig.clone(),
+                    param_names: Vec::new(),
+                    file: None,
+                    line: None,
+                    external: false,
+                    exported: false,
+                    address_taken: false,
+                    body: vec![Stmt::Return {
+                        value: Some(
+                            "i8* getelementptr inbounds ([8 x i8], [8 x i8]* @ReturnedBuf, i64 0, i64 0)"
+                                .to_string(),
+                        ),
+                        loc: None,
+                    }],
+                },
+                Func {
+                    key: "fprintf".to_string(),
+                    sig: format_sig.clone(),
+                    param_names: Vec::new(),
+                    file: None,
+                    line: None,
+                    external: true,
+                    exported: true,
+                    address_taken: false,
+                    body: Vec::new(),
+                },
+                Func {
+                    key: "main".to_string(),
+                    sig: void_sig(),
+                    param_names: Vec::new(),
+                    file: None,
+                    line: None,
+                    external: false,
+                    exported: true,
+                    address_taken: false,
+                    body: vec![
+                        Stmt::CallDirect {
+                            callee: "producer".to_string(),
+                            sig: ptr_sig,
+                            args: Vec::new(),
+                            dest: Some("%p".to_string()),
+                            loc: None,
+                        },
+                        Stmt::CallDirect {
+                            callee: "fprintf".to_string(),
+                            sig: format_sig,
+                            args: vec![
+                                "%stream".to_string(),
+                                "@Fmt".to_string(),
+                                "%p".to_string(),
+                            ],
+                            dest: Some("%written".to_string()),
+                            loc: None,
+                        },
+                    ],
+                },
+            ],
+            globals: vec![test_global("ReturnedBuf"), test_global("Fmt")],
+            global_init: vec![
+                Stmt::GlobalRef {
+                    global: "ReturnedBuf".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                },
+                Stmt::GlobalRef {
+                    global: "Fmt".to_string(),
+                    access: Access::Ref,
+                    loc: None,
+                },
+            ],
+        };
+
+        let rendered = run_cc2json(
+            &pir,
+            Path::new("returned_inline_constexpr_external_use.pir.json"),
+            &cc2json_test_opts(),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(json["escaped_globals"], serde_json::json!([]), "{rendered}");
+    }
+
+    #[test]
+    fn cc2json_direct_returned_global_escapes() {
+        let pir = Pir {
+            module: "direct_returned_global".to_string(),
+            source: None,
+            lowering: Default::default(),
+            functions: vec![Func {
+                key: "main".to_string(),
+                sig: Signature {
+                    ret: AbiClass::Integer,
+                    params: Vec::new(),
+                    vararg: false,
+                    cc: "ccc".to_string(),
+                },
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: true,
+                address_taken: false,
+                body: vec![Stmt::Return {
+                    value: Some("@ReturnedBuf".to_string()),
+                    loc: None,
+                }],
+            }],
+            globals: vec![test_global("ReturnedBuf")],
+            global_init: vec![Stmt::GlobalRef {
+                global: "ReturnedBuf".to_string(),
+                access: Access::Mod,
+                loc: None,
+            }],
+        };
+
+        let rendered = run_cc2json(
+            &pir,
+            Path::new("direct_returned_global.pir.json"),
             &cc2json_test_opts(),
         )
         .unwrap();

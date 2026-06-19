@@ -57,13 +57,15 @@ matches `mutated_globals`, `escaped_globals`, `mutable_global_tissue`, `unique_f
   handful: pangs' field-insensitive Steensgaard produces spurious aliased writes onto defined
   aggregates that cclyzer's field-sensitive points-to avoids.
 * **`escaped_globals`.** Computed over real allocation-level points-to
-  (`solve_steensgaard_with_points_to`): an allocation pointed to by an externally-visible global
-  escapes (transitively), plus a syntactic return-escape. A **collapse guard** ignores pointee
-  sets that contain a string constant — the hallmark of pangs' field-insensitive merging of an
+  for global memory objects: an allocation pointed to by an externally-visible global escapes
+  (transitively), plus cclyzer-compatible direct returned globals. Inline constant-expression
+  returns are not treated as escape roots by themselves; OMP's formatting-only
+  `prot()`/`do_date()` static buffers stay local, while `stat2info.info_xjtr_0` is rendered
+  directly and `pathconcat.buf_xjtr_2` is rendered when the returned value flows into
+  `new_ignorefile`. A **collapse guard** ignores pointee sets
+  that contain a string constant — the hallmark of pangs' field-insensitive merging of an
   aggregate's fields (e.g. OMP's `struct sorts {char*; fnptr;}`), which would otherwise escape a
-  ~40-element blob. lib-small/hashmap/sbase match exactly. OMP still over-reports a few function
-  pointers reachable through a clean fnptr global (`getfulltree`) that cclyzer, for reasons not
-  derivable from the published rules, does not escape, and misses one returned static buffer.
+  ~40-element blob.
 * **`call_graph_components`.** Contents match (as sets) far more often than order does. We order
   by smallest call-site key — exact on lib-small, not always on larger modules (cclyzer orders by
   instruction/function refmode strings pangs does not emit). A few components also differ in
