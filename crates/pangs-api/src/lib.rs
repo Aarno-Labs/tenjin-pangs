@@ -59,7 +59,7 @@ impl Default for Opts {
             stage: Stage::Conservative,
             build_mode: BuildMode::Library,
             exports: BTreeSet::new(),
-            partition_budget: 10_000,
+            partition_budget: 100_000,
             enable_b1_initval: true,
             enable_b2_simple: true,
             enable_b3_confined: true,
