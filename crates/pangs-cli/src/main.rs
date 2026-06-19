@@ -131,6 +131,8 @@ enum Command {
         /// `--internalize-globals`). Off by default, matching how the goldens were produced.
         #[arg(long)]
         internalize_globals: bool,
+        #[arg(long, default_value_t = 100_000, hide = true)]
+        partition_budget: u64,
     },
 }
 
@@ -535,12 +537,14 @@ fn run() -> Result<()> {
             stage,
             entrypoints,
             internalize_globals,
+            partition_budget,
         } => {
             let pir = Pir::from_path(&module)?;
             let opts = pangs_clients::Cc2jsonOpts {
                 stage: stage.into(),
                 build_mode: entrypoints.into(),
                 internalize_globals,
+                partition_budget,
             };
             let json = pangs_clients::run_cc2json(&pir, &module, &opts)?;
             fs::write(&json_out, &json)

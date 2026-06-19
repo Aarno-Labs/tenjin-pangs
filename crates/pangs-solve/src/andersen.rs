@@ -62,18 +62,80 @@ pub fn solve_andersen_with_overrides(
     exact_targets: &BTreeMap<String, Vec<String>>,
     confined_targets: &BTreeSet<String>,
 ) -> SolveResult {
-    let (mut base, classes) = crate::solve_steensgaard_with_classes(pir, pag, build_mode);
-    let refined = Refiner::new(
+    let (base, classes) = crate::solve_steensgaard_with_classes(pir, pag, build_mode);
+    finish_andersen(
         pir,
         pag,
         &classes,
+        base,
+        build_mode,
+        partition_budget,
+        exact_targets,
+        confined_targets,
+        false,
+    )
+}
+
+/// Solve Andersen and materialize allocation-level points-to for *global memory objects*
+/// (`SolveResult::node_points_to`, keyed `obj:global:<name>`), refining the partitions below the
+/// budget and falling back to the Steensgaard global points-to for the rest. This is the cc2json
+/// escape client's solve: it sharpens which allocations a global's memory reaches (so escape need
+/// not over-approximate every within-budget partition) while keeping the Steensgaard answer for
+/// uninteresting/oversize partitions.
+pub fn solve_andersen_with_global_points_to(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: BuildMode,
+    partition_budget: u64,
+) -> SolveResult {
+    // Seed `base.node_points_to` with the Steensgaard global-object points-to; the refiner then
+    // overwrites the in-scope globals it sharpens, leaving the rest as the Steensgaard fallback.
+    let (base, classes) = crate::solve_steensgaard_classes_materialized(
+        pir,
+        pag,
+        build_mode,
+        crate::PointsToMaterialization::GlobalObjects,
+    );
+    finish_andersen(
+        pir,
+        pag,
+        &classes,
+        base,
+        build_mode,
+        partition_budget,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+        true,
+    )
+}
+
+/// Run the refiner over `base`/`classes` and fold the refined facts back into `base`. When
+/// `materialize_global_points_to` is set, also overwrite `base.node_points_to` for the global
+/// objects whose partitions were refined.
+#[allow(clippy::too_many_arguments)]
+fn finish_andersen(
+    pir: &Pir,
+    pag: &Pag,
+    classes: &SteensClasses,
+    mut base: SolveResult,
+    build_mode: BuildMode,
+    partition_budget: u64,
+    exact_targets: &BTreeMap<String, Vec<String>>,
+    confined_targets: &BTreeSet<String>,
+    materialize_global_points_to: bool,
+) -> SolveResult {
+    let mut refiner = Refiner::new(
+        pir,
+        pag,
+        classes,
         &base,
         build_mode,
         partition_budget,
         exact_targets,
         confined_targets,
-    )
-    .run();
+    );
+    refiner.materialize_global_points_to = materialize_global_points_to;
+    let refined = refiner.run();
 
     // Override only the refined facts; keep global escape/unknown-caller facts from
     // Steensgaard. Unrefined/oversize node partitions retain their Steensgaard node rows.
@@ -85,6 +147,11 @@ pub fn solve_andersen_with_overrides(
             node.external_sources = external_sources;
         }
     }
+    // Refined in-scope globals replace their Steensgaard `node_points_to` entry; oversize and
+    // uninteresting globals keep the Steensgaard fallback already seeded into `base`.
+    for (label, allocs) in refined.global_points_to {
+        base.node_points_to.insert(label, allocs);
+    }
     base.metrics.rounds = refined.rounds;
     base.metrics.oversize_fallbacks = refined.oversize_fallbacks;
     base.metrics.oversize_fallback_max_size = refined.oversize_fallback_max_size;
@@ -94,6 +161,9 @@ pub fn solve_andersen_with_overrides(
 struct RefinerOutput {
     indirect_calls: Vec<IndirectCallResolution>,
     nodes: Vec<(String, bool, Vec<String>, Vec<String>)>,
+    /// Refined global-object points-to (`obj:global:<name>` label → named allocations), only
+    /// populated when `Refiner::materialize_global_points_to` is set.
+    global_points_to: Vec<(String, BTreeSet<String>)>,
     rounds: usize,
     oversize_fallbacks: usize,
     oversize_fallback_max_size: usize,
@@ -143,6 +213,8 @@ struct Refiner<'a> {
     in_scope: Vec<bool>,
     oversize_fallbacks: usize,
     oversize_fallback_max_size: usize,
+    /// When set, `run` also emits refined points-to for in-scope global memory objects.
+    materialize_global_points_to: bool,
 }
 
 impl<'a> Refiner<'a> {
@@ -230,6 +302,7 @@ impl<'a> Refiner<'a> {
             in_scope: vec![false; n_base],
             oversize_fallbacks: 0,
             oversize_fallback_max_size: 0,
+            materialize_global_points_to: false,
         };
         refiner.build_scope();
         refiner
@@ -405,9 +478,15 @@ impl<'a> Refiner<'a> {
 
         let indirect_calls = self.emit_indirect_calls(&in_scope_sites, &pts);
         let nodes = self.emit_node_resolutions(&pts);
+        let global_points_to = if self.materialize_global_points_to {
+            self.emit_global_points_to(&pts)
+        } else {
+            Vec::new()
+        };
         RefinerOutput {
             indirect_calls,
             nodes,
+            global_points_to,
             rounds,
             oversize_fallbacks: self.oversize_fallbacks,
             oversize_fallback_max_size: self.oversize_fallback_max_size,
@@ -774,6 +853,53 @@ impl<'a> Refiner<'a> {
                 Vec::new()
             };
             out.push((node.label.clone(), external, globals, external_sources));
+        }
+        out
+    }
+
+    /// Refined `ptr_points_to` for every in-scope global memory object: the named allocations
+    /// (function + global keys) reachable from the object cell *and all its materialized field
+    /// cells*. Unioning the fields keeps this object-granular — the same shape cc2json's escape
+    /// fixpoint consumes from the Steensgaard fallback — while still benefiting from Andersen's
+    /// reduced cross-object over-merge. Ω is not a named allocation, so it is dropped.
+    fn emit_global_points_to(&self, pts: &Solve) -> Vec<(String, BTreeSet<String>)> {
+        let mut out = Vec::new();
+        for node in &self.pag.nodes {
+            if !matches!(
+                node.kind,
+                NodeKind::Object {
+                    object: ObjectKind::Global,
+                    ..
+                }
+            ) || !self.in_scope[node.id.0 as usize]
+            {
+                continue;
+            }
+            let obj = node.id.0;
+            let mut content_cells = vec![obj];
+            if let Some(fields) = pts.obj_fields.get(&obj) {
+                content_cells.extend(fields.iter().copied());
+            }
+            let mut allocs = BTreeSet::new();
+            for cell in content_cells {
+                let Some(set) = pts.pts.get(&cell) else {
+                    continue;
+                };
+                for &o in set {
+                    if o == self.omega {
+                        continue;
+                    }
+                    let root = pts.field_base.get(&o).copied().unwrap_or(o);
+                    if let Some(&idx) = self.fn_cell_to_index.get(&root) {
+                        allocs.insert(self.pir.functions[idx].key.clone());
+                    } else if let Some(&idx) = self.global_of_cell.get(&root) {
+                        allocs.insert(self.pir.globals[idx].key.clone());
+                    }
+                }
+            }
+            if !allocs.is_empty() {
+                out.push((node.label.clone(), allocs));
+            }
         }
         out
     }

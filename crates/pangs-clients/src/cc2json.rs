@@ -21,17 +21,21 @@ use anyhow::{Context, Result};
 use pangs_api::{Analysis, BuildMode, CallKind, Callee, Caller, FuncId, GlobalTarget, Opts, Stage};
 use pangs_pag::{Pag, PagOpts};
 use pangs_pir::{Access, Func, Loc, Pir, Stmt};
-use pangs_solve::{solve_steensgaard_with_global_points_to, SolveResult};
+use pangs_solve::{
+    solve_andersen_with_global_points_to, solve_steensgaard_with_global_points_to, SolveResult,
+};
 
 /// Options for the `cc2json` subcommand. `entrypoints`/`build_mode` follow pangs naming
 /// (library = all functions reachable; executable = reachable from `main`). `internalize_globals`
 /// mirrors cclyzer's flag — when off (the default, matching how the goldens were produced),
-/// external-linkage globals are externally visible and can anchor escape.
+/// external-linkage globals are externally visible and can anchor escape. `partition_budget`
+/// caps which partitions the Andersen stage refines (oversize ones fall back to Steensgaard).
 #[derive(Debug, Clone)]
 pub struct Cc2jsonOpts {
     pub stage: Stage,
     pub build_mode: BuildMode,
     pub internalize_globals: bool,
+    pub partition_budget: u64,
 }
 
 /// Run the analysis on `pir` and render the `cc2json` JSON summary.
@@ -43,8 +47,10 @@ pub fn run_cc2json(pir: &Pir, _input_path: &Path, opts: &Cc2jsonOpts) -> Result<
     };
     let analysis = Analysis::run(pir, &api_opts).context("run pangs analysis")?;
 
-    // Allocation-level points-to (cclyzer ran unification, so escape/mutation use a steens solve
-    // regardless of the call-graph stage).
+    // Global-object points-to for escape analysis. The Andersen stage refines this within the
+    // partition budget (oversize/uninteresting partitions keep the Steensgaard answer); the Steens
+    // stage uses Steensgaard for every partition. cclyzer ran unification, so its goldens match the
+    // Steens stage exactly — Andersen only narrows (never widens) the points-to it builds on.
     let pag = Pag::from_pir(
         pir,
         &PagOpts {
@@ -52,7 +58,15 @@ pub fn run_cc2json(pir: &Pir, _input_path: &Path, opts: &Cc2jsonOpts) -> Result<
             ..PagOpts::default()
         },
     );
-    let solved = solve_steensgaard_with_global_points_to(pir, &pag, opts.build_mode.into());
+    let solved = match opts.stage {
+        Stage::Andersen => solve_andersen_with_global_points_to(
+            pir,
+            &pag,
+            opts.build_mode.into(),
+            opts.partition_budget,
+        ),
+        _ => solve_steensgaard_with_global_points_to(pir, &pag, opts.build_mode.into()),
+    };
 
     let source = pir.source.clone().unwrap_or_default();
 
@@ -1307,11 +1321,71 @@ mod tests {
             stage: Stage::Steens,
             build_mode: BuildMode::Library,
             internalize_globals: false,
+            partition_budget: 100_000,
         };
         let got = run_cc2json(&pir, &bc, &opts).unwrap();
         let golden =
             std::fs::read_to_string(root.join("ju_cc2json/lib-small-g-O0.cc2json.json")).unwrap();
         assert_eq!(got, golden, "cc2json output diverged from lib-small golden");
+    }
+
+    /// The Andersen stage runs over the same module without panicking and produces a parseable
+    /// summary. Andersen only *narrows* the points-to the escape fixpoint builds on, so its
+    /// `escaped_globals` must be a subset of the Steens stage's — never a superset (a widening
+    /// would be a soundness regression in the narrowing ledger).
+    #[test]
+    fn lib_small_andersen_escaped_globals_subset_of_steens() {
+        let root = workspace_root();
+        let bc = root.join("ju_cc2json/lib-small-g-O0.bc");
+        if !bc.exists() {
+            return;
+        }
+        let pir = Pir::from_path(&bc).unwrap();
+        let base = Cc2jsonOpts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            internalize_globals: false,
+            partition_budget: 100_000,
+        };
+        let andersen = Cc2jsonOpts {
+            stage: Stage::Andersen,
+            ..base.clone()
+        };
+
+        let escaped = |opts: &Cc2jsonOpts| -> Vec<String> {
+            let pag = Pag::from_pir(
+                &pir,
+                &PagOpts {
+                    build_mode: opts.build_mode.into(),
+                    ..PagOpts::default()
+                },
+            );
+            let solved = match opts.stage {
+                Stage::Andersen => pangs_solve::solve_andersen_with_global_points_to(
+                    &pir,
+                    &pag,
+                    opts.build_mode.into(),
+                    opts.partition_budget,
+                ),
+                _ => pangs_solve::solve_steensgaard_with_global_points_to(
+                    &pir,
+                    &pag,
+                    opts.build_mode.into(),
+                ),
+            };
+            escaped_globals(&pir, &solved, opts.internalize_globals)
+        };
+
+        let steens_escaped: BTreeSet<String> = escaped(&base).into_iter().collect();
+        for g in escaped(&andersen) {
+            assert!(
+                steens_escaped.contains(&g),
+                "andersen escaped global {g:?} not in steens envelope (ledger break)"
+            );
+        }
+
+        // And the full renderer runs end-to-end under the Andersen stage.
+        assert!(run_cc2json(&pir, &bc, &andersen).is_ok());
     }
 
     #[test]

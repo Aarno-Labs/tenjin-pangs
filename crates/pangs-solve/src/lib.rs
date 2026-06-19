@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 mod andersen;
 mod cfl;
-pub use andersen::{solve_andersen, solve_andersen_with_overrides};
+pub use andersen::{
+    solve_andersen, solve_andersen_with_global_points_to, solve_andersen_with_overrides,
+};
 
 // Experimental tier-E prototype APIs. These are intentionally kept out of the
 // PANGS-lite `analyze` path; use them only through diagnostic/query surfaces or a
@@ -264,7 +266,20 @@ pub fn solve_steensgaard_with_classes(
     pag: &Pag,
     build_mode: BuildMode,
 ) -> (SolveResult, SteensClasses) {
+    solve_steensgaard_classes_materialized(pir, pag, build_mode, PointsToMaterialization::None)
+}
+
+/// Like [`solve_steensgaard_with_classes`] but also materializes `SolveResult::node_points_to`
+/// per `materialization`. The Andersen pass uses this to seed a Steensgaard global-object
+/// points-to fallback (`solve_andersen_with_global_points_to`) for partitions it does not refine.
+pub(crate) fn solve_steensgaard_classes_materialized(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: BuildMode,
+    materialization: PointsToMaterialization,
+) -> (SolveResult, SteensClasses) {
     let mut solver = Solver::new(pir, pag, build_mode);
+    solver.points_to_materialization = materialization;
     solver.run();
     let classes = solver.export_classes();
     let result = solver.finish();
@@ -353,7 +368,7 @@ struct Solver<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PointsToMaterialization {
+pub(crate) enum PointsToMaterialization {
     None,
     AllNodes,
     GlobalObjects,
