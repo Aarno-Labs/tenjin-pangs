@@ -1714,7 +1714,21 @@ fn stationarity_verdicts_from_modrefs(
                     .or_default()
                     .push(stationarity_writer_from_modref(mr));
             }
-            GlobalTarget::Unknown(_) => unknown_writers.push(stationarity_writer_from_modref(mr)),
+            GlobalTarget::Unknown(_) if !mr.pointee_globals.is_empty() => {
+                let writer = stationarity_writer_from_modref(mr);
+                for global_key in &mr.pointee_globals {
+                    if global_lookup.contains_key(global_key) {
+                        runtime_writers
+                            .entry(global_key.clone())
+                            .or_default()
+                            .push(writer.clone());
+                    }
+                }
+            }
+            GlobalTarget::Unknown(_) if unknown_modref_may_touch_module_global(mr) => {
+                unknown_writers.push(stationarity_writer_from_modref(mr));
+            }
+            GlobalTarget::Unknown(_) => {}
         }
     }
     for writers in runtime_writers.values_mut() {
@@ -1795,6 +1809,33 @@ fn stationarity_writer_from_modref(mr: &ModRef) -> StationarityWriter {
         via: mr.via,
         witness: mr.witness.clone(),
     }
+}
+
+fn unknown_modref_may_touch_module_global(mr: &ModRef) -> bool {
+    if !mr.pointee_globals.is_empty() {
+        return true;
+    }
+    let Some(detail) = mr.detail.as_deref() else {
+        return true;
+    };
+    if detail.starts_with("high_fanout_pointer_modref:") {
+        return true;
+    }
+    if detail.contains("omega:inttoptr") || detail.contains("omega:ptrtoint_escape") {
+        return true;
+    }
+    if let Some(count) = detail_pointee_count(detail) {
+        return count > 0;
+    }
+    false
+}
+
+fn detail_pointee_count(detail: &str) -> Option<usize> {
+    let suffix = detail.rsplit('|').find_map(|part| {
+        part.strip_prefix("pointee_count=")
+            .and_then(|value| value.parse::<usize>().ok())
+    });
+    suffix
 }
 
 fn stationarity_writer_cmp(left: &StationarityWriter, right: &StationarityWriter) -> Ordering {
@@ -3468,7 +3509,7 @@ fn push_high_fanout_pointer_modref_fallback(
                 summary.label, fanout
             )),
             address_node: Some(summary.label.to_string()),
-            pointee_globals: Vec::new(),
+            pointee_globals: summary.pointee_global_keys.to_vec(),
         },
         Some(phase),
     );
@@ -3728,7 +3769,7 @@ fn push_pointer_modrefs_from_pag(
                             summary.pointee_global_count,
                         )),
                         address_node: Some(summary.label.to_string()),
-                        pointee_globals: Vec::new(),
+                        pointee_globals: summary.pointee_global_keys.to_vec(),
                     },
                     Some(phase),
                 );
@@ -3800,7 +3841,7 @@ fn push_pointer_memset_modrefs_from_pir(
                             "high_fanout_pointer_modref:source=stmt:memset_dst:node={label}:fanout={fanout}:occurrences=1"
                         )),
                         address_node: Some(label),
-                        pointee_globals: Vec::new(),
+                        pointee_globals: resolution.pointee_globals.to_vec(),
                     },
                     Some(ModRefSourcePhase::MemsetMemcpy),
                 );

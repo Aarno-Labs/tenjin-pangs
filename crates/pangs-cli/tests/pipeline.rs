@@ -1746,6 +1746,9 @@ fn analyze_steens_collapses_high_fanout_pointer_modref_to_unknown() {
                 .as_str()
                 .unwrap()
                 .starts_with("high_fanout_pointer_modref:source=pag_pointer")
+            && row["pointee_globals"]
+                .as_array()
+                .is_some_and(|globals| globals.len() == 17)
     }));
     assert!(!modref.iter().any(|row| {
         row["access"] == "mod"
@@ -1788,7 +1791,7 @@ fn analyze_andersen_refines_spurious_external_store_address_modref() {
             && row["witness"] == "driver@m5_store.c:8:1#0"
             && row["detail"] == "edge:store|omega:steens_external|pointee_count=1"
             && row["address_node"] == "val:driver:%gp"
-            && row.get("pointee_globals").is_none()
+            && row["pointee_globals"] == serde_json::json!(["@Table"])
     }));
 
     let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))

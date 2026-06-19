@@ -328,6 +328,10 @@ Implemented in this worktree:
 - Added `PANGS_POINTER_MODREF_PROFILE_GLOBAL=<global>` as an opt-in pointer-modref
   diagnostic. It prints the top emitters whose pointee set contains the requested global,
   including the address node, fanout, occurrence count, and a small pointee sample.
+- Added `PANGS_PARTITION_PROFILE=1` / `PANGS_PARTITION_PROFILE_TOP=<n>` as an opt-in
+  Andersen partition diagnostic. It reports top interesting partitions by size, edge-family
+  counts, global/function samples, indirect-call and omega-seed context, top load/store hubs
+  with witnesses, and graph-cut component sizes for the main edge families.
 - Added a PAG pointer-modref reporting filter for precise storage addresses:
   - direct alloca storage accesses are local stack traffic and are not expanded to globals;
   - bare direct global symbols stay suppressed in pointer expansion, relying on `GlobalRef`
@@ -345,6 +349,10 @@ Implemented in this worktree:
   route through a summary cell for the base instead of root-wide field collapse. This preserves
   the existing conservative aliasing between dynamic and materialized constant fields, and
   profiles now report `unknown_fields` rather than legacy collapse counts.
+- Unknown modref rows now retain `pointee_globals` when the analysis knows the target set.
+  Stationarity uses that set target-specifically, and ignores external/omega writes with zero
+  named module-global pointees. Arbitrary-address sources such as `inttoptr` and high-fanout
+  fallbacks remain conservative blockers.
 - Taught InitVal to treat scalar pointer initializers to data globals as complete
   non-dispatch values. This covers OMP-style lowering where a scalar pointer global stores a
   temp `gep` of a string constant.
@@ -359,28 +367,48 @@ Final OMP validation:
 ```text
 cargo run -q -p pangs-cli -- analyze \
   /home/brk/pangs-corpus/_out_bc/exe-OMP__tree-O0.bc \
-  --out /tmp/omp_tree_final_verify \
+  --out /tmp/omp_tree_targeted_unknown_default \
   --stage andersen \
   --build-mode executable
 
 rg '"name":"file_pathsep".*"access":"mod"|"access":"mod".*"name":"file_pathsep"' \
-  /tmp/omp_tree_final_verify/modref.jsonl
+  /tmp/omp_tree_targeted_unknown_default/modref.jsonl
 # no output
 
 cargo run -q -p pangs-cli -- cc2json \
   /home/brk/pangs-corpus/_out_bc/exe-OMP__tree-O0.bc \
-  --json-out /tmp/omp_tree_final_verify.cc2json.json \
+  --json-out /tmp/omp_tree_targeted_unknown_default.cc2json.json \
   --entrypoints executable
 
 jq '.mutated_globals | index("file_pathsep"), length' \
-  /tmp/omp_tree_final_verify.cc2json.json
+  /tmp/omp_tree_targeted_unknown_default.cc2json.json
 # null
 # 48
 
-jq -r 'select(.global == "file_pathsep") | {global, complete_initval, stationary, reason}' \
-  /tmp/omp_tree_final_verify/stationarity.jsonl
+jq -r 'select(.global == "file_pathsep") |
+       {global, complete_initval, stationary, reason, writers:(.runtime_writers|length)}' \
+  /tmp/omp_tree_targeted_unknown_default/stationarity.jsonl
 # {"global":"file_pathsep","complete_initval":true,"stationary":false,
-#  "reason":"unknown_runtime_writer"}
+#  "reason":"exported_global","writers":0}
+```
+
+Partition diagnostic sample:
+
+```text
+PANGS_PARTITION_PROFILE=1 PANGS_PARTITION_PROFILE_TOP=1 \
+cargo run -q -p pangs-cli -- analyze \
+  /home/brk/pangs-corpus/_out_bc/exe-OMP__tree-O0.bc \
+  --out /tmp/omp_tree_partition_profile_top1 \
+  --stage andersen \
+  --build-mode executable
+
+# largest interesting partition:
+# root=9896 nodes=5012 edges=5500 cost=52686144 oversize=true
+# edge_counts=addr_of=354,assign=846,gep_const=568,gep_unknown=347,
+#             load=2493,memcpy=2,store=890
+# top hub includes class=11221 loads=2211 stores=844 with witnesses in split/...
+# cut=all_edges largest_node_components=[4939, 14, 12, 7, 7, 5, 5, 5]
+# cut=without_load_store largest_node_components=[98, 79, 43, 28, 28, 27, 23, 22]
 ```
 
 Final OMP metrics snapshot:
@@ -388,7 +416,7 @@ Final OMP metrics snapshot:
 ```json
 {
   "globals_with_complete_initval": 32,
-  "stationary_globals": 0,
+  "stationary_globals": 36,
   "mutable_globals_total": 86,
   "pointer_modref_high_fanout_fallbacks": 890,
   "pointer_modref_high_fanout_fallback_rows": 24920,
@@ -416,10 +444,10 @@ Remaining follow-ups from the original plan:
   not show the intended metric improvement. The remaining broad rows are dominated by
   fallback/imprecise partitions, so this change does not split the oversized OMP component by
   itself.
-- `file_pathsep` now has `complete_initval:true`, but it is not certified stationary because
-  remaining high-fanout unknown runtime writers conservatively block stationarity. Phase 3 is
-  still useful locally, but another partition/fallback precision pass is needed to reduce or
-  eliminate those unknown rows in this program.
+- `file_pathsep` now has `complete_initval:true` and zero runtime writers in stationarity.
+  It is still not certified stationary because the current executable policy treats exported
+  data symbols as externally mutable. Changing that policy is separate from the concrete
+  `mutated_globals` false positive.
 - The external-call solver model remains conservative; `strchr` and `strrchr` are still only
   known-readonly in the cc2json syntactic call-argument rule, not in the core PAG boundary
   model. The cc2json behavior is now regression-tested.

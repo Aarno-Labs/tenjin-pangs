@@ -596,6 +596,43 @@ fn m2_4_scalar_pointer_global_runtime_write_blocks_stationarity() {
 }
 
 #[test]
+fn m2_4_external_unknown_store_without_global_pointees_does_not_block_stationarity() {
+    let pir = Pir::from_path(m2_4_fixture(
+        "initval_scalar_pointer_global_external_unknown_store.pir.json",
+    ))
+    .unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert!(analysis.modrefs().iter().any(|mr| matches!(
+        mr.global,
+        pangs_api::GlobalTarget::Unknown(_)
+    ) && mr.detail.as_deref()
+        == Some("edge:store|omega:unknown_result|pointee_count=0")));
+
+    let sep = analysis.lookup_global("@Sep").unwrap();
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == sep)
+        .unwrap();
+    assert!(verdict.complete_initval);
+    assert!(verdict.stationary);
+    assert_eq!(verdict.reason, StationarityReason::Stationary);
+    assert!(verdict.runtime_writers.is_empty());
+    assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
+    assert_eq!(analysis.metrics().stationary_globals, 1);
+}
+
+#[test]
 fn m2_4_unknown_runtime_mod_blocks_stationarity() {
     let pir = Pir::from_path(m2_4_fixture(
         "initval_unknown_runtime_mod_blocks_stationarity.pir.json",
@@ -2774,7 +2811,7 @@ fn andersen_refines_spurious_external_store_address_modref() {
             && mr.witness.as_deref() == Some("driver@m5_store.c:8:1#0")
             && mr.detail.as_deref() == Some("edge:store|omega:steens_external|pointee_count=1")
             && mr.address_node.as_deref() == Some("val:driver:%gp")
-            && mr.pointee_globals.is_empty()
+            && mr.pointee_globals == vec!["@Table".to_string()]
     }));
     assert!(andersen.modrefs().iter().any(|mr| {
         mr.global == pangs_api::GlobalTarget::Name(table)

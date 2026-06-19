@@ -179,6 +179,58 @@ struct ScopeProfile {
     in_scope_memcpys: usize,
 }
 
+#[derive(Debug, Default)]
+struct PartitionProfile {
+    root: usize,
+    nodes: usize,
+    values: usize,
+    allocas: usize,
+    globals: Vec<String>,
+    functions: Vec<String>,
+    icalls: usize,
+    ext_classes: usize,
+    esc_classes: usize,
+    edge_counts: BTreeMap<&'static str, usize>,
+    omega_seed_counts: BTreeMap<&'static str, usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartitionCut {
+    None,
+    WithoutLoad,
+    WithoutStore,
+    WithoutLoadStore,
+    WithoutUnknownGep,
+    WithoutConstGep,
+    WithoutMemcpyMemset,
+}
+
+impl PartitionCut {
+    fn label(self) -> &'static str {
+        match self {
+            PartitionCut::None => "all_edges",
+            PartitionCut::WithoutLoad => "without_load",
+            PartitionCut::WithoutStore => "without_store",
+            PartitionCut::WithoutLoadStore => "without_load_store",
+            PartitionCut::WithoutUnknownGep => "without_unknown_gep",
+            PartitionCut::WithoutConstGep => "without_const_gep",
+            PartitionCut::WithoutMemcpyMemset => "without_memcpy_memset",
+        }
+    }
+
+    fn removes(self, family: &str) -> bool {
+        match self {
+            PartitionCut::None => false,
+            PartitionCut::WithoutLoad => family == "load",
+            PartitionCut::WithoutStore => family == "store",
+            PartitionCut::WithoutLoadStore => family == "load" || family == "store",
+            PartitionCut::WithoutUnknownGep => family == "gep_unknown",
+            PartitionCut::WithoutConstGep => family == "gep_const",
+            PartitionCut::WithoutMemcpyMemset => family == "memcpy",
+        }
+    }
+}
+
 /// One abstract object that can appear in a points-to set: a PAG object node, a lazily
 /// materialized field of one, or the single Ω object.
 type Cell = u32;
@@ -392,10 +444,353 @@ impl<'a> Refiner<'a> {
             .max()
             .unwrap_or(0) as usize;
 
+        if partition_profile_enabled() {
+            self.print_partition_profile(&interesting, &oversize, &nodes_in, &edges_in);
+        }
+
         for i in 0..self.n_base {
             let ap = self.ap_find(self.classes.class_of(NodeId(i as u32)));
             self.in_scope[i] = interesting.contains(&ap) && !oversize.contains(&ap);
         }
+    }
+
+    fn print_partition_profile(
+        &self,
+        interesting: &HashSet<usize>,
+        oversize: &HashSet<usize>,
+        nodes_in: &HashMap<usize, u64>,
+        edges_in: &HashMap<usize, u64>,
+    ) {
+        let top = partition_profile_top();
+        let mut profiles: HashMap<usize, PartitionProfile> = HashMap::new();
+        for node in &self.pag.nodes {
+            let class = self.classes.class_of(node.id);
+            let ap = ap_find_const(&self.ap_parent, class);
+            let profile = profiles.entry(ap).or_insert_with(|| PartitionProfile {
+                root: ap,
+                ..PartitionProfile::default()
+            });
+            profile.nodes += 1;
+            if self.classes.ext.get(class).copied().unwrap_or(false) {
+                profile.ext_classes += 1;
+            }
+            if self.classes.esc.get(class).copied().unwrap_or(false) {
+                profile.esc_classes += 1;
+            }
+            match &node.kind {
+                NodeKind::Value { .. } | NodeKind::Param { .. } | NodeKind::Return { .. } => {
+                    profile.values += 1;
+                }
+                NodeKind::Object { object, key, .. } => match object {
+                    ObjectKind::Alloca => profile.allocas += 1,
+                    ObjectKind::Global => profile.globals.push(key.clone()),
+                    ObjectKind::Function => profile.functions.push(key.clone()),
+                },
+            }
+        }
+        for callsite in &self.pag.callsites {
+            if callsite.kind != CallKind::Indirect {
+                continue;
+            }
+            let Some(operand) = callsite.operand else {
+                continue;
+            };
+            let ap = ap_find_const(&self.ap_parent, self.classes.class_of(operand));
+            profiles
+                .entry(ap)
+                .or_insert_with(|| PartitionProfile {
+                    root: ap,
+                    ..PartitionProfile::default()
+                })
+                .icalls += 1;
+        }
+        for edge in &self.pag.edges {
+            let ap = ap_find_const(&self.ap_parent, self.classes.class_of(edge.dst));
+            *profiles
+                .entry(ap)
+                .or_insert_with(|| PartitionProfile {
+                    root: ap,
+                    ..PartitionProfile::default()
+                })
+                .edge_counts
+                .entry(edge_family(edge.kind))
+                .or_insert(0) += 1;
+        }
+        for seed in &self.pag.omega_seeds {
+            let Some(ap) = self.omega_seed_partition(seed) else {
+                continue;
+            };
+            *profiles
+                .entry(ap)
+                .or_insert_with(|| PartitionProfile {
+                    root: ap,
+                    ..PartitionProfile::default()
+                })
+                .omega_seed_counts
+                .entry(omega_seed_kind_label(seed.kind))
+                .or_insert(0) += 1;
+        }
+
+        let mut interesting_profiles: Vec<_> = profiles
+            .values_mut()
+            .filter(|profile| interesting.contains(&profile.root))
+            .collect();
+        for profile in &mut interesting_profiles {
+            profile.globals.sort();
+            profile.globals.dedup();
+            profile.functions.sort();
+            profile.functions.dedup();
+        }
+        interesting_profiles.sort_by(|left, right| {
+            nodes_in
+                .get(&right.root)
+                .copied()
+                .unwrap_or(right.nodes as u64)
+                .cmp(
+                    &nodes_in
+                        .get(&left.root)
+                        .copied()
+                        .unwrap_or(left.nodes as u64),
+                )
+                .then_with(|| left.root.cmp(&right.root))
+        });
+
+        eprintln!(
+            "pangs partition profile: interesting={} oversize={} top={}",
+            interesting.len(),
+            oversize.len(),
+            top
+        );
+        for profile in interesting_profiles.into_iter().take(top) {
+            let n = nodes_in
+                .get(&profile.root)
+                .copied()
+                .unwrap_or(profile.nodes as u64);
+            let e = edges_in.get(&profile.root).copied().unwrap_or(0);
+            let cost = n.saturating_mul(n.saturating_add(e));
+            eprintln!(
+                "pangs partition profile: root={} nodes={} edges={} cost={} oversize={} values={} allocas={} globals={} functions={} icalls={} ext_classes={} esc_classes={}",
+                profile.root,
+                n,
+                e,
+                cost,
+                oversize.contains(&profile.root),
+                profile.values,
+                profile.allocas,
+                profile.globals.len(),
+                profile.functions.len(),
+                profile.icalls,
+                profile.ext_classes,
+                profile.esc_classes
+            );
+            eprintln!(
+                "pangs partition profile: root={} edge_counts={}",
+                profile.root,
+                format_counts(&profile.edge_counts)
+            );
+            if !profile.omega_seed_counts.is_empty() {
+                eprintln!(
+                    "pangs partition profile: root={} omega_seeds={}",
+                    profile.root,
+                    format_counts(&profile.omega_seed_counts)
+                );
+            }
+            eprintln!(
+                "pangs partition profile: root={} global_sample={:?} function_sample={:?}",
+                profile.root,
+                sample_strings(&profile.globals, 12),
+                sample_strings(&profile.functions, 12)
+            );
+            let hubs = self.partition_hubs(profile.root, 5);
+            if !hubs.is_empty() {
+                eprintln!(
+                    "pangs partition profile: root={} top_load_store_hubs={}",
+                    profile.root,
+                    hubs.join("; ")
+                );
+            }
+            let cuts = [
+                PartitionCut::None,
+                PartitionCut::WithoutLoad,
+                PartitionCut::WithoutStore,
+                PartitionCut::WithoutLoadStore,
+                PartitionCut::WithoutUnknownGep,
+                PartitionCut::WithoutConstGep,
+                PartitionCut::WithoutMemcpyMemset,
+            ];
+            for cut in cuts {
+                eprintln!(
+                    "pangs partition profile: root={} cut={} largest_node_components={:?}",
+                    profile.root,
+                    cut.label(),
+                    self.partition_cut_components(profile.root, cut, 8)
+                );
+            }
+            eprintln!(
+                "pangs partition profile: root={} cut=without_external_boundary largest_node_components=n/a(no explicit partition edge)",
+                profile.root
+            );
+            eprintln!(
+                "pangs partition profile: root={} cut=without_indirect_bindings largest_node_components=n/a(no explicit partition edge)",
+                profile.root
+            );
+        }
+    }
+
+    fn omega_seed_partition(&self, seed: &pangs_pag::OmegaSeed) -> Option<usize> {
+        match seed.target {
+            SeedTarget::Node(node) => {
+                Some(ap_find_const(&self.ap_parent, self.classes.class_of(node)))
+            }
+            SeedTarget::Callsite(callsite) => self
+                .pag
+                .callsites
+                .get(callsite.0 as usize)
+                .and_then(|callsite| callsite.operand)
+                .map(|node| ap_find_const(&self.ap_parent, self.classes.class_of(node))),
+        }
+    }
+
+    fn diagnostic_join_edge(&self, edge: &pangs_pag::Edge) -> Option<(usize, usize, &'static str)> {
+        let src = self.classes.class_of(edge.src);
+        let dst = self.classes.class_of(edge.dst);
+        match edge.kind {
+            EdgeKind::AddrOf => Some((self.classes.pointee[dst]?, src, "addr_of")),
+            EdgeKind::Assign => Some((src, dst, "assign")),
+            EdgeKind::Load => Some((dst, self.classes.pointee[src]?, "load")),
+            EdgeKind::Store => Some((self.classes.pointee[dst]?, src, "store")),
+            EdgeKind::Gep { byte_off } => Some((
+                self.classes.pointee[dst]?,
+                self.classes.pointee[src]?,
+                if byte_off.is_some() {
+                    "gep_const"
+                } else {
+                    "gep_unknown"
+                },
+            )),
+            EdgeKind::Memcpy { .. } => {
+                let dst_p = self.classes.pointee[dst]?;
+                let src_p = self.classes.pointee[src]?;
+                Some((
+                    self.classes.pointee[dst_p]?,
+                    self.classes.pointee[src_p]?,
+                    "memcpy",
+                ))
+            }
+        }
+    }
+
+    fn partition_hubs(&self, ap: usize, limit: usize) -> Vec<String> {
+        let mut counts: HashMap<usize, (usize, usize)> = HashMap::new();
+        let mut witnesses: HashMap<usize, Vec<String>> = HashMap::new();
+        for edge in &self.pag.edges {
+            let Some((left, right, family)) = self.diagnostic_join_edge(edge) else {
+                continue;
+            };
+            if ap_find_const(&self.ap_parent, left) != ap
+                || ap_find_const(&self.ap_parent, right) != ap
+            {
+                continue;
+            }
+            match family {
+                "load" => {
+                    counts.entry(right).or_default().0 += 1;
+                    push_limited_witness(&mut witnesses, right, edge_witness("load", edge), 3);
+                }
+                "store" => {
+                    counts.entry(left).or_default().1 += 1;
+                    push_limited_witness(&mut witnesses, left, edge_witness("store", edge), 3);
+                }
+                _ => {}
+            }
+        }
+        let mut hubs: Vec<_> = counts
+            .into_iter()
+            .filter(|(_, (loads, stores))| *loads > 0 || *stores > 0)
+            .collect();
+        hubs.sort_by(
+            |(left_root, (left_loads, left_stores)), (right_root, (right_loads, right_stores))| {
+                right_loads
+                    .saturating_add(*right_stores)
+                    .cmp(&left_loads.saturating_add(*left_stores))
+                    .then_with(|| left_root.cmp(right_root))
+            },
+        );
+        hubs.into_iter()
+            .take(limit)
+            .map(|(root, (loads, stores))| {
+                format!(
+                    "class={} loads={} stores={} labels={:?} witnesses={:?}",
+                    root,
+                    loads,
+                    stores,
+                    self.class_label_sample(root, 4),
+                    witnesses.remove(&root).unwrap_or_default()
+                )
+            })
+            .collect()
+    }
+
+    fn partition_cut_components(&self, ap: usize, cut: PartitionCut, limit: usize) -> Vec<usize> {
+        let mut nodes = BTreeSet::<u32>::new();
+        for node in &self.pag.nodes {
+            if ap_find_const(&self.ap_parent, self.classes.class_of(node.id)) == ap {
+                nodes.insert(node.id.0);
+            }
+        }
+        let mut adjacency: HashMap<u32, Vec<u32>> = HashMap::new();
+        for edge in &self.pag.edges {
+            let family = edge_family(edge.kind);
+            if cut.removes(family) {
+                continue;
+            }
+            let src_ap = ap_find_const(&self.ap_parent, self.classes.class_of(edge.src));
+            let dst_ap = ap_find_const(&self.ap_parent, self.classes.class_of(edge.dst));
+            if src_ap == ap && dst_ap == ap {
+                nodes.insert(edge.src.0);
+                nodes.insert(edge.dst.0);
+                adjacency.entry(edge.src.0).or_default().push(edge.dst.0);
+                adjacency.entry(edge.dst.0).or_default().push(edge.src.0);
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut sizes = Vec::new();
+        for &start in &nodes {
+            if !seen.insert(start) {
+                continue;
+            }
+            let mut stack = vec![start];
+            let mut size = 0usize;
+            while let Some(node) = stack.pop() {
+                size += 1;
+                if let Some(neighbors) = adjacency.get(&node) {
+                    for &next in neighbors {
+                        if seen.insert(next) {
+                            stack.push(next);
+                        }
+                    }
+                }
+            }
+            sizes.push(size);
+        }
+        sizes.sort_by(|left, right| right.cmp(left));
+        sizes.truncate(limit);
+        sizes
+    }
+
+    fn class_label_sample(&self, class: usize, limit: usize) -> Vec<String> {
+        let mut labels = self
+            .pag
+            .nodes
+            .iter()
+            .filter(|node| self.classes.class_of(node.id) == class)
+            .map(|node| node.label.clone())
+            .take(limit)
+            .collect::<Vec<_>>();
+        if labels.is_empty() && class >= self.n_base {
+            labels.push(format!("synthetic:{class}"));
+        }
+        labels
     }
 
     // ----- CG-refinement outer loop -----------------------------------------------------
@@ -926,6 +1321,88 @@ fn maps_equal(a: &HashMap<usize, Vec<usize>>, b: &HashMap<usize, Vec<usize>>) ->
 
 fn andersen_profile_enabled() -> bool {
     std::env::var_os("PANGS_ANDERSEN_PROFILE").is_some()
+}
+
+fn partition_profile_enabled() -> bool {
+    std::env::var_os("PANGS_PARTITION_PROFILE").is_some()
+}
+
+fn partition_profile_top() -> usize {
+    std::env::var("PANGS_PARTITION_PROFILE_TOP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(20)
+}
+
+fn ap_find_const(parent: &[usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        x = parent[x];
+    }
+    x
+}
+
+fn edge_family(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::AddrOf => "addr_of",
+        EdgeKind::Assign => "assign",
+        EdgeKind::Load => "load",
+        EdgeKind::Store => "store",
+        EdgeKind::Gep { byte_off: Some(_) } => "gep_const",
+        EdgeKind::Gep { byte_off: None } => "gep_unknown",
+        EdgeKind::Memcpy { .. } => "memcpy",
+    }
+}
+
+fn omega_seed_kind_label(kind: OmegaSeedKind) -> &'static str {
+    match kind {
+        OmegaSeedKind::ExportedSymbol => "exported_symbol",
+        OmegaSeedKind::ImportedSymbol => "imported_symbol",
+        OmegaSeedKind::ExternalCallBoundary => "external_call_boundary",
+        OmegaSeedKind::VarargCallBoundary => "vararg_call_boundary",
+        OmegaSeedKind::PtrToInt => "ptr_to_int",
+        OmegaSeedKind::IntToPtr => "int_to_ptr",
+        OmegaSeedKind::UnknownOperandEscape => "unknown_operand_escape",
+        OmegaSeedKind::UnknownResultExternal => "unknown_result_external",
+    }
+}
+
+fn format_counts(counts: &BTreeMap<&'static str, usize>) -> String {
+    counts
+        .iter()
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn sample_strings(values: &[String], limit: usize) -> Vec<String> {
+    values.iter().take(limit).cloned().collect()
+}
+
+fn push_limited_witness(
+    witnesses: &mut HashMap<usize, Vec<String>>,
+    root: usize,
+    witness: String,
+    limit: usize,
+) {
+    let samples = witnesses.entry(root).or_default();
+    if samples.len() < limit {
+        samples.push(witness);
+    }
+}
+
+fn edge_witness(kind: &str, edge: &pangs_pag::Edge) -> String {
+    let owner = match &edge.owner {
+        pangs_pag::Owner::Module => "module".to_string(),
+        pangs_pag::Owner::GlobalInit => "global_init".to_string(),
+        pangs_pag::Owner::Function(func) => func.clone(),
+    };
+    let loc = edge
+        .loc
+        .as_ref()
+        .map(|loc| format!("{}:{}:{}", loc.file, loc.line, loc.col))
+        .unwrap_or_else(|| "noloc".to_string());
+    format!("{}:{}:{}->{}", kind, owner, loc, edge.id.0)
 }
 
 /// One stateless inclusion solve over a fixed constraint set.
