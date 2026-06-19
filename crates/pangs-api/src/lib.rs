@@ -3548,6 +3548,7 @@ fn flush_local_pointer_access_rows(
                 access,
                 row.witness,
                 summary,
+                modref_stationarity_pointees(summary, key.suppress_direct_symbol),
                 fanout,
                 row.count,
                 ModRefSourcePhase::PagPointer,
@@ -3576,6 +3577,7 @@ fn push_high_fanout_pointer_modref_fallback(
     access: Access,
     witness: Option<String>,
     summary: &ModRefNodeSummary<'_>,
+    stationarity_pointee_globals: Rc<[GlobalId]>,
     fanout: usize,
     occurrences: u64,
     phase: ModRefSourcePhase,
@@ -3600,10 +3602,27 @@ fn push_high_fanout_pointer_modref_fallback(
             )),
             address_node: Some(summary.label.to_string()),
             pointee_globals: Vec::new(),
-            stationarity_pointee_globals: None,
+            stationarity_pointee_globals: Some(stationarity_pointee_globals),
         },
         Some(phase),
     );
+}
+
+fn modref_stationarity_pointees(
+    summary: &ModRefNodeSummary<'_>,
+    suppress_direct_symbol: bool,
+) -> Rc<[GlobalId]> {
+    if !suppress_direct_symbol || summary.direct_symbol_global.is_none() {
+        return Rc::clone(&summary.pointee_global_ids);
+    }
+    Rc::from(
+        summary
+            .pointee_global_ids
+            .iter()
+            .copied()
+            .filter(|&gid| summary.direct_symbol_global != Some(gid))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn flush_local_pointer_modref_rows(
@@ -3849,6 +3868,10 @@ fn push_pointer_modrefs_from_pag(
                         pointer_access.access,
                         witness.clone(),
                         summary,
+                        modref_stationarity_pointees(
+                            summary,
+                            pointer_access.suppress_direct_symbol,
+                        ),
                         fanout,
                         1,
                         phase,
@@ -4012,7 +4035,10 @@ fn push_pointer_memset_modrefs_from_pir(
                         )),
                         address_node: Some(label),
                         pointee_globals: Vec::new(),
-                        stationarity_pointee_globals: None,
+                        stationarity_pointee_globals: Some(global_ids_for_keys(
+                            resolution.pointee_globals.iter(),
+                            global_lookup,
+                        )),
                     },
                     Some(ModRefSourcePhase::MemsetMemcpy),
                 );

@@ -109,6 +109,20 @@ fn mutated_globals(pir: &Pir, analysis: &Analysis) -> Vec<String> {
             GlobalTarget::Name(id) => {
                 mutated.insert(analysis.globals()[*id].key.clone());
             }
+            GlobalTarget::Unknown(_)
+                if mr
+                    .stationarity_pointee_globals
+                    .as_deref()
+                    .is_some_and(|ids| !ids.is_empty()) =>
+            {
+                mutated.extend(
+                    mr.stationarity_pointee_globals
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|&id| analysis.globals()[id].key.clone()),
+                );
+            }
             GlobalTarget::Unknown(_) if !mr.pointee_globals.is_empty() => {
                 mutated.extend(mr.pointee_globals.iter().cloned());
             }
@@ -1556,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn cc2json_high_fanout_unknown_store_conservatively_mutates_defined_globals() {
+    fn cc2json_high_fanout_unknown_store_uses_retained_target_set() {
         let fixture = workspace_root().join("fixtures/synthetic/m1_6/high_fanout_modref.pir.json");
         let pir = Pir::from_path(&fixture).unwrap();
 

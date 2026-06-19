@@ -149,7 +149,8 @@
     { "key": "@G13", "mutable": true },
     { "key": "@G14", "mutable": true },
     { "key": "@G15", "mutable": true },
-    { "key": "@G16", "mutable": true }
+    { "key": "@G16", "mutable": true },
+    { "key": "@Untouched", "mutable": true }
   ],
   "global_init": [
     { "kind": "global_ref", "global": "@G00", "access": "mod" },
@@ -168,6 +169,7 @@
     { "kind": "global_ref", "global": "@G13", "access": "mod" },
     { "kind": "global_ref", "global": "@G14", "access": "mod" },
     { "kind": "global_ref", "global": "@G15", "access": "mod" },
-    { "kind": "global_ref", "global": "@G16", "access": "mod" }
+    { "kind": "global_ref", "global": "@G16", "access": "mod" },
+    { "kind": "global_ref", "global": "@Untouched", "access": "mod" }
   ]
 }
