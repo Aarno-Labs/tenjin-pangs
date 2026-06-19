@@ -31,7 +31,7 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = 1_000, hide = true)]
+        #[arg(long, default_value_t = 10_000, hide = true)]
         partition_budget: u64,
         #[arg(long)]
         validate: bool,
@@ -48,7 +48,7 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = 1_000, hide = true)]
+        #[arg(long, default_value_t = 10_000, hide = true)]
         partition_budget: u64,
     },
     DumpPir {
@@ -89,7 +89,7 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = 1_000, hide = true)]
+        #[arg(long, default_value_t = 10_000, hide = true)]
         partition_budget: u64,
     },
     /// Run the M2.7 pre-analysis ablation: M1 baseline, B2 only, B1 only, and both.
@@ -101,7 +101,7 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = 1_000, hide = true)]
+        #[arg(long, default_value_t = 10_000, hide = true)]
         partition_budget: u64,
     },
     /// Instrument every indirect call in a module, writing an instrumented `.bc`.
