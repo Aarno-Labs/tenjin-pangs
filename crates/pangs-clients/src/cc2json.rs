@@ -178,25 +178,37 @@ fn defined_globals(pir: &Pir) -> BTreeSet<&str> {
 }
 
 /// Globals whose address is passed to a non-readonly call-argument position (cclyzer's
-/// mutation-via-(external-)function rule). Only direct calls are scanned. Returns full global
-/// names; the caller drops `.`-prefixed ones.
+/// mutation-via-(external-)function rule). Direct calls use the ported readonly table; indirect
+/// calls have no callee identity here, so any global-address argument is conservatively mutated.
+/// Returns full global names; the caller drops `.`-prefixed ones.
 fn mutated_via_call_args(pir: &Pir, global_names: &BTreeSet<&str>) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for func in &pir.functions {
         let mut resolver = BaseGlobalResolver::new(func);
         for stmt in &func.body {
-            let Stmt::CallDirect { callee, args, .. } = stmt else {
-                continue;
-            };
-            for (index, arg) in args.iter().enumerate() {
-                if known_readonly_arg(callee, index) {
-                    continue;
-                }
-                if let Some(base) = resolver.resolve_arg_global(arg) {
-                    if global_names.contains(base.as_str()) {
-                        out.insert(base);
+            match stmt {
+                Stmt::CallDirect { callee, args, .. } => {
+                    for (index, arg) in args.iter().enumerate() {
+                        if known_readonly_arg(callee, index) {
+                            continue;
+                        }
+                        if let Some(base) = resolver.resolve_arg_global(arg) {
+                            if global_names.contains(base.as_str()) {
+                                out.insert(base);
+                            }
+                        }
                     }
                 }
+                Stmt::CallIndirect { args, .. } => {
+                    for arg in args {
+                        if let Some(base) = resolver.resolve_arg_global(arg) {
+                            if global_names.contains(base.as_str()) {
+                                out.insert(base);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -214,50 +226,70 @@ fn first_global_symbol(operand: &str) -> Option<String> {
 }
 
 /// Whether argument `index` of `callee` is a known read-only pointer position. Ported from the
-/// `known_readonly_arg` rules in escape-analysis.dl (substring matches on the callee name), plus
-/// `__assert_fail` (all positions read-only) so the `__PRETTY_FUNCTION__`/`__func__` strings it
-/// receives are not treated as mutated.
+/// `known_readonly_arg` rules in escape-analysis.dl, plus `__assert_fail` (all positions
+/// read-only) so the `__PRETTY_FUNCTION__`/`__func__` strings it receives are not treated as
+/// mutated. Match exact libc names and anchored LLVM intrinsic prefixes; substring matching would
+/// incorrectly classify unrelated writable callees whose names merely contain a readonly helper.
 fn known_readonly_arg(callee: &str, index: usize) -> bool {
-    let c = |needle: &str| callee.contains(needle);
+    let callee = normalized_callee_name(callee);
     // assert helpers: all arguments are read-only.
-    if c("__assert_fail") || c("__assert_perror_fail") || c("__assert_rtn") {
+    if matches!(
+        callee,
+        "__assert_fail" | "__assert_perror_fail" | "__assert_rtn"
+    ) {
         return true;
     }
     // memcpy/memmove source (arg 1), incl. LLVM intrinsics.
-    if (c("memcpy") || c("memmove") || c("llvm.memcpy.p0") || c("llvm.memmove.p0")) && index == 1 {
+    if (matches!(
+        callee,
+        "memcpy" | "memmove" | "__memcpy_chk" | "__memmove_chk"
+    ) || callee.starts_with("llvm.memcpy.")
+        || callee.starts_with("llvm.memmove."))
+        && index == 1
+    {
         return true;
     }
     // strcpy/strncpy source (arg 1).
-    if (c("strcpy") || c("strncpy")) && index == 1 {
+    if matches!(
+        callee,
+        "strcpy" | "strncpy" | "__strcpy_chk" | "__strncpy_chk"
+    ) && index == 1
+    {
         return true;
     }
     // string search/compare: args 0,1,2 read-only.
-    if (c("strlen")
-        || c("strcmp")
-        || c("strncmp")
-        || c("strchr")
-        || c("strrchr")
-        || c("strstr")
-        || c("strcspn")
-        || c("strspn")
-        || c("strpbrk"))
-        && index <= 2
+    if matches!(
+        callee,
+        "strlen"
+            | "strcmp"
+            | "strncmp"
+            | "strchr"
+            | "strrchr"
+            | "strstr"
+            | "strcspn"
+            | "strspn"
+            | "strpbrk"
+    ) && index <= 2
     {
         return true;
     }
     // memory search: memchr/memcmp args 0,1,2.
-    if (c("memchr") || c("memcmp")) && index <= 2 {
+    if matches!(callee, "memchr" | "memcmp") && index <= 2 {
         return true;
     }
     // bsearch: key/array (args 0,1).
-    if c("bsearch") && index <= 1 {
+    if callee == "bsearch" && index <= 1 {
         return true;
     }
     // llvm.objectsize: arg 0.
-    if c("llvm.objectsize.") && index == 0 {
+    if callee.starts_with("llvm.objectsize.") && index == 0 {
         return true;
     }
     false
+}
+
+fn normalized_callee_name(callee: &str) -> &str {
+    callee.strip_prefix('@').unwrap_or(callee)
 }
 
 // ---------------------------------------------------------------------------
@@ -1412,12 +1444,20 @@ mod tests {
                         dest: None,
                         loc: None,
                     },
+                    Stmt::CallDirect {
+                        callee: "not_strchr_but_writes".to_string(),
+                        sig: void_sig(),
+                        args: vec!["@SubstringMutated".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
                 ],
             }],
             globals: vec![
                 test_global("ReadonlyA"),
                 test_global("ReadonlyB"),
                 test_global("Mutated"),
+                test_global("SubstringMutated"),
             ],
             global_init: vec![
                 Stmt::GlobalRef {
@@ -1435,6 +1475,11 @@ mod tests {
                     access: Access::Mod,
                     loc: None,
                 },
+                Stmt::GlobalRef {
+                    global: "SubstringMutated".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                },
             ],
         };
 
@@ -1447,7 +1492,65 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(
             json["mutated_globals"],
-            serde_json::json!(["Mutated"]),
+            serde_json::json!(["Mutated", "SubstringMutated"]),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn cc2json_indirect_call_args_are_conservatively_mutated_globals() {
+        let pir = Pir {
+            module: "indirect_global_arg".to_string(),
+            source: None,
+            lowering: Default::default(),
+            functions: vec![Func {
+                key: "main".to_string(),
+                sig: void_sig(),
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: true,
+                address_taken: false,
+                body: vec![Stmt::CallIndirect {
+                    operand: "%fp".to_string(),
+                    sig: void_sig(),
+                    args: vec![
+                        "@IndirectMutated".to_string(),
+                        "i8* bitcast (@IndirectExprMutated to i8*)".to_string(),
+                    ],
+                    dest: None,
+                    loc: None,
+                }],
+            }],
+            globals: vec![
+                test_global("IndirectMutated"),
+                test_global("IndirectExprMutated"),
+            ],
+            global_init: vec![
+                Stmt::GlobalRef {
+                    global: "IndirectMutated".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                },
+                Stmt::GlobalRef {
+                    global: "IndirectExprMutated".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                },
+            ],
+        };
+
+        let rendered = run_cc2json(
+            &pir,
+            Path::new("indirect_global_arg.pir.json"),
+            &cc2json_test_opts(),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            json["mutated_globals"],
+            serde_json::json!(["IndirectMutated", "IndirectExprMutated"]),
             "{rendered}"
         );
     }
