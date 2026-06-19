@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use pangs_api::{Analysis, BuildMode, CallKind, Callee, Caller, FuncId, GlobalTarget, Opts, Stage};
 use pangs_pag::{Pag, PagOpts};
 use pangs_pir::{Access, Func, Loc, Pir, Stmt};
-use pangs_solve::{solve_steensgaard_with_points_to, SolveResult};
+use pangs_solve::{solve_steensgaard_with_global_points_to, SolveResult};
 
 /// Options for the `cc2json` subcommand. `entrypoints`/`build_mode` follow pangs naming
 /// (library = all functions reachable; executable = reachable from `main`). `internalize_globals`
@@ -52,7 +52,7 @@ pub fn run_cc2json(pir: &Pir, _input_path: &Path, opts: &Cc2jsonOpts) -> Result<
             ..PagOpts::default()
         },
     );
-    let solved = solve_steensgaard_with_points_to(pir, &pag, opts.build_mode.into());
+    let solved = solve_steensgaard_with_global_points_to(pir, &pag, opts.build_mode.into());
 
     let source = pir.source.clone().unwrap_or_default();
 

@@ -3,7 +3,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Instant;
 
-use pangs_pag::{BuildMode, CallKind, NodeId, NodeKind, OmegaSeedKind, Pag, SeedTarget};
+use pangs_pag::{
+    BuildMode, CallKind, NodeId, NodeKind, ObjectKind, OmegaSeedKind, Pag, SeedTarget,
+};
 use pangs_pir::{fsa_compatible, Pir, Signature};
 use serde::{Deserialize, Serialize};
 
@@ -225,12 +227,30 @@ pub fn solve_steensgaard(pir: &Pir, pag: &Pag, build_mode: BuildMode) -> SolveRe
     solver.finish()
 }
 
-/// Like [`solve_steensgaard`] but also materializes `SolveResult::node_points_to` (allocation-level
-/// points-to). Used by the cc2json client; the normal pipeline uses `solve_steensgaard` and pays
-/// nothing for this.
-pub fn solve_steensgaard_with_points_to(pir: &Pir, pag: &Pag, build_mode: BuildMode) -> SolveResult {
+/// Like [`solve_steensgaard`] but also materializes `SolveResult::node_points_to` for every PAG
+/// node. Diagnostic clients can use this for full allocation-level points-to; the normal pipeline
+/// uses `solve_steensgaard` and pays nothing for this.
+pub fn solve_steensgaard_with_points_to(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: BuildMode,
+) -> SolveResult {
     let mut solver = Solver::new(pir, pag, build_mode);
-    solver.want_points_to = true;
+    solver.points_to_materialization = PointsToMaterialization::AllNodes;
+    solver.run();
+    solver.finish()
+}
+
+/// Like [`solve_steensgaard_with_points_to`] but only materializes object-node points-to for
+/// globals. This is enough for cc2json's escape fixpoint (`ptr_points_to` from global memory
+/// objects) without building allocation-level points-to sets for every SSA/PAG node.
+pub fn solve_steensgaard_with_global_points_to(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: BuildMode,
+) -> SolveResult {
+    let mut solver = Solver::new(pir, pag, build_mode);
+    solver.points_to_materialization = PointsToMaterialization::GlobalObjects;
     solver.run();
     solver.finish()
 }
@@ -327,9 +347,16 @@ struct Solver<'a> {
     profile_started: Instant,
     profile_interval_candidate_pairs: u64,
     next_profile_candidate_pairs: u64,
-    /// When set, `finish` materializes `SolveResult::node_points_to` (the cc2json client needs
-    /// allocation-level points-to). Off for the normal `analyze` pipeline so it pays nothing.
-    want_points_to: bool,
+    /// Controls optional `SolveResult::node_points_to` materialization. Off for the normal
+    /// `analyze` pipeline so it pays nothing.
+    points_to_materialization: PointsToMaterialization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointsToMaterialization {
+    None,
+    AllNodes,
+    GlobalObjects,
 }
 
 #[derive(Debug, Clone)]
@@ -475,7 +502,7 @@ impl<'a> Solver<'a> {
             profile_started: Instant::now(),
             profile_interval_candidate_pairs: steens_profile_interval_candidate_pairs(),
             next_profile_candidate_pairs: steens_profile_interval_candidate_pairs(),
-            want_points_to: false,
+            points_to_materialization: PointsToMaterialization::None,
         }
     }
 
@@ -794,10 +821,9 @@ impl<'a> Solver<'a> {
         self.metrics.rounds = 1;
         let metrics = self.metrics.clone();
 
-        let node_points_to = if self.want_points_to {
-            self.materialize_points_to()
-        } else {
-            BTreeMap::new()
+        let node_points_to = match self.points_to_materialization {
+            PointsToMaterialization::None => BTreeMap::new(),
+            mode => self.materialize_points_to(mode),
         };
 
         SolveResult {
@@ -814,10 +840,24 @@ impl<'a> Solver<'a> {
     /// `global_objs ∪ fn_objs` of `find(pointee(class_of(node)))`. Object nodes thus expose
     /// `ptr_points_to` (what a memory cell holds); value/param/return nodes expose
     /// `operand_points_to`. Memoized per pointee-class root, so this is O(#nodes).
-    fn materialize_points_to(&mut self) -> BTreeMap<String, BTreeSet<String>> {
+    fn materialize_points_to(
+        &mut self,
+        mode: PointsToMaterialization,
+    ) -> BTreeMap<String, BTreeSet<String>> {
         let mut by_pointee_root: Vec<Option<BTreeSet<String>>> = vec![None; self.classes.len()];
         let mut out = BTreeMap::new();
         for node in &self.pag.nodes {
+            if mode == PointsToMaterialization::GlobalObjects
+                && !matches!(
+                    node.kind,
+                    NodeKind::Object {
+                        object: ObjectKind::Global,
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
             let root = self.find(node.id.0 as usize);
             let Some(pointee) = self.classes[root].pointee else {
                 continue;
@@ -1502,6 +1542,15 @@ mod tests {
             .node_points_to
             .values()
             .any(|allocs| allocs.contains("cb")));
+
+        let with_global_pt =
+            solve_steensgaard_with_global_points_to(&pir, &pag, BuildMode::Library);
+        assert!(!with_global_pt.node_points_to.is_empty());
+        assert!(with_global_pt
+            .node_points_to
+            .keys()
+            .all(|key| key.starts_with("obj:global:")));
+        assert!(with_global_pt.node_points_to.len() <= with_pt.node_points_to.len());
     }
 
     #[test]
