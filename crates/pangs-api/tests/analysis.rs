@@ -596,6 +596,37 @@ fn m2_4_scalar_pointer_global_runtime_write_blocks_stationarity() {
 }
 
 #[test]
+fn m2_4_value_escape_does_not_block_scalar_pointer_global_stationarity() {
+    let pir = Pir::from_path(m2_4_fixture(
+        "initval_scalar_pointer_global_value_escape.pir.json",
+    ))
+    .unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let sep = analysis.lookup_global("@Sep").unwrap();
+    assert_eq!(analysis.globals()[sep].escape, EscapeStatus::External);
+    assert!(analysis.globals()[sep].stationary);
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == sep)
+        .unwrap();
+    assert!(verdict.complete_initval);
+    assert!(verdict.stationary);
+    assert_eq!(verdict.reason, StationarityReason::Stationary);
+    assert!(verdict.runtime_writers.is_empty());
+}
+
+#[test]
 fn m2_4_external_unknown_store_without_global_pointees_does_not_block_stationarity() {
     let pir = Pir::from_path(m2_4_fixture(
         "initval_scalar_pointer_global_external_unknown_store.pir.json",

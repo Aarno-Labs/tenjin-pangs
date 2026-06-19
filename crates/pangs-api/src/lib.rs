@@ -574,6 +574,7 @@ impl Analysis {
 
         let mut global_lookup = HashMap::new();
         let mut globals = Vec::new();
+        let mut external_storage_globals = BTreeSet::new();
         for global in &module.globals {
             if is_ignored_client_global(&global.key) {
                 continue;
@@ -583,6 +584,9 @@ impl Analysis {
                 return Err(AnalysisError::DuplicateGlobal(global.key.clone()));
             }
             let exported = is_exported_global(global.exported, &global.key, opts);
+            if exported {
+                external_storage_globals.insert(global.key.clone());
+            }
             globals.push(GlobalInfo {
                 key: global.key.clone(),
                 file: global.file.clone(),
@@ -1084,6 +1088,12 @@ impl Analysis {
                         global.never_written = state.never_written;
                     }
                 }
+                mark_external_storage_globals(
+                    &mut external_storage_globals,
+                    module,
+                    &global_lookup,
+                    &solved.nodes,
+                );
                 solver_postprocess_us = solver_postprocess_started.elapsed().as_micros() as u64;
 
                 let pointer_modref_started = Instant::now();
@@ -1130,6 +1140,7 @@ impl Analysis {
                 &initval_report.complete_globals,
                 &initval_report.diagnostics,
                 &global_lookup,
+                &external_storage_globals,
                 &modrefs,
             )
         };
@@ -1702,9 +1713,11 @@ fn stationarity_verdicts_from_modrefs(
     complete_globals: &BTreeSet<String>,
     initval_diagnostics: &BTreeMap<String, Vec<InitValDiagnostic>>,
     global_lookup: &HashMap<String, GlobalId>,
+    external_storage_globals: &BTreeSet<String>,
     modrefs: &[ModRef],
 ) -> (BTreeSet<String>, Vec<StationarityVerdict>) {
     let mut runtime_writers = BTreeMap::<String, Vec<StationarityWriter>>::new();
+    let mut target_unknown_writers = BTreeMap::<String, Vec<StationarityWriter>>::new();
     let mut unknown_writers = Vec::<StationarityWriter>::new();
     for mr in modrefs {
         if mr.access != Access::Mod {
@@ -1726,7 +1739,7 @@ fn stationarity_verdicts_from_modrefs(
                 let writer = stationarity_writer_from_modref(mr);
                 for &gid in mr.stationarity_pointee_globals.as_deref().unwrap_or(&[]) {
                     if let Some(global) = globals.get(gid.0 as usize) {
-                        runtime_writers
+                        target_unknown_writers
                             .entry(global.key.clone())
                             .or_default()
                             .push(writer.clone());
@@ -1737,7 +1750,7 @@ fn stationarity_verdicts_from_modrefs(
                 let writer = stationarity_writer_from_modref(mr);
                 for global_key in &mr.pointee_globals {
                     if global_lookup.contains_key(global_key) {
-                        runtime_writers
+                        target_unknown_writers
                             .entry(global_key.clone())
                             .or_default()
                             .push(writer.clone());
@@ -1751,6 +1764,10 @@ fn stationarity_verdicts_from_modrefs(
         }
     }
     for writers in runtime_writers.values_mut() {
+        writers.sort_by(stationarity_writer_cmp);
+        writers.dedup_by(|left, right| stationarity_writer_cmp(left, right) == Ordering::Equal);
+    }
+    for writers in target_unknown_writers.values_mut() {
         writers.sort_by(stationarity_writer_cmp);
         writers.dedup_by(|left, right| stationarity_writer_cmp(left, right) == Ordering::Equal);
     }
@@ -1786,7 +1803,7 @@ fn stationarity_verdicts_from_modrefs(
         let mut writers = Vec::new();
         let reason = if !complete_initval
             && !(absence_only_initval
-                && global_info.escape == EscapeStatus::Module
+                && !external_storage_globals.contains(&global.key)
                 && unknown_writers.is_empty()
                 && !runtime_writers.contains_key(&global.key))
         {
@@ -1794,7 +1811,10 @@ fn stationarity_verdicts_from_modrefs(
         } else if !unknown_writers.is_empty() {
             writers.extend(unknown_writers.iter().cloned());
             StationarityReason::UnknownRuntimeWriter
-        } else if global_info.escape == EscapeStatus::External {
+        } else if let Some(known_unknown_writers) = target_unknown_writers.get(&global.key) {
+            writers.extend(known_unknown_writers.iter().cloned());
+            StationarityReason::UnknownRuntimeWriter
+        } else if external_storage_globals.contains(&global.key) {
             StationarityReason::ExportedGlobal
         } else if let Some(known_writers) = runtime_writers.get(&global.key) {
             writers.extend(known_writers.iter().cloned());
@@ -1936,6 +1956,33 @@ fn is_exported_func(marked: bool, key: &str, opts: &Opts) -> bool {
 
 fn is_exported_global(marked: bool, key: &str, opts: &Opts) -> bool {
     opts.exports.contains(key) || (opts.build_mode == BuildMode::Library && marked)
+}
+
+fn mark_external_storage_globals(
+    external_storage_globals: &mut BTreeSet<String>,
+    module: &Pir,
+    global_lookup: &HashMap<String, GlobalId>,
+    nodes: &BTreeMap<String, NodeResolution>,
+) {
+    for global in &module.globals {
+        if !global_lookup.contains_key(&global.key) {
+            continue;
+        }
+        if global_symbol_labels(&global.key)
+            .iter()
+            .any(|label| nodes.get(label).is_some_and(|node| node.external))
+        {
+            external_storage_globals.insert(global.key.clone());
+        }
+    }
+}
+
+fn global_symbol_labels(key: &str) -> Vec<String> {
+    let mut labels = vec![format!("sym:global:{key}")];
+    if !key.starts_with('@') {
+        labels.push(format!("sym:global:@{key}"));
+    }
+    labels
 }
 
 fn is_ignored_client_global(key: &str) -> bool {
@@ -3546,7 +3593,7 @@ fn push_high_fanout_pointer_modref_fallback(
             )),
             address_node: Some(summary.label.to_string()),
             pointee_globals: Vec::new(),
-            stationarity_pointee_globals: Some(Rc::clone(&summary.pointee_global_ids)),
+            stationarity_pointee_globals: None,
         },
         Some(phase),
     );
@@ -3910,10 +3957,7 @@ fn push_pointer_memset_modrefs_from_pir(
                         )),
                         address_node: Some(label),
                         pointee_globals: Vec::new(),
-                        stationarity_pointee_globals: Some(global_ids_for_keys(
-                            resolution.pointee_globals.iter(),
-                            global_lookup,
-                        )),
+                        stationarity_pointee_globals: None,
                     },
                     Some(ModRefSourcePhase::MemsetMemcpy),
                 );
