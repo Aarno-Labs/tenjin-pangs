@@ -71,7 +71,7 @@ pub fn run_cc2json(pir: &Pir, _input_path: &Path, opts: &Cc2jsonOpts) -> Result<
     let source = pir.source.clone().unwrap_or_default();
 
     let mutated = mutated_globals(pir, &analysis);
-    let escaped = escaped_globals(pir, &solved, opts.internalize_globals);
+    let escaped = escaped_globals(pir, &solved, opts.internalize_globals, opts.build_mode);
 
     let mut json = JsonBuilder::new();
     write_cc2json(&mut json, pir, &analysis, &source, &mutated, &escaped);
@@ -110,10 +110,12 @@ fn mutated_globals(pir: &Pir, analysis: &Analysis) -> Vec<String> {
                 mutated.insert(analysis.globals()[*id].key.clone());
             }
             GlobalTarget::Unknown(_)
-                if mr
-                    .stationarity_pointee_globals
-                    .as_deref()
-                    .is_some_and(|ids| !ids.is_empty()) =>
+                if !high_fanout_modref_has_string_pointee(mr)
+                    && !unknown_modref_has_unrendered_pointees(mr)
+                    && mr
+                        .stationarity_pointee_globals
+                        .as_deref()
+                        .is_some_and(|ids| !ids.is_empty()) =>
             {
                 mutated.extend(
                     mr.stationarity_pointee_globals
@@ -123,7 +125,10 @@ fn mutated_globals(pir: &Pir, analysis: &Analysis) -> Vec<String> {
                         .map(|&id| analysis.globals()[id].key.clone()),
                 );
             }
-            GlobalTarget::Unknown(_) if !mr.pointee_globals.is_empty() => {
+            GlobalTarget::Unknown(_)
+                if !mr.pointee_globals.is_empty()
+                    && !unknown_modref_has_unrendered_pointees(mr) =>
+            {
                 mutated.extend(mr.pointee_globals.iter().cloned());
             }
             GlobalTarget::Unknown(_) if unknown_modref_may_touch_module_global(mr) => {
@@ -158,18 +163,33 @@ fn mutated_globals(pir: &Pir, analysis: &Analysis) -> Vec<String> {
 
 fn unknown_modref_may_touch_module_global(mr: &pangs_api::ModRef) -> bool {
     if !mr.pointee_globals.is_empty() {
-        return true;
+        return !unknown_modref_has_unrendered_pointees(mr);
     }
     let Some(detail) = mr.detail.as_deref() else {
         return true;
     };
     if detail.starts_with("high_fanout_pointer_modref:") {
+        if detail.contains("pointee_has_string=true") {
+            return false;
+        }
         return true;
     }
     if detail.contains("omega:inttoptr") || detail.contains("omega:ptrtoint_escape") {
         return true;
     }
     detail_pointee_count(detail).is_some_and(|count| count > 0)
+}
+
+fn high_fanout_modref_has_string_pointee(mr: &pangs_api::ModRef) -> bool {
+    mr.detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("pointee_has_string=true"))
+}
+
+fn unknown_modref_has_unrendered_pointees(mr: &pangs_api::ModRef) -> bool {
+    mr.detail.as_deref().is_some_and(|detail| {
+        detail_pointee_count(detail).is_some_and(|count| count > mr.pointee_globals.len())
+    })
 }
 
 fn detail_pointee_count(detail: &str) -> Option<usize> {
@@ -328,22 +348,28 @@ fn normalized_callee_name(callee: &str) -> &str {
 /// DIVERGENCE: escape that flows only through *aliased* (memory-indirect) stores or through
 /// escaping external-call arguments is not modeled — pangs may under-report there relative to
 /// cclyzer's points-to-based analysis. Names are `.`-filtered, ordered global-then-function.
-fn escaped_globals(pir: &Pir, solved: &SolveResult, internalize_globals: bool) -> Vec<String> {
+fn escaped_globals(
+    pir: &Pir,
+    solved: &SolveResult,
+    internalize_globals: bool,
+    build_mode: BuildMode,
+) -> Vec<String> {
     let global_names: BTreeSet<&str> = pir.globals.iter().map(|g| g.key.as_str()).collect();
     let func_names: BTreeSet<&str> = pir.functions.iter().map(|f| f.key.as_str()).collect();
     let is_known = |n: &str| global_names.contains(n) || func_names.contains(n);
     let defined = defined_globals(pir);
 
     // Externally-accessible base globals (external-linkage, defined here). With internalize, none.
-    let externally_visible: Vec<&str> = if internalize_globals {
-        Vec::new()
-    } else {
-        pir.globals
-            .iter()
-            .filter(|g| g.exported && defined.contains(g.key.as_str()))
-            .map(|g| g.key.as_str())
-            .collect()
-    };
+    let externally_visible: Vec<&str> =
+        if internalize_globals || build_mode == BuildMode::Executable {
+            Vec::new()
+        } else {
+            pir.globals
+                .iter()
+                .filter(|g| g.exported && defined.contains(g.key.as_str()))
+                .map(|g| g.key.as_str())
+                .collect()
+        };
 
     let mut escaped: BTreeSet<String> = BTreeSet::new();
 
@@ -1586,6 +1612,144 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cc2json_high_fanout_with_string_pointee_is_not_mutation_evidence() {
+        let mut body = vec![Stmt::Alloca {
+            dest: "%slot".to_string(),
+            ty: "i8*".to_string(),
+            loc: None,
+        }];
+        for idx in 0..=16 {
+            body.push(Stmt::Store {
+                address: "%slot".to_string(),
+                value: format!("@G{idx:02}"),
+                loc: None,
+            });
+        }
+        body.push(Stmt::Store {
+            address: "%slot".to_string(),
+            value: "@.str.collapse".to_string(),
+            loc: None,
+        });
+        body.push(Stmt::Load {
+            dest: "%p".to_string(),
+            address: "%slot".to_string(),
+            loc: None,
+        });
+        body.push(Stmt::Store {
+            address: "%p".to_string(),
+            value: "%x".to_string(),
+            loc: None,
+        });
+
+        let mut globals = (0..=16)
+            .map(|idx| test_global(&format!("@G{idx:02}")))
+            .collect::<Vec<_>>();
+        globals.push(Global {
+            key: "@.str.collapse".to_string(),
+            file: None,
+            line: None,
+            is_const: true,
+            mutable: false,
+            init_refs: Vec::new(),
+            exported: false,
+        });
+        let global_init = (0..=16)
+            .map(|idx| Stmt::GlobalRef {
+                global: format!("@G{idx:02}"),
+                access: Access::Mod,
+                loc: None,
+            })
+            .collect();
+        let pir = Pir {
+            module: "high_fanout_string_collapse".to_string(),
+            source: None,
+            lowering: Default::default(),
+            functions: vec![Func {
+                key: "main".to_string(),
+                sig: void_sig(),
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: true,
+                address_taken: false,
+                body,
+            }],
+            globals,
+            global_init,
+        };
+
+        let rendered = run_cc2json(
+            &pir,
+            Path::new("high_fanout_string_collapse.pir.json"),
+            &cc2json_test_opts(),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(json["mutated_globals"], serde_json::json!([]), "{rendered}");
+    }
+
+    #[test]
+    fn executable_cc2json_does_not_escape_functions_via_exported_global_roots() {
+        let pir = Pir {
+            module: "executable_exported_fp_root".to_string(),
+            source: None,
+            lowering: Default::default(),
+            functions: vec![
+                Func {
+                    key: "main".to_string(),
+                    sig: void_sig(),
+                    param_names: Vec::new(),
+                    file: None,
+                    line: None,
+                    external: false,
+                    exported: true,
+                    address_taken: false,
+                    body: vec![Stmt::Store {
+                        address: "@Dispatch".to_string(),
+                        value: "@Target".to_string(),
+                        loc: None,
+                    }],
+                },
+                Func {
+                    key: "Target".to_string(),
+                    sig: void_sig(),
+                    param_names: Vec::new(),
+                    file: None,
+                    line: None,
+                    external: false,
+                    exported: false,
+                    address_taken: true,
+                    body: Vec::new(),
+                },
+            ],
+            globals: vec![Global {
+                key: "Dispatch".to_string(),
+                file: None,
+                line: None,
+                is_const: false,
+                mutable: true,
+                init_refs: Vec::new(),
+                exported: true,
+            }],
+            global_init: vec![Stmt::GlobalRef {
+                global: "Dispatch".to_string(),
+                access: Access::Mod,
+                loc: None,
+            }],
+        };
+
+        let rendered = run_cc2json(
+            &pir,
+            Path::new("executable_exported_fp_root.pir.json"),
+            &cc2json_test_opts(),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(json["escaped_globals"], serde_json::json!([]), "{rendered}");
+    }
+
     /// The `lib-small` library golden was produced by cclyzer's unification analysis; pangs'
     /// `steens` stage reproduces it byte-for-byte through the full cc2json renderer.
     #[test]
@@ -1653,7 +1817,7 @@ mod tests {
                     opts.build_mode.into(),
                 ),
             };
-            escaped_globals(&pir, &solved, opts.internalize_globals)
+            escaped_globals(&pir, &solved, opts.internalize_globals, opts.build_mode)
         };
 
         let steens_escaped: BTreeSet<String> = escaped(&base).into_iter().collect();

@@ -3204,6 +3204,7 @@ struct ModRefNodeSummaryData {
     pointee_global_ids: Rc<[GlobalId]>,
     pointee_global_sample: Rc<[String]>,
     pointee_global_count: usize,
+    pointee_has_string: bool,
     external_source_suffix: Option<String>,
     direct_symbol_global: Option<GlobalId>,
 }
@@ -3589,6 +3590,13 @@ fn push_high_fanout_pointer_modref_fallback(
         Access::Ref => "omega_load",
         Access::Mod => "omega_store",
     };
+    let mut detail = format!(
+        "high_fanout_pointer_modref:source={source}:node={}:fanout={}:occurrences={occurrences}",
+        summary.label, fanout
+    );
+    if summary.pointee_has_string {
+        detail.push_str(":pointee_has_string=true");
+    }
     modrefs.push_with_phase(
         ModRef {
             func,
@@ -3596,10 +3604,7 @@ fn push_high_fanout_pointer_modref_fallback(
             access,
             via: Via::Unknown,
             witness,
-            detail: Some(format!(
-                "high_fanout_pointer_modref:source={source}:node={}:fanout={}:occurrences={occurrences}",
-                summary.label, fanout
-            )),
+            detail: Some(detail),
             address_node: Some(summary.label.to_string()),
             pointee_globals: Vec::new(),
             stationarity_pointee_globals: Some(stationarity_pointee_globals),
@@ -3690,11 +3695,16 @@ fn build_modref_node_summary_data(
             .cloned()
             .collect::<Vec<_>>(),
     );
+    let pointee_has_string = resolution
+        .pointee_globals
+        .iter()
+        .any(|global_key| looks_like_string_global_key(global_key));
     ModRefNodeSummaryData {
         external: resolution.external,
         pointee_global_ids,
         pointee_global_sample,
         pointee_global_count: resolution.pointee_globals.len(),
+        pointee_has_string,
         external_source_suffix: resolution
             .external
             .then(|| modref_external_source_suffix(&resolution.external_sources))
@@ -4023,6 +4033,16 @@ fn push_pointer_memset_modrefs_from_pir(
                 .count();
             if high_fanout_limit > 0 && fanout > high_fanout_limit {
                 modrefs.note_high_fanout_fallback(fanout as u64);
+                let mut detail = format!(
+                    "high_fanout_pointer_modref:source=stmt:memset_dst:node={label}:fanout={fanout}:occurrences=1"
+                );
+                if resolution
+                    .pointee_globals
+                    .iter()
+                    .any(|global_key| looks_like_string_global_key(global_key))
+                {
+                    detail.push_str(":pointee_has_string=true");
+                }
                 modrefs.push_with_phase(
                     ModRef {
                         func: func_id,
@@ -4030,9 +4050,7 @@ fn push_pointer_memset_modrefs_from_pir(
                         access: Access::Mod,
                         via: Via::Unknown,
                         witness,
-                        detail: Some(format!(
-                            "high_fanout_pointer_modref:source=stmt:memset_dst:node={label}:fanout={fanout}:occurrences=1"
-                        )),
+                        detail: Some(detail),
                         address_node: Some(label),
                         pointee_globals: Vec::new(),
                         stationarity_pointee_globals: Some(global_ids_for_keys(
@@ -4081,6 +4099,10 @@ fn push_pointer_memset_modrefs_from_pir(
             }
         }
     }
+}
+
+fn looks_like_string_global_key(global_key: &str) -> bool {
+    global_key.starts_with('.') || global_key.starts_with("@.")
 }
 
 fn modref_external_source_suffix(sources: &[String]) -> Option<String> {
