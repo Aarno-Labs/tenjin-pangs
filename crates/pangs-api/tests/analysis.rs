@@ -2598,6 +2598,8 @@ fn steens_memcpy_modref_exports_aliased_direct_symbol_and_unknown_rows() {
     let src_aliased = analysis.lookup_global("@SrcAliased").unwrap();
     let direct_dst = analysis.lookup_global("@DirectDst").unwrap();
     let direct_src = analysis.lookup_global("@DirectSrc").unwrap();
+    let direct_expr_dst = analysis.lookup_global("@DirectExprDst").unwrap();
+    let direct_expr_src = analysis.lookup_global("@DirectExprSrc").unwrap();
     let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();
 
     assert!(raw_modrefs.iter().any(|mr| {
@@ -2627,6 +2629,20 @@ fn steens_memcpy_modref_exports_aliased_direct_symbol_and_unknown_rows() {
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Aliased
             && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:7:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(direct_expr_src)
+            && mr.access == Access::Ref
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:8:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(direct_expr_dst)
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:8:1#0")
     }));
     assert!(raw_modrefs.iter().any(|mr| {
         mr.func == main

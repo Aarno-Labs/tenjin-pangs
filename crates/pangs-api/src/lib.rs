@@ -1107,6 +1107,13 @@ impl Analysis {
                     &mut noloc_ord,
                 );
                 modrefs.print_profile("after-pag");
+                push_pointer_memcpy_constexpr_modrefs_from_pir(
+                    &mut modrefs,
+                    module,
+                    &func_lookup,
+                    &global_lookup,
+                    &mut noloc_ord,
+                );
                 push_pointer_memset_modrefs_from_pir(
                     &mut modrefs,
                     module,
@@ -3902,6 +3909,42 @@ fn push_pointer_modrefs_from_pag(
     );
     access_profile.print("top-emitters-done");
     flush_local_pointer_modref_rows(modrefs, active_func, &mut local_rows);
+}
+
+fn push_pointer_memcpy_constexpr_modrefs_from_pir(
+    modrefs: &mut ModRefBuilder,
+    module: &Pir,
+    func_lookup: &HashMap<String, FuncId>,
+    global_lookup: &HashMap<String, GlobalId>,
+    noloc_ord: &mut BTreeMap<(String, String), u32>,
+) {
+    for func in &module.functions {
+        let Some(&func_id) = func_lookup.get(&func.key) else {
+            continue;
+        };
+        for stmt in &func.body {
+            let Stmt::Memcpy { dst, src, loc, .. } = stmt else {
+                continue;
+            };
+            for (operand, access) in [(src, Access::Ref), (dst, Access::Mod)] {
+                if global_lookup.contains_key(operand) {
+                    continue;
+                }
+                let Some(gid) = label_known_global(operand, global_lookup) else {
+                    continue;
+                };
+                let witness = witness_key(&func.key, loc, noloc_ord, "global");
+                modrefs.push_named_empty(
+                    func_id,
+                    gid,
+                    access,
+                    Via::Aliased,
+                    witness.as_deref(),
+                    Some(ModRefSourcePhase::MemsetMemcpy),
+                );
+            }
+        }
+    }
 }
 
 fn push_pointer_memset_modrefs_from_pir(

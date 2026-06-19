@@ -1545,6 +1545,20 @@ fn analyze_steens_exports_memcpy_pointer_modref_rows() {
     }));
     assert!(modref.iter().any(|row| {
         row["func"] == "main"
+            && row["global"]["name"] == "@DirectExprSrc"
+            && row["access"] == "ref"
+            && row["via"] == "aliased"
+            && row["witness"] == "main@m1_6_memcpy.c:8:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["name"] == "@DirectExprDst"
+            && row["access"] == "mod"
+            && row["via"] == "aliased"
+            && row["witness"] == "main@m1_6_memcpy.c:8:1#0"
+    }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
             && row["global"]["unknown"] == "omega_load"
             && row["access"] == "ref"
             && row["via"] == "unknown"

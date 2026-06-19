@@ -53,6 +53,13 @@
           "src": "@DirectSrc",
           "bytes": 8,
           "loc": { "file": "m1_6_memcpy.c", "line": 7, "col": 1 }
+        },
+        {
+          "kind": "memcpy",
+          "dst": "i8* bitcast ([8 x i8]* @DirectExprDst to i8*)",
+          "src": "i8* bitcast ([8 x i8]* @DirectExprSrc to i8*)",
+          "bytes": 8,
+          "loc": { "file": "m1_6_memcpy.c", "line": 8, "col": 1 }
         }
       ]
     }
@@ -72,6 +79,14 @@
     },
     {
       "key": "@DirectSrc",
+      "mutable": true
+    },
+    {
+      "key": "@DirectExprDst",
+      "mutable": true
+    },
+    {
+      "key": "@DirectExprSrc",
       "mutable": true
     }
   ]
