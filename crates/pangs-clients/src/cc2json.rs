@@ -14,7 +14,7 @@
 //! `lib-small` golden: `mutated_globals`, `global_initializer_references`, `mutable_global_tissue`,
 //! `unique_filenames`, `call_graph_components`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -316,44 +316,75 @@ fn escaped_globals(pir: &Pir, solved: &SolveResult, internalize_globals: bool) -
     out
 }
 
-/// Map each SSA result name in a function body to its defining statement.
-fn operand_def_map(func: &Func) -> HashMap<&str, &Stmt> {
-    let mut map = HashMap::new();
-    for stmt in &func.body {
-        let dest = match stmt {
-            Stmt::Alloca { dest, .. }
-            | Stmt::Assign { dest, .. }
-            | Stmt::Load { dest, .. }
-            | Stmt::Gep { dest, .. }
-            | Stmt::PtrToInt { dest, .. }
-            | Stmt::IntToPtr { dest, .. } => Some(dest.as_str()),
-            _ => None,
-        };
-        if let Some(dest) = dest {
-            map.entry(dest).or_insert(stmt);
-        }
-    }
-    map
-}
-
 struct BaseGlobalResolver<'a> {
-    defs: HashMap<&'a str, &'a Stmt>,
-    memo: HashMap<&'a str, Option<String>>,
-    visiting: HashSet<&'a str>,
+    defs: HashMap<&'a str, usize>,
+    entries: Vec<BaseDef<'a>>,
+    can_reach_global: Vec<bool>,
+    memo: Vec<Option<Option<&'a str>>>,
+    visiting: Vec<bool>,
 }
 
-enum BaseGlobalResolution {
-    Found(String),
+enum BaseDef<'a> {
+    Gep(SourceRef<'a>),
+    Assign(Vec<SourceRef<'a>>),
+    Other,
+}
+
+#[derive(Clone, Copy)]
+enum SourceRef<'a> {
+    Global(&'a str),
+    Def(usize),
+    Other,
+}
+
+enum BaseGlobalResolution<'a> {
+    Found(&'a str),
     NotFound,
     Cycle,
 }
 
 impl<'a> BaseGlobalResolver<'a> {
     fn new(func: &'a Func) -> Self {
+        let mut defs = HashMap::new();
+        for stmt in &func.body {
+            let Some(dest) = stmt_dest(stmt) else {
+                continue;
+            };
+            if !defs.contains_key(dest) {
+                let id = defs.len();
+                defs.insert(dest, id);
+            }
+        }
+
+        let mut entries = Vec::with_capacity(defs.len());
+        entries.resize_with(defs.len(), || None);
+        for stmt in &func.body {
+            let Some(dest) = stmt_dest(stmt) else {
+                continue;
+            };
+            let id = defs[dest];
+            if entries[id].is_some() {
+                continue;
+            }
+            entries[id] = Some(match stmt {
+                Stmt::Gep { base, .. } => BaseDef::Gep(source_ref(&defs, base)),
+                Stmt::Assign { sources, .. } => {
+                    BaseDef::Assign(sources.iter().map(|s| source_ref(&defs, s)).collect())
+                }
+                _ => BaseDef::Other,
+            });
+        }
+        let entries = entries
+            .into_iter()
+            .map(|entry| entry.unwrap_or(BaseDef::Other))
+            .collect::<Vec<_>>();
+        let can_reach_global = compute_can_reach_global(&entries);
         Self {
-            defs: operand_def_map(func),
-            memo: HashMap::new(),
-            visiting: HashSet::new(),
+            memo: vec![None; entries.len()],
+            visiting: vec![false; entries.len()],
+            defs,
+            entries,
+            can_reach_global,
         }
     }
 
@@ -369,66 +400,157 @@ impl<'a> BaseGlobalResolver<'a> {
     /// chains: a literal `@name`, or a temp defined by a gep/bitcast/select (`Assign`) over a base
     /// that resolves. Never traces through a `Load` (that would be a dereference, not the address).
     fn resolve_base_global(&mut self, operand: &'a str) -> Option<String> {
-        match self.resolve_base_global_inner(operand) {
-            BaseGlobalResolution::Found(name) => Some(name),
-            BaseGlobalResolution::NotFound | BaseGlobalResolution::Cycle => None,
+        let mut touched = Vec::new();
+        match self.resolve_operand(operand, &mut touched) {
+            BaseGlobalResolution::Found(name) => Some(name.to_string()),
+            BaseGlobalResolution::NotFound | BaseGlobalResolution::Cycle => {
+                for id in touched {
+                    if self.memo[id].is_none() {
+                        self.memo[id] = Some(None);
+                    }
+                }
+                None
+            }
         }
     }
 
-    fn resolve_base_global_inner(&mut self, operand: &'a str) -> BaseGlobalResolution {
-        if let Some(name) = operand.strip_prefix('@') {
-            return BaseGlobalResolution::Found(name.to_string());
-        }
-
+    fn resolve_operand(
+        &mut self,
+        operand: &'a str,
+        touched: &mut Vec<usize>,
+    ) -> BaseGlobalResolution<'a> {
         if matches!(operand, "null" | "undef" | "poison") {
             return BaseGlobalResolution::NotFound;
         }
+        self.resolve_source(source_ref(&self.defs, operand), touched)
+    }
 
-        if let Some(cached) = self.memo.get(operand) {
+    fn resolve_source(
+        &mut self,
+        source: SourceRef<'a>,
+        touched: &mut Vec<usize>,
+    ) -> BaseGlobalResolution<'a> {
+        match source {
+            SourceRef::Global(name) => BaseGlobalResolution::Found(name),
+            SourceRef::Def(id) if self.can_reach_global[id] => self.resolve_def(id, touched),
+            SourceRef::Def(_) | SourceRef::Other => BaseGlobalResolution::NotFound,
+        }
+    }
+
+    fn resolve_def(&mut self, id: usize, touched: &mut Vec<usize>) -> BaseGlobalResolution<'a> {
+        if let Some(cached) = self.memo[id] {
             return match cached {
-                Some(name) => BaseGlobalResolution::Found(name.clone()),
+                Some(name) => BaseGlobalResolution::Found(name),
                 None => BaseGlobalResolution::NotFound,
             };
         }
-        if !self.visiting.insert(operand) {
+        if self.visiting[id] {
             return BaseGlobalResolution::Cycle;
         }
+        self.visiting[id] = true;
+        touched.push(id);
 
-        let resolved = match self.defs.get(operand).copied() {
-            Some(Stmt::Gep { base, .. }) => self.resolve_base_global_inner(base),
-            Some(Stmt::Assign { sources, .. }) => {
-                let mut saw_cycle = false;
-                let mut found = None;
-                for source in sources {
-                    match self.resolve_base_global_inner(source) {
-                        BaseGlobalResolution::Found(name) => {
-                            found = Some(name);
-                            break;
-                        }
-                        BaseGlobalResolution::NotFound => {}
-                        BaseGlobalResolution::Cycle => saw_cycle = true,
+        let resolved = if let Some(base) = match &self.entries[id] {
+            BaseDef::Gep(base) => Some(*base),
+            _ => None,
+        } {
+            self.resolve_source(base, touched)
+        } else if let Some(len) = match &self.entries[id] {
+            BaseDef::Assign(sources) => Some(sources.len()),
+            _ => None,
+        } {
+            let mut saw_cycle = false;
+            let mut found = None;
+            for index in 0..len {
+                let source = match &self.entries[id] {
+                    BaseDef::Assign(sources) => sources[index],
+                    _ => unreachable!("base-global resolver entry changed during recursion"),
+                };
+                match self.resolve_source(source, touched) {
+                    BaseGlobalResolution::Found(name) => {
+                        found = Some(name);
+                        break;
                     }
-                }
-                match found {
-                    Some(name) => BaseGlobalResolution::Found(name),
-                    None if saw_cycle => BaseGlobalResolution::Cycle,
-                    None => BaseGlobalResolution::NotFound,
+                    BaseGlobalResolution::NotFound => {}
+                    BaseGlobalResolution::Cycle => saw_cycle = true,
                 }
             }
-            _ => BaseGlobalResolution::NotFound,
+            match found {
+                Some(name) => BaseGlobalResolution::Found(name),
+                None if saw_cycle => BaseGlobalResolution::Cycle,
+                None => BaseGlobalResolution::NotFound,
+            }
+        } else {
+            BaseGlobalResolution::NotFound
         };
 
-        self.visiting.remove(operand);
+        self.visiting[id] = false;
         match &resolved {
             BaseGlobalResolution::Found(name) => {
-                self.memo.insert(operand, Some(name.clone()));
+                self.memo[id] = Some(Some(*name));
             }
             BaseGlobalResolution::NotFound => {
-                self.memo.insert(operand, None);
+                self.memo[id] = Some(None);
             }
             BaseGlobalResolution::Cycle => {}
         }
         resolved
+    }
+}
+
+fn compute_can_reach_global(entries: &[BaseDef<'_>]) -> Vec<bool> {
+    let mut can_reach = vec![false; entries.len()];
+    loop {
+        let mut changed = false;
+        for (id, entry) in entries.iter().enumerate() {
+            if can_reach[id] {
+                continue;
+            }
+            let reaches = match entry {
+                BaseDef::Gep(base) => source_can_reach_global(&can_reach, *base),
+                BaseDef::Assign(sources) => sources
+                    .iter()
+                    .any(|source| source_can_reach_global(&can_reach, *source)),
+                BaseDef::Other => false,
+            };
+            if reaches {
+                can_reach[id] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return can_reach;
+        }
+    }
+}
+
+fn source_can_reach_global(can_reach: &[bool], source: SourceRef<'_>) -> bool {
+    match source {
+        SourceRef::Global(_) => true,
+        SourceRef::Def(id) => can_reach[id],
+        SourceRef::Other => false,
+    }
+}
+
+fn stmt_dest(stmt: &Stmt) -> Option<&str> {
+    match stmt {
+        Stmt::Alloca { dest, .. }
+        | Stmt::Assign { dest, .. }
+        | Stmt::Load { dest, .. }
+        | Stmt::Gep { dest, .. }
+        | Stmt::PtrToInt { dest, .. }
+        | Stmt::IntToPtr { dest, .. } => Some(dest.as_str()),
+        _ => None,
+    }
+}
+
+fn source_ref<'a>(defs: &HashMap<&'a str, usize>, operand: &'a str) -> SourceRef<'a> {
+    if let Some(name) = operand.strip_prefix('@') {
+        SourceRef::Global(name)
+    } else if let Some(&id) = defs.get(operand) {
+        SourceRef::Def(id)
+    } else {
+        SourceRef::Other
     }
 }
 
@@ -1146,6 +1268,28 @@ mod tests {
             resolver.resolve_arg_global("i8* bitcast (@H to i8*)"),
             Some("H".to_string())
         );
+    }
+
+    #[test]
+    fn base_global_resolver_caches_unresolved_cycles() {
+        let func = test_func(vec![
+            Stmt::Assign {
+                dest: "%a".to_string(),
+                sources: vec!["%b".to_string()],
+                loc: None,
+            },
+            Stmt::Assign {
+                dest: "%b".to_string(),
+                sources: vec!["%a".to_string()],
+                loc: None,
+            },
+        ]);
+
+        let mut resolver = BaseGlobalResolver::new(&func);
+        assert!(!resolver.can_reach_global[resolver.defs["%a"]]);
+        assert!(!resolver.can_reach_global[resolver.defs["%b"]]);
+        assert_eq!(resolver.resolve_base_global("%a"), None);
+        assert_eq!(resolver.resolve_base_global("%b"), None);
     }
 
     /// The `lib-small` library golden was produced by cclyzer's unification analysis; pangs'
