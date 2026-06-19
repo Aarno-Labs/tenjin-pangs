@@ -404,7 +404,8 @@ fn escaped_globals(
     }
 
     // Return-escape: a pointer to a global value returned from a function escapes (covers returned
-    // `static` buffers). Resolved syntactically through gep/bitcast chains.
+    // `static` buffers). Resolved syntactically through gep/bitcast chains and inline constant
+    // expressions emitted directly in `ret` operands.
     for func in &pir.functions {
         let mut resolver = BaseGlobalResolver::new(func);
         for stmt in &func.body {
@@ -412,7 +413,7 @@ fn escaped_globals(
                 value: Some(value), ..
             } = stmt
             {
-                if let Some(base) = resolver.resolve_base_global(value) {
+                if let Some(base) = resolver.resolve_arg_global(value) {
                     if is_known(&base) {
                         escaped.insert(base);
                     }
@@ -1445,6 +1446,56 @@ mod tests {
         assert!(!resolver.can_reach_global[resolver.defs["%b"]]);
         assert_eq!(resolver.resolve_base_global("%a"), None);
         assert_eq!(resolver.resolve_base_global("%b"), None);
+    }
+
+    #[test]
+    fn cc2json_returned_inline_constexpr_global_escapes() {
+        let pir = Pir {
+            module: "returned_inline_constexpr".to_string(),
+            source: None,
+            lowering: Default::default(),
+            functions: vec![Func {
+                key: "main".to_string(),
+                sig: Signature {
+                    ret: AbiClass::Integer,
+                    params: Vec::new(),
+                    vararg: false,
+                    cc: "ccc".to_string(),
+                },
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: true,
+                address_taken: false,
+                body: vec![Stmt::Return {
+                    value: Some(
+                        "i8* getelementptr inbounds ([8 x i8], [8 x i8]* @ReturnedBuf, i64 0, i64 0)"
+                            .to_string(),
+                    ),
+                    loc: None,
+                }],
+            }],
+            globals: vec![test_global("ReturnedBuf")],
+            global_init: vec![Stmt::GlobalRef {
+                global: "ReturnedBuf".to_string(),
+                access: Access::Mod,
+                loc: None,
+            }],
+        };
+
+        let rendered = run_cc2json(
+            &pir,
+            Path::new("returned_inline_constexpr.pir.json"),
+            &cc2json_test_opts(),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            json["escaped_globals"],
+            serde_json::json!(["ReturnedBuf"]),
+            "{rendered}"
+        );
     }
 
     #[test]
