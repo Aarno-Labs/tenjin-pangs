@@ -186,6 +186,8 @@ pub struct ModRef {
     pub address_node: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pointee_globals: Vec<String>,
+    #[serde(skip)]
+    pub stationarity_pointee_globals: Option<Rc<[GlobalId]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -807,6 +809,7 @@ impl Analysis {
                                 detail: None,
                                 address_node: None,
                                 pointee_globals: Vec::new(),
+                                stationarity_pointee_globals: None,
                             });
                         }
                     }
@@ -1714,6 +1717,22 @@ fn stationarity_verdicts_from_modrefs(
                     .or_default()
                     .push(stationarity_writer_from_modref(mr));
             }
+            GlobalTarget::Unknown(_)
+                if mr
+                    .stationarity_pointee_globals
+                    .as_deref()
+                    .is_some_and(|globals| !globals.is_empty()) =>
+            {
+                let writer = stationarity_writer_from_modref(mr);
+                for &gid in mr.stationarity_pointee_globals.as_deref().unwrap_or(&[]) {
+                    if let Some(global) = globals.get(gid.0 as usize) {
+                        runtime_writers
+                            .entry(global.key.clone())
+                            .or_default()
+                            .push(writer.clone());
+                    }
+                }
+            }
             GlobalTarget::Unknown(_) if !mr.pointee_globals.is_empty() => {
                 let writer = stationarity_writer_from_modref(mr);
                 for global_key in &mr.pointee_globals {
@@ -1812,7 +1831,12 @@ fn stationarity_writer_from_modref(mr: &ModRef) -> StationarityWriter {
 }
 
 fn unknown_modref_may_touch_module_global(mr: &ModRef) -> bool {
-    if !mr.pointee_globals.is_empty() {
+    if mr
+        .stationarity_pointee_globals
+        .as_deref()
+        .is_some_and(|globals| !globals.is_empty())
+        || !mr.pointee_globals.is_empty()
+    {
         return true;
     }
     let Some(detail) = mr.detail.as_deref() else {
@@ -2659,6 +2683,10 @@ impl ModRefBuilder {
                 let existing = &mut self.rows[idx];
                 existing.witness =
                     preferred_modref_witness(existing.witness.take(), row.witness.take());
+                merge_stationarity_pointees(
+                    &mut existing.stationarity_pointee_globals,
+                    row.stationarity_pointee_globals,
+                );
                 self.note_modref_result(phase, false);
                 return;
             }
@@ -2673,6 +2701,10 @@ impl ModRefBuilder {
             let existing = &mut self.rows[idx];
             existing.witness =
                 preferred_modref_witness(existing.witness.take(), row.witness.take());
+            merge_stationarity_pointees(
+                &mut existing.stationarity_pointee_globals,
+                row.stationarity_pointee_globals,
+            );
             self.note_modref_result(phase, false);
             return;
         }
@@ -2712,6 +2744,7 @@ impl ModRefBuilder {
             detail: None,
             address_node: None,
             pointee_globals: Vec::new(),
+            stationarity_pointee_globals: None,
         });
         self.note_modref_result(phase, true);
     }
@@ -3088,7 +3121,7 @@ fn transitive_modref_high_fanout_limit() -> usize {
     std::env::var("PANGS_TRANSITIVE_MODREF_HIGH_FANOUT_LIMIT")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(65_536)
+        .unwrap_or(16_384)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3115,7 +3148,6 @@ struct PointerAccess {
 struct ModRefNodeSummaryData {
     external: bool,
     pointee_global_ids: Rc<[GlobalId]>,
-    pointee_global_keys: Rc<[String]>,
     pointee_global_sample: Rc<[String]>,
     pointee_global_count: usize,
     external_source_suffix: Option<String>,
@@ -3270,13 +3302,18 @@ struct PointerAccessEmitterProfile {
     next_rows: u64,
     entries: Vec<PointerAccessEmitterEntry>,
     target_global: Option<String>,
+    target_global_id: Option<GlobalId>,
     target_entries: Vec<PointerAccessEmitterEntry>,
 }
 
 impl PointerAccessEmitterProfile {
-    fn from_env() -> Self {
+    fn from_env(global_lookup: &HashMap<String, GlobalId>) -> Self {
         let limit = pointer_modref_profile_top_emitters();
         let interval_rows = pointer_modref_profile_interval_attempts();
+        let target_global = pointer_modref_profile_global();
+        let target_global_id = target_global
+            .as_deref()
+            .and_then(|global| global_lookup.get(global).copied());
         Self {
             enabled: pointer_modref_profile_enabled() && limit > 0,
             limit,
@@ -3285,7 +3322,8 @@ impl PointerAccessEmitterProfile {
             interval_rows,
             next_rows: interval_rows,
             entries: Vec::new(),
-            target_global: pointer_modref_profile_global(),
+            target_global,
+            target_global_id,
             target_entries: Vec::new(),
         }
     }
@@ -3317,12 +3355,10 @@ impl PointerAccessEmitterProfile {
             self.entries.push(entry.clone());
             Self::sort_and_truncate(&mut self.entries, self.limit);
         }
-        if self.target_global.as_deref().is_some_and(|target| {
-            summary
-                .pointee_global_keys
-                .iter()
-                .any(|global| global == target)
-        }) && self.should_keep(&self.target_entries, expanded_rows)
+        if self
+            .target_global_id
+            .is_some_and(|target| summary.pointee_global_ids.contains(&target))
+            && self.should_keep(&self.target_entries, expanded_rows)
         {
             self.target_entries.push(entry);
             Self::sort_and_truncate(&mut self.target_entries, self.limit);
@@ -3509,7 +3545,8 @@ fn push_high_fanout_pointer_modref_fallback(
                 summary.label, fanout
             )),
             address_node: Some(summary.label.to_string()),
-            pointee_globals: summary.pointee_global_keys.to_vec(),
+            pointee_globals: Vec::new(),
+            stationarity_pointee_globals: Some(Rc::clone(&summary.pointee_global_ids)),
         },
         Some(phase),
     );
@@ -3572,7 +3609,6 @@ fn build_modref_node_summary_data(
     let direct_symbol_global = label
         .strip_prefix("sym:global:")
         .and_then(|global_key| global_lookup.get(global_key).copied());
-    let pointee_global_keys = Rc::<[String]>::from(resolution.pointee_globals.to_vec());
     let pointee_global_sample = Rc::<[String]>::from(
         resolution
             .pointee_globals
@@ -3584,7 +3620,6 @@ fn build_modref_node_summary_data(
     ModRefNodeSummaryData {
         external: resolution.external,
         pointee_global_ids,
-        pointee_global_keys,
         pointee_global_sample,
         pointee_global_count: resolution.pointee_globals.len(),
         external_source_suffix: resolution
@@ -3593,6 +3628,34 @@ fn build_modref_node_summary_data(
             .flatten(),
         direct_symbol_global,
     }
+}
+
+fn global_key_by_id(global_lookup: &HashMap<String, GlobalId>) -> Vec<String> {
+    let mut keys = vec![String::new(); global_lookup.len()];
+    for (key, &gid) in global_lookup {
+        if let Some(slot) = keys.get_mut(gid.0 as usize) {
+            *slot = key.clone();
+        }
+    }
+    keys
+}
+
+fn global_keys_for_ids(ids: &[GlobalId], global_key_by_id: &[String]) -> Vec<String> {
+    ids.iter()
+        .filter_map(|gid| global_key_by_id.get(gid.0 as usize))
+        .filter(|key| !key.is_empty())
+        .cloned()
+        .collect()
+}
+
+fn global_ids_for_keys<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    global_lookup: &HashMap<String, GlobalId>,
+) -> Rc<[GlobalId]> {
+    Rc::from(
+        keys.filter_map(|key| global_lookup.get(key).copied())
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn push_pointer_modrefs_from_pag(
@@ -3610,9 +3673,10 @@ fn push_pointer_modrefs_from_pag(
     let mut missing_nodes = vec![false; pag.nodes.len()];
     let mut local_accesses = LocalPointerAccessRows::new(pag.nodes.len());
     let mut local_rows = LocalPointerModRefRows::new(global_lookup.len());
-    let mut access_profile = PointerAccessEmitterProfile::from_env();
+    let mut access_profile = PointerAccessEmitterProfile::from_env(global_lookup);
     let high_fanout_limit = pointer_modref_high_fanout_limit();
     let precise_storage_addresses = precise_storage_addresses(pag, global_lookup);
+    let global_key_by_id = global_key_by_id(global_lookup);
     let mut active_func = None;
     for edge in &pag.edges {
         let Some((owner, func, accesses)) = edge_accesses(edge, func_lookup) else {
@@ -3769,7 +3833,11 @@ fn push_pointer_modrefs_from_pag(
                             summary.pointee_global_count,
                         )),
                         address_node: Some(summary.label.to_string()),
-                        pointee_globals: summary.pointee_global_keys.to_vec(),
+                        pointee_globals: global_keys_for_ids(
+                            &summary.pointee_global_ids,
+                            &global_key_by_id,
+                        ),
+                        stationarity_pointee_globals: Some(Rc::clone(&summary.pointee_global_ids)),
                     },
                     Some(phase),
                 );
@@ -3841,7 +3909,11 @@ fn push_pointer_memset_modrefs_from_pir(
                             "high_fanout_pointer_modref:source=stmt:memset_dst:node={label}:fanout={fanout}:occurrences=1"
                         )),
                         address_node: Some(label),
-                        pointee_globals: resolution.pointee_globals.to_vec(),
+                        pointee_globals: Vec::new(),
+                        stationarity_pointee_globals: Some(global_ids_for_keys(
+                            resolution.pointee_globals.iter(),
+                            global_lookup,
+                        )),
                     },
                     Some(ModRefSourcePhase::MemsetMemcpy),
                 );
@@ -3874,6 +3946,10 @@ fn push_pointer_memset_modrefs_from_pir(
                         )),
                         address_node: Some(label.clone()),
                         pointee_globals: resolution.pointee_globals.to_vec(),
+                        stationarity_pointee_globals: Some(global_ids_for_keys(
+                            resolution.pointee_globals.iter(),
+                            global_lookup,
+                        )),
                     },
                     Some(ModRefSourcePhase::MemsetMemcpy),
                 );
@@ -4205,6 +4281,7 @@ impl TransitiveModRefs {
                 detail: payload.detail.clone(),
                 address_node: payload.address_node.clone(),
                 pointee_globals: payload.pointee_globals.clone(),
+                stationarity_pointee_globals: None,
             }
         })
     }
@@ -4283,6 +4360,27 @@ impl Ord for ModRefPayload {
         }
         self.pointee_globals.cmp(&other.pointee_globals)
     }
+}
+
+fn merge_stationarity_pointees(
+    existing: &mut Option<Rc<[GlobalId]>>,
+    incoming: Option<Rc<[GlobalId]>>,
+) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    let Some(current) = existing.as_ref() else {
+        *existing = Some(incoming);
+        return;
+    };
+    if current.as_ref() == incoming.as_ref() {
+        return;
+    }
+    let mut merged = current.iter().copied().collect::<Vec<_>>();
+    merged.extend(incoming.iter().copied());
+    merged.sort();
+    merged.dedup();
+    *existing = Some(Rc::from(merged));
 }
 
 fn access_rank(access: Access) -> u8 {

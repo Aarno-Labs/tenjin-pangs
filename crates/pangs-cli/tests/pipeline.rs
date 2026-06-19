@@ -1746,9 +1746,7 @@ fn analyze_steens_collapses_high_fanout_pointer_modref_to_unknown() {
                 .as_str()
                 .unwrap()
                 .starts_with("high_fanout_pointer_modref:source=pag_pointer")
-            && row["pointee_globals"]
-                .as_array()
-                .is_some_and(|globals| globals.len() == 17)
+            && row.get("pointee_globals").is_none()
     }));
     assert!(!modref.iter().any(|row| {
         row["access"] == "mod"
