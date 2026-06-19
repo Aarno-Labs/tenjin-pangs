@@ -528,6 +528,74 @@ fn m2_4_dynamic_initializer_gep_poisons_initval() {
 }
 
 #[test]
+fn m2_4_scalar_pointer_global_initializer_is_complete_and_stationary() {
+    let pir = Pir::from_path(m2_4_fixture("initval_scalar_pointer_global.pir.json")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let sep = analysis.lookup_global("@Sep").unwrap();
+    let slash = analysis.lookup_global("@Slash").unwrap();
+    assert!(analysis.globals()[sep].stationary);
+    assert!(!analysis.globals()[slash].stationary);
+
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == sep)
+        .unwrap();
+    assert!(verdict.complete_initval);
+    assert!(verdict.stationary);
+    assert_eq!(verdict.reason, StationarityReason::Stationary);
+    assert!(verdict.runtime_writers.is_empty());
+    assert!(verdict.initval_diagnostics.is_empty());
+    assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
+    assert_eq!(analysis.metrics().stationary_globals, 1);
+}
+
+#[test]
+fn m2_4_scalar_pointer_global_runtime_write_blocks_stationarity() {
+    let pir = Pir::from_path(m2_4_fixture(
+        "initval_scalar_pointer_global_runtime_write.pir.json",
+    ))
+    .unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let sep = analysis.lookup_global("@Sep").unwrap();
+    assert!(!analysis.globals()[sep].stationary);
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == sep)
+        .unwrap();
+    assert!(verdict.complete_initval);
+    assert!(!verdict.stationary);
+    assert_eq!(verdict.reason, StationarityReason::RuntimeWriter);
+    assert!(verdict
+        .runtime_writers
+        .iter()
+        .any(|writer| writer.witness.as_deref() == Some("writer@m2_4_scalar_ptr.c:5:3#0")));
+    assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
+    assert_eq!(analysis.metrics().stationary_globals, 0);
+}
+
+#[test]
 fn m2_4_unknown_runtime_mod_blocks_stationarity() {
     let pir = Pir::from_path(m2_4_fixture(
         "initval_unknown_runtime_mod_blocks_stationarity.pir.json",

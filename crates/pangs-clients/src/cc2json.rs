@@ -1228,7 +1228,7 @@ impl JsonBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pangs_pir::{AbiClass, Signature};
+    use pangs_pir::{AbiClass, Global, Signature};
     use std::path::PathBuf;
 
     fn workspace_root() -> PathBuf {
@@ -1251,6 +1251,36 @@ mod tests {
             exported: false,
             address_taken: false,
             body,
+        }
+    }
+
+    fn void_sig() -> Signature {
+        Signature {
+            ret: AbiClass::Void,
+            params: Vec::new(),
+            vararg: false,
+            cc: "ccc".to_string(),
+        }
+    }
+
+    fn test_global(key: &str) -> Global {
+        Global {
+            key: key.to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            init_refs: Vec::new(),
+            exported: false,
+        }
+    }
+
+    fn cc2json_test_opts() -> Cc2jsonOpts {
+        Cc2jsonOpts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            internalize_globals: false,
+            partition_budget: 100_000,
         }
     }
 
@@ -1304,6 +1334,83 @@ mod tests {
         assert!(!resolver.can_reach_global[resolver.defs["%b"]]);
         assert_eq!(resolver.resolve_base_global("%a"), None);
         assert_eq!(resolver.resolve_base_global("%b"), None);
+    }
+
+    #[test]
+    fn cc2json_strchr_and_strrchr_args_are_readonly_for_mutated_globals() {
+        let pir = Pir {
+            module: "readonly_search".to_string(),
+            source: None,
+            lowering: Default::default(),
+            functions: vec![Func {
+                key: "main".to_string(),
+                sig: void_sig(),
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: true,
+                address_taken: false,
+                body: vec![
+                    Stmt::CallDirect {
+                        callee: "strchr".to_string(),
+                        sig: void_sig(),
+                        args: vec!["@ReadonlyA".to_string(), "47".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                    Stmt::CallDirect {
+                        callee: "strrchr".to_string(),
+                        sig: void_sig(),
+                        args: vec!["@ReadonlyB".to_string(), "47".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                    Stmt::CallDirect {
+                        callee: "may_write".to_string(),
+                        sig: void_sig(),
+                        args: vec!["@Mutated".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                ],
+            }],
+            globals: vec![
+                test_global("ReadonlyA"),
+                test_global("ReadonlyB"),
+                test_global("Mutated"),
+            ],
+            global_init: vec![
+                Stmt::GlobalRef {
+                    global: "ReadonlyA".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                },
+                Stmt::GlobalRef {
+                    global: "ReadonlyB".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                },
+                Stmt::GlobalRef {
+                    global: "Mutated".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                },
+            ],
+        };
+
+        let rendered = run_cc2json(
+            &pir,
+            Path::new("readonly_search.pir.json"),
+            &cc2json_test_opts(),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            json["mutated_globals"],
+            serde_json::json!(["Mutated"]),
+            "{rendered}"
+        );
     }
 
     /// The `lib-small` library golden was produced by cclyzer's unification analysis; pangs'

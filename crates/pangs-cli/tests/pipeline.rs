@@ -320,6 +320,36 @@ fn analyze_exports_m2_5_stationarity_unknown_writer_evidence() {
 }
 
 #[test]
+fn analyze_exports_scalar_pointer_initval_stationarity() {
+    let fixture = m2_4_fixture("initval_scalar_pointer_global.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "andersen");
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert_eq!(metrics["globals_with_complete_initval"], 1);
+    assert_eq!(metrics["stationary_globals"], 1);
+
+    let stationarity: Vec<Value> = fs::read_to_string(out.join("stationarity.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let sep = stationarity
+        .iter()
+        .find(|row| row["global"] == "@Sep")
+        .unwrap();
+    assert_eq!(sep["complete_initval"], true);
+    assert_eq!(sep["stationary"], true);
+    assert_eq!(sep["reason"], "stationary");
+    assert!(sep["initval_diagnostics"]
+        .as_array()
+        .is_none_or(|diagnostics| diagnostics.is_empty()));
+}
+
+#[test]
 fn m2_ablation_reports_preanalysis_variants() {
     let fixture = m2_2_fixture("simple_local_assign.pir.json");
     let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
@@ -1659,6 +1689,80 @@ fn analyze_steens_exports_memset_pointer_modref_rows() {
                         && taint["witness"] == "main@m1_6_memset.c:4:1#0"
                 })
         }));
+}
+
+#[test]
+fn analyze_steens_does_not_expand_precise_stack_or_global_storage_to_pointees() {
+    let fixture = m1_6_fixture("precise_storage_modref.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "steens");
+
+    let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["name"] == "@Cell"
+            && row["access"] == "mod"
+            && row["via"] == "direct"
+            && row["witness"] == "main@m1_6_precise_storage.c:2:1#0"
+    }));
+    assert!(!modref
+        .iter()
+        .any(|row| row["global"]["name"] == "@Other" && row["access"] == "mod"));
+    assert_eq!(
+        modref
+            .iter()
+            .filter(|row| row["global"]["name"] == "@Cell" && row["access"] == "mod")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn analyze_steens_collapses_high_fanout_pointer_modref_to_unknown() {
+    let fixture = m1_6_fixture("high_fanout_modref.pir.json");
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out");
+
+    run_analyze_stage(&fixture, &out, "steens");
+
+    let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["unknown"] == "omega_store"
+            && row["access"] == "mod"
+            && row["via"] == "unknown"
+            && row["witness"] == "main@m1_6_high_fanout.c:19:1#0"
+            && row["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("high_fanout_pointer_modref:source=pag_pointer")
+    }));
+    assert!(!modref.iter().any(|row| {
+        row["access"] == "mod"
+            && row["global"]
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.starts_with("@G"))
+    }));
+
+    let metrics: Value =
+        serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
+    assert!(
+        metrics["pointer_modref_high_fanout_fallbacks"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
 }
 
 #[test]

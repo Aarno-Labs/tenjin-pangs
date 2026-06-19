@@ -547,8 +547,7 @@ fn run() -> Result<()> {
                 partition_budget,
             };
             let json = pangs_clients::run_cc2json(&pir, &module, &opts)?;
-            fs::write(&json_out, &json)
-                .with_context(|| format!("write {}", json_out.display()))?;
+            fs::write(&json_out, &json).with_context(|| format!("write {}", json_out.display()))?;
             eprintln!("cc2json: wrote {}", json_out.display());
         }
     }

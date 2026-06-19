@@ -1,0 +1,154 @@
+{
+  "module": "m1_6_high_fanout_modref",
+  "functions": [
+    {
+      "key": "main",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "alloca",
+          "dest": "%slot",
+          "ty": "i8*",
+          "loc": null
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G00",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 1, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G01",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 2, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G02",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 3, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G03",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 4, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G04",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 5, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G05",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 6, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G06",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 7, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G07",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 8, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G08",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 9, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G09",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 10, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G10",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 11, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G11",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 12, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G12",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 13, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G13",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 14, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G14",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 15, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G15",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 16, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@G16",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 17, "col": 1 }
+        },
+        {
+          "kind": "load",
+          "dest": "%p",
+          "address": "%slot",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 18, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%p",
+          "value": "%x",
+          "loc": { "file": "m1_6_high_fanout.c", "line": 19, "col": 1 }
+        }
+      ]
+    }
+  ],
+  "globals": [
+    { "key": "@G00", "mutable": true },
+    { "key": "@G01", "mutable": true },
+    { "key": "@G02", "mutable": true },
+    { "key": "@G03", "mutable": true },
+    { "key": "@G04", "mutable": true },
+    { "key": "@G05", "mutable": true },
+    { "key": "@G06", "mutable": true },
+    { "key": "@G07", "mutable": true },
+    { "key": "@G08", "mutable": true },
+    { "key": "@G09", "mutable": true },
+    { "key": "@G10", "mutable": true },
+    { "key": "@G11", "mutable": true },
+    { "key": "@G12", "mutable": true },
+    { "key": "@G13", "mutable": true },
+    { "key": "@G14", "mutable": true },
+    { "key": "@G15", "mutable": true },
+    { "key": "@G16", "mutable": true }
+  ]
+}

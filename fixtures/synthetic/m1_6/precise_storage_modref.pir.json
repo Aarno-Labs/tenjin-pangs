@@ -1,0 +1,49 @@
+{
+  "module": "m1_6_precise_storage_modref",
+  "functions": [
+    {
+      "key": "main",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "alloca",
+          "dest": "%slot",
+          "ty": "i8*",
+          "loc": null
+        },
+        {
+          "kind": "store",
+          "address": "%slot",
+          "value": "@Cell",
+          "loc": { "file": "m1_6_precise_storage.c", "line": 1, "col": 1 }
+        },
+        {
+          "kind": "global_ref",
+          "global": "@Cell",
+          "access": "mod",
+          "loc": { "file": "m1_6_precise_storage.c", "line": 2, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "@Cell",
+          "value": "@Other",
+          "loc": { "file": "m1_6_precise_storage.c", "line": 2, "col": 1 }
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@Cell",
+      "mutable": true
+    },
+    {
+      "key": "@Other",
+      "mutable": true
+    }
+  ]
+}

@@ -568,14 +568,14 @@ impl<'a> Refiner<'a> {
         solve.run();
         if profile {
             eprintln!(
-                "pangs andersen profile: solve done steps={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} collapsed={}",
+                "pangs andersen profile: solve done steps={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={}",
                 solve.steps,
                 solve.pts.len(),
                 solve.pts_facts(),
                 solve.succ.len(),
                 solve.copy_edges(),
                 solve.fields.len(),
-                solve.collapsed.len()
+                solve.unknown_fields.len()
             );
         }
         solve
@@ -948,12 +948,17 @@ struct Solve {
     /// canonicalized only into this finite vocabulary.
     known_offsets: HashSet<i64>,
     /// base object cell -> its materialized constant-offset field cells. Needed to
-    /// retroactively conflate them when the base later receives a non-constant access (M2.1).
+    /// retroactively connect them when the base later receives a non-constant access (M2.1).
     obj_fields: HashMap<Cell, Vec<Cell>>,
-    /// base object cells that have had a non-constant (`⊤`) access — their fields are
-    /// conflated with the whole object (the generalization pair, `PLAN-M2_lite_delta.md`
-    /// §1 M2.1). A field distinction is unsound once an unknown offset can alias it.
-    collapsed: HashSet<Cell>,
+    /// base object cell -> per-base unknown-offset summary cell. Dynamic GEPs over the same
+    /// object all route through this cell rather than collapsing every future field to the
+    /// whole-object cell.
+    unknown_fields: HashMap<Cell, Cell>,
+    /// unknown-offset summary cell -> base object cell.
+    unknown_field_base: HashMap<Cell, Cell>,
+    /// base object cells that have had a direct load/store through the whole object. If the
+    /// object also has an unknown-offset summary, the direct cell aliases the summary.
+    direct_accessed: HashSet<Cell>,
     worklist: Vec<Cell>,
     queued: HashSet<Cell>,
     profile: bool,
@@ -977,7 +982,9 @@ impl Solve {
             field_offset: HashMap::new(),
             known_offsets: HashSet::new(),
             obj_fields: HashMap::new(),
-            collapsed: HashSet::new(),
+            unknown_fields: HashMap::new(),
+            unknown_field_base: HashMap::new(),
+            direct_accessed: HashSet::new(),
             worklist: Vec::new(),
             queued: HashSet::new(),
             profile,
@@ -1059,48 +1066,35 @@ impl Solve {
     /// Field/subobject identity for `base + off` (M2.1, `PLAN-M2_lite_delta.md` §1 M2.1).
     ///
     /// A **constant** offset gets its own subobject cell, giving field sensitivity. A
-    /// **non-constant** offset (`None`) is the unknown-offset `⊤` case: it can alias *any*
-    /// field of `base`, so we **conflate** `base`'s fields with the whole-object cell and
-    /// route the access there. This is the generalization pair recast as a collapse — it is
-    /// the principled fix for the M1.4b false negative where a value stored through a
-    /// dynamic-index GEP was invisible to a constant-offset load of the same object. The
-    /// collapse is sound (a superset) and only touches objects actually indexed by an
-    /// unknown offset; all-constant objects keep full field precision.
+    /// **non-constant** offset (`None`) uses a per-root unknown-offset summary cell. The
+    /// summary aliases every materialized constant field for that root, so a dynamic-index
+    /// store is visible to constant-field loads (and vice versa), but we avoid routing all
+    /// future fields through the whole-object cell. This keeps the M2.1 soundness property
+    /// while reducing broad cross-field/root pollution.
     fn field_of(&mut self, base: Cell, off: Option<i64>) -> Cell {
         if base == self.omega {
             return self.omega;
+        }
+        if self.unknown_field_base.contains_key(&base) {
+            return base;
         }
         if let Some(&root) = self.field_base.get(&base) {
             // Keep nested constant GEPs finite by canonicalizing them back to root+offset
             // rather than creating field-of-field chains. We only materialize combined
             // offsets that occur in the fixed graph's finite offset vocabulary; other nested
-            // constants collapse to root. Unknown nested offsets also collapse the root
-            // object because they may alias any root field.
+            // constants route to the root's unknown-offset summary. Unknown nested offsets
+            // also route to the root summary because they may alias any root field.
             let base_off = self.field_offset.get(&base).copied().unwrap_or(0);
             return match off.and_then(|delta| base_off.checked_add(delta)) {
                 Some(combined) if combined == base_off => base,
                 Some(combined) if self.known_offsets.contains(&combined) => {
                     self.field_of(root, Some(combined))
                 }
-                Some(_) => {
-                    self.collapse(root);
-                    root
-                }
-                None => {
-                    self.collapse(root);
-                    root
-                }
+                Some(_) | None => self.unknown_field_of(root),
             };
         }
-        if self.collapsed.contains(&base) {
-            // Every access to a `⊤`-collapsed object names the whole-object cell.
-            return base;
-        }
         match off {
-            None => {
-                self.collapse(base);
-                base
-            }
+            None => self.unknown_field_of(base),
             Some(off) => {
                 if let Some(&cell) = self.fields.get(&(base, off)) {
                     return cell;
@@ -1111,24 +1105,54 @@ impl Solve {
                 self.field_base.insert(cell, base);
                 self.field_offset.insert(cell, off);
                 self.obj_fields.entry(base).or_default().push(cell);
+                if let Some(&summary) = self.unknown_fields.get(&base) {
+                    self.add_copy(cell, summary);
+                    self.add_copy(summary, cell);
+                }
                 cell
             }
         }
     }
 
-    /// Mark `base` as `⊤`-accessed and conflate its already-materialized field cells with
-    /// the whole-object cell, in both directions: a value stored to any field becomes
-    /// visible to the unknown-offset access, and vice versa. Idempotent; future fields of a
-    /// collapsed object route straight to `base` via `field_of`.
-    fn collapse(&mut self, base: Cell) {
-        if !self.collapsed.insert(base) {
+    fn unknown_field_of(&mut self, base: Cell) -> Cell {
+        if let Some(&cell) = self.unknown_fields.get(&base) {
+            return cell;
+        }
+        let cell = self.next_field;
+        self.next_field += 1;
+        self.unknown_fields.insert(base, cell);
+        self.unknown_field_base.insert(cell, base);
+        self.field_base.insert(cell, base);
+        self.obj_fields.entry(base).or_default().push(cell);
+        if let Some(fields) = self.obj_fields.get(&base).cloned() {
+            for field in fields {
+                if field == cell {
+                    continue;
+                }
+                self.add_copy(field, cell);
+                self.add_copy(cell, field);
+            }
+        }
+        if self.direct_accessed.contains(&base) {
+            self.add_copy(base, cell);
+            self.add_copy(cell, base);
+        }
+        cell
+    }
+
+    fn note_direct_access(&mut self, base: Cell) {
+        if base == self.omega
+            || self.field_base.contains_key(&base)
+            || self.unknown_field_base.contains_key(&base)
+        {
             return;
         }
-        if let Some(fields) = self.obj_fields.get(&base).cloned() {
-            for f in fields {
-                self.add_copy(f, base);
-                self.add_copy(base, f);
-            }
+        if !self.direct_accessed.insert(base) {
+            return;
+        }
+        if let Some(&summary) = self.unknown_fields.get(&base) {
+            self.add_copy(base, summary);
+            self.add_copy(summary, base);
         }
     }
 
@@ -1143,7 +1167,7 @@ impl Solve {
     fn maybe_report_progress(&self) {
         if self.profile && self.steps % 10_000 == 0 {
             eprintln!(
-                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} collapsed={}",
+                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={}",
                 self.steps,
                 self.worklist.len(),
                 self.queued.len(),
@@ -1152,7 +1176,7 @@ impl Solve {
                 self.succ.len(),
                 self.copy_edges(),
                 self.fields.len(),
-                self.collapsed.len()
+                self.unknown_fields.len()
             );
         }
     }
@@ -1195,6 +1219,7 @@ impl Solve {
                 self.report_large_product("load", n, ps.len(), objs.len());
                 for p in ps {
                     for &o in &objs {
+                        self.note_direct_access(o);
                         self.add_copy(o, p);
                     }
                 }
@@ -1204,6 +1229,7 @@ impl Solve {
                 self.report_large_product("store", n, qs.len(), objs.len());
                 for (q, omega_source) in qs {
                     for &o in &objs {
+                        self.note_direct_access(o);
                         if q == self.omega {
                             self.add_pts_with_source(o, self.omega, omega_source.as_deref());
                         } else {
@@ -1243,7 +1269,9 @@ impl Solve {
                         .unwrap_or_default();
                     self.report_large_product("memcpy", n, dobjs.len(), sobjs.len());
                     for &od in &dobjs {
+                        self.note_direct_access(od);
                         for &os in &sobjs {
+                            self.note_direct_access(os);
                             self.add_copy(os, od);
                         }
                     }

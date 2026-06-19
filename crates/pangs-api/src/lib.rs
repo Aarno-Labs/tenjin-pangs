@@ -3030,11 +3030,17 @@ fn pointer_modref_profile_top_emitters() -> usize {
         .unwrap_or(20)
 }
 
+fn pointer_modref_profile_global() -> Option<String> {
+    std::env::var("PANGS_POINTER_MODREF_PROFILE_GLOBAL")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
 fn pointer_modref_high_fanout_limit() -> usize {
     std::env::var("PANGS_POINTER_MODREF_HIGH_FANOUT_LIMIT")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(4096)
+        .unwrap_or(16)
 }
 
 fn transitive_modref_high_fanout_limit() -> usize {
@@ -3068,6 +3074,8 @@ struct PointerAccess {
 struct ModRefNodeSummaryData {
     external: bool,
     pointee_global_ids: Rc<[GlobalId]>,
+    pointee_global_keys: Rc<[String]>,
+    pointee_global_sample: Rc<[String]>,
     pointee_global_count: usize,
     external_source_suffix: Option<String>,
     direct_symbol_global: Option<GlobalId>,
@@ -3205,6 +3213,8 @@ struct PointerAccessEmitterEntry {
     fanout: usize,
     func: FuncId,
     node_label: String,
+    pointee_global_count: usize,
+    pointee_global_sample: Rc<[String]>,
     access_rank: u8,
     suppress_direct_symbol: bool,
 }
@@ -3218,6 +3228,8 @@ struct PointerAccessEmitterProfile {
     interval_rows: u64,
     next_rows: u64,
     entries: Vec<PointerAccessEmitterEntry>,
+    target_global: Option<String>,
+    target_entries: Vec<PointerAccessEmitterEntry>,
 }
 
 impl PointerAccessEmitterProfile {
@@ -3232,6 +3244,8 @@ impl PointerAccessEmitterProfile {
             interval_rows,
             next_rows: interval_rows,
             entries: Vec::new(),
+            target_global: pointer_modref_profile_global(),
+            target_entries: Vec::new(),
         }
     }
 
@@ -3247,26 +3261,30 @@ impl PointerAccessEmitterProfile {
         }
         let expanded_rows = occurrences.saturating_mul(fanout as u64);
         self.observed_rows = self.observed_rows.saturating_add(expanded_rows);
-        if self.should_keep(expanded_rows) {
-            self.entries.push(PointerAccessEmitterEntry {
-                expanded_rows,
-                occurrences,
-                fanout,
-                func: FuncId(key.func),
-                node_label: summary.label.to_string(),
-                access_rank: key.access_rank,
-                suppress_direct_symbol: key.suppress_direct_symbol,
-            });
-            self.entries.sort_by(|left, right| {
-                right
-                    .expanded_rows
-                    .cmp(&left.expanded_rows)
-                    .then_with(|| right.occurrences.cmp(&left.occurrences))
-                    .then_with(|| right.fanout.cmp(&left.fanout))
-                    .then_with(|| left.func.cmp(&right.func))
-                    .then_with(|| left.node_label.cmp(&right.node_label))
-            });
-            self.entries.truncate(self.limit);
+        let entry = PointerAccessEmitterEntry {
+            expanded_rows,
+            occurrences,
+            fanout,
+            func: FuncId(key.func),
+            node_label: summary.label.to_string(),
+            pointee_global_count: summary.pointee_global_count,
+            pointee_global_sample: Rc::clone(&summary.pointee_global_sample),
+            access_rank: key.access_rank,
+            suppress_direct_symbol: key.suppress_direct_symbol,
+        };
+        if self.should_keep(&self.entries, expanded_rows) {
+            self.entries.push(entry.clone());
+            Self::sort_and_truncate(&mut self.entries, self.limit);
+        }
+        if self.target_global.as_deref().is_some_and(|target| {
+            summary
+                .pointee_global_keys
+                .iter()
+                .any(|global| global == target)
+        }) && self.should_keep(&self.target_entries, expanded_rows)
+        {
+            self.target_entries.push(entry);
+            Self::sort_and_truncate(&mut self.target_entries, self.limit);
         }
         if self.observed_rows >= self.next_rows {
             self.print("top-emitters-progress");
@@ -3276,12 +3294,60 @@ impl PointerAccessEmitterProfile {
         }
     }
 
-    fn should_keep(&self, expanded_rows: u64) -> bool {
-        self.entries.len() < self.limit
-            || self
-                .entries
+    fn sort_and_truncate(entries: &mut Vec<PointerAccessEmitterEntry>, limit: usize) {
+        entries.sort_by(|left, right| {
+            right
+                .expanded_rows
+                .cmp(&left.expanded_rows)
+                .then_with(|| right.occurrences.cmp(&left.occurrences))
+                .then_with(|| right.fanout.cmp(&left.fanout))
+                .then_with(|| left.func.cmp(&right.func))
+                .then_with(|| left.node_label.cmp(&right.node_label))
+        });
+        entries.truncate(limit);
+    }
+
+    fn should_keep(&self, entries: &[PointerAccessEmitterEntry], expanded_rows: u64) -> bool {
+        entries.len() < self.limit
+            || entries
                 .last()
                 .is_some_and(|entry| expanded_rows > entry.expanded_rows)
+    }
+
+    fn print_entry(prefix: &str, idx: usize, entry: &PointerAccessEmitterEntry) {
+        eprintln!(
+            "{prefix} #{}: expanded_rows={} occurrences={} fanout={} \
+             pointee_global_count={} func={} access_rank={} suppress_direct_symbol={} \
+             node={} pointee_sample={}",
+            idx + 1,
+            entry.expanded_rows,
+            entry.occurrences,
+            entry.fanout,
+            entry.pointee_global_count,
+            entry.func.0,
+            entry.access_rank,
+            entry.suppress_direct_symbol,
+            entry.node_label,
+            entry.pointee_global_sample.join(","),
+        );
+    }
+
+    fn print_entries(&self, label: &str, entries: &[PointerAccessEmitterEntry]) {
+        let prefix = format!("pangs pointer modref profile {label}");
+        for (idx, entry) in entries.iter().enumerate() {
+            Self::print_entry(&prefix, idx, entry);
+        }
+    }
+
+    fn print_target_entries(&self, label: &str) {
+        let Some(target) = self.target_global.as_deref() else {
+            return;
+        };
+        eprintln!(
+            "pangs pointer modref profile {label}: target_global={target} target_entries={}",
+            self.target_entries.len(),
+        );
+        self.print_entries(&format!("{label} target-global"), &self.target_entries);
     }
 
     fn print(&self, label: &str) {
@@ -3294,20 +3360,8 @@ impl PointerAccessEmitterProfile {
             self.observed_rows,
             self.entries.len(),
         );
-        for (idx, entry) in self.entries.iter().enumerate() {
-            eprintln!(
-                "pangs pointer modref profile {label} #{}: expanded_rows={} occurrences={} \
-                 fanout={} func={} access_rank={} suppress_direct_symbol={} node={}",
-                idx + 1,
-                entry.expanded_rows,
-                entry.occurrences,
-                entry.fanout,
-                entry.func.0,
-                entry.access_rank,
-                entry.suppress_direct_symbol,
-                entry.node_label,
-            );
-        }
+        self.print_entries(label, &self.entries);
+        self.print_target_entries(label);
     }
 }
 
@@ -3477,9 +3531,20 @@ fn build_modref_node_summary_data(
     let direct_symbol_global = label
         .strip_prefix("sym:global:")
         .and_then(|global_key| global_lookup.get(global_key).copied());
+    let pointee_global_keys = Rc::<[String]>::from(resolution.pointee_globals.to_vec());
+    let pointee_global_sample = Rc::<[String]>::from(
+        resolution
+            .pointee_globals
+            .iter()
+            .take(16)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
     ModRefNodeSummaryData {
         external: resolution.external,
         pointee_global_ids,
+        pointee_global_keys,
+        pointee_global_sample,
         pointee_global_count: resolution.pointee_globals.len(),
         external_source_suffix: resolution
             .external
@@ -3506,6 +3571,7 @@ fn push_pointer_modrefs_from_pag(
     let mut local_rows = LocalPointerModRefRows::new(global_lookup.len());
     let mut access_profile = PointerAccessEmitterProfile::from_env();
     let high_fanout_limit = pointer_modref_high_fanout_limit();
+    let precise_storage_addresses = precise_storage_addresses(pag, global_lookup);
     let mut active_func = None;
     for edge in &pag.edges {
         let Some((owner, func, accesses)) = edge_accesses(edge, func_lookup) else {
@@ -3561,6 +3627,33 @@ fn push_pointer_modrefs_from_pag(
             } else {
                 ModRefSourcePhase::PagPointer
             };
+            if phase == ModRefSourcePhase::PagPointer {
+                if precise_storage_addresses
+                    .local_allocas
+                    .contains(&pointer_access.address_node)
+                {
+                    continue;
+                }
+                if precise_storage_addresses
+                    .direct_global_symbols
+                    .contains(&pointer_access.address_node)
+                {
+                    continue;
+                }
+                if let Some(&gid) = precise_storage_addresses
+                    .global_bases
+                    .get(&pointer_access.address_node)
+                {
+                    push_local_pointer_modref_row(
+                        &mut local_rows,
+                        gid,
+                        pointer_access.access,
+                        witness.as_deref(),
+                        1,
+                    );
+                    continue;
+                }
+            }
             if phase != ModRefSourcePhase::PagPointer {
                 flush_local_pointer_access_rows(
                     modrefs,
@@ -3663,6 +3756,7 @@ fn push_pointer_memset_modrefs_from_pir(
     nodes: &BTreeMap<String, NodeResolution>,
     noloc_ord: &mut BTreeMap<(String, String), u32>,
 ) {
+    let high_fanout_limit = pointer_modref_high_fanout_limit();
     for func in &module.functions {
         let Some(&func_id) = func_lookup.get(&func.key) else {
             continue;
@@ -3688,6 +3782,30 @@ fn push_pointer_memset_modrefs_from_pir(
                 continue;
             };
             let witness = witness_key(&func.key, loc, noloc_ord, "global");
+            let fanout = resolution
+                .pointee_globals
+                .iter()
+                .filter(|global_key| global_lookup.contains_key(*global_key))
+                .count();
+            if high_fanout_limit > 0 && fanout > high_fanout_limit {
+                modrefs.note_high_fanout_fallback(fanout as u64);
+                modrefs.push_with_phase(
+                    ModRef {
+                        func: func_id,
+                        global: GlobalTarget::Unknown("omega_store".to_string()),
+                        access: Access::Mod,
+                        via: Via::Unknown,
+                        witness,
+                        detail: Some(format!(
+                            "high_fanout_pointer_modref:source=stmt:memset_dst:node={label}:fanout={fanout}:occurrences=1"
+                        )),
+                        address_node: Some(label),
+                        pointee_globals: Vec::new(),
+                    },
+                    Some(ModRefSourcePhase::MemsetMemcpy),
+                );
+                continue;
+            }
             for global_key in resolution.pointee_globals.iter() {
                 let Some(&gid) = global_lookup.get(global_key) else {
                     continue;
@@ -3753,6 +3871,97 @@ fn modref_detail_with_external_suffix_and_pointee_count(
 
 fn modref_detail_with_external_sources(base: &str, sources: &[String]) -> String {
     modref_detail_with_external_suffix(base, modref_external_source_suffix(sources).as_deref())
+}
+
+struct PreciseStorageAddresses {
+    local_allocas: BTreeSet<pangs_pag::NodeId>,
+    direct_global_symbols: BTreeSet<pangs_pag::NodeId>,
+    global_bases: BTreeMap<pangs_pag::NodeId, GlobalId>,
+}
+
+fn precise_storage_addresses(
+    pag: &Pag,
+    global_lookup: &HashMap<String, GlobalId>,
+) -> PreciseStorageAddresses {
+    let mut local_allocas = BTreeSet::new();
+    let mut direct_global_symbols = BTreeSet::new();
+    let mut global_bases = BTreeMap::new();
+    for node in &pag.nodes {
+        if let Some(global) = node
+            .label
+            .strip_prefix("sym:global:")
+            .and_then(|global_key| global_lookup.get(global_key).copied())
+        {
+            direct_global_symbols.insert(node.id);
+            global_bases.insert(node.id, global);
+        } else if let Some(global) = label_known_global(&node.label, global_lookup) {
+            global_bases.insert(node.id, global);
+        }
+    }
+    for edge in &pag.edges {
+        if !matches!(edge.kind, EdgeKind::AddrOf) {
+            continue;
+        }
+        let Some(src) = pag.nodes.get(edge.src.0 as usize) else {
+            continue;
+        };
+        match &src.kind {
+            pangs_pag::NodeKind::Object {
+                object: pangs_pag::ObjectKind::Alloca,
+                ..
+            } => {
+                local_allocas.insert(edge.dst);
+            }
+            pangs_pag::NodeKind::Object {
+                object: pangs_pag::ObjectKind::Global,
+                key,
+                ..
+            } => {
+                if let Some(&global) = global_lookup.get(key) {
+                    direct_global_symbols.insert(edge.dst);
+                    global_bases.insert(edge.dst, global);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for edge in &pag.edges {
+            let Some(&global) = global_bases.get(&edge.src) else {
+                continue;
+            };
+            if !matches!(edge.kind, EdgeKind::Gep { byte_off: Some(_) }) {
+                continue;
+            }
+            changed |= global_bases.insert(edge.dst, global).is_none();
+        }
+    }
+    PreciseStorageAddresses {
+        local_allocas,
+        direct_global_symbols,
+        global_bases,
+    }
+}
+
+fn label_known_global(label: &str, global_lookup: &HashMap<String, GlobalId>) -> Option<GlobalId> {
+    for token in label.split('@').skip(1) {
+        let symbol: String = token
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '$'))
+            .collect();
+        if !symbol.is_empty() {
+            if let Some(&global) = global_lookup.get(&symbol) {
+                return Some(global);
+            }
+            let sigiled = format!("@{symbol}");
+            if let Some(&global) = global_lookup.get(&sigiled) {
+                return Some(global);
+            }
+        }
+    }
+    None
 }
 
 fn edge_accesses(

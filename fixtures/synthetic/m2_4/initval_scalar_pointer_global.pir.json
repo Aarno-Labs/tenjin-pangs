@@ -1,0 +1,35 @@
+{
+  "module": "m2_4.initval_scalar_pointer_global",
+  "functions": [
+    {
+      "key": "reader",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "global_ref",
+          "global": "@Sep",
+          "access": "ref",
+          "loc": { "file": "m2_4_scalar_ptr.c", "line": 3, "col": 3 }
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@Sep",
+      "mutable": true
+    },
+    {
+      "key": "@Slash",
+      "is_const": true,
+      "mutable": false
+    }
+  ],
+  "global_init": [
+    { "kind": "store", "address": "@Sep", "value": "@Slash" }
+  ]
+}

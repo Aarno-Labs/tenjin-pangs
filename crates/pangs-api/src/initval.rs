@@ -247,6 +247,11 @@ impl<'a> InitValResolver<'a> {
                 .insert(format!("function:{}@global_init", target.key));
             return Some(out);
         }
+        if let Some(global) = self.global_key(value) {
+            let mut out = SlotValue::default();
+            out.sites.insert(format!("global:{global}@global_init"));
+            return Some(out);
+        }
         let stmt_index = self.global_init_definition_before(before_stmt, value)?;
         match &self.module.global_init[stmt_index] {
             Stmt::Assign { sources, .. } => {
@@ -275,9 +280,9 @@ impl<'a> InitValResolver<'a> {
     }
 
     fn function_place(&self, func_index: usize, before_stmt: usize, value: &str) -> Option<SubObj> {
-        if self.globals.contains(value) {
+        if let Some(global) = self.global_key(value) {
             return Some(SubObj {
-                root: value.to_string(),
+                root: global.to_string(),
                 byte_off: 0,
             });
         }
@@ -303,9 +308,9 @@ impl<'a> InitValResolver<'a> {
     }
 
     fn global_init_place(&self, before_stmt: usize, value: &str) -> Option<SubObj> {
-        if self.globals.contains(value) {
+        if let Some(global) = self.global_key(value) {
             return Some(SubObj {
-                root: value.to_string(),
+                root: global.to_string(),
                 byte_off: 0,
             });
         }
@@ -354,9 +359,16 @@ impl<'a> InitValResolver<'a> {
     fn mentioned_globals(&self, stmt: &Stmt) -> BTreeSet<String> {
         stmt_operands(stmt)
             .into_iter()
-            .filter(|operand| self.globals.contains(*operand))
-            .map(str::to_string)
+            .filter_map(|operand| self.global_key(operand).map(str::to_string))
             .collect()
+    }
+
+    fn global_key<'b>(&self, operand: &'b str) -> Option<&'b str> {
+        if self.globals.contains(operand) {
+            return Some(operand);
+        }
+        let stripped = operand.strip_prefix('@')?;
+        self.globals.contains(stripped).then_some(stripped)
     }
 }
 
