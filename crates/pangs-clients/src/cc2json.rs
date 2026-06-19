@@ -98,32 +98,71 @@ pub fn run_cc2json(pir: &Pir, _input_path: &Path, opts: &Cc2jsonOpts) -> Result<
 /// global). It cannot follow values that flow through memory/loads, so executables relying on
 /// aliased arguments may still under-report relative to cclyzer's full points-to.
 fn mutated_globals(pir: &Pir, analysis: &Analysis) -> Vec<String> {
-    let mut mutated: BTreeSet<&str> = analysis
+    let defined = defined_globals(pir);
+    let mut mutated = BTreeSet::<String>::new();
+    for mr in analysis
         .modrefs()
         .iter()
         .filter(|mr| matches!(mr.access, Access::Mod))
-        .filter_map(|mr| match &mr.global {
-            GlobalTarget::Name(id) => Some(analysis.globals()[*id].key.as_str()),
-            GlobalTarget::Unknown(_) => None,
-        })
-        .collect();
+    {
+        match &mr.global {
+            GlobalTarget::Name(id) => {
+                mutated.insert(analysis.globals()[*id].key.clone());
+            }
+            GlobalTarget::Unknown(_) if !mr.pointee_globals.is_empty() => {
+                mutated.extend(mr.pointee_globals.iter().cloned());
+            }
+            GlobalTarget::Unknown(_) if unknown_modref_may_touch_module_global(mr) => {
+                mutated.extend(
+                    analysis
+                        .globals()
+                        .iter()
+                        .filter(|g| g.mutable && defined.contains(g.key.as_str()))
+                        .map(|g| g.key.clone()),
+                );
+            }
+            GlobalTarget::Unknown(_) => {}
+        }
+    }
 
     let global_names: BTreeSet<&str> = pir.globals.iter().map(|g| g.key.as_str()).collect();
     let arg_mutated = mutated_via_call_args(pir, &global_names);
-    mutated.extend(arg_mutated.iter().map(String::as_str));
+    mutated.extend(arg_mutated);
 
     // cclyzer only forms a global_allocation for globals *defined* in the module, so external
     // declarations (e.g. libc's `stdout`) are never mutated. pangs records a `GlobalRef` mod in
     // `global_init` for exactly the defined globals (those with an initializer), so restrict to
     // that set. This drops field-insensitive aliased false-positives that land on extern decls
     // (sbase's `stdout`) without losing defined aggregates like `g_buffer`.
-    let defined = defined_globals(pir);
     analysis
         .globals()
         .iter()
         .filter(|g| mutated.contains(g.key.as_str()) && defined.contains(g.key.as_str()))
         .filter_map(|g| process_global_name(&g.key))
         .collect()
+}
+
+fn unknown_modref_may_touch_module_global(mr: &pangs_api::ModRef) -> bool {
+    if !mr.pointee_globals.is_empty() {
+        return true;
+    }
+    let Some(detail) = mr.detail.as_deref() else {
+        return true;
+    };
+    if detail.starts_with("high_fanout_pointer_modref:") {
+        return true;
+    }
+    if detail.contains("omega:inttoptr") || detail.contains("omega:ptrtoint_escape") {
+        return true;
+    }
+    detail_pointee_count(detail).is_some_and(|count| count > 0)
+}
+
+fn detail_pointee_count(detail: &str) -> Option<usize> {
+    detail.rsplit('|').find_map(|part| {
+        part.strip_prefix("pointee_count=")
+            .and_then(|value| value.parse::<usize>().ok())
+    })
 }
 
 /// Globals *defined* in this module (those with a constant initializer). pangs' PIR lowering emits
@@ -1409,6 +1448,23 @@ mod tests {
         assert_eq!(
             json["mutated_globals"],
             serde_json::json!(["Mutated"]),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn cc2json_high_fanout_unknown_store_conservatively_mutates_defined_globals() {
+        let fixture = workspace_root().join("fixtures/synthetic/m1_6/high_fanout_modref.pir.json");
+        let pir = Pir::from_path(&fixture).unwrap();
+
+        let rendered = run_cc2json(&pir, &fixture, &cc2json_test_opts()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let expected = (0..=16)
+            .map(|idx| format!("@G{idx:02}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            json["mutated_globals"],
+            serde_json::json!(expected),
             "{rendered}"
         );
     }

@@ -150,5 +150,24 @@
     { "key": "@G14", "mutable": true },
     { "key": "@G15", "mutable": true },
     { "key": "@G16", "mutable": true }
+  ],
+  "global_init": [
+    { "kind": "global_ref", "global": "@G00", "access": "mod" },
+    { "kind": "global_ref", "global": "@G01", "access": "mod" },
+    { "kind": "global_ref", "global": "@G02", "access": "mod" },
+    { "kind": "global_ref", "global": "@G03", "access": "mod" },
+    { "kind": "global_ref", "global": "@G04", "access": "mod" },
+    { "kind": "global_ref", "global": "@G05", "access": "mod" },
+    { "kind": "global_ref", "global": "@G06", "access": "mod" },
+    { "kind": "global_ref", "global": "@G07", "access": "mod" },
+    { "kind": "global_ref", "global": "@G08", "access": "mod" },
+    { "kind": "global_ref", "global": "@G09", "access": "mod" },
+    { "kind": "global_ref", "global": "@G10", "access": "mod" },
+    { "kind": "global_ref", "global": "@G11", "access": "mod" },
+    { "kind": "global_ref", "global": "@G12", "access": "mod" },
+    { "kind": "global_ref", "global": "@G13", "access": "mod" },
+    { "kind": "global_ref", "global": "@G14", "access": "mod" },
+    { "kind": "global_ref", "global": "@G15", "access": "mod" },
+    { "kind": "global_ref", "global": "@G16", "access": "mod" }
   ]
 }
