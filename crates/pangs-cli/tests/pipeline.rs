@@ -1673,6 +1673,13 @@ fn analyze_steens_exports_memset_pointer_modref_rows() {
             && row["via"] == "aliased"
             && row["witness"] == "main@m1_6_memset.c:5:1#0"
     }));
+    assert!(modref.iter().any(|row| {
+        row["func"] == "main"
+            && row["global"]["name"] == "@DirectExprDst"
+            && row["access"] == "mod"
+            && row["via"] == "aliased"
+            && row["witness"] == "main@m1_6_memset.c:6:1#0"
+    }));
     assert!(!modref.iter().any(|row| row["access"] == "ref"));
 
     let components: Value =

@@ -2774,6 +2774,7 @@ fn steens_memset_modref_exports_direct_aliased_and_unknown_store_rows() {
     let main = analysis.lookup_func("main").unwrap();
     let aliased = analysis.lookup_global("@Aliased").unwrap();
     let direct_dst = analysis.lookup_global("@DirectDst").unwrap();
+    let direct_expr_dst = analysis.lookup_global("@DirectExprDst").unwrap();
     let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();
 
     assert!(raw_modrefs.iter().any(|mr| {
@@ -2797,6 +2798,13 @@ fn steens_memset_modref_exports_direct_aliased_and_unknown_store_rows() {
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Aliased
             && mr.witness.as_deref() == Some("main@m1_6_memset.c:5:1#0")
+    }));
+    assert!(raw_modrefs.iter().any(|mr| {
+        mr.func == main
+            && mr.global == pangs_api::GlobalTarget::Name(direct_expr_dst)
+            && mr.access == Access::Mod
+            && mr.via == pangs_api::Via::Aliased
+            && mr.witness.as_deref() == Some("main@m1_6_memset.c:6:1#0")
     }));
     assert!(!raw_modrefs.iter().any(|mr| mr.access == Access::Ref));
 

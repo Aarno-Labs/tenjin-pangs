@@ -3933,6 +3933,18 @@ fn push_pointer_memset_modrefs_from_pir(
                 );
                 continue;
             }
+            if let Some(gid) = label_known_global(dst, global_lookup) {
+                let witness = witness_key(&func.key, loc, noloc_ord, "global");
+                modrefs.push_named_empty(
+                    func_id,
+                    gid,
+                    Access::Mod,
+                    Via::Aliased,
+                    witness.as_deref(),
+                    Some(ModRefSourcePhase::MemsetMemcpy),
+                );
+                continue;
+            }
             let label = pag_value_label(module, &func.key, dst);
             let Some(resolution) = nodes.get(&label) else {
                 continue;

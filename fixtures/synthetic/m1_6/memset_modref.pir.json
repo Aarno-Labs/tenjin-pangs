@@ -41,6 +41,13 @@
           "value": "%byte",
           "bytes": 8,
           "loc": { "file": "m1_6_memset.c", "line": 5, "col": 1 }
+        },
+        {
+          "kind": "memset",
+          "dst": "i8* bitcast ([8 x i8]* @DirectExprDst to i8*)",
+          "value": "%byte",
+          "bytes": 8,
+          "loc": { "file": "m1_6_memset.c", "line": 6, "col": 1 }
         }
       ]
     }
@@ -52,6 +59,10 @@
     },
     {
       "key": "@DirectDst",
+      "mutable": true
+    },
+    {
+      "key": "@DirectExprDst",
       "mutable": true
     }
   ]
