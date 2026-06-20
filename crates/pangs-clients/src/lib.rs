@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -836,13 +836,15 @@ where
     I: IntoIterator<Item = T>,
 {
     let path = path.as_ref();
-    let mut file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut file = BufWriter::new(file);
     let mut count = 0;
     for record in records {
         serde_json::to_writer(&mut file, &record)?;
         file.write_all(b"\n")?;
         count += 1;
     }
+    file.flush()?;
     files.push(FileRecord {
         name: path.file_name().unwrap().to_string_lossy().to_string(),
         records: count,
@@ -857,9 +859,11 @@ fn write_json<T: Serialize>(
     files: &mut Vec<FileRecord>,
 ) -> Result<()> {
     let path = path.as_ref();
-    let mut file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut file = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut file, value)?;
     file.write_all(b"\n")?;
+    file.flush()?;
     if files.is_empty() && path.file_name().is_some_and(|name| name == "manifest.json") {
         return Ok(());
     }
