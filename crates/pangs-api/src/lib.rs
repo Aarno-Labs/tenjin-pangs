@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Deref;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -9,7 +10,7 @@ use pangs_solve::{
     debug_assert_narrows, solve_andersen_with_overrides, solve_steensgaard, IndirectCallResolution,
     NodeResolution,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 mod differential;
@@ -236,7 +237,7 @@ pub struct StationarityVerdict {
     pub complete_initval: bool,
     pub stationary: bool,
     pub reason: StationarityReason,
-    pub runtime_writers: Vec<StationarityWriter>,
+    pub runtime_writers: StationarityWriters,
     pub initval_diagnostics: Vec<InitValDiagnostic>,
 }
 
@@ -258,6 +259,51 @@ pub struct StationarityWriter {
     pub access: Access,
     pub via: Via,
     pub witness: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StationarityWriters(Rc<[StationarityWriter]>);
+
+impl StationarityWriters {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, StationarityWriter> {
+        self.0.iter()
+    }
+}
+
+impl From<Vec<StationarityWriter>> for StationarityWriters {
+    fn from(writers: Vec<StationarityWriter>) -> Self {
+        Self(Rc::from(writers))
+    }
+}
+
+impl Deref for StationarityWriters {
+    type Target = [StationarityWriter];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl Serialize for StationarityWriters {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StationarityWriters {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<StationarityWriter>::deserialize(deserializer).map(Self::from)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1706,7 +1752,7 @@ fn conservative_stationarity_verdicts(
                     complete_initval: false,
                     stationary: false,
                     reason: StationarityReason::ConservativeStage,
-                    runtime_writers: Vec::new(),
+                    runtime_writers: StationarityWriters::default(),
                     initval_diagnostics: Vec::new(),
                 })
         })
@@ -1723,63 +1769,20 @@ fn stationarity_verdicts_from_modrefs(
     external_storage_globals: &BTreeSet<String>,
     modrefs: &[ModRef],
 ) -> (BTreeSet<String>, Vec<StationarityVerdict>) {
-    let mut runtime_writers = BTreeMap::<String, Vec<StationarityWriter>>::new();
-    let mut target_unknown_writers = BTreeMap::<String, Vec<StationarityWriter>>::new();
     let mut unknown_writers = Vec::<StationarityWriter>::new();
     for mr in modrefs {
-        if mr.access != Access::Mod {
-            continue;
+        if is_module_unknown_stationarity_writer(mr) {
+            unknown_writers.push(stationarity_writer_from_modref(mr));
         }
-        match &mr.global {
-            GlobalTarget::Name(gid) => {
-                runtime_writers
-                    .entry(globals[gid.0 as usize].key.clone())
-                    .or_default()
-                    .push(stationarity_writer_from_modref(mr));
-            }
-            GlobalTarget::Unknown(_)
-                if mr
-                    .stationarity_pointee_globals
-                    .as_deref()
-                    .is_some_and(|globals| !globals.is_empty()) =>
-            {
-                let writer = stationarity_writer_from_modref(mr);
-                for &gid in mr.stationarity_pointee_globals.as_deref().unwrap_or(&[]) {
-                    if let Some(global) = globals.get(gid.0 as usize) {
-                        target_unknown_writers
-                            .entry(global.key.clone())
-                            .or_default()
-                            .push(writer.clone());
-                    }
-                }
-            }
-            GlobalTarget::Unknown(_) if !mr.pointee_globals.is_empty() => {
-                let writer = stationarity_writer_from_modref(mr);
-                for global_key in &mr.pointee_globals {
-                    if global_lookup.contains_key(global_key) {
-                        target_unknown_writers
-                            .entry(global_key.clone())
-                            .or_default()
-                            .push(writer.clone());
-                    }
-                }
-            }
-            GlobalTarget::Unknown(_) if unknown_modref_may_touch_module_global(mr) => {
-                unknown_writers.push(stationarity_writer_from_modref(mr));
-            }
-            GlobalTarget::Unknown(_) => {}
-        }
-    }
-    for writers in runtime_writers.values_mut() {
-        writers.sort_by(stationarity_writer_cmp);
-        writers.dedup_by(|left, right| stationarity_writer_cmp(left, right) == Ordering::Equal);
-    }
-    for writers in target_unknown_writers.values_mut() {
-        writers.sort_by(stationarity_writer_cmp);
-        writers.dedup_by(|left, right| stationarity_writer_cmp(left, right) == Ordering::Equal);
     }
     unknown_writers.sort_by(stationarity_writer_cmp);
     unknown_writers.dedup_by(|left, right| stationarity_writer_cmp(left, right) == Ordering::Equal);
+    let unknown_writers = StationarityWriters::from(unknown_writers);
+    let (runtime_writers, target_unknown_writers) = if unknown_writers.is_empty() {
+        collect_targeted_stationarity_writers(modrefs, globals, global_lookup)
+    } else {
+        (BTreeMap::new(), BTreeMap::new())
+    };
 
     let mut stationary_globals = BTreeSet::new();
     let mut verdicts = Vec::new();
@@ -1807,7 +1810,7 @@ fn stationarity_verdicts_from_modrefs(
         initval_diagnostics
             .dedup_by(|left, right| initval_diagnostic_cmp(left, right) == Ordering::Equal);
         let absence_only_initval = initval_is_absence_only(&initval_diagnostics);
-        let mut writers = Vec::new();
+        let mut writers = StationarityWriters::default();
         let reason = if !complete_initval
             && !(absence_only_initval
                 && !external_storage_globals.contains(&global.key)
@@ -1816,15 +1819,15 @@ fn stationarity_verdicts_from_modrefs(
         {
             StationarityReason::IncompleteInitval
         } else if !unknown_writers.is_empty() {
-            writers.extend(unknown_writers.iter().cloned());
+            writers = unknown_writers.clone();
             StationarityReason::UnknownRuntimeWriter
         } else if let Some(known_unknown_writers) = target_unknown_writers.get(&global.key) {
-            writers.extend(known_unknown_writers.iter().cloned());
+            writers = known_unknown_writers.clone();
             StationarityReason::UnknownRuntimeWriter
         } else if external_storage_globals.contains(&global.key) {
             StationarityReason::ExportedGlobal
         } else if let Some(known_writers) = runtime_writers.get(&global.key) {
-            writers.extend(known_writers.iter().cloned());
+            writers = known_writers.clone();
             StationarityReason::RuntimeWriter
         } else {
             stationary_globals.insert(global.key.clone());
@@ -1847,6 +1850,135 @@ fn stationarity_verdicts_from_modrefs(
     (stationary_globals, verdicts)
 }
 
+fn collect_targeted_stationarity_writers(
+    modrefs: &[ModRef],
+    globals: &[GlobalInfo],
+    global_lookup: &HashMap<String, GlobalId>,
+) -> (
+    BTreeMap<String, StationarityWriters>,
+    BTreeMap<String, StationarityWriters>,
+) {
+    let mut runtime_writers = BTreeMap::<String, Vec<StationarityWriter>>::new();
+    let mut target_unknown_writer_groups =
+        BTreeMap::<Vec<GlobalId>, Vec<StationarityWriter>>::new();
+    for mr in modrefs {
+        if mr.access != Access::Mod {
+            continue;
+        }
+        match &mr.global {
+            GlobalTarget::Name(gid) => {
+                runtime_writers
+                    .entry(globals[gid.0 as usize].key.clone())
+                    .or_default()
+                    .push(stationarity_writer_from_modref(mr));
+            }
+            GlobalTarget::Unknown(_)
+                if mr
+                    .stationarity_pointee_globals
+                    .as_deref()
+                    .is_some_and(|globals| !globals.is_empty()) =>
+            {
+                let targets = stationarity_target_key_from_ids(
+                    mr.stationarity_pointee_globals.as_deref().unwrap_or(&[]),
+                    globals,
+                );
+                if !targets.is_empty() {
+                    target_unknown_writer_groups
+                        .entry(targets)
+                        .or_default()
+                        .push(stationarity_writer_from_modref(mr));
+                }
+            }
+            GlobalTarget::Unknown(_) if !mr.pointee_globals.is_empty() => {
+                let targets =
+                    stationarity_target_key_from_names(&mr.pointee_globals, global_lookup);
+                if !targets.is_empty() {
+                    target_unknown_writer_groups
+                        .entry(targets)
+                        .or_default()
+                        .push(stationarity_writer_from_modref(mr));
+                }
+            }
+            GlobalTarget::Unknown(_) => {}
+        }
+    }
+    for writers in runtime_writers.values_mut() {
+        writers.sort_by(stationarity_writer_cmp);
+        writers.dedup_by(|left, right| stationarity_writer_cmp(left, right) == Ordering::Equal);
+    }
+    for writers in target_unknown_writer_groups.values_mut() {
+        writers.sort_by(stationarity_writer_cmp);
+        writers.dedup_by(|left, right| stationarity_writer_cmp(left, right) == Ordering::Equal);
+    }
+    let mut target_unknown_groups_by_global = BTreeMap::<GlobalId, Vec<StationarityWriters>>::new();
+    for (targets, writers) in target_unknown_writer_groups {
+        let writers = StationarityWriters::from(writers);
+        for gid in targets {
+            target_unknown_groups_by_global
+                .entry(gid)
+                .or_default()
+                .push(writers.clone());
+        }
+    }
+    let target_unknown_writers: BTreeMap<String, StationarityWriters> =
+        target_unknown_groups_by_global
+            .into_iter()
+            .filter_map(|(gid, groups)| {
+                globals.get(gid.0 as usize).map(|global| {
+                    let writers = merge_stationarity_writer_groups(groups);
+                    (global.key.clone(), writers)
+                })
+            })
+            .collect();
+    (
+        runtime_writers
+            .into_iter()
+            .map(|(global, writers)| (global, StationarityWriters::from(writers)))
+            .collect(),
+        target_unknown_writers
+            .into_iter()
+            .map(|(global, writers)| (global, StationarityWriters::from(writers)))
+            .collect(),
+    )
+}
+
+fn stationarity_target_key_from_ids(ids: &[GlobalId], globals: &[GlobalInfo]) -> Vec<GlobalId> {
+    let mut targets = ids
+        .iter()
+        .copied()
+        .filter(|gid| globals.get(gid.0 as usize).is_some())
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+fn stationarity_target_key_from_names(
+    names: &[String],
+    global_lookup: &HashMap<String, GlobalId>,
+) -> Vec<GlobalId> {
+    let mut targets = names
+        .iter()
+        .filter_map(|name| global_lookup.get(name).copied())
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+fn merge_stationarity_writer_groups(groups: Vec<StationarityWriters>) -> StationarityWriters {
+    if groups.len() == 1 {
+        return groups.into_iter().next().unwrap();
+    }
+    let mut writers = groups
+        .iter()
+        .flat_map(|group| group.iter().cloned())
+        .collect::<Vec<_>>();
+    writers.sort_by(stationarity_writer_cmp);
+    writers.dedup_by(|left, right| stationarity_writer_cmp(left, right) == Ordering::Equal);
+    StationarityWriters::from(writers)
+}
+
 fn stationarity_writer_from_modref(mr: &ModRef) -> StationarityWriter {
     StationarityWriter {
         func: Some(mr.func),
@@ -1855,6 +1987,21 @@ fn stationarity_writer_from_modref(mr: &ModRef) -> StationarityWriter {
         via: mr.via,
         witness: mr.witness.clone(),
     }
+}
+
+fn is_module_unknown_stationarity_writer(mr: &ModRef) -> bool {
+    if mr.access != Access::Mod || !matches!(mr.global, GlobalTarget::Unknown(_)) {
+        return false;
+    }
+    if mr
+        .stationarity_pointee_globals
+        .as_deref()
+        .is_some_and(|globals| !globals.is_empty())
+        || !mr.pointee_globals.is_empty()
+    {
+        return false;
+    }
+    unknown_modref_may_touch_module_global(mr)
 }
 
 fn unknown_modref_may_touch_module_global(mr: &ModRef) -> bool {
