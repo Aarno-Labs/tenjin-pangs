@@ -265,25 +265,6 @@ scope.
 
 ## 3. Work items
 
-### D0 — marker-survival spike (~1 day, do first)
-
-The riskiest external assumption in the whole design is `DISPOSITION.md` §5.2's claim
-that no-op marker calls survive C→Rust translation robustly. Verify before building on
-it: toy C program with `pangs_*` marker calls (extern declarations in a header, empty
-definitions in one TU) → run the project's actual C→Rust translator → confirm the calls
-appear in the Rust output, attributable by name, deletable mechanically. Also test the
-awkward placements: marker as last statement of a block, marker inside a
-macro-adjacent line, marker in a TU compiled with different flags.
-**Exit criterion:** a written note in this file's §8 recording what survived and any
-placement rules the C→C tool must obey. If the spike *fails*, the fallback (source-map
-emission by the C→C tool, `DISPOSITION.md` §5.2's alternative) gets promoted before D5
-is built — that decision reverses cheaply now and expensively later.
-
-**Blocked (as of 2026-07-15):** the project's C→Rust translator is not present in this
-workspace and no in-repo note records its command, repository, or supported flags. D0
-cannot run until the project owner supplies that (record it here when known). Nothing
-else is held up: per §4, D1a/D1b/D1c/D2/D2b have no dependency on D0 — only D5 does.
-
 ### D1 — manifest, fact assembly, cascade (~400 lines + crate scaffolding)
 
 Split for independent landing:
@@ -391,7 +372,7 @@ member-only demotion for `immutable`/`localize`.
 
 ### D5 — marker contract (~150 lines analysis-side + harness)
 
-Consumes D0's placement rules. Deliverables: (a) marker codec already in D1a — this
+Deliverables: (a) marker codec already in D1a — this
 item adds the **marker inventory** schema (key → marker symbol → kind) appended to the
 manifest by the C→C tool and *validated* by a `pangs-manifest` helper the Rust rewriter
 calls (every disposition needing a marker has one; no orphan markers); (b) generation
