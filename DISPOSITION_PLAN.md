@@ -30,8 +30,11 @@ reviewable against them:
    D1a).
 4. **Determinism.** Emission uses one canonical pretty-JSON encoding: record fields in
    schema order; flattened unknown fields in lexical order; globals by key; groups by
-   id; traces in cascade order; a trailing newline; and no dependence on hash-map
-   iteration. Arbitrary input whitespace and object-key order need not be preserved.
+   id; traces in cascade order; audit-ledger records by `id`; override-report entries
+   by (scope kind, key, requested strategy); certificate failure `codes` lexically;
+   witness lists by the canonical witness key (§1.5); coupling evidence edges by
+   (kind, members) and their `sites` by (file, line, col); a trailing newline; and no
+   dependence on hash-map iteration. Arbitrary input whitespace and object-key order need not be preserved.
    Canonicalizing the same semantic input produces byte-identical output, and a second
    canonicalization is a byte-level no-op. This is what makes golden-file testing and
    manifest diffing work.
@@ -58,8 +61,76 @@ leans on: (a) the uniquification pre-pass runs **before** analysis, so manifest 
 match what the C→C tool and translator see — recorded as a run assumption in
 `pangs-audit.json`; (b) fact assembly asserts key uniqueness and hard-errors on
 collision (the backstop if (a) is ever violated or the harness's scheme changes). Path
-normalization (case, symlinks, build-dir prefixes) happens once, in lowering, against a
-configured repo root — nowhere else.
+normalization happens once, in lowering, against the configured repo root — nowhere
+else — by the algorithm below.
+
+**Normalization algorithm.** Load-bearing: changing it later orphans every override
+file, so it is fixed here. Keys are a pure function of (DI metadata, `repo_root`) —
+lexical throughout, with exactly one filesystem-touching step:
+
+1. `repo_root` is absolutized and `realpath`'d **once** at analysis start; the
+   resolved form is what `run.analysis.repo_root` records.
+2. The source path is assembled per DWARF rules: `DIFile.filename` if absolute,
+   otherwise `DIFile.directory` joined with it. A still-relative result (relative
+   compilation directory) is unresolvable → step 5.
+3. The assembled path is normalized **lexically only**: separators to `/`, `.`
+   segments dropped, `..` segments collapsed against their lexical parent, **no case
+   folding, no per-file `realpath`** — keys must match the path spelling the C→C
+   tool and translator see in the build tree, and per-file symlink resolution would
+   tie keys to the analysis machine's filesystem state instead. A build that spells
+   paths through an in-repo symlink gets keys as stable as that spelling (the §8
+   key-instability risk row covers drift).
+4. The `repo_root` prefix is stripped — trying the resolved form first, then the
+   as-given absolute form, to tolerate a root reached via symlink. The remainder is
+   `tu-path`.
+5. A path that ends up outside `repo_root`, cannot be absolutized, or contains a
+   literal `::` (which would break key parsing — no escaping scheme: the case does
+   not occur in real C trees, and a loud diagnostic beats a permanent codec) makes
+   the symbol **unkeyable**: the global goes to `unkeyed_globals` with witness kind
+   `unnormalizable-path`; a function in this state is treated like the missing-DI
+   case below (it cannot anchor certificates).
+
+`symbol-name` must match `[A-Za-z0-9_.$]+` — C identifiers plus LLVM/uniquifier
+decorations, colon-free by construction. `tu-path` may contain a single `:` but never
+`::` (step 5), so a key parses unambiguously at its **last** `::`; fact assembly
+validates both components, and nothing unkeyable ever reaches `globals[]`.
+
+Decisions the grammar previously left open:
+
+- **The grammar covers all symbol identities *in the manifest*, functions included —
+  and only defined symbols ever receive one.** Certificates, witnesses, and the
+  once-lock rewiring are keyed by function identity, and internal-linkage (static)
+  functions collide across TUs exactly like globals do. One grammar, one parser,
+  both symbol kinds. But the qualified key is a **manifest-layer identity, derived
+  at fact assembly** from (DI defining file, symbol name) — it does not replace the
+  raw LLVM names (`FuncInfo.key` / `GlobalInfo.key`) that the existing analysis
+  export streams use; those identifiers stay as they are, and manifest records carry
+  the raw name alongside (`meta.llvm_name`) as the this-run join key back to the
+  streams — evidence, never identity. **External declarations get no qualified key
+  and no synthetic grammar**: they have no defining TU, cannot be disposition
+  subjects or certificate anchors (both require rewriting a definition we own), and
+  where a witness needs to mention one (`pthread_create`, a libc sink) its `symbol`
+  field carries the raw name as free evidence text.
+- **`repo_root` is an explicit lowering input** (CLI flag / config, no default
+  guessing), recorded in `run.analysis.repo_root` so key derivation is reproducible
+  from the manifest alone.
+- **The defining-TU path comes from DI metadata** (`DIGlobalVariable` /
+  `DISubprogram` file), the same source D1b-pre already names for type spelling.
+  Today's lowering emits `file: None` for every global
+  (`crates/pangs-pir/src/llvm_sys.rs`, `bump_missing_debug_location("global")`) —
+  capturing it is part of the D1b-pre scope, not a new discovery.
+- **A symbol with no DI defining file cannot get a cross-tool identity, and no
+  identity means no cross-tool decision.** No `?::name` fallback keys: a key either
+  follows the grammar or the global is out of scope for this layer. Since `globals[]`
+  records require a key, such a global does not appear there at all — it goes in the
+  analysis-owned **`unkeyed_globals`** diagnostic collection
+  (`{ llvm_name, witness }`, witness kind `missing-debug-metadata`; `DISPOSITION.md`
+  §3), carries no facts or disposition, is unreachable by overrides and markers, and
+  is counted in the `unhandled` remainder for reporting (coverage loss, never
+  corruption — consistent with O1's stance that builds lacking debug metadata
+  certify nothing). A *function* with no DI file is handled analogously where its
+  identity is needed: it cannot be named in certificates, so certificates that would
+  reference it fail with the same witness kind.
 
 ### 1.2 Marker name mangling
 
@@ -79,7 +150,47 @@ D5 still emits a hard error on collision (paranoia is cheap here). The codec liv
 one shared crate (§2) — analysis, C→C tool, and Rust rewriter must never reimplement
 it.
 
-### 1.3 `pangs-dispose` exit codes
+### 1.3 `pangs-dispose` CLI contract: I/O and exit codes
+
+**Input.** `pangs-dispose <export-dir | manifest-path>`: the directory form resolves
+`<dir>/pangs-manifest.json`. The soundness ledger is located as the **sibling
+`pangs-audit.json` next to the manifest** by default, overridable with
+`--audit <path>`; the manifest never embeds a ledger path (embedded paths go stale
+when exports are copied). A **missing ledger is exit code 1**, never auto-created:
+analysis emission always writes it (at minimum the run-assumption records, §1.1), so
+absence means an incomplete or hand-pruned export, and inventing an empty ledger
+would silently discard the claim that analysis-sourced assumptions were ever
+recorded.
+
+**Overrides selection.** Both explicit and discovered, with explicit winning:
+`--overrides <path>` if given (pointing at a missing file ⇒ exit 1 — an explicit
+request must be satisfiable); otherwise the sibling `pangs-overrides.toml` next to
+the manifest is auto-discovered *if present*; otherwise no overrides (a valid run).
+`--no-overrides` suppresses auto-discovery (baselines, idempotence harnesses);
+combining it with `--overrides` is a usage error. `run.dispose.overrides_file`
+records the resolved path (null when none) and `overrides_sha256` the content hash,
+so a manifest states exactly which override set produced it — the reproducibility
+anchor for the idempotence test. One consequence to know: with `--out <dir>`, a
+*later* rerun on the output directory will not auto-discover the original overrides
+file (it is not copied); the recorded `overrides_file`/`overrides_sha256` make that
+loud — rerunning with a different effective override set changes `run.dispose`
+visibly rather than silently.
+
+**Output.** Default is **in-place rewrite of both artifacts**; `--out <dir>` writes
+the pair elsewhere and leaves the inputs untouched. The pair is replaced via
+temp-file + rename in the target directory: ledger renamed first, manifest last —
+the manifest is the commit point. Two renames are not jointly atomic; the crash
+window leaves a new ledger beside an old manifest, which the next run overwrites
+wholesale (both are pure functions of their inputs, §1.7), and no individual file is
+ever observable torn.
+
+**Export-index interaction.** The disposition artifacts live in the export directory
+but are **excluded from the export manifest's `files` index** (`manifest.json`,
+`schemas/manifest.schema.json`): that index carries sha256es of the immutable
+analysis streams, and indexing artifacts that `pangs-dispose` rewrites offline would
+stale it by design.
+
+**Exit codes.**
 
 | Code | Meaning |
 |---|---|
@@ -95,10 +206,32 @@ failure is diagnosable from artifacts alone.
 
 The "audited soundness inventory" becomes a machine artifact, `pangs-audit.json`,
 emitted alongside the manifest: a list of assumption records
-`{ id, kind, scope (global key | run), source ("analysis" | "override" | "entry-spine"),
-text, witness? }`. Accepted-risk overrides (D2) append `kind: "accepted-risk"` records.
+
+```jsonc
+{ "id": "ar-…", "kind": "accepted-risk" | "run-assumption" | ...,
+  "scope":   { "kind": "run" }
+           | { "kind": "global", "key": "src/state.c::g_stats" }
+           | { "kind": "group",  "key": "grp-cmd" },      // typed — group-level
+                                                          //   accepted-risk records
+                                                          //   (DISPOSITION.md §6) need it
+  "source": "analysis" | "override" | "entry-spine",
+  "text": "...", "witness": <Witness>? }
+```
+
+Accepted-risk overrides (D2) append `kind: "accepted-risk"` records — one per
+honored pin, group pins producing a single `scope.kind: "group"` record whose
+witness names every failed member/guard.
 The human-readable inventory sections in `DESIGN.md` §8 remain the catalog of *kinds*;
 the JSON is the per-run instantiation.
+
+**Relationship to the existing `audit.jsonl`: augments, never replaces.** The export
+directory's `audit.jsonl` (`schemas/audit.schema.json`) is the stream of per-site
+Ω-taint *findings* — things the analysis detected in the program. `pangs-audit.json`
+is the ledger of *assumptions* — things a human or a run configuration asserted and
+must remain accountable for. Findings stay in `audit.jsonl` untouched; ledger
+witnesses may reference findings by their site/kind, and the two artifacts share no
+records. The ledger's JSON Schema lands as `schemas/disposition-audit.schema.json`,
+beside `schemas/disposition-manifest.schema.json` (§2 naming note).
 
 Record ids are deterministic:
 `id = "ar-" + first 32 hex chars of SHA-256(canonical JSON of { kind, scope, source,
@@ -147,13 +280,23 @@ invariant; the schema validator re-checks it.
 
 `kind` is an open string registry (additive evolution: consumers tolerate unknown
 kinds). Initial entries: `write-site`, `escape-site`, `violation-finding`,
-`spawn-reachability`, `signal-registration`, `omega-access-path`.
+`spawn-reachability`, `signal-registration`, `omega-access-path`, `external-escape`,
+`missing-debug-metadata`, `unnormalizable-path`.
+
+**Canonical witness key** — the one ordering/tiebreak rule for witnesses everywhere
+(ground rule 4 sorting, §1.9's "lexicographically smallest witness" selection): the
+tuple `(kind, site.file, site.line, site.col, symbol, note)` compared
+lexicographically, with absent fields ordering before present ones.
 
 **word_sized_scalar:**
 
 ```jsonc
-{ "value": <bool>, "type_spelling": "<C spelling>"?, "size_bits": <int>? }
-// type_spelling and size_bits present iff value is true
+{ "value": <bool>,
+  "type_spelling": "<C spelling, outermost typedef name if any>"?,
+  "size_bits": <int>?,
+  "class": "integer" | "boolean" | "enum" | "pointer"?,
+  "signed": <bool>? }               // integer/enum only
+// all optional fields present iff value is true (semantics: §1.9)
 ```
 
 **Certificate slot** (`phase_stationarity`, `atomic_eligibility`, `mutex_eligibility`):
@@ -164,9 +307,23 @@ kinds). Initial entries: `write-site`, `escape-site`, `violation-finding`,
 | { "status": "failed",
     "codes": ["never-quiescent", ...],                       // ≥1, pass-owned registry
     "witnesses": [ <Witness>, ... ],                         // per-code witnesses
+    "recipe": { ... }?,                                      // optional: same shape as
+                                                             //   the certified payload,
+                                                             //   attached when the pass
+                                                             //   could compute the
+                                                             //   rewrite plan despite
+                                                             //   the failure — gates
+                                                             //   accept_risk (§4.2)
     "diagnostics": { ... }? }                                // optional pass-owned extras
                                                              // (e.g. rescuable site lists)
 ```
+
+The `recipe` field is what separates **"evidence failed"** from **"rewrite plan
+absent"**: a kill-rule failure (say `thread-writer`) can still carry a full
+publication payload if P selection ran, and an accepted-risk pin is executable only
+then. A `never-quiescent` failure has no publication point to attach, so no recipe —
+and no pin can be honored, `accept_risk` or not. Passes MAY attach recipes on
+failure; they are never required to.
 
 The producing pass emits this slot shape **directly** — there is no wrapping of a
 pass-native document, and no nested verdict fields. For `phase_stationarity` the
@@ -202,9 +359,12 @@ The cascade guard "localization verdict OK" is `verdict == "ok"`.
 Guard names are the fact names of the strategy's conjuncts (`DISPOSITION.md` §1) plus
 `violation_taint`, the implicit conjunct of every guard: a tainted global skips every
 configured entry with `guard-failed: ["violation_taint", ...]` and lands on
-`unhandled`. `cascade_trace` covers exactly the configured order — a strategy disabled
-by config appears nowhere in the trace (the order itself is recorded in
-`run.dispose`).
+`unhandled`. `cascade_trace` records exactly the **attempted-and-skipped** entries:
+the configured strategies strictly before the chosen one, in configured order (all
+configured strategies when the result is `unhandled`). Entries after the chosen
+strategy are never attempted (first-applicable) and do not appear; neither do
+strategies disabled by config (the order itself is recorded in `run.dispose`). The
+chosen strategy is not a trace entry — it lives in `disposition.chosen`.
 
 Rust-side these are `EvidencedBool`, `Witness`, `WordSizedScalar`,
 `CertificateSlot<C>` (an `Option` around a two-variant `status`-tagged enum),
@@ -225,9 +385,18 @@ CascadeConfig { mode: application | library, order: [strategy, ...] }
 - **Defaults** when no `[cascade]` block is present: application =
   `["immutable", "once-lock", "atomic", "mutex", "localize"]`; library = the same
   without `localize`.
+- **`mode` defaults from the analysis build mode** recorded in `run.analysis.opts`:
+  `executable` → `application`, `library` → `library`. An explicit `--mode` flag may
+  *narrow* `application` → `library` (e.g. to forbid `localize` for a binary that
+  will be librarified); widening `library` → `application` is a config error — the
+  analysis ran without a `main` spine and `localize`'s premises don't hold.
 - `unhandled` is the implicit last entry and may not be listed. Duplicates and unknown
   strategy names are config errors. `localize` under `mode = library` is a config
   error — the applications-only rule is enforced loudly here, never skipped silently.
+- **The order also bounds overrides**: a pin may only name a listed strategy — pins on
+  omitted strategies are `rejected-strategy-disabled` regardless of `accept_risk`
+  (`DISPOSITION.md` §4.2). Exception: `unhandled` is never listed but always pinnable
+  (safe opt-out).
 - Strategies whose producing pass has not run **may** be listed (the defaults include
   `atomic`/`mutex` from day one): a `null` fact slot skips per-global as
   `fact-not-computed` (ground rule 6), keeping the default order stable across pass
@@ -254,6 +423,182 @@ CascadeConfig { mode: application | library, order: [strategy, ...] }
 The D2 idempotence test is therefore exact: `pangs-dispose` on its own output with the
 same config and overrides is a byte-level no-op across both artifacts, and changing
 only the overrides file changes only dispose-owned content.
+
+### 1.8 Concrete shared-record shapes (completing schema v2)
+
+Typing rule for D1a: **shared records are strongly typed now; pass-owned certificate
+payloads are typed envelopes around opaque values.** Concretely, the certificate-slot
+envelope (`status`/`codes`/`witnesses`) is typed, while `certificate` and
+`diagnostics` interiors are `serde_json::Value` in v1 code — the JSON Schema does not
+validate their interior, the producing pass's document (`ONCELOCK.md` §2 for
+phase-stationarity) stays normative, and each landing pass promotes its payload to a
+typed struct without changing the JSON shape (no `schema_version` bump). Everything
+below is a shared record and is fixed here:
+
+```jsonc
+// run.analysis — mirrors the existing export-manifest header fields
+{ "pangs_git": "...", "llvm_version": "...", "input_path": "...",
+  "input_sha256": "...", "opts": { /* analysis Opts, as today */ },
+  "repo_root": "...",                       // §1.1; key derivation input
+  "entry_spine": { ... } }                  // ONCELOCK.md §2.1; null in library mode
+
+// globals[].meta
+{ "linkage": "internal" | "external",
+  "type_spelling": "<C spelling>" | null,   // DI-derived (§1.1, D1b-pre)
+  "size_bits": <int> | null,
+  "llvm_name": "<raw LLVM symbol>",         // this-run join key to the analysis
+                                            //   export streams (§1.1) — evidence,
+                                            //   never identity
+  "file": "..." | null, "line": <int> | null }   // evidence, never identity
+
+// override_report
+{ "entries": [
+    { "scope": "global" | "group" | "cascade",
+      "key": "<global key | group id | null for cascade blocks>",
+      "requested": "<strategy | order list>",
+      "accept_risk": <bool>,
+      "outcome": "honored" | "honored-accepted-risk" | "rejected"
+               | "rejected-strategy-disabled" | "rejected-strategy-unavailable"
+               | "rejected-no-recipe" | "unmatched-key",
+      "reason": "<free text>" | null,
+      "witness": <Witness>? } ],
+  "counts": { "honored": n, "honored_accepted_risk": n, "rejected": n,
+              "rejected_strategy_disabled": n, "rejected_strategy_unavailable": n,
+              "rejected_no_recipe": n, "unmatched_key": n } }
+
+// unkeyed_globals[] — analysis-owned diagnostics (§1.1: no key ⇒ not in globals[])
+{ "llvm_name": "<raw LLVM symbol>", "witness": <Witness> }
+
+// coupling_groups[].evidence — a list of typed edges
+[ { "kind": "co-write" | "oncelock-interval",
+    "members": ["<key>", "<key>"],
+    "sites": [ <Site>, ... ] } ]
+
+// coupling_groups[].strategy_support.once_lock — the D2b common-P certificate
+  { "supported": true,
+    "publication_function": "<function key>",
+    "common_interval": { "earliest": <Site>, "latest": <Site> },
+    "common_p": <Site> }
+| { "supported": false, "witness": <Witness> }   // names the first failing condition
+
+// materialization — C→C-tool-owned (DISPOSITION.md §3.3)
+{ "tool": { "name": "...", "version": "..." },
+  "marker_inventory": [
+    { "key": "<global key>", "kind": "publish" | "disposition_<strategy>",
+      "marker": "<symbol>", "group": "<group id>" | null,
+      "insertion": <Site> } ],                   // evidence-only
+  "demotions": [ { "key": "<global key>", "from": "<strategy>",
+                   "witness": <Witness> } ] }
+
+// globals[].disposition.demotion — mirror of the demotions entry, on the record
+{ "from": "<strategy>", "witness": <Witness> }
+```
+
+`Site` is the witness site object from §1.5 (`{ file, line, col?, function? }`).
+
+### 1.9 Fact-production rules (D1b normative — not to be inferred)
+
+- **`written`** is *may-written*: `value = !never_written` from the solved solution,
+  which today is also false when the object's storage escapes externally
+  (`crates/pangs-solve/src/lib.rs`, `never_written = !escape_external ∧ no store
+  reaches the class`). The witness is a concrete write site when one exists
+  (`kind: "write-site"`), otherwise the escape that prevents ruling writes out
+  (`kind: "external-escape"`). The `immutable` guard's `¬written ∧
+  ¬omega_escaped_address` is therefore partially redundant — accepted; redundancy in
+  a soundness guard is free.
+- **`violation_taint(g)`**: true iff some violation finding's containing function `f`
+  has `g` in its *direct or aliased* modref rows (not transitive closure — tainting
+  everything `main` reaches would drown the signal; the object-level side channel a
+  violation can open is already covered by Ω, i.e. `omega_escaped_address`). Witness:
+  the finding, `kind: "violation-finding"`.
+- **`access_set_complete(g)`**, evaluated in this order with the first failing
+  condition as witness: (a) no modref row for `g` has `Via::Unknown`; (b)
+  `¬omega_escaped_address(g)`; (c) `g` is not exported to external storage (library
+  mode); (d) no accessor function of `g` is violation-tainted. When several sites
+  fail one condition, the witness is the lexicographically smallest witness key
+  (determinism, ground rule 4).
+- **`word_sized_scalar(g)`** — the name is historical shorthand; the actual
+  predicate is "has a matching Rust atomic type on the target":
+  - **Widths**: `size_bits ∈ {8, 16, 32, 64}` ∩ the target's supported atomic
+    widths (from the LLVM target triple / data layout recorded at lowering — all
+    four on the mainstream x86-64/aarch64 targets), **not** "exactly pointer
+    width". Additionally the global's alignment must equal its size (natural
+    alignment — a packed placement disqualifies; atomics require it).
+  - **Qualifying type classes**, after peeling `typedef`/`const`/`volatile`/
+    `restrict` DI wrappers: integers (`DW_ATE_signed`/`unsigned`/`*_char`) →
+    `AtomicIN`/`AtomicUN`; `_Bool` (`DW_ATE_boolean`) → `AtomicBool`; enums
+    (`DW_TAG_enumeration_type`) via their underlying integer width — included in
+    the fact (they widen the M3 gate counter in the overcount direction, which is
+    correct for a build/no-build gate; whether D3 certifies enum retyping is D3's
+    call); data and function pointers (`DW_TAG_pointer_type`) → `AtomicPtr`.
+    Floats and everything else: `false` (no stable Rust atomic).
+  - **Reconstruction from DI**: `type_spelling` is the *outermost* name as written
+    (the typedef name when one exists — that is the spelling the rewriter must
+    reproduce); `signed` comes from the `DW_ATE` encoding of the fully-resolved
+    base type (enums: their underlying type; pointers/booleans: absent); `class`
+    records which rule fired so the §7 gate counter can be broken down without
+    re-parsing spellings.
+- **`localization(g)`** — assembled from `ComponentInfo` (`compute_components`),
+  stated exactly because it feeds a cascade guard:
+  - A global may appear in the `mutable_globals` of **several** components (each
+    component collects its members' modref targets). The verdict is the
+    conjunction: `verdict: "ok"` iff `g` appears in at least one component and
+    **every** containing component has `frozen: false` (which in the current code
+    is `taint.is_empty()`). Note this is deliberately stricter than the existing
+    `in_rewritable_components` metric, which counts membership in *any* non-frozen
+    component — localizing `g` rewrites all its accessors, so every containing
+    component must be rewritable.
+  - `component` field: the lexicographically smallest containing component id
+    (evidence, not identity).
+  - `blockers`: the union of the frozen containing components' `taint` entries,
+    mapped by kind — `unknown_caller` → `unknown-caller-taint`, `unknown_callee` →
+    `unknown-callee-taint`, everything else (`unknown_global` and all audit-taint
+    kinds such as `inline_asm`, `fnptr_ptrtoint`) → `frozen-component` with the
+    original taint kind preserved in the blocker witness's `note` and the taint's
+    witness key parsed into its `site`. Deduplicated and sorted by the canonical
+    witness key.
+  - `g` in no component at all ⇒ `localization: null` (the client did not cover
+    it; surfaces as `fact-not-computed` in the trace rather than a fabricated
+    verdict).
+- **Spawn / signal-registration API registries.** A registry entry carries its
+  calling convention, so extensions are well-defined:
+  `{ name, kind: "spawn" | "signal", entry: {"arg": i} | {"pointee_of_arg": i} }`
+  (0-based argument indices). Built-in defaults:
+
+  | name | kind | entry operand |
+  |---|---|---|
+  | `pthread_create` | spawn | `arg 2` (`start_routine`) |
+  | `thrd_create` | spawn | `arg 1` (`func`) |
+  | `signal` | signal | `arg 1` (`handler`) |
+  | `sigaction` | signal | `pointee_of_arg 1` (handler inside `*act`) |
+
+  Extensible via analysis opts (recorded in `run.analysis.opts`); never silently
+  hardcoded elsewhere. Evaluation rules:
+  - **Recognition runs over final-call-graph edges** to a registry function —
+    indirect calls that resolve to one count the same as direct calls. An indirect
+    call with an Ω/unknown-callee edge needs no special case: its function-pointer
+    arguments already Ω-escape under the boundary rules, so Ω conservatism covers
+    whatever it might have registered.
+  - **Entry/handler set at a site** = every function object in the solved pts of the
+    designated operand; for `pointee_of_arg`, every function object reachable
+    through the operand's pointees (v1: any function in the pts of memory reachable
+    from the struct pointer — covers both `sa_handler` and `sa_sigaction` without
+    field discrimination). `SIG_DFL`/`SIG_IGN` integer constants are not handlers.
+  - **Multiple resolved targets are all treated as entries/handlers** (union).
+  - **Unresolved operand** (pts contains the Ω/unknown element): the entry set
+    conservatively expands to the resolved targets **∪ every function whose address
+    Ω-escapes** — that is exactly what the Ω element denotes, so this is the model's
+    own answer, not an ad-hoc widening. Dependent facts then take their evidenced
+    polarity (`thread_visible`/`signal_context_access` true for the affected
+    globals) with the registration site as witness (kind
+    `spawn-reachability`/`signal-registration`, note recording the unresolved
+    operand). The over-approximation lands in the safe direction: it blocks `mutex`
+    and widens reporting, never certifies.
+
+  A *missing* registry entry still cannot corrupt: an entry function or handler
+  passed to an unrecognized external is Ω-escaped by the existing boundary rules, so
+  the miss degrades to conservatism (`omega_escaped_address` / kill rules), not to a
+  false certificate. The registries only *refine*.
 
 ## 2. Code layout
 
@@ -298,7 +643,11 @@ Split for independent landing:
   manifest parses and re-emits byte-identically; a deliberately non-canonical fixture
   canonicalizes once and is byte-identical on the second pass.
 - **D1b — fact assembly (phase-F post-pass, ~200 lines + lowering plumbing below).**
-  One scan assembling the `DISPOSITION.md` §2 vector per client-relevant global.
+  One scan assembling the `DISPOSITION.md` §2 vector per client-relevant global —
+  population per `DISPOSITION.md` §3: every defined mutable global (the existing
+  `GlobalInfo.mutable` bit, post ignore-list, function-scope statics included;
+  stationary/never-written included), with unkeyable globals diverted to
+  `unkeyed_globals` instead of `globals[]`.
   New-but-cheap facts built here: `signal_context_access` (reader/writer functions
   whose addresses flow to signal-registration sites — the Ω escape-site scan already
   walks these); `access_set_complete` (factored from the ONCELOCK kill-rule
@@ -310,25 +659,51 @@ Split for independent landing:
   **Repository readiness (audited 2026-07-15):** D1b is *not* pure assembly over
   currently exported facts. `GlobalInfo` (`crates/pangs-api/src/lib.rs`) today
   carries only `is_const`/`mutable`/`stationary`/`never_written`/`escape` — no
-  linkage, no C type spelling or size, and no spawn-reachability, signal-context, or
-  access-completeness scans exist anywhere in phase F yet — and keys are raw symbol
-  names from lowering (`value_name`), not the §1.1 TU-qualified grammar. D1b
+  linkage, no C type spelling or size, **no definition-vs-declaration bit**, and no
+  spawn-reachability, signal-context, or access-completeness scans exist anywhere in
+  phase F yet — and keys are raw symbol names from lowering (`value_name`), not the
+  §1.1 TU-qualified grammar. D1b
   therefore includes lowering/pangs-api plumbing (still zero solver changes, ground
   rule 1), split so it lands safely:
-  - **D1b-pre (lowering, land first and alone):** TU-qualified keys per §1.1
-    (defining-TU capture + path normalization at the `pangs-pir` boundary) — this
-    renames every key in every existing export stream, so it is one atomic change
-    with a full golden-file refresh; plus `linkage` and C type spelling / size
-    metadata on globals (the O1b dependency, pulled forward into `meta` and
-    `word_sized_scalar`). The type-spelling source is **LLVM DI metadata**
+  - **D1b-pre (lowering, land first and alone):** capture the *inputs* for §1.1
+    manifest keys — DI defining-file path (normalized against `repo_root` at the
+    `pangs-pir` boundary) and `linkage` on defined functions and globals, plus C
+    type spelling / size metadata on globals (the O1b dependency, pulled forward
+    into `meta` and `word_sized_scalar`); **plus an `is_definition` bit on globals**,
+    which does not exist today — `collect_globals`
+    (`crates/pangs-pir/src/llvm_sys.rs`) lowers every module global with no
+    declaration/definition split (functions get an `LLVMIsDeclaration` check;
+    globals never did), so PIR `Global` and `GlobalInfo` gain the bit from
+    `LLVMIsDeclaration(global) == 0`. The §3 population rule ("every *defined*
+    mutable global") keys off it; without it, external declarations would leak into
+    `globals[]`. **No mass key rename**: existing export streams keep their raw
+    LLVM identifiers (§1.1) — the qualified key is derived at fact assembly, so
+    D1b-pre is additive metadata columns and the golden-file churn is additive too,
+    not a whole-stream rewrite. External declarations receive
+    `is_definition: false`, `file: null`, and are otherwise unaffected throughout. The type-spelling source is **LLVM DI metadata**
     (`DIGlobalVariable` → `DIType` chain), which O1's `-O0`/debug-info requirement
     already guarantees — LLVM types alone cannot supply typedef names, struct tags,
     or signedness, and `word_sized_scalar` needs signedness to pick `AtomicI32` vs
     `AtomicU32`. Missing DI ⇒ `null` spelling ⇒ `word_sized_scalar` is false, per
     O1b's explicit-null-never-guess posture.
-  - **D1b proper:** the three new F scans and the assembly pass, as above.
+  - **D1b proper:** the three new F scans and the assembly pass, as above; **plus
+    the provenance plumbing the §1.9 witnesses require**, which the current API does
+    not retain (confirmed in-scope here; additive throughout, and recording *why* a
+    bit was set changes no solver semantics — ground rule 1 holds):
+    - `omega_escaped_address: true` needs an escape-site witness, but the solver
+      exports only a class-level `escape_external` bit (`GlobalResolution`) and
+      `GlobalInfo` only an `EscapeStatus` — solver postprocessing records, per
+      escaped manifest global, one external-boundary event from which the escape is
+      derivable, picked as the lexicographically smallest witness key (§1.9's
+      determinism tiebreak).
+    - `violation_taint` needs each finding's containing function, which every
+      emission site already knows (it feeds `audit_taints`) but `Finding` does not
+      store — `Finding` gains a `function` field (serde-default, additive).
+    - escape-based `written: true` (§1.9's `external-escape` witness) reuses the
+      same recorded boundary event as the Ω escape witness.
 
-  Revised estimate: ~200 lines assembly + ~250 lines lowering plumbing.
+  Revised estimate: ~200 lines assembly + ~250 lines lowering plumbing + ~150 lines
+  provenance plumbing (API fields + solver postprocessing).
 - **D1c — cascade evaluator (in `pangs-dispose`, ~150 lines).** Pure function:
   `fn dispose(&Facts, &CascadeConfig) -> (Disposition, Vec<CascadeSkip>)`. Guards
   exactly as `DISPOSITION.md` §1 (including the implicit `¬violation_taint` conjunct
@@ -340,19 +715,25 @@ Split for independent landing:
 
 **Acceptance:** golden manifest for a hand-built fact fixture; property test over a
 generated grid of fact vectors (all boolean combinations × certificate
-present/absent/null) asserting (a) chosen strategy's guard holds, (b) every earlier
-strategy has a recorded skip reason, (c) determinism.
+present/absent/null) asserting (a) chosen strategy's guard holds, (b) every
+*configured* strategy earlier than the chosen one has a recorded skip reason and no
+other entries appear (§1.5 trace rule), (c) determinism.
 
 ### D2 — override machinery (~250 lines, in `pangs-dispose`)
 
 TOML format per `DISPOSITION.md` §4.1 (serde + `toml`). Validation per §4.2, in this
 order per override: key resolution (§1.1 grammar; unmatched ⇒ `unmatched-key`) →
-group-conflict check (§4.2 rule 3) → **availability check** (a pin on a
-certificate-requiring strategy whose slot is `null` ⇒ `rejected-strategy-unavailable`,
-regardless of `accept_risk` — accepted risk waives evidence that exists and points the
-wrong way; it cannot substitute for computation that never ran, and a forced `atomic`
-with no D3 output would be a manifest its rewriter cannot execute; availability at the
-policy stage means exactly "required certificate slot non-null" — whether a downstream
+**enablement check** (pinned strategy absent from the configured order ⇒
+`rejected-strategy-disabled` regardless of `accept_risk`; `unhandled` is exempt —
+always pinnable, always honored as a safe opt-out, including for group pins; a
+*member* `unhandled` pin disagreeing with the resolved group disposition still falls
+to the rule-3 group conflict below) →
+group-conflict check (§4.2 rule 3) → **availability check** (certificate-requiring
+strategies: slot `null` ⇒ `rejected-strategy-unavailable`; slot failed with no
+attached `recipe` (§1.5) ⇒ `rejected-no-recipe`; both regardless of `accept_risk` —
+accepted risk waives evidence, it cannot substitute for computation that never ran
+nor conjure a rewrite plan the pass could not produce; group pins check the
+group-level certificate `strategy_support.<strategy>` instead; whether a downstream
 rewriter exists remains a consumer concern handled by demotion) → independent
 fact-support check (is the pinned strategy's own guard satisfied?) → outcome
 (`honored` / `honored-accepted-risk` / `rejected`). Group pins resolve before member pins using the
@@ -366,8 +747,15 @@ unknown strategy names and applied globally before any per-global evaluation.
 **Acceptance:** the override matrix test — each §4.2 outcome × {global pin, group pin,
 cascade cap, unmatched key, missing accept_risk, accept_risk present} — including the
 strategy-unavailable rows (null slot pinned with and without `accept_risk`; both
-reject) — plus exit-code assertions (§1.3), plus idempotence: re-running
-`pangs-dispose` on its own output with the same overrides is a byte-level no-op.
+reject), the recipe rows (failed slot *with* recipe + `accept_risk` ⇒ honored as
+accepted-risk; failed slot *without* recipe ⇒ rejected `no-recipe` even with
+`accept_risk`; group variant against `strategy_support`), the strategy-disabled rows
+(omitted-from-order strategy pinned with and
+without `accept_risk`; both reject; global and group variants), and the `unhandled`
+pin rows (global pin honored, group pin honored, member pin conflicting with the
+resolved group disposition rejected as a rule-3 group conflict) — plus exit-code
+assertions (§1.3), plus idempotence: re-running `pangs-dispose` on its own output
+with the same overrides is a byte-level no-op.
 
 ### D2b — shared coupling post-pass (~200 lines, phase F)
 
@@ -378,12 +766,17 @@ own evidence):
 1. **Co-write evidence:** two globals both directly written by the same function, in
    the same region when region info is available (v1: same function suffices).
 2. **ONCELOCK evidence** (for certified globals): publication-interval overlap ∧
-   init-subtree intersection — exported by O6 exactly for this.
+   init-subtree intersection — read directly from the O1–O5 per-global certificates.
+   Ownership, to be unambiguous: **D2b consumes O1–O5 output; O6 consumes D2b's
+   group ids** (for reports and the manifest hand-off). O6 exports nothing that D2b
+   needs.
 
 Cluster by union-find over evidence edges; group id = `"grp-" + hash8(smallest member
 key)` (stable across runs, ground rule 4); emit `coupling_groups` with the evidence
-edges as witnesses. Config: an evidence-strength threshold, default permissive, so
-tightening is a data-driven follow-up rather than a redesign.
+edges as witnesses. **No evidence-strength threshold in v1**: clustering is
+unconditional union-find over the two evidence kinds — the documented over-grouping
+below is the accepted cost, and a threshold (with a concrete shape and semantics) is
+a v2 follow-up if group statistics demand one.
 
 **Group strategy-support derivation (analysis-owned; closes the common-P gap).** D2b
 also computes, per group, the group-specific certificates `DISPOSITION.md` §6 step 1
@@ -412,7 +805,7 @@ certificate. Joint `once-lock`/`mutex` materialization failure demotes the whole
 `immutable`/`localize` materialization failure may demote only the affected member.
 
 **Acceptance:** unit fixtures (the `cmd_table`+`cmd_count` pair; two unrelated globals
-written by one utility function — expected to over-group at default threshold, test
+written by one utility function — expected to over-group in v1, test
 documents this as intended); determinism of ids under member reordering; a
 group-resolution matrix covering empty/non-empty support intersections, reordered
 cascades, missing common OnceLock publication, multi-member atomic rejection, group
@@ -426,9 +819,10 @@ Deliverables: (a) marker codec already in D1a — this
 item adds the **marker inventory** schema (key → marker symbol → kind) appended to the
 manifest by the C→C tool and *validated* by a `pangs-manifest` helper the Rust rewriter
 calls (every disposition needing a marker has one; no orphan markers); (b) generation
-of `pangs_markers.h` from a manifest (`pangs-dispose --emit-marker-header`):
-declarations + empty definitions guarded so multiple inclusion and single-definition
-both work; (c) the round-trip harness (§5).
+of the marker artifacts from a manifest (`pangs-dispose --emit-markers <dir>`), **two
+outputs** per `DISPOSITION.md` §5.2's linkage contract: `pangs_markers.h` with plain
+declarations only (include-anywhere safe) and `pangs_markers.c` with the empty
+definitions (compiled and linked exactly once); (c) the round-trip harness (§5).
 
 **Acceptance:** the round-trip test — toy program + manifest → mock C→C materializer
 plants markers → real translator → fixture rewriter matches every inventory entry,
@@ -548,7 +942,7 @@ schedule D3/D4; negligible ⇒ record the numbers and close the slots (they rema
 | Risk | Mitigation |
 |---|---|
 | Marker calls don't survive the translator (whole §5 contract collapses) | D0 spike first; documented fallback = C→C-emitted source map; decision recorded here |
-| Translator not available to this repo (D0 cannot run at all) | D0 marked blocked with what's needed from the project owner; D5 is the only dependent item; everything else proceeds |
+| Translator and production Rust rewriter not available to this repo (D0 cannot run; D5's final validation can't use the real rewriter) | blocked pending commands/repositories/flags from the project owner (record here when known); the §5 fixture rewriter stands in for D5 testing; D5 is the only dependent item; everything else proceeds |
 | Key instability across runs (path spelling, harness rename scheme drifting) breaks overrides | grammar + normalization fixed in §1.1, owned by lowering; uniqueness asserted at fact assembly; parse/format property tests; `unmatched-key` is loud by design |
 | Schema churn while O6 and the C→C tool are being written against it | D1a lands first and freezes v2 via golden tests; additive-only rule; unknown-field preservation protects mixed-version tooling |
 | Coupling heuristic too permissive/strict | advisory for all consumers except D3, which re-derives; threshold is config; over-grouping documented in tests as intended v1 behavior |

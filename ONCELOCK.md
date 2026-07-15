@@ -237,7 +237,7 @@ Coordinates inside the payload are same-run evidence, never identity (`DISPOSITI
 //   null                                                  — pass didn't run
 // | { "status": "certified", "certificate": <payload> }   — this example
 // | { "status": "failed", "codes": [...],                 — see §2.2
-//     "witnesses": [...], "diagnostics": { ... }? }
+//     "witnesses": [...], "recipe": { ... }?, "diagnostics": { ... }? }
 {
   "status": "certified",
   "certificate": {
@@ -290,7 +290,16 @@ An uncertified global emits the slot's failed variant: `codes` carries one or mo
 reason codes below, `witnesses` carries their per-code witnesses (shared `Witness`
 shape, `DISPOSITION_PLAN.md` §1.5), and richer evidence — e.g. the rescuable site
 list of `observation-before-quiescence` — goes under the pass-owned optional
-`diagnostics` object rather than being flattened away.
+`diagnostics` object rather than being flattened away. When the rewrite plan is
+computable despite the failure — a kill-rule failure (`omega-writer` /
+`thread-writer` / `violation-taint` / `recursive-main`) on a global whose quiescence
+and P selection otherwise succeeded — the pass MAY attach the full certified-shape
+payload as `recipe`, which is what makes an accepted-risk override executable
+(`DISPOSITION.md` §4.2); quiescence-level failures (`never-quiescent`, `no-single-P`)
+have no publication point and never carry one. v1 runs kill rules before P selection
+(O4 before O3), so attaching recipes on killed globals means letting O3 run for them
+anyway — cheap, and worth doing only if accepted-risk pins on killed globals turn
+out to be a real workflow (§6 telemetry decides).
 
 Failure codes are **routing input for the disposition cascade** (`DISPOSITION.md` §1),
 not terminal verdicts: a global this pass cannot certify falls through to the next

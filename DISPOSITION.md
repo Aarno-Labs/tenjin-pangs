@@ -119,13 +119,13 @@ Per-global facts, with producers:
 
 | Fact | Type | Producer | Status |
 |---|---|---|---|
-| `written` | evidenced bool (witness when true: a writing site) | F `writers(o)` scan | exists (`never_written`) |
+| `written` | evidenced bool, *may-written* semantics (witness when true: a write site, or the external escape that prevents ruling writes out — `DISPOSITION_PLAN.md` §1.9) | F `writers(o)` scan | exists (`never_written`) |
 | `omega_escaped_address` | evidenced bool (witness when true: the escape site) | Ω machinery | exists |
 | `violation_taint` | evidenced bool (witness when true: the violation finding) — gates every strategy, §1 | A′ detection | exists |
 | `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) — **reporting fact, not a guard**: thread visibility alone defeats no strategy (thread readers are a primary OnceLock use case; the thread-*writer* kill rule lives inside the phase-stationarity certificate) | F scan over spawn sites | specified; exported by D1b |
 | `signal_context_access` | evidenced bool (true iff accessed under a registered signal handler; witness when true: registration site + accessing function) | F scan over Ω escape sites of handlers | new, cheap |
 | `access_set_complete` | evidenced bool (true iff every access site enumerated; **witness when false**: the Ω-tainted path) | F scan | specified (the ONCELOCK kill-rule conjunction, factored out); built by D1b |
-| `word_sized_scalar` | `{ value, type_spelling?, size_bits? }` | lowering metadata (O1b) | exists after O1b |
+| `word_sized_scalar` | `{ value, type_spelling?, size_bits?, class?, signed? }` — true iff the type has a matching Rust atomic on the target (`DISPOSITION_PLAN.md` §1.9; the name is historical shorthand, not "pointer-width only") | lowering metadata (O1b) | exists after O1b |
 | `phase_stationarity` | certificate slot (null \| certified \| failed+codes+witnesses) | ONCELOCK pass | specified |
 | `atomic_eligibility` | certificate slot | future pass (§9 D3) | reserved slot |
 | `mutex_eligibility` | certificate slot | future pass (§9 D4) | reserved slot |
@@ -147,6 +147,25 @@ One versioned JSON document per analyzed program — **`pangs-manifest.json`,
 (which becomes the `facts.phase_stationarity` sub-object; see §8). It is the single
 artifact consumed by *both* toolchain stages and referenced by override files.
 
+**Population — "client-relevant global" defined precisely:** `globals[]` contains
+**every defined mutable global**: every global with a definition in the analyzed
+module whose type is not const-qualified (the existing `GlobalInfo.mutable` bit),
+after the existing ignore-list filter, function-scope statics included. Excluded:
+`const` globals (nothing to decide — already immutable in source), external
+declarations (no defining TU here; not ours to rewrite). Stationary and never-written
+globals are *included* — they are precisely the `immutable`/`once-lock` candidates.
+
+One carve-out: a defined mutable global whose defining-TU path cannot be recovered
+*or normalized* (`DISPOSITION_PLAN.md` §1.1 — no DI metadata, or a path outside
+`repo_root` / unparseable under the key grammar) has no valid key and therefore
+**cannot appear in `globals[]`**, whose records require one. Such globals go in a
+separate analysis-owned diagnostic collection, **`unkeyed_globals`** — best-effort
+LLVM name + witness (`missing-debug-metadata` or `unnormalizable-path`), no facts,
+no disposition. They are behaviorally
+`unhandled` (no identity ⇒ no override can match them, no marker can name them, no
+tool acts on them ⇒ left as-is) and are counted in the `unhandled` remainder of the
+§10.1 disposition distribution so coverage reporting stays honest.
+
 ### 3.1 Identity and keying (load-bearing for overrides)
 
 Overrides and cross-stage references must survive re-runs and source drift, so globals
@@ -159,7 +178,15 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
 - `translation_unit` is the *defining* TU path, repo-relative, required for
   internal-linkage globals (two `static int verbose;` in different files are distinct
   keys) and retained for external-linkage globals for uniformity (their `name` is
-  already unique program-wide).
+  already unique program-wide). The same grammar covers **function identities**
+  wherever the manifest references them (certificates, witnesses, once-lock
+  rewiring) — static functions collide across TUs exactly like globals
+  (`DISPOSITION_PLAN.md` §1.1). Qualified keys are a **manifest-layer identity over
+  defined symbols only**, derived at fact assembly: the analysis export streams keep
+  their raw LLVM identifiers (joined via `meta.llvm_name`), and external
+  declarations — which have no defining TU — receive no key, synthetic or otherwise;
+  they can be neither disposition subjects nor certificate anchors, and appear in
+  witness text by raw name only.
 - Function-scope statics get no extra qualification: the translation harness uniquifies
   their names in a pre-pass that runs *before* the analysis, so every static's name is
   TU-unique by the time PANGS sees it. That ordering is a recorded run assumption, and
@@ -225,6 +252,10 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
       }
     }
   ],
+  "unkeyed_globals": [                   // analysis-owned diagnostic collection (§3
+    { "llvm_name": "counter.1",          //   population rule): defined mutable globals
+      "witness": { "kind": "missing-debug-metadata" } }   // with no recoverable key
+  ],
   "coupling_groups": [ { "id": "grp-cmd", "members": [...], "evidence": {...},
                          "strategy_support": {          // analysis-owned, from D2b:
                            "once_lock": { /* common-P certificate or absent-with-
@@ -252,7 +283,7 @@ The manifest flows strictly forward through three stages, each owning named sect
 
 | Stage | Owns |
 |---|---|
-| analysis | `run.analysis`; `globals[].key`, `.meta`, `.facts`; `coupling_groups[].{id, members, evidence, strategy_support}` |
+| analysis | `run.analysis`; `globals[].key`, `.meta`, `.facts`; `unkeyed_globals`; `coupling_groups[].{id, members, evidence, strategy_support}` |
 | `pangs-dispose` | `run.dispose`; `globals[].disposition`; `coupling_groups[].group_disposition`; `override_report` |
 | C→C tool | `materialization` (marker inventory §5.2, demotion records §5.3) |
 
@@ -297,14 +328,39 @@ order = ["immutable", "once-lock", "mutex", "localize"]   # e.g., no atomics any
 
 ### 4.2 Validation rules
 
-A precondition runs before any outcome is considered: **a pin on a
-certificate-requiring strategy whose slot is `null` is rejected as
-`strategy-unavailable`, regardless of `accept_risk`.** Accepted risk waives evidence
-that exists and points the wrong way; it cannot substitute for computation that never
-ran — a forced `atomic` with no D3 output would be a manifest its rewriter cannot
-execute (no per-site load/store/RMW classification exists). Availability at the
-policy stage means exactly "the required certificate slot is non-null"; whether a
-downstream rewriter exists remains a consumer concern handled by §5.3 demotion.
+Two preconditions run before any outcome is considered.
+
+First, **a pin may only name a strategy present in the configured order, or
+`unhandled`**. A pin on a strategy omitted from the order is rejected as
+`strategy-disabled`, regardless of `accept_risk` — the order is the exhaustive
+enablement list (§1), and if overrides could bypass it, a uniformity cap like
+"everything localizes" would be unenforceable; `accept_risk` waives evidence, never
+policy. The recourse is editing the `[cascade]` order. `unhandled` is the standing
+exception: it never appears in the order (implicit last) but is **always pinnable —
+an explicit `unhandled` pin is a safe opt-out** (user-directed demotion; its guard is
+vacuous), honored with `provenance: "override"`, no `accept_risk` needed, even on a
+violation-tainted global. The same applies to group pins. One sharp edge: a *member*
+`unhandled` pin that disagrees with the resolved group disposition is still a group
+conflict under rule 3 below — opting one member out of a joint `once-lock`/`mutex`
+representation would split it, exactly what rule 3 exists to prevent; pin the whole
+group instead.
+
+Second, **a pin on a certificate-requiring strategy must have a materialization
+recipe, and `accept_risk` cannot waive that**: a `null` slot is rejected as
+`strategy-unavailable`, and a failed slot without an attached `recipe`
+(`DISPOSITION_PLAN.md` §1.5) is rejected as `no-recipe` — regardless of `accept_risk`
+in both cases. Accepted risk waives *evidence* that exists and points the wrong way;
+it cannot substitute for computation that never ran, nor conjure a rewrite plan the
+pass could not produce: a forced `atomic` with no per-site load/store/RMW
+classification, or a forced `once-lock` on a `never-quiescent` global with no
+publication point, would be a manifest its rewriter cannot execute. The honorable
+accepted-risk case is exactly **"evidence failed, recipe present"** — e.g. a
+`thread-writer` kill on a global whose publication payload was still computed. For a
+*group* pin the recipe is the group-level certificate (`strategy_support.<strategy>`):
+an unsupported group has no common publication point, hence no recipe, hence no
+honorable pin. Availability at the policy stage means exactly "slot non-null and
+recipe present"; whether a downstream rewriter exists remains a consumer concern
+handled by §5.3 demotion.
 
 Past that precondition, the policy stage validates each override against the fact
 vector. Three outcomes:
@@ -330,7 +386,9 @@ vector. Three outcomes:
 
 The manifest's `override_report` lists every override with its outcome
 (`honored` / `honored-accepted-risk` / `rejected` + reason /
-`rejected-strategy-unavailable` / `unmatched-key`). Unmatched
+`rejected-strategy-disabled` / `rejected-strategy-unavailable` / `rejected-no-recipe`
+/ `unmatched-key`).
+Unmatched
 keys and rejections are also process exit-code failures in CI usage: an override file
 that no longer matches the program is a drifted artifact and must be loud.
 
