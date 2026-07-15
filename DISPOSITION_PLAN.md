@@ -26,10 +26,15 @@ reviewable against them:
    evaluator must be a pure function of `(fact vector, config, overrides)` with no
    access to the PAG or solution.
 3. **Additive schema evolution only.** Field removal or rename = new schema_version =
-   a decision, not a refactor. Unknown fields round-trip (see D1a).
-4. **Determinism.** Same inputs ⇒ byte-identical manifest. All collections sorted at
-   emission (globals by key, groups by id, traces in cascade order). This is what makes
-   golden-file testing and manifest diffing work.
+   a decision, not a refactor. Unknown fields survive parse/canonicalize/emit (see
+   D1a).
+4. **Determinism.** Emission uses one canonical pretty-JSON encoding: record fields in
+   schema order; flattened unknown fields in lexical order; globals by key; groups by
+   id; traces in cascade order; a trailing newline; and no dependence on hash-map
+   iteration. Arbitrary input whitespace and object-key order need not be preserved.
+   Canonicalizing the same semantic input produces byte-identical output, and a second
+   canonicalization is a byte-level no-op. This is what makes golden-file testing and
+   manifest diffing work.
 5. **Demotion-only for consumers.** Downstream tools may demote a global to
    `unhandled` (with witness), never promote or reinterpret.
 6. **`null` ≠ failed.** A fact slot that was not computed is `null` and skips its
@@ -98,7 +103,7 @@ conventions):
 
 | Crate | Contents | Depended on by |
 |---|---|---|
-| `pangs-manifest` | schema v2 serde types (`Key`, `Meta`, `Facts`, `PhaseStationarity`, `Disposition`, `CascadeTrace`, `CouplingGroup`, `RunHeader`, `OverrideReport`, `AuditRecord`), key grammar + parser (§1.1), marker codec (§1.2), schema-version constants | analysis, `pangs-dispose`, C→C tool, Rust rewriter — **the one shared dependency; keep it std+serde only** |
+| `pangs-manifest` | schema v2 serde types (`Key`, `Meta`, `Facts`, `PhaseStationarity`, `Disposition`, `CascadeTrace`, `CouplingGroup`, `RunHeader`, `OverrideReport`, `AuditRecord`), key grammar + parser (§1.1), marker codec (§1.2), schema-version constants, canonical JSON read/write | analysis, `pangs-dispose`, C→C tool, Rust rewriter — **the one shared dependency; keep it std+serde+serde_json only** |
 | `pangs-dispose` | the policy stage: cascade evaluator, override machinery, group disposition resolution, report + ledger emission. Library + thin CLI | CI, users |
 | (existing analysis crate, phase F) | fact-assembly post-pass, coupling post-pass (D2b), marker-inventory schema checks | — |
 
@@ -133,9 +138,12 @@ Split for independent landing:
 - **D1a — `pangs-manifest` crate (~300 lines).** Types + serde for the §3 schema of
   `DISPOSITION.md`; key parser/formatter with the §1.1 grammar (property test:
   parse∘format = id); marker codec (§1.2) with collision detection; unknown-field
-  preservation on round-trip (`#[serde(flatten)] extra: Map<String, Value>` on every
-  record type — an older `pangs-dispose` must not strip fields written by a newer
-  analysis). Golden test: a checked-in v2 manifest round-trips byte-identically.
+  preservation on canonical round-trip (`#[serde(flatten)] extra: BTreeMap<String,
+  Value>` on every record type — an older `pangs-dispose` must not strip fields written
+  by a newer analysis). All tools use the crate's canonical JSON writer rather than
+  calling `serde_json` emission directly. Golden test: a checked-in canonical v2
+  manifest parses and re-emits byte-identically; a deliberately non-canonical fixture
+  canonicalizes once and is byte-identical on the second pass.
 - **D1b — fact assembly (phase-F post-pass, ~200 lines).** One scan assembling the
   `DISPOSITION.md` §2 vector per client-relevant global. New-but-cheap facts built
   here: `signal_context_access` (reader/writer functions whose addresses flow to
@@ -147,7 +155,8 @@ Split for independent landing:
   then the slots are `null`, which the cascade already tolerates (ground rule 6).
 - **D1c — cascade evaluator (in `pangs-dispose`, ~150 lines).** Pure function:
   `fn dispose(&Facts, &CascadeConfig) -> (Disposition, Vec<CascadeSkip>)`. Guards
-  exactly as `DISPOSITION.md` §1; config = ordered strategy list + per-strategy
+  exactly as `DISPOSITION.md` §1 and are evaluated independently — support for one
+  strategy never implies support for another; config = ordered strategy list + per-strategy
   enable/cap; `unhandled` is always the implicit last entry and cannot be configured
   away. Every skip records `{strategy, reason}` where reason names the failing guard
   or `fact-not-computed`.
@@ -161,10 +170,13 @@ strategy has a recorded skip reason, (c) determinism.
 
 TOML format per `DISPOSITION.md` §4.1 (serde + `toml`). Validation per §4.2, in this
 order per override: key resolution (§1.1 grammar; unmatched ⇒ `unmatched-key`) →
-group-conflict check (§4.2 rule 3) → fact-support check (is the pinned strategy's guard
-satisfied?) → outcome (`honored` / `honored-accepted-risk` / `rejected`). Group pins
-resolve before member pins so a member pin conflicting with a group pin is reported
-against the group, with both records in the report. Accepted risks append to
+group-conflict check (§4.2 rule 3) → independent fact-support check (is the pinned
+strategy's own guard satisfied?) → outcome (`honored` /
+`honored-accepted-risk` / `rejected`). Group pins resolve before member pins using the
+group-support intersection algorithm in `DISPOSITION.md` §6. A member pin that differs
+from the resolved group disposition is rejected even with `accept_risk`; group pins
+whose group guard fails use the ordinary accepted-risk rule. Both records appear in
+the report. Accepted risks append to
 `pangs-audit.json` (§1.4). Cascade-reorder blocks (`[cascade]`) are validated for
 unknown strategy names and applied globally before any per-global evaluation.
 
@@ -189,9 +201,21 @@ key)` (stable across runs, ground rule 4); emit `coupling_groups` with the evide
 edges as witnesses. Config: an evidence-strength threshold, default permissive, so
 tightening is a data-driven follow-up rather than a redesign.
 
+Policy resolution is separate from clustering: compute each member's independent
+support set, intersect those sets, apply the group-specific guards from
+`DISPOSITION.md` §6, then select the first supported configured strategy (or validate
+the group override). Never compare enum ordinals or infer support from an earlier
+certificate. Joint `once-lock`/`mutex` materialization failure demotes the whole group;
+`immutable`/`localize` materialization failure may demote only the affected member.
+
 **Acceptance:** unit fixtures (the `cmd_table`+`cmd_count` pair; two unrelated globals
 written by one utility function — expected to over-group at default threshold, test
-documents this as intended); determinism of ids under member reordering.
+documents this as intended); determinism of ids under member reordering; a
+group-resolution matrix covering empty/non-empty support intersections, reordered
+cascades, missing common OnceLock publication, multi-member atomic rejection, group
+pins with and without `accept_risk`, and conflicting member pins. The mock materializer
+also verifies whole-group demotion for a failed joint `once-lock`/`mutex` rewrite and
+member-only demotion for `immutable`/`localize`.
 
 ### D5 — marker contract (~150 lines analysis-side + harness)
 
@@ -285,12 +309,12 @@ contract must be testable without them:
 
 | Layer | Test | Introduced by |
 |---|---|---|
-| schema | round-trip byte-identity; unknown-field preservation; version-gate error (§1.3 code 3) | D1a |
+| schema | canonical round-trip byte-identity; one-pass normalization of non-canonical input; unknown-field preservation; version-gate error (§1.3 code 3) | D1a |
 | key/marker codecs | parse∘format property; mangling collision fixture | D1a |
 | cascade | fact-grid property test (guard holds, skips recorded, deterministic) | D1c |
 | overrides | outcome matrix × override kinds; exit codes; idempotence | D2 |
-| coupling | fixtures incl. documented over-grouping; id stability | D2b |
-| contract | mock-materializer + fixture-rewriter round trip; demotion path | D5 |
+| coupling | fixtures incl. documented over-grouping; id stability; support-intersection and override matrix | D2b |
+| contract | mock-materializer + fixture-rewriter round trip; joint-group and member-only demotion paths | D5 |
 | ledger | accepted-risk append + uniqueness of record ids | D2 |
 | end-to-end | golden `pangs-manifest.json` + `pangs-audit.json` on the small-program corpus, diffed on every change (lite idiom) | D1b onward |
 

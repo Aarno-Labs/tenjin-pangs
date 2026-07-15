@@ -66,14 +66,18 @@ The policy stage assigns each client-relevant global the **first applicable** en
 6. unhandled   otherwise (with the accumulated failure witnesses)
 ```
 
-Rationale for the order: **prefer the strategy that encodes the strongest verified
-property in the Rust type system.** `immutable` makes illegal writes unrepresentable;
-`once-lock` makes re-initialization a loud panic and needs no per-access synchronization
-reasoning; `atomic` constrains every access site but permits torn multi-global
-invariants; `mutex` is the general fallback with runtime cost and deadlock surface;
-`localize` is the most invasive rewrite. A global that certifies at level *k* would also
-survive at *k+1*, so the cascade is a refinement chain, not a partition of incomparable
-options — which is what makes "first applicable" sound.
+Rationale for the order: **prefer the applicable strategy that encodes the strongest
+verified property in the Rust type system.** `immutable` makes illegal writes
+unrepresentable; `once-lock` makes re-initialization a loud panic and needs no
+per-access synchronization reasoning; `atomic` constrains every access site but
+permits torn multi-global invariants; `mutex` is the general fallback with runtime cost
+and deadlock surface; `localize` is the most invasive rewrite.
+
+The order is a **preference list over independent applicability predicates**, not a
+proof lattice. A certificate for one strategy never implies support for a later
+strategy: for example, phase-stationarity does not prove atomic access-shape
+compatibility or mutex reentrancy safety. "First applicable" is sound because every
+entry evaluates its own guard; order affects preference only.
 
 Two knobs, both policy-level (never analysis-level):
 
@@ -227,9 +231,8 @@ order = ["immutable", "once-lock", "mutex", "localize"]   # e.g., no atomics any
 
 The policy stage validates each override against the fact vector. Three outcomes:
 
-1. **Within certified options** (the pinned strategy's facts support it — e.g., pinning
-   `mutex` for a global that certified `once-lock`; every cascade level below the
-   certified one is supported by construction, §1): honored,
+1. **Within certified options** (the pinned strategy's own guard is satisfied by its
+   facts/certificate): honored,
    `provenance: "override"`.
 2. **Contradicting facts** (e.g., `atomic` for a global with
    `access_set_complete: false`, or any pin on a `violation_taint` global): honored
@@ -238,11 +241,12 @@ The policy stage validates each override against the fact vector. Three outcomes
    — an accepted-risk pin is an assumption of exactly the same standing as a
    library-mode ordering assertion, and must survive in the same ledger. Without
    `accept_risk`, the override is **rejected** and the cascade result stands.
-3. **Group conflict** (pinning one member of a coupling group to a disposition
-   incompatible with the group's, §6): rejected with the group evidence as witness —
-   never silently honored, never silently split. The user's recourse is to pin the
-   whole group or to override the group membership itself (an `accept_risk` operation,
-   since group evidence is a fact).
+3. **Group conflict** (pinning one member of a coupling group to a disposition other
+   than the resolved group disposition, §6): rejected with the group evidence as
+   witness — never silently honored, never silently split, even with `accept_risk`.
+   The user's v1 recourse is to pin the whole group. Group-membership overrides are not
+   part of the v1 override grammar; adding them later requires an explicit
+   accepted-risk record because membership is an analysis fact.
 
 ### 4.3 Override report
 
@@ -307,7 +311,12 @@ pangs_disposition__atomic__src_state_c__g_stats();
 The C→C tool never makes a disposition decision; it executes the manifest. If it cannot
 execute one (e.g., publication point inside a macro expansion it cannot rewrite), it
 demotes that global to `unhandled` in its output manifest copy with a witness —
-demotion is always safe (coverage loss, never corruption), promotion is forbidden.
+demotion is always safe (coverage loss, never corruption), promotion is forbidden. If
+the failed materialization is a joint `once-lock` or `mutex` representation, the tool
+demotes the entire coupling group; it must not leave a partially materialized joint
+representation. For `immutable` and `localize`, group membership is policy/layout
+advice rather than a joint runtime representation, so an execution failure may demote
+only the affected member.
 
 ## 6. Coupling groups (shared component)
 
@@ -333,9 +342,30 @@ eligibility must itself re-derive co-write evidence conservatively — its certi
 not the shared heuristic, is what licenses the rewrite), while a spurious group merely
 over-couples a rewrite.
 
-The policy stage assigns **one disposition per group** (the weakest member's cascade
-level, or the group override), recorded as `group_disposition`; members inherit it with
+The policy stage resolves a group after computing each member's independent strategy
+support set and individual cascade result:
+
+1. For each configured strategy, compute `group_support(strategy)`. It requires the
+   strategy's own guard to hold for every member, plus any group-specific condition:
+   `once-lock` requires a group certificate naming one common publication point;
+   `atomic` is unsupported for a group with more than one member; and `mutex` requires
+   the group-level reentrancy certificate emitted by D4. `unhandled` is always
+   supported. `immutable` and `localize` add no group-specific guard beyond every
+   member's ordinary guard.
+2. Without a group override, choose the first group-supported strategy in the
+   configured cascade. Thus cascade reordering changes preference, never proof.
+3. A group override is honored normally only when that strategy is group-supported.
+   If it is not, it follows the ordinary contradictory-facts rule: reject it unless
+   `accept_risk = true`, in which case record one accepted-risk audit entry whose
+   witness names every failed member and group-specific guard.
+4. A member override is applied only if it agrees with the resolved group disposition;
+   otherwise it is a group conflict under §4.2 rule 3.
+
+The result is recorded as `group_disposition`; members inherit it with
 `provenance: "group-constraint"` when it differs from their individual cascade result.
+For `localize`, membership remains advisory to context-struct field clustering after
+the uniform policy assignment; it does not require the C→C tool to materialize one
+joint runtime object.
 
 ## 7. Soundness matrix
 
@@ -448,10 +478,11 @@ existing passes degenerates gracefully: `immutable` / `once-lock` / `localize` /
    But a hot-path scalar behind `OnceLock` costs an `Option` check per read where
    `AtomicI32::load(Relaxed)` would not. If profiling shows this matters, the answer is
    a per-global override, not a cascade reorder — revisit only if it is pervasive.
-2. **Group disposition = weakest member** (§6) discards a stronger certificate on other
-   members. Alternative: split the group when the evidence shows the coupling is
-   write-side only (no reader assumes cross-member consistency). Needs a reader-side
-   coupling fact; deferred until group statistics exist.
+2. **Group support-set intersection** (§6) can discard a strategy supported by only
+   some members. A future alternative is to split the group when the evidence shows
+   the coupling is write-side only (no reader assumes cross-member consistency).
+   That requires a reader-side coupling fact and is deferred until group statistics
+   exist; v1 keeps the conservative intersection rule.
 3. **Manifest as the sole channel vs. in-source annotations for humans.** Markers are
    machine-facing; should the C→C stage also emit human-readable
    `/* PANGS: once-lock, see manifest */` comments for reviewability of the
