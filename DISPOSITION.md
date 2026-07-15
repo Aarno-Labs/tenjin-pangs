@@ -60,11 +60,21 @@ The policy stage assigns each client-relevant global the **first applicable** en
 1. immutable   iff  never-written ∧ ¬omega-escaped-address
 2. once-lock   iff  phase-stationarity certificate present
 3. atomic      iff  atomic-eligibility certificate present            (future pass)
-4. mutex       iff  access-set-complete ∧ ¬signal-context-access
-                    ∧ reentrancy check passes                          (future pass)
+4. mutex       iff  mutex-eligibility certificate present             (future pass)
 5. localize    iff  build mode = application ∧ localization verdict OK
 6. unhandled   otherwise (with the accumulated failure witnesses)
 ```
+
+Guard-shape rule: **a strategy backed by an eligibility pass has a certificate-only
+guard** — the cascade reads one slot, and the pass's certificate internally requires
+its precondition facts (D4's requires `access_set_complete`,
+`¬signal_context_access`, and the reentrancy check; D3's analogously) — while
+strategies without a pass (`immutable`, `localize`) compose raw facts directly.
+Duplicating a pass's preconditions in the cascade guard would create a second,
+divergeable definition; the slot's failure codes already say *which* precondition
+failed, and that is what `cascade_trace` reports (a mutex skip is
+`guard-failed: ["mutex_eligibility"]` or `fact-not-computed`, with the detail in
+the slot).
 
 Rationale for the order: **prefer the applicable strategy that encodes the strongest
 verified property in the Rust type system.** `immutable` makes illegal writes
@@ -241,11 +251,16 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
       },
 
       "disposition": {
-        "chosen": "once-lock",
+        "chosen": "once-lock",           // FINAL result: post-override, post-group,
+                                         //   post-demotion
+        "cascade_chosen": "once-lock",   // the independent cascade result — a pure
+                                         //   function of (facts, config) only
         "provenance": "cascade",         // "cascade" | "override" | "override-accepted-risk"
                                          // | "group-constraint" (§6) | "demoted" (§5.3)
-        "cascade_trace": [               // why each earlier *configured* entry was skipped
-          { "strategy": "immutable",
+                                         // — explains chosen ≠ cascade_chosen;
+                                         //   "cascade" ⇒ they are equal
+        "cascade_trace": [               // relative to cascade_chosen ONLY: why each
+          { "strategy": "immutable",     //   configured entry before it was skipped
             "reason": { "kind": "guard-failed", "failed": ["written"] } }
         ],
         "override": null                 // §4: echo of the applied override record, if any
@@ -262,7 +277,11 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
                                              witness; DISPOSITION_PLAN.md D2b */ },
                            "mutex": null                // reserved for D4
                          },
-                         "group_disposition": "once-lock" } ],
+                         "group_disposition": "once-lock",
+                         "group_provenance": "cascade",  // "cascade" | "override" |
+                                                         //   "override-accepted-risk"
+                         "override": null } ],           // echo of an applied GROUP pin —
+                                                         //   the only place it is echoed
   "override_report": { ... },            // §4.3; dispose-owned
   "materialization": { ... }             // §5: C→C-tool-owned — marker inventory (§5.2)
                                          //   and demotion records (§5.3); absent until
@@ -412,13 +431,15 @@ verbatim but drop or mangle comments — declared in a shipped header
 
 ```c
 /* at ONCELOCK publication point P, inserted by the C→C stage: */
-pangs_publish__src_commands_c__cmd_table();
+pangs_publish__src_commands_c__cmd_table__9f3a01c4();
 
 /* immediately before a marker-needing global's definition — one call site inside a
    dummy constructor-attribute function, or an adjacent no-op declaration record —
    whichever the C→C tool finds robust; the contract is only that the marker's NAME
-   carries the identity: */
-pangs_disposition__atomic__src_state_c__g_stats();
+   carries the identity (spelling per the authoritative grammar,
+   DISPOSITION_PLAN.md §1.2: kind "disposition_" + strategy, then the mangled key,
+   then the hash suffix): */
+pangs_disposition_atomic__src_state_c__g_stats__ab12cd34();
 ```
 
 - Marker names embed the §3.1 key (mangled: path separators and dots to `_`), so the
@@ -483,7 +504,8 @@ execute one (e.g., publication point inside a macro expansion it cannot rewrite)
 demotes that global to `unhandled` in its output manifest copy — concretely: it sets
 `disposition.chosen = "unhandled"`, `provenance: "demoted"`, and a
 `demotion: { from: "<original strategy>", witness: {...} }` record, and lists the
-demotion in the `materialization` section —
+demotion in the `materialization` section, leaving `cascade_chosen` and
+`cascade_trace` exactly as the policy stage wrote them —
 demotion is always safe (coverage loss, never corruption), promotion is forbidden. If
 the failed materialization is a joint `once-lock` or `mutex` representation, the tool
 demotes the entire coupling group; it must not leave a partially materialized joint
@@ -533,12 +555,28 @@ support set and individual cascade result:
 3. A group override is honored normally only when that strategy is group-supported.
    If it is not, it follows the ordinary contradictory-facts rule: reject it unless
    `accept_risk = true`, in which case record one accepted-risk audit entry whose
-   witness names every failed member and group-specific guard.
+   `failures` list identifies every failed member and group-specific guard
+   structurally (one `{member, guard, witness}` record each —
+   `DISPOSITION_PLAN.md` §1.8 — never free text).
 4. A member override is applied only if it agrees with the resolved group disposition;
    otherwise it is a group conflict under §4.2 rule 3.
 
-The result is recorded as `group_disposition`; members inherit it with
-`provenance: "group-constraint"` when it differs from their individual cascade result.
+The result is recorded as `group_disposition`; members inherit it in `chosen` with
+`provenance: "group-constraint"` when it differs from their individual cascade
+result, which stays visible untouched in `cascade_chosen` — the trace never has to
+"explain" the inherited choice (a member whose own cascade picked `immutable` has no
+skip reason for it, and needs none: `provenance` plus the group record carry that
+explanation; §3.2).
+
+Serialization of a *group* override on member records is fixed as follows: members
+keep `override: null` and plain `provenance: "group-constraint"` (or `"cascade"`
+when `chosen` happens to equal `cascade_chosen`) — the pin itself is echoed exactly
+once, on the group record (`group_provenance: "override"` /
+`"override-accepted-risk"` plus its `override` echo, §3.2) and in the
+`override_report`. A member's `override` field echoes only *member* pins. Rationale:
+echoing a group pin onto N members stores N divergeable copies of one decision; the
+provenance chain member → `group_disposition` → group override reconstructs it
+losslessly.
 For `localize`, membership remains advisory to context-struct field clustering after
 the uniform policy assignment; it does not require the C→C tool to materialize one
 joint runtime object.
@@ -626,8 +664,9 @@ existing passes degenerates gracefully: `immutable` / `once-lock` / `localize` /
 ### Testing
 
 - Golden-file the full manifest on the small-program corpus (lite idiom).
-- Property test the cascade: for every fact vector in a generated grid, the chosen
-  disposition's guard holds and every skipped entry has a recorded reason.
+- Property test the cascade: for every fact vector in a generated grid,
+  `cascade_chosen`'s guard holds and every skipped entry has a recorded reason
+  (the trace invariant binds to `cascade_chosen`, not the final `chosen` — §3.2).
 - Override matrix tests: each §4.2 outcome × (global pin, group pin, cascade cap,
   unmatched key).
 - Round-trip marker test: emit markers into a toy program, translate, verify the Rust

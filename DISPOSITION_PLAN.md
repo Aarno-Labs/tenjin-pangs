@@ -20,7 +20,11 @@ Ground rules, restated as implementation invariants — every PR touching this l
 reviewable against them:
 
 1. **No solver changes.** Everything here is phase-F post-pass or downstream tooling;
-   A′–D′ semantics and outputs are frozen inputs. A work item that "needs" a solver
+   A′–D′ semantics are frozen inputs. Precisely: no solver-*semantic* changes —
+   constraint generation, propagation, and every existing output bit stay untouched —
+   while **additive output/postprocessing plumbing is allowed** (extra provenance
+   fields, targeted points-to materialization for D1b); that is how witnesses are
+   produced at all. A work item that "needs" a semantic solver
    change is mis-scoped — stop and re-read `DISPOSITION.md` §2's rule of construction.
 2. **Facts never contain preferences; policy never computes facts.** The cascade
    evaluator must be a pure function of `(fact vector, config, overrides)` with no
@@ -113,7 +117,11 @@ Decisions the grammar previously left open:
   field carries the raw name as free evidence text.
 - **`repo_root` is an explicit lowering input** (CLI flag / config, no default
   guessing), recorded in `run.analysis.repo_root` so key derivation is reproducible
-  from the manifest alone.
+  from the manifest alone. **Scope: mandatory only for commands that emit
+  disposition artifacts** (the manifest/ledger emission path errors without it);
+  every other command — the existing analyze/export/metrics surface, whose loader
+  takes only an input path today — is unchanged, avoiding CLI and fixture churn for
+  runs that never mint keys.
 - **The defining-TU path comes from DI metadata** (`DIGlobalVariable` /
   `DISubprogram` file), the same source D1b-pre already names for type spelling.
   Today's lowering emits `file: None` for every global
@@ -161,6 +169,15 @@ analysis emission always writes it (at minimum the run-assumption records, §1.1
 absence means an incomplete or hand-pruned export, and inventing an empty ledger
 would silently discard the claim that analysis-sourced assumptions were ever
 recorded.
+
+**Initial emission.** `pangs analyze` gains an **opt-in `--dispose` flag** (with
+`--repo-root`, and optionally `--mode`, `--overrides`/`--no-overrides`, `--out`):
+one run does analysis → fact assembly → in-process policy stage (§2's "one code
+path, two invocation modes") → atomic pair emission. Without `--dispose`, `analyze`
+is byte-identical to today — no new required flags, no fixture churn (the §1.1
+repo-root scope rule). `--dispose` without `--repo-root` is exit 1. No separate
+analysis+emission command: offline `pangs-dispose` already covers every re-run
+case, and a second analysis entry point would duplicate the `analyze` surface.
 
 **Overrides selection.** Both explicit and discovered, with explicit winning:
 `--overrides <path>` if given (pointing at a missing file ⇒ exit 1 — an explicit
@@ -215,12 +232,20 @@ emitted alongside the manifest: a list of assumption records
                                                           //   accepted-risk records
                                                           //   (DISPOSITION.md §6) need it
   "source": "analysis" | "override" | "entry-spine",
-  "text": "...", "witness": <Witness>? }
+  "text": "...", "witness": <Witness>?,
+  "failures": [ <GuardFailure>, ... ]? }               // structured multi-failure
+                                                       //   evidence (§1.8); sorted by
+                                                       //   (member, guard, canonical
+                                                       //   witness key)
 ```
 
 Accepted-risk overrides (D2) append `kind: "accepted-risk"` records — one per
-honored pin, group pins producing a single `scope.kind: "group"` record whose
-witness names every failed member/guard.
+honored pin. A group pin produces a single `scope.kind: "group"` record whose
+`failures` list identifies **every failed member and guard structurally** (one
+`GuardFailure` each — never encoded into free-text `note`); a global pin
+contradicting several facts uses the same field with the global's own key as
+`member`. The `failures` list participates in the record's deterministic id hash
+like every other field.
 The human-readable inventory sections in `DESIGN.md` §8 remain the catalog of *kinds*;
 the JSON is the per-run instantiation.
 
@@ -234,8 +259,10 @@ records. The ledger's JSON Schema lands as `schemas/disposition-audit.schema.jso
 beside `schemas/disposition-manifest.schema.json` (§2 naming note).
 
 Record ids are deterministic:
-`id = "ar-" + first 32 hex chars of SHA-256(canonical JSON of { kind, scope, source,
-text })` — 128 bits, because audit inventories can reach tens of thousands of records
+`id = "ar-" + first 32 hex chars of SHA-256(canonical JSON of the record with the
+"id" field omitted)` — **every semantic field hashes**, `witness` and `failures`
+included, so records differing only in evidence get distinct ids. 128 bits, because
+audit inventories can reach tens of thousands of records
 on a 1 MLoC target and a 32-bit id's birthday bound would make hard-error collisions
 an avoidable operational nuisance. (Marker names keep the §1.2 FNV hash8: that
 namespace is far smaller, the mangled key carries most of the identity, and D5's
@@ -266,7 +293,11 @@ no cascade entry reads it). Evidenced polarity per fact: `written`,
 Guard facts: all of the above **except `thread_visible`**, which is a reporting fact —
 thread visibility alone defeats no strategy (thread *readers* are a primary OnceLock
 use case; the thread-*writer* kill rule lives inside the phase-stationarity
-certificate where it belongs). Fact assembly asserts the witness-iff-evidenced
+certificate where it belongs). Guard facts feed the cascade either directly
+(`written`, `omega_escaped_address`, `violation_taint` — the fact-composed guards) or
+as an eligibility pass's certificate preconditions (`access_set_complete`,
+`signal_context_access` → D4; `DISPOSITION.md` §1's certificate-only guard rule).
+Fact assembly asserts the witness-iff-evidenced
 invariant; the schema validator re-checks it.
 
 **Witness:**
@@ -359,12 +390,18 @@ The cascade guard "localization verdict OK" is `verdict == "ok"`.
 Guard names are the fact names of the strategy's conjuncts (`DISPOSITION.md` §1) plus
 `violation_taint`, the implicit conjunct of every guard: a tainted global skips every
 configured entry with `guard-failed: ["violation_taint", ...]` and lands on
-`unhandled`. `cascade_trace` records exactly the **attempted-and-skipped** entries:
-the configured strategies strictly before the chosen one, in configured order (all
-configured strategies when the result is `unhandled`). Entries after the chosen
-strategy are never attempted (first-applicable) and do not appear; neither do
-strategies disabled by config (the order itself is recorded in `run.dispose`). The
-chosen strategy is not a trace entry — it lives in `disposition.chosen`.
+`unhandled`. `cascade_trace` is defined **relative to `cascade_chosen` only** — the
+independent cascade result, a pure function of (facts, config) with no override or
+group input (`DISPOSITION.md` §3.2). It records exactly the attempted-and-skipped
+entries: the configured strategies strictly before `cascade_chosen`, in configured
+order (all configured strategies when `cascade_chosen` is `unhandled`). Entries
+after `cascade_chosen` are never attempted (first-applicable) and do not appear;
+neither do strategies disabled by config (the order itself is recorded in
+`run.dispose`). Neither `cascade_chosen` nor the final `chosen` is a trace entry.
+When overrides, group constraints, or downstream demotion make `chosen` differ from
+`cascade_chosen`, the trace does **not** explain the difference — `provenance`, the
+`override` echo, the group record, and the `demotion` record do; the trace would
+otherwise be asked to justify a strategy that never failed a guard.
 
 Rust-side these are `EvidencedBool`, `Witness`, `WordSizedScalar`,
 `CertificateSlot<C>` (an `Option` around a two-variant `status`-tagged enum),
@@ -440,12 +477,21 @@ below is a shared record and is fixed here:
 { "pangs_git": "...", "llvm_version": "...", "input_path": "...",
   "input_sha256": "...", "opts": { /* analysis Opts, as today */ },
   "repo_root": "...",                       // §1.1; key derivation input
+  "target_triple": "x86_64-unknown-linux-gnu",
+  "data_layout": "e-m:e-p270:32:32-...",    // verbatim LLVM data layout string
+  "supported_atomic_widths": [8, 16, 32, 64],  // derived at lowering (§1.9)
   "entry_spine": { ... } }                  // ONCELOCK.md §2.1; null in library mode
+
+// GuardFailure — shared structured evidence for multi-failure records
+// (accepted-risk ledger records §1.4, override-report entries below);
+// lists sorted by (member, guard, canonical witness key §1.5)
+{ "member": "src/foo.c::g", "guard": "violation_taint", "witness": <Witness> }
 
 // globals[].meta
 { "linkage": "internal" | "external",
   "type_spelling": "<C spelling>" | null,   // DI-derived (§1.1, D1b-pre)
   "size_bits": <int> | null,
+  "align_bits": <int> | null,               // effective ABI alignment (D1b-pre)
   "llvm_name": "<raw LLVM symbol>",         // this-run join key to the analysis
                                             //   export streams (§1.1) — evidence,
                                             //   never identity
@@ -461,7 +507,9 @@ below is a shared record and is fixed here:
                | "rejected-strategy-disabled" | "rejected-strategy-unavailable"
                | "rejected-no-recipe" | "unmatched-key",
       "reason": "<free text>" | null,
-      "witness": <Witness>? } ],
+      "witness": <Witness>?,
+      "failures": [ <GuardFailure>, ... ]? } ],   // same shared shape and sort as
+                                                  //   the ledger records (§1.4)
   "counts": { "honored": n, "honored_accepted_risk": n, "rejected": n,
               "rejected_strategy_disabled": n, "rejected_strategy_unavailable": n,
               "rejected_no_recipe": n, "unmatched_key": n } }
@@ -512,18 +560,38 @@ below is a shared record and is fixed here:
   violation can open is already covered by Ω, i.e. `omega_escaped_address`). Witness:
   the finding, `kind: "violation-finding"`.
 - **`access_set_complete(g)`**, evaluated in this order with the first failing
-  condition as witness: (a) no modref row for `g` has `Via::Unknown`; (b)
-  `¬omega_escaped_address(g)`; (c) `g` is not exported to external storage (library
-  mode); (d) no accessor function of `g` is violation-tainted. When several sites
+  condition as witness: (a) no *unknown-access* modref row **applies to `g`** —
+  where a row applies to `g` iff its target is `GlobalTarget::Name(g)`, or its
+  target is `GlobalTarget::Unknown(_)` and `g`'s **raw LLVM name**
+  (`meta.llvm_name`) appears in the row's `pointee_globals` candidate set — the
+  candidate lists carry raw LLVM names, so matching is via `meta.llvm_name`, never
+  the qualified manifest key (the current representation puts unknown rows
+  under `Unknown`, never `Name`; attribution is via the candidate list) — **and —
+  the conservative rule — an `Unknown`-target row with an empty/unbounded
+  `pointee_globals` set fails (a) for every global**, with that row as witness (its
+  candidates could not be enumerated, so no access set can claim completeness; such
+  rows should be rare because Ω-derived unknowns already surface via (b), and the
+  §7 counters will show if this over-fires); (b)
+  `¬omega_escaped_address(g)`; (c) `g` is not **exported** — precisely the
+  analysis-level exported bit (`is_exported_global`: external linkage ∧ default
+  visibility ∧ the run's `exports` config under its build mode), *not* raw external
+  linkage alone and *not* escape — an exported global is nameable by client code
+  the analysis never sees, so its access set cannot be complete in library mode;
+  (b) and (c) deliberately partition the exposure surface: (b) = address escaped
+  (any mode), (c) = reachable by name (library builds); (d) no accessor function of
+  `g` is violation-tainted. When several sites
   fail one condition, the witness is the lexicographically smallest witness key
   (determinism, ground rule 4).
 - **`word_sized_scalar(g)`** — the name is historical shorthand; the actual
   predicate is "has a matching Rust atomic type on the target":
-  - **Widths**: `size_bits ∈ {8, 16, 32, 64}` ∩ the target's supported atomic
-    widths (from the LLVM target triple / data layout recorded at lowering — all
-    four on the mainstream x86-64/aarch64 targets), **not** "exactly pointer
-    width". Additionally the global's alignment must equal its size (natural
-    alignment — a packed placement disqualifies; atomics require it).
+  - **Widths**: `size_bits ∈ run.analysis.supported_atomic_widths` (captured at
+    lowering by the conservative rule in D1b-pre — all of {8, 16, 32, 64} on the
+    mainstream x86-64/aarch64 targets), **not** "exactly pointer width".
+    Additionally `align_bits` — the *effective ABI* alignment D1b-pre records, not
+    LLVM's often-zero explicit attribute — must equal `size_bits` (natural
+    alignment; a packed placement disqualifies; atomics require it).
+  - **Missing inputs fail closed**: absent type spelling, size, alignment, or
+    target atomic-width support ⇒ `value: false`. Never guessed, never defaulted.
   - **Qualifying type classes**, after peeling `typedef`/`const`/`volatile`/
     `restrict` DI wrappers: integers (`DW_ATE_signed`/`unsigned`/`*_char`) →
     `AtomicIN`/`AtomicUN`; `_Bool` (`DW_ATE_boolean`) → `AtomicBool`; enums
@@ -585,6 +653,12 @@ below is a shared record and is fixed here:
     from the struct pointer — covers both `sa_handler` and `sa_sigaction` without
     field discrimination). `SIG_DFL`/`SIG_IGN` integer constants are not handlers.
   - **Multiple resolved targets are all treated as entries/handlers** (union).
+  - **Points-to materialization is targeted.** The normal solver result does not
+    retain per-node pts sets (`node_points_to` is optional and populated only by
+    special entry points today); D1b materializes function-object target sets
+    **only for registry-site operands and the memory reachable from
+    `pointee_of_arg` operands** — never an all-node export. Additive plumbing under
+    ground rule 1's semantic/output distinction.
   - **Unresolved operand** (pts contains the Ω/unknown element): the entry set
     conservatively expands to the resolved targets **∪ every function whose address
     Ω-escapes** — that is exactly what the Ω element denotes, so this is the model's
@@ -669,7 +743,15 @@ Split for independent landing:
     manifest keys — DI defining-file path (normalized against `repo_root` at the
     `pangs-pir` boundary) and `linkage` on defined functions and globals, plus C
     type spelling / size metadata on globals (the O1b dependency, pulled forward
-    into `meta` and `word_sized_scalar`); **plus an `is_definition` bit on globals**,
+    into `meta` and `word_sized_scalar`); **plus `align_bits` on globals** — the
+    *effective ABI alignment* from the data layout
+    (`LLVMABIAlignmentOfType`-style), never LLVM's explicit alignment attribute
+    alone, which is legitimately 0/unspecified; **plus target capture on the run
+    header** — `run.analysis.target_triple`, the verbatim `data_layout` string, and
+    `supported_atomic_widths` derived at lowering by the conservative rule
+    `{8, 16, 32} ∪ {64 iff pointer width ≥ 64 bits}` (undercounting widths can only
+    turn `word_sized_scalar` false — the sound direction; per-target refinement is
+    an additive follow-up); **plus an `is_definition` bit on globals**,
     which does not exist today — `collect_globals`
     (`crates/pangs-pir/src/llvm_sys.rs`) lowers every module global with no
     declaration/definition split (functions get an `LLVMIsDeclaration` check;
@@ -705,7 +787,10 @@ Split for independent landing:
   Revised estimate: ~200 lines assembly + ~250 lines lowering plumbing + ~150 lines
   provenance plumbing (API fields + solver postprocessing).
 - **D1c — cascade evaluator (in `pangs-dispose`, ~150 lines).** Pure function:
-  `fn dispose(&Facts, &CascadeConfig) -> (Disposition, Vec<CascadeSkip>)`. Guards
+  `fn cascade(&Facts, &CascadeConfig) -> (Strategy, Vec<CascadeSkip>)` — producing
+  `cascade_chosen` and its trace, nothing else; the final `chosen` is layered on
+  afterwards by override application (D2), group resolution (D2b), and, downstream,
+  demotion — none of which touch this function's output. Guards
   exactly as `DISPOSITION.md` §1 (including the implicit `¬violation_taint` conjunct
   on every guard) and are evaluated independently — support for one strategy never
   implies support for another; config = `CascadeConfig` per §1.6; `unhandled` is
@@ -715,9 +800,10 @@ Split for independent landing:
 
 **Acceptance:** golden manifest for a hand-built fact fixture; property test over a
 generated grid of fact vectors (all boolean combinations × certificate
-present/absent/null) asserting (a) chosen strategy's guard holds, (b) every
-*configured* strategy earlier than the chosen one has a recorded skip reason and no
-other entries appear (§1.5 trace rule), (c) determinism.
+present/absent/null) asserting (a) `cascade_chosen`'s guard holds, (b) every
+*configured* strategy earlier than `cascade_chosen` has a recorded skip reason and no
+other entries appear (§1.5 trace rule — the invariant binds `cascade_trace` to
+`cascade_chosen`, never to the final `chosen`), (c) determinism.
 
 ### D2 — override machinery (~250 lines, in `pangs-dispose`)
 
