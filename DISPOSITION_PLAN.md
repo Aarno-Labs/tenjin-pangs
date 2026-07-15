@@ -101,12 +101,17 @@ The human-readable inventory sections in `DESIGN.md` §8 remain the catalog of *
 the JSON is the per-run instantiation.
 
 Record ids are deterministic:
-`id = "ar-" + hash8(canonical JSON of { kind, scope, source, text })`, using the same
-FNV-1a-32 as §1.2. Two distinct records hashing to the same id after generation is a
-hard error (which also catches emitting the same assumption twice). Ownership on
-re-run follows `DISPOSITION.md` §3.3: `pangs-dispose` deletes and regenerates exactly
-the `source: "override"` records and preserves `analysis`/`entry-spine` records
-byte-for-byte, so the D2 idempotence test covers this artifact too.
+`id = "ar-" + first 32 hex chars of SHA-256(canonical JSON of { kind, scope, source,
+text })` — 128 bits, because audit inventories can reach tens of thousands of records
+on a 1 MLoC target and a 32-bit id's birthday bound would make hard-error collisions
+an avoidable operational nuisance. (Marker names keep the §1.2 FNV hash8: that
+namespace is far smaller, the mangled key carries most of the identity, and D5's
+emission-time collision check backstops it.) Two distinct records with the same id
+after generation is still a hard error — it also catches emitting the same assumption
+twice. Ownership on re-run follows `DISPOSITION.md` §3.3: `pangs-dispose` deletes and
+regenerates exactly the `source: "override"` records and preserves
+`analysis`/`entry-spine` records semantically unchanged — byte-identical after
+canonical re-emission — so the D2 idempotence test covers this artifact too.
 
 ### 1.5 Fact and certificate encodings (schema v2, frozen by D1a's golden)
 
@@ -116,13 +121,20 @@ These shapes complete `DISPOSITION.md` §2/§3.
 
 ```jsonc
 { "value": <bool>, "witness": <Witness> }   // witness present iff value is the
-                                            // fact's *blocking* polarity
+                                            // fact's *evidenced* polarity
 ```
 
-Blocking polarity per fact (the direction that removes strategies): `written`,
-`omega_escaped_address`, `violation_taint`, `thread_visible`, `signal_context_access`
-block when **true**; `access_set_complete` blocks when **false**. Fact assembly
-asserts the witness-iff-blocking invariant; the schema validator re-checks it.
+Every boolean fact declares an **evidenced polarity** — the direction that demands
+proof — and, separately, whether it is a **guard fact** (a conjunct of some cascade
+guard, `DISPOSITION.md` §1) or a **reporting fact** (routing/measurement input only;
+no cascade entry reads it). Evidenced polarity per fact: `written`,
+`omega_escaped_address`, `violation_taint`, `signal_context_access`, and
+`thread_visible` are evidenced when **true**; `access_set_complete` when **false**.
+Guard facts: all of the above **except `thread_visible`**, which is a reporting fact —
+thread visibility alone defeats no strategy (thread *readers* are a primary OnceLock
+use case; the thread-*writer* kill rule lives inside the phase-stationarity
+certificate where it belongs). Fact assembly asserts the witness-iff-evidenced
+invariant; the schema validator re-checks it.
 
 **Witness:**
 
@@ -148,15 +160,22 @@ kinds). Initial entries: `write-site`, `escape-site`, `violation-finding`,
 
 ```jsonc
   null                                                       // not computed
-| { "status": "certified", "certificate": { ... } }          // pass-specific payload
+| { "status": "certified", "certificate": { ... } }          // pass-specific payload C
 | { "status": "failed",
     "codes": ["never-quiescent", ...],                       // ≥1, pass-owned registry
-    "witnesses": [ <Witness>, ... ] }
+    "witnesses": [ <Witness>, ... ],                         // per-code witnesses
+    "diagnostics": { ... }? }                                // optional pass-owned extras
+                                                             // (e.g. rescuable site lists)
 ```
 
-The certified `phase_stationarity` payload is `ONCELOCK.md` §2's per-global object
-verbatim; D3/D4 define their payloads when built. Failure-code registries are owned by
-the producing pass.
+The producing pass emits this slot shape **directly** — there is no wrapping of a
+pass-native document, and no nested verdict fields. For `phase_stationarity` the
+certified payload `C` is the whole ONCELOCK success content,
+`{ publication, writers, init_subtree, readers, observations }` (`ONCELOCK.md` §2.1 —
+its former inner `certificate` object is renamed `publication`); the failed variant
+carries the §2.2 reason codes as `codes`, their per-code witnesses as `witnesses`, and
+any richer evidence (site lists) under `diagnostics`. D3/D4 define their payloads when
+built. Failure-code and `diagnostics` registries are owned by the producing pass.
 
 **Localization verdict:**
 
@@ -243,7 +262,7 @@ conventions):
 
 | Crate | Contents | Depended on by |
 |---|---|---|
-| `pangs-manifest` | schema v2 serde types (`Key`, `Meta`, `Facts`, `PhaseStationarity`, `Disposition`, `CascadeTrace`, `CouplingGroup`, `RunHeader`, `OverrideReport`, `AuditRecord`), key grammar + parser (§1.1), marker codec (§1.2), schema-version constants, canonical JSON read/write | analysis, `pangs-dispose`, C→C tool, Rust rewriter — **the one shared dependency; keep it std+serde+serde_json only** |
+| `pangs-manifest` | schema v2 serde types (`Key`, `Meta`, `Facts`, `PhaseStationarity`, `Disposition`, `CascadeTrace`, `CouplingGroup`, `RunHeader`, `OverrideReport`, `AuditRecord`), key grammar + parser (§1.1), marker codec (§1.2), schema-version constants, canonical JSON read/write | analysis, `pangs-dispose`, C→C tool, Rust rewriter — **the one shared dependency; keep it std+serde+serde_json+sha2 only** (`sha2` earns its slot: §1.4 audit ids) |
 | `pangs-dispose` | the policy stage: cascade evaluator, override machinery, group disposition resolution, report + ledger emission. Library + thin CLI | CI, users |
 | (existing analysis crate, phase F) | fact-assembly post-pass, coupling post-pass (D2b), marker-inventory schema checks | — |
 
@@ -301,7 +320,12 @@ Split for independent landing:
     renames every key in every existing export stream, so it is one atomic change
     with a full golden-file refresh; plus `linkage` and C type spelling / size
     metadata on globals (the O1b dependency, pulled forward into `meta` and
-    `word_sized_scalar`).
+    `word_sized_scalar`). The type-spelling source is **LLVM DI metadata**
+    (`DIGlobalVariable` → `DIType` chain), which O1's `-O0`/debug-info requirement
+    already guarantees — LLVM types alone cannot supply typedef names, struct tags,
+    or signedness, and `word_sized_scalar` needs signedness to pick `AtomicI32` vs
+    `AtomicU32`. Missing DI ⇒ `null` spelling ⇒ `word_sized_scalar` is false, per
+    O1b's explicit-null-never-guess posture.
   - **D1b proper:** the three new F scans and the assembly pass, as above.
 
   Revised estimate: ~200 lines assembly + ~250 lines lowering plumbing.
@@ -323,9 +347,15 @@ strategy has a recorded skip reason, (c) determinism.
 
 TOML format per `DISPOSITION.md` §4.1 (serde + `toml`). Validation per §4.2, in this
 order per override: key resolution (§1.1 grammar; unmatched ⇒ `unmatched-key`) →
-group-conflict check (§4.2 rule 3) → independent fact-support check (is the pinned
-strategy's own guard satisfied?) → outcome (`honored` /
-`honored-accepted-risk` / `rejected`). Group pins resolve before member pins using the
+group-conflict check (§4.2 rule 3) → **availability check** (a pin on a
+certificate-requiring strategy whose slot is `null` ⇒ `rejected-strategy-unavailable`,
+regardless of `accept_risk` — accepted risk waives evidence that exists and points the
+wrong way; it cannot substitute for computation that never ran, and a forced `atomic`
+with no D3 output would be a manifest its rewriter cannot execute; availability at the
+policy stage means exactly "required certificate slot non-null" — whether a downstream
+rewriter exists remains a consumer concern handled by demotion) → independent
+fact-support check (is the pinned strategy's own guard satisfied?) → outcome
+(`honored` / `honored-accepted-risk` / `rejected`). Group pins resolve before member pins using the
 group-support intersection algorithm in `DISPOSITION.md` §6. A member pin that differs
 from the resolved group disposition is rejected even with `accept_risk`; group pins
 whose group guard fails use the ordinary accepted-risk rule. Both records appear in
@@ -334,9 +364,10 @@ the report. Accepted risks append to
 unknown strategy names and applied globally before any per-global evaluation.
 
 **Acceptance:** the override matrix test — each §4.2 outcome × {global pin, group pin,
-cascade cap, unmatched key, missing accept_risk, accept_risk present} — plus exit-code
-assertions (§1.3), plus idempotence: re-running `pangs-dispose` on its own output with
-the same overrides is a byte-level no-op.
+cascade cap, unmatched key, missing accept_risk, accept_risk present} — including the
+strategy-unavailable rows (null slot pinned with and without `accept_risk`; both
+reject) — plus exit-code assertions (§1.3), plus idempotence: re-running
+`pangs-dispose` on its own output with the same overrides is a byte-level no-op.
 
 ### D2b — shared coupling post-pass (~200 lines, phase F)
 
@@ -353,6 +384,25 @@ Cluster by union-find over evidence edges; group id = `"grp-" + hash8(smallest m
 key)` (stable across runs, ground rule 4); emit `coupling_groups` with the evidence
 edges as witnesses. Config: an evidence-strength threshold, default permissive, so
 tightening is a data-driven follow-up rather than a redesign.
+
+**Group strategy-support derivation (analysis-owned; closes the common-P gap).** D2b
+also computes, per group, the group-specific certificates `DISPOSITION.md` §6 step 1
+consumes, stored as `coupling_groups[].strategy_support`:
+
+- `strategy_support.once_lock` — the **common-P certificate**, derived purely from
+  the members' `phase_stationarity` certificates: every member certified ∧ same
+  `publication.publication_function` after identical spine descent ∧ nonempty
+  intersection of the members' publication intervals ∧ at least one insertable
+  boundary inside the intersection. Present as the intersected interval + chosen
+  common P; absent with a witness naming the first failing condition otherwise.
+- `strategy_support.mutex` — reserved slot, `null` until D4 emits the group
+  reentrancy certificate.
+
+No new analysis: interval intersection over per-member certificates is a scan, per
+`DISPOSITION.md` §2's rule of construction. This fixes the pipeline **run order** as
+O1–O5 (per-global certificates) → D2b (clustering + support derivation) → fact
+assembly (attaches `coupling_group` ids and emits `coupling_groups`) →
+`pangs-dispose`; work-item *landing* order in §4 is unchanged.
 
 Policy resolution is separate from clustering: compute each member's independent
 support set, intersect those sets, apply the group-specific guards from
@@ -428,9 +478,12 @@ Against the lite milestones: D1a/D1c have **zero analysis dependencies** and can
 built immediately. D1b needs M1 facts only (`written`, Ω bits, spawn reachability) —
 the manifest ships at M1 with `phase_stationarity`/`coupling_group` null and a
 degenerate but useful cascade (`immutable`/`localize`/`unhandled`). M2+O-items fill
-the `once-lock` slot; D2b can land any time after D1b. D5 waits for D0 and for the
-C→C tool to be ready to consume dispositions — until then the round-trip harness's
-mock materializer (§5) stands in. This ordering means **the disposition layer is never
+the `once-lock` slot; D2b can land any time after D1b (its ONCELOCK evidence input
+and `strategy_support.once_lock` derivation simply stay empty/`null` until O1–O5
+exist — note the within-run pipeline order is O1–O5 → D2b → fact assembly →
+`pangs-dispose`, which is independent of this landing order). D5 waits for D0 and for
+the C→C tool to be ready to consume dispositions — until then the round-trip
+harness's mock materializer (§5) stands in. This ordering means **the disposition layer is never
 the blocker**: each analysis improvement lights up cascade entries in an
 already-shipping manifest.
 

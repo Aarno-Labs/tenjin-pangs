@@ -122,7 +122,7 @@ Per-global facts, with producers:
 | `written` | evidenced bool (witness when true: a writing site) | F `writers(o)` scan | exists (`never_written`) |
 | `omega_escaped_address` | evidenced bool (witness when true: the escape site) | Ω machinery | exists |
 | `violation_taint` | evidenced bool (witness when true: the violation finding) — gates every strategy, §1 | A′ detection | exists |
-| `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) | F scan over spawn sites | specified (ONCELOCK kill-rule input); exported by D1b |
+| `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) — **reporting fact, not a guard**: thread visibility alone defeats no strategy (thread readers are a primary OnceLock use case; the thread-*writer* kill rule lives inside the phase-stationarity certificate) | F scan over spawn sites | specified; exported by D1b |
 | `signal_context_access` | evidenced bool (true iff accessed under a registered signal handler; witness when true: registration site + accessing function) | F scan over Ω escape sites of handlers | new, cheap |
 | `access_set_complete` | evidenced bool (true iff every access site enumerated; **witness when false**: the Ω-tainted path) | F scan | specified (the ONCELOCK kill-rule conjunction, factored out); built by D1b |
 | `word_sized_scalar` | `{ value, type_spelling?, size_bits? }` | lowering metadata (O1b) | exists after O1b |
@@ -136,7 +136,7 @@ Rule of construction: every fact is either derivable from the materialized solut
 one scan, or it does not belong in the vector. Nothing here re-enters the solver.
 
 The concrete JSON/Rust encodings of these types — the evidenced-bool object and its
-per-fact blocking polarity, witness records, the certificate-slot union, the
+per-fact evidenced polarity, witness records, the certificate-slot union, the
 localization verdict, and cascade skip reasons — are fixed in `DISPOSITION_PLAN.md`
 §1.5 and are part of what D1a's golden test freezes as schema v2.
 
@@ -204,7 +204,9 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
         "access_set_complete": { "value": true },
         "word_sized_scalar": { "value": false },
         "phase_stationarity": { "status": "certified",
-                                "certificate": { /* ONCELOCK payload, verbatim */ } },
+                                "certificate": { /* ONCELOCK.md §2.1 payload:
+                                     publication, writers, init_subtree,
+                                     readers, observations */ } },
         "atomic_eligibility": null,      // pass not yet built; null ≠ failed
         "mutex_eligibility": null,
         "coupling_group": "grp-cmd",
@@ -224,6 +226,11 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
     }
   ],
   "coupling_groups": [ { "id": "grp-cmd", "members": [...], "evidence": {...},
+                         "strategy_support": {          // analysis-owned, from D2b:
+                           "once_lock": { /* common-P certificate or absent-with-
+                                             witness; DISPOSITION_PLAN.md D2b */ },
+                           "mutex": null                // reserved for D4
+                         },
                          "group_disposition": "once-lock" } ],
   "override_report": { ... },            // §4.3; dispose-owned
   "materialization": { ... }             // §5: C→C-tool-owned — marker inventory (§5.2)
@@ -233,11 +240,11 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
 ```
 
 Field discipline (inherited from the lite provenance philosophy): additive evolution
-only; every boolean fact carries a witness on its *blocking* polarity (the direction
-that removes strategies — `DISPOSITION_PLAN.md` §1.5 fixes the polarity per fact);
-`null` means *not computed*, and is distinct from a present-but-failed certificate —
-the cascade treats `null` as "skip this entry" and the gap is visible in
-`cascade_trace`.
+only; every boolean fact carries a witness on its *evidenced* polarity (the direction
+that demands proof — `DISPOSITION_PLAN.md` §1.5 fixes the polarity per fact and which
+facts are cascade-guard conjuncts vs. reporting-only); `null` means *not computed*,
+and is distinct from a present-but-failed certificate — the cascade treats `null` as
+"skip this entry" and the gap is visible in `cascade_trace`.
 
 ### 3.3 Stage ownership and re-runs
 
@@ -245,7 +252,7 @@ The manifest flows strictly forward through three stages, each owning named sect
 
 | Stage | Owns |
 |---|---|
-| analysis | `run.analysis`; `globals[].key`, `.meta`, `.facts`; `coupling_groups[].{id, members, evidence}` |
+| analysis | `run.analysis`; `globals[].key`, `.meta`, `.facts`; `coupling_groups[].{id, members, evidence, strategy_support}` |
 | `pangs-dispose` | `run.dispose`; `globals[].disposition`; `coupling_groups[].group_disposition`; `override_report` |
 | C→C tool | `materialization` (marker inventory §5.2, demotion records §5.3) |
 
@@ -253,12 +260,14 @@ The manifest flows strictly forward through three stages, each owning named sect
 sections** (with a warning when it deletes any): re-disposing discards prior
 dispositions, the old override report, and any marker inventory or demotion records —
 after a re-dispose, the C→C stage must run again before its outputs can be trusted.
-Earlier stages' sections are read-only inputs, preserved verbatim. This rule is what
-makes `pangs-dispose` a pure function of (analysis-owned sections, config, overrides)
-and gives the idempotence test its exact meaning. The same ownership discipline
-applies to `pangs-audit.json`: dispose regenerates only records with
-`source: "override"` and preserves all others byte-for-byte (deterministic record ids:
-`DISPOSITION_PLAN.md` §1.4).
+Earlier stages' sections are read-only inputs, preserved semantically unchanged —
+byte-identical after canonical re-emission (raw input formatting is not retained;
+ground rule 4 of `DISPOSITION_PLAN.md` §0). This rule is what makes `pangs-dispose` a
+pure function of (analysis-owned sections, config, overrides) and gives the
+idempotence test its exact meaning. The same ownership discipline applies to
+`pangs-audit.json`: dispose regenerates only records with `source: "override"` and
+preserves all others under the same canonical-emission guarantee (deterministic
+record ids: `DISPOSITION_PLAN.md` §1.4).
 
 ## 4. User overrides
 
@@ -288,7 +297,17 @@ order = ["immutable", "once-lock", "mutex", "localize"]   # e.g., no atomics any
 
 ### 4.2 Validation rules
 
-The policy stage validates each override against the fact vector. Three outcomes:
+A precondition runs before any outcome is considered: **a pin on a
+certificate-requiring strategy whose slot is `null` is rejected as
+`strategy-unavailable`, regardless of `accept_risk`.** Accepted risk waives evidence
+that exists and points the wrong way; it cannot substitute for computation that never
+ran — a forced `atomic` with no D3 output would be a manifest its rewriter cannot
+execute (no per-site load/store/RMW classification exists). Availability at the
+policy stage means exactly "the required certificate slot is non-null"; whether a
+downstream rewriter exists remains a consumer concern handled by §5.3 demotion.
+
+Past that precondition, the policy stage validates each override against the fact
+vector. Three outcomes:
 
 1. **Within certified options** (the pinned strategy's own guard is satisfied by its
    facts/certificate): honored,
@@ -310,7 +329,8 @@ The policy stage validates each override against the fact vector. Three outcomes
 ### 4.3 Override report
 
 The manifest's `override_report` lists every override with its outcome
-(`honored` / `honored-accepted-risk` / `rejected` + reason / `unmatched-key`). Unmatched
+(`honored` / `honored-accepted-risk` / `rejected` + reason /
+`rejected-strategy-unavailable` / `unmatched-key`). Unmatched
 keys and rejections are also process exit-code failures in CI usage: an override file
 that no longer matches the program is a drifted artifact and must be loud.
 
@@ -442,11 +462,14 @@ support set and individual cascade result:
 
 1. For each configured strategy, compute `group_support(strategy)`. It requires the
    strategy's own guard to hold for every member, plus any group-specific condition:
-   `once-lock` requires a group certificate naming one common publication point;
-   `atomic` is unsupported for a group with more than one member; and `mutex` requires
-   the group-level reentrancy certificate emitted by D4. `unhandled` is always
-   supported. `immutable` and `localize` add no group-specific guard beyond every
-   member's ordinary guard.
+   `once-lock` requires the common-publication-point certificate at
+   `coupling_groups[].strategy_support.once_lock` — analysis-owned, derived by D2b
+   from the members' phase-stationarity certificates (nonempty publication-interval
+   intersection in one common publication function; `DISPOSITION_PLAN.md` D2b);
+   `atomic` is unsupported for a group with more than one member; and `mutex`
+   requires the group-level reentrancy certificate at `strategy_support.mutex`
+   (reserved, emitted by D4). `unhandled` is always supported. `immutable` and
+   `localize` add no group-specific guard beyond every member's ordinary guard.
 2. Without a group override, choose the first group-supported strategy in the
    configured cascade. Thus cascade reordering changes preference, never proof.
 3. A group override is honored normally only when that strategy is group-supported.
@@ -484,18 +507,22 @@ soundness inventory.
 
 ## 8. Amendments required to the other documents
 
-1. **`ONCELOCK.md`** — trim to pure fact production:
-   - §2's standalone schema (v1) is superseded; its per-global payload becomes the
-     `facts.phase_stationarity` object of the v2 manifest, unchanged in content.
-     Failure reason codes are retained verbatim but re-described as routing input, not
-     terminal verdicts.
+1. **`ONCELOCK.md`** — trim to pure fact production (applied):
+   - §2's standalone schema (v1) is superseded; the pass emits the shared
+     certificate-slot shape (`DISPOSITION_PLAN.md` §1.5) directly as
+     `facts.phase_stationarity` — certified payload
+     `{ publication, writers, init_subtree, readers, observations }`, failed variant
+     `codes`/`witnesses`/`diagnostics`. Failure reason codes keep their §2.2 meanings
+     but are re-described as routing input, not terminal verdicts.
    - §4.4's "consumption is purely subtractive" paragraph is superseded by §5.3 here
      (exemption **plus publication marker**).
    - §2.3 co-quiescence detection moves to the shared coupling component (§6 here);
-     the ONCELOCK pass consumes group ids instead of computing them. Work item O6
-     shrinks accordingly.
-   - Kill-rule bits consumed internally (`thread_visible` etc.) are additionally
-     surfaced as first-class manifest facts (§2 here).
+     the ONCELOCK pass stays per-global while D2b derives the group common-P
+     certificate (`strategy_support.once_lock`) from its per-global output. Work item
+     O6 shrinks accordingly.
+   - The spawn-reachability bit consumed internally is additionally surfaced as the
+     first-class reporting fact `thread_visible` (§2 here; not a cascade guard — the
+     kill rule is thread-*writer*, inside the certificate).
 2. **`DESIGN_lite.md` §2F** — the client list gains the disposition stage as a named
    post-pass, and the sentence "Globals localization: unchanged from `DESIGN.md` §7"
    gains "…consuming the disposition manifest (see `DISPOSITION.md`)". The two

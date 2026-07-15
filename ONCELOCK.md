@@ -212,8 +212,11 @@ certificates)** are likewise deferred; see §7.
 ## 2. Output facts (the manifest's `phase_stationarity` payload)
 
 *This pass no longer emits a standalone JSON document — the original schema_version-1
-form is superseded.* The per-global payload below is embedded verbatim as
-`facts.phase_stationarity` in `pangs-manifest.json` (schema v2, `DISPOSITION.md` §3).
+form is superseded.* The pass emits the manifest's shared **certificate-slot** shape
+(`DISPOSITION_PLAN.md` §1.5) **directly** as `facts.phase_stationarity` in
+`pangs-manifest.json` (schema v2, `DISPOSITION.md` §3): there is no pass-native
+wrapper, no nested verdict field, and the certified payload below is the slot's
+`certificate` value.
 Global identity, linkage, and type spelling live in the manifest record's `key`/`meta`;
 the entry-spine description lives in the manifest's run header; the coupling-group id is
 a sibling fact (`facts.coupling_group`) from the shared coupling post-pass (§2.3).
@@ -226,57 +229,68 @@ Coordinates inside the payload are same-run evidence, never identity (`DISPOSITI
 // inside a pangs-manifest.json global record (DISPOSITION.md §3.2):
 //   { "key": "src/commands.c::cmd_table",
 //     "meta": { "linkage": "internal", "type": "struct cmd_entry [512]" },
-//     "facts": { "phase_stationarity": <this object>,
+//     "facts": { "phase_stationarity": <this slot>,
 //                "coupling_group": "grp-cmd", ... },
 //     "disposition": { ... } }
+//
+// The slot is the shared certificate-slot union (DISPOSITION_PLAN.md §1.5):
+//   null                                                  — pass didn't run
+// | { "status": "certified", "certificate": <payload> }   — this example
+// | { "status": "failed", "codes": [...],                 — see §2.2
+//     "witnesses": [...], "diagnostics": { ... }? }
 {
-  "verdict": "phase-stationary",     // "phase-stationary" | "not-certified"
-  // ---- present iff verdict == "phase-stationary" ----
+  "status": "certified",
   "certificate": {
-    "publication_function": "main",  // may be a spine function after descent
-    "publication_point": { "file": "src/main.c", "line": 88, "col": 5,
-                           "after_stmt": "parse_rc_file(rcpath(argv));" },
-    "publication_interval": {        // full valid range, for client flexibility
-      "earliest": { "file": "src/main.c", "line": 88 },
-      "latest":   { "file": "src/main.c", "line": 102 }
+    "publication": {                   // the P decision (formerly "certificate")
+      "publication_function": "main",  // may be a spine function after descent
+      "publication_point": { "file": "src/main.c", "line": 88, "col": 5,
+                             "after_stmt": "parse_rc_file(rcpath(argv));" },
+      "publication_interval": {        // full valid range, for client flexibility
+        "earliest": { "file": "src/main.c", "line": 88 },
+        "latest":   { "file": "src/main.c", "line": 102 }
+      },
+      "spine_descent_path": [],        // call sites spliced, outermost first
+      "kill_rules_checked": ["omega-writer", "thread-writer",
+                              "violation-taint", "recursive-main"],
+      "assumptions": []                // per-global extra assumptions, if any
     },
-    "spine_descent_path": [],        // call sites spliced, outermost first
-    "kill_rules_checked": ["omega-writer", "thread-writer",
-                            "violation-taint", "recursive-main"],
-    "assumptions": []                // per-global extra assumptions, if any
-  },
-  "writers": [                       // ALL provably pre-P; the rewrite worklist
-    { "function": "register_cmd", "site": { "file": "src/commands.c", "line": 31 },
-      "kind": "via-pointer" },       // "direct" | "via-pointer"
-    { "function": "register_cmd", "site": { "file": "src/commands.c", "line": 32 },
-      "kind": "direct" }
-  ],
-  "init_subtree": [                  // functions needing local rewiring, with the
-    { "function": "init_builtin_cmds",     // spine call sites that reach them
-      "spine_call_sites": [{ "file": "src/main.c", "line": 86 }] },
-    { "function": "parse_rc_file",
-      "spine_call_sites": [{ "file": "src/main.c", "line": 87 }] },
-    { "function": "register_cmd", "spine_call_sites": [] }   // interior node
-  ],
-  "readers": {
-    "pre_p": [                       // route through the local
-      { "function": "register_cmd", "site": { "file": "src/commands.c", "line": 30 } }
+    "writers": [                       // ALL provably pre-P; the rewrite worklist
+      { "function": "register_cmd", "site": { "file": "src/commands.c", "line": 31 },
+        "kind": "via-pointer" },       // "direct" | "via-pointer"
+      { "function": "register_cmd", "site": { "file": "src/commands.c", "line": 32 },
+        "kind": "direct" }
     ],
-    "post_p_functions_count": 143,   // unchanged signatures; count + sample only
-    "post_p_sample": ["execute", "complete_cmd", "show_help"],
-    "both_phase": []                 // functions read-reachable from both phases:
-                                     // the awkward bucket, listed exhaustively
-  },
-  "observations": {                  // pseudo-reads that constrained P
-    "escape_sites": [],              // e.g., signal handler registration of a reader
-    "spawn_sites": []
-  },
-  // ---- present iff verdict == "not-certified" ----
-  "failure": null                    // see §2.2 reason codes
+    "init_subtree": [                  // functions needing local rewiring, with the
+      { "function": "init_builtin_cmds",     // spine call sites that reach them
+        "spine_call_sites": [{ "file": "src/main.c", "line": 86 }] },
+      { "function": "parse_rc_file",
+        "spine_call_sites": [{ "file": "src/main.c", "line": 87 }] },
+      { "function": "register_cmd", "spine_call_sites": [] }   // interior node
+    ],
+    "readers": {
+      "pre_p": [                       // route through the local
+        { "function": "register_cmd", "site": { "file": "src/commands.c", "line": 30 } }
+      ],
+      "post_p_functions_count": 143,   // unchanged signatures; count + sample only
+      "post_p_sample": ["execute", "complete_cmd", "show_help"],
+      "both_phase": []                 // functions read-reachable from both phases:
+                                       // the awkward bucket, listed exhaustively
+    },
+    "observations": {                  // pseudo-reads that constrained P
+      "escape_sites": [],              // e.g., signal handler registration of a reader
+      "spawn_sites": []
+    }
+  }
 }
 ```
 
-### 2.2 Failure reason codes (`failure.reasons`, list)
+### 2.2 Failure reason codes (the failed variant's `codes` list)
+
+An uncertified global emits the slot's failed variant: `codes` carries one or more
+reason codes below, `witnesses` carries their per-code witnesses (shared `Witness`
+shape, `DISPOSITION_PLAN.md` §1.5), and richer evidence — e.g. the rescuable site
+list of `observation-before-quiescence` — goes under the pass-owned optional
+`diagnostics` object rather than being flattened away.
 
 Failure codes are **routing input for the disposition cascade** (`DISPOSITION.md` §1),
 not terminal verdicts: a global this pass cannot certify falls through to the next
@@ -301,10 +315,14 @@ consistency) matter beyond this pass: the same co-write evidence gates atomic
 eligibility and sets mutex granularity. Detection therefore lives in the shared coupling
 post-pass (`DISPOSITION.md` §6, work item D2b), which uses this pass's publication
 intervals (overlap) and init subtrees (intersection) as part of its clustering evidence.
-This pass *consumes* group ids (`facts.coupling_group`): certified members of one group
-should publish as **one `OnceLock<Struct>` at one `P`** — a reader seeing new
-`cmd_count` with old `cmd_table` becomes unrepresentable. Group disposition resolution
-(weakest member wins, overrides) belongs to the policy stage, not here.
+This pass stays strictly per-global: certified members of one group should publish as
+**one `OnceLock<Struct>` at one `P`** — a reader seeing new `cmd_count` with old
+`cmd_table` becomes unrepresentable — and the group-level common-P certificate that
+licenses this is derived by D2b from the members' per-global certificates
+(publication-interval intersection in one common publication function), stored
+analysis-owned at `coupling_groups[].strategy_support.once_lock`
+(`DISPOSITION_PLAN.md` D2b). Group disposition resolution (support-set intersection
+per `DISPOSITION.md` §6, overrides) belongs to the policy stage, not here.
 
 ### 2.4 Report artifacts
 
@@ -362,10 +380,13 @@ document.
   witnesses.
 - **O5 — spine descent (~200 lines).** Unique-call-site check, statement-CFG splicing,
   re-run O2/O3, depth bound, record descent path.
-- **O6 — facts emission + reports (~150 lines).** §2 payload handed to the manifest
-  assembler (`DISPOSITION.md` work item D1), quiescence profile, gate counters.
-  Co-quiescence clustering moved out to the shared coupling post-pass (D2b); this pass
-  only exports publication intervals and init subtrees as clustering evidence.
+- **O6 — facts emission + reports (~150 lines).** Emits the §2 certificate-slot shape
+  directly to the manifest assembler (`DISPOSITION.md` work item D1 — no pass-native
+  wrapper), plus quiescence profile and gate counters. Co-quiescence clustering moved
+  out to the shared coupling post-pass (D2b); this pass only exports publication
+  intervals and init subtrees as clustering evidence, from which D2b also derives the
+  group common-P certificate (`strategy_support.once_lock`). Within-run pipeline
+  order: O1–O5 → D2b → fact assembly (`DISPOSITION_PLAN.md` §4).
 - **O7 (v2, gated) — multi-point placement.** Only if the `no-single-P` counter is
   material at the §6 measurement.
 - **O8 (v2) — library/no-main entry spines.** Add the input format, audited ordering
