@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 fn m1_1_fixture(name: &str) -> PathBuf {
@@ -2030,6 +2031,224 @@ fn differential_ledger_holds_on_synthetic_suite() {
 }
 
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
+
+#[test]
+fn analyze_dispose_emits_policy_pair_without_indexing_it() {
+    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
+    let tmp = TempDir::new().unwrap();
+    let bc = tmp.path().join("dispose.bc");
+    let out = tmp.path().join("out");
+    assert!(Command::new(CLANG_14)
+        .args(["-O0", "-g", "-emit-llvm", "-c"])
+        .arg(m1_1_fixture("fp_smoke.c"))
+        .arg("-o")
+        .arg(&bc)
+        .status()
+        .unwrap()
+        .success());
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(&bc)
+        .arg("--out")
+        .arg(&out)
+        .arg("--build-mode")
+        .arg("executable")
+        .arg("--dispose")
+        .arg("--repo-root")
+        .arg(&repo_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let disposition: Value =
+        serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
+    assert_eq!(disposition["schema_version"], 2);
+    let counter = disposition["globals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|global| global["key"] == "fixtures/synthetic/m1_1/fp_smoke.c::g_counter")
+        .expect("g_counter disposition record");
+    assert_eq!(counter["facts"]["word_sized_scalar"]["value"], true);
+    assert_eq!(counter["facts"]["word_sized_scalar"]["class"], "integer");
+    assert_eq!(counter["facts"]["word_sized_scalar"]["signed"], true);
+    assert!(out.join("pangs-audit.json").exists());
+    let export_index: Value =
+        serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        !export_index["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "pangs-manifest.json"
+                || entry["path"] == "pangs-audit.json")
+    );
+    // Full-artifact golden: normalize only machine/run identity, then hash the canonical bytes.
+    // On failure the ordinary assertions above retain readable field-level diagnostics.
+    let manifest_bytes = fs::read_to_string(out.join("pangs-manifest.json")).unwrap();
+    let normalized = manifest_bytes
+        .replace(bc.to_str().unwrap(), "<INPUT>")
+        .replace(
+            fs::canonicalize(&repo_root).unwrap().to_str().unwrap(),
+            "<REPO_ROOT>",
+        )
+        .replace(
+            disposition["run"]["analysis"]["input_sha256"]
+                .as_str()
+                .unwrap(),
+            "<INPUT_SHA256>",
+        )
+        .replace(
+            disposition["run"]["analysis"]["pangs_git"]
+                .as_str()
+                .unwrap(),
+            "<PANGS_GIT>",
+        );
+    assert_eq!(
+        sha256_text(&normalized),
+        "7904bb1c44cee5ec57b6416cd87093b5e99df4e160e163eac4649d663dd28b70"
+    );
+    let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
+    assert_eq!(
+        sha256_text(&audit),
+        "3f67622fff7479b8c146c11d843c20f83f39d0481cce4ddb948d96a537c0e0b4"
+    );
+
+    let library_out = tmp.path().join("library-out");
+    let library = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(&bc)
+        .arg("--out")
+        .arg(&library_out)
+        .arg("--build-mode")
+        .arg("library")
+        .arg("--dispose")
+        .arg("--repo-root")
+        .arg(&repo_root)
+        .output()
+        .unwrap();
+    assert!(
+        library.status.success(),
+        "{}",
+        String::from_utf8_lossy(&library.stderr)
+    );
+    let library_manifest: Value =
+        serde_json::from_slice(&fs::read(library_out.join("pangs-manifest.json")).unwrap())
+            .unwrap();
+    let library_counter = library_manifest["globals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|global| global["meta"]["llvm_name"] == "g_counter")
+        .unwrap();
+    assert_eq!(
+        library_counter["facts"]["omega_escaped_address"]["value"],
+        false
+    );
+    assert_eq!(
+        library_counter["facts"]["access_set_complete"]["value"],
+        false
+    );
+    assert!(
+        library_counter["facts"]["access_set_complete"]["witness"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("reachable by name")
+    );
+}
+
+fn sha256_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+#[test]
+fn analyze_dispose_reports_registry_reachability_and_coupling() {
+    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
+    let tmp = TempDir::new().unwrap();
+    let bc = tmp.path().join("registry.bc");
+    let out = tmp.path().join("out");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = repo_root.join("fixtures/synthetic/disposition/registry_and_coupling.c");
+    assert!(Command::new(CLANG_14)
+        .args(["-O0", "-g", "-emit-llvm", "-c"])
+        .arg(source)
+        .arg("-o")
+        .arg(&bc)
+        .status()
+        .unwrap()
+        .success());
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(&bc)
+        .arg("--out")
+        .arg(&out)
+        .arg("--build-mode")
+        .arg("executable")
+        .arg("--dispose")
+        .arg("--repo-root")
+        .arg(&repo_root)
+        .arg("--registry-config")
+        .arg(repo_root.join("fixtures/synthetic/disposition/registry_config.json"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
+    let globals = manifest["globals"].as_array().unwrap();
+    let left = globals
+        .iter()
+        .find(|global| global["meta"]["llvm_name"] == "left_state")
+        .unwrap();
+    let right = globals
+        .iter()
+        .find(|global| global["meta"]["llvm_name"] == "right_state")
+        .unwrap();
+    let handler_only = globals
+        .iter()
+        .find(|global| global["meta"]["llvm_name"] == "handler_only_state")
+        .unwrap();
+    let custom = globals
+        .iter()
+        .find(|global| global["meta"]["llvm_name"] == "custom_state")
+        .unwrap();
+    assert_eq!(left["facts"]["thread_visible"]["value"], true);
+    assert_eq!(left["facts"]["signal_context_access"]["value"], false);
+    assert_eq!(right["facts"]["thread_visible"]["value"], true);
+    assert_eq!(right["facts"]["signal_context_access"]["value"], true);
+    assert_eq!(handler_only["facts"]["thread_visible"]["value"], false);
+    assert_eq!(
+        handler_only["facts"]["signal_context_access"]["value"],
+        true
+    );
+    assert_eq!(custom["facts"]["thread_visible"]["value"], true);
+    assert_eq!(custom["facts"]["signal_context_access"]["value"], false);
+    assert_eq!(
+        manifest["run"]["analysis"]["opts"]["disposition_registries"][0]["name"],
+        "register_worker"
+    );
+    assert_eq!(
+        left["facts"]["coupling_group"],
+        right["facts"]["coupling_group"]
+    );
+    let groups = manifest["coupling_groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert!(groups[0]["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|edge| {
+            edge["kind"] == "co-write" && edge["members"].as_array().unwrap().len() == 2
+        }));
+}
 
 fn workspace_path(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

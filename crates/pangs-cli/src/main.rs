@@ -5,9 +5,12 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use pangs_api::{Analysis, BuildMode, Opts, Stage};
+use pangs_api::{Analysis, BuildMode, Opts, RegistryApi, Stage};
+use pangs_dispose::{apply_policy, config_with_overrides, parse_overrides, write_artifact_pair};
+use pangs_manifest::DisposeMode;
 use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
 use pangs_pir::Pir;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Parser)]
 #[command(name = "pangs")]
@@ -35,6 +38,19 @@ enum Command {
         partition_budget: u64,
         #[arg(long)]
         validate: bool,
+        #[arg(long)]
+        dispose: bool,
+        #[arg(long, requires = "dispose")]
+        repo_root: Option<PathBuf>,
+        #[arg(long, requires = "dispose")]
+        mode: Option<DisposeModeArg>,
+        #[arg(long, requires = "dispose", conflicts_with = "no_overrides")]
+        overrides: Option<PathBuf>,
+        #[arg(long, requires = "dispose")]
+        no_overrides: bool,
+        /// JSON array of additional or replacement spawn/signal registry entries.
+        #[arg(long, requires = "dispose")]
+        registry_config: Option<PathBuf>,
     },
     Stats {
         module: PathBuf,
@@ -190,6 +206,21 @@ enum BuildModeArg {
     Executable,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DisposeModeArg {
+    Application,
+    Library,
+}
+
+impl From<DisposeModeArg> for DisposeMode {
+    fn from(value: DisposeModeArg) -> Self {
+        match value {
+            DisposeModeArg::Application => Self::Application,
+            DisposeModeArg::Library => Self::Library,
+        }
+    }
+}
+
 impl From<BuildModeArg> for BuildMode {
     fn from(value: BuildModeArg) -> Self {
         match value {
@@ -217,21 +248,39 @@ fn run() -> Result<()> {
             exports,
             partition_budget,
             validate,
+            dispose,
+            repo_root,
+            mode,
+            overrides,
+            no_overrides,
+            registry_config,
         } => {
             let pipeline_started = Instant::now();
-            let pir = Pir::from_path(&module)?;
+            let pir = if dispose {
+                let repo_root = repo_root
+                    .as_ref()
+                    .context("--dispose requires --repo-root")?;
+                Pir::from_path_with_repo_root(&module, repo_root)?
+            } else {
+                Pir::from_path(&module)?
+            };
             let opts = Opts {
                 stage: stage.into(),
                 build_mode: build_mode.into(),
                 exports: read_exports(exports)?,
                 partition_budget,
+                disposition_registries: read_registry_config(registry_config.as_deref())?,
                 ..Opts::default()
             };
             eprintln!(
                 "pangs analyze stage={:?} build_mode={:?}",
                 opts.stage, opts.build_mode
             );
-            let analysis = Analysis::run(&pir, &opts)?;
+            let analysis = if dispose {
+                Analysis::run_with_disposition(&pir, &opts)?
+            } else {
+                Analysis::run(&pir, &opts)?
+            };
             pangs_clients::export_analysis(
                 &analysis,
                 &opts,
@@ -240,6 +289,62 @@ fn run() -> Result<()> {
                 validate,
                 pipeline_started,
             )?;
+            if dispose {
+                let repo_root = repo_root.as_ref().expect("checked above");
+                let target = pir
+                    .target
+                    .as_ref()
+                    .context("--dispose requires LLVM target metadata")?;
+                let (mut disposition_manifest, mut ledger) =
+                    pangs_clients::assemble_disposition_artifacts(
+                        &analysis, &pir, &opts, &module, repo_root, target,
+                    )?;
+                let analysis_mode = match opts.build_mode {
+                    BuildMode::Executable => DisposeMode::Application,
+                    BuildMode::Library => DisposeMode::Library,
+                };
+                let disposition_mode = match mode.map(DisposeMode::from) {
+                    None => analysis_mode,
+                    Some(DisposeMode::Library) => DisposeMode::Library,
+                    Some(DisposeMode::Application) if analysis_mode == DisposeMode::Application => {
+                        DisposeMode::Application
+                    }
+                    Some(DisposeMode::Application) => {
+                        anyhow::bail!("cannot widen a library analysis to application mode")
+                    }
+                };
+                let discovered = out.join("pangs-overrides.toml");
+                let overrides_path = if no_overrides {
+                    None
+                } else if let Some(path) = overrides {
+                    if !path.exists() {
+                        anyhow::bail!("explicit override file does not exist: {}", path.display());
+                    }
+                    Some(fs::canonicalize(path)?)
+                } else {
+                    discovered
+                        .exists()
+                        .then(|| fs::canonicalize(discovered))
+                        .transpose()?
+                };
+                let (override_config, overrides_sha256) =
+                    load_disposition_overrides(overrides_path.as_deref())?;
+                let config = config_with_overrides(disposition_mode, override_config.as_ref())?;
+                let outcome = apply_policy(
+                    &mut disposition_manifest,
+                    &mut ledger,
+                    &config,
+                    override_config.as_ref(),
+                    overrides_path.map(|path| path.display().to_string()),
+                    overrides_sha256,
+                )?;
+                write_artifact_pair(&out, &disposition_manifest, &ledger)?;
+                if outcome.override_problems {
+                    anyhow::bail!(
+                        "one or more disposition overrides were rejected or unmatched; artifacts were written"
+                    );
+                }
+            }
         }
         Command::Stats { module } => {
             let pir = Pir::from_path(&module)?;
@@ -586,6 +691,32 @@ fn read_exports(path: Option<PathBuf>) -> Result<BTreeSet<String>> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(ToOwned::to_owned)
         .collect())
+}
+
+fn read_registry_config(path: Option<&std::path::Path>) -> Result<Vec<RegistryApi>> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let bytes =
+        fs::read(path).with_context(|| format!("read registry config {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse registry config {} as a JSON array", path.display()))
+}
+
+fn load_disposition_overrides(
+    path: Option<&std::path::Path>,
+) -> Result<(Option<pangs_dispose::Overrides>, Option<String>)> {
+    let Some(path) = path else {
+        return Ok((None, None));
+    };
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let text = std::str::from_utf8(&bytes).context("override file is not UTF-8")?;
+    let overrides = parse_overrides(text)?;
+    let sha = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((Some(overrides), Some(sha)))
 }
 
 fn function_signatures(pir: &Pir) -> BTreeMap<String, pangs_pir::Signature> {

@@ -34,6 +34,11 @@
       "type": "string",
       "minLength": 1,
       "description": "Optional detector-specific detail, for example callee:fatalx."
+    },
+    "function": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "This-run function id used to join the finding back to analysis facts."
     }
   }
 }

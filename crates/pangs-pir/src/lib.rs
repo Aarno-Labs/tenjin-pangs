@@ -42,12 +42,21 @@ pub struct Pir {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "LoweringStats::is_empty")]
     pub lowering: LoweringStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetInfo>,
     #[serde(default)]
     pub functions: Vec<Func>,
     #[serde(default)]
     pub globals: Vec<Global>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub global_init: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetInfo {
+    pub triple: String,
+    pub data_layout: String,
+    pub supported_atomic_widths: Vec<u64>,
 }
 
 impl Pir {
@@ -57,7 +66,7 @@ impl Pir {
             path.extension().and_then(|ext| ext.to_str()),
             Some("bc" | "ll")
         ) {
-            return llvm_sys::lower_path(path);
+            return llvm_sys::lower_path(path, None);
         }
         let data = fs::read_to_string(path).map_err(|source| PirError::Read {
             path: path.display().to_string(),
@@ -67,6 +76,20 @@ impl Pir {
             path: path.display().to_string(),
             source,
         })
+    }
+
+    pub fn from_path_with_repo_root(
+        path: impl AsRef<Path>,
+        repo_root: impl AsRef<Path>,
+    ) -> Result<Self, PirError> {
+        let path = path.as_ref();
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("bc" | "ll")
+        ) {
+            return llvm_sys::lower_path(path, Some(repo_root.as_ref()));
+        }
+        Self::from_path(path)
     }
 }
 
@@ -109,12 +132,67 @@ pub struct Global {
     pub mutable: bool,
     #[serde(default)]
     pub exported: bool,
+    #[serde(default = "default_true")]
+    pub is_definition: bool,
+    #[serde(default)]
+    pub linkage: SymbolLinkage,
+    #[serde(default)]
+    pub type_spelling: Option<String>,
+    #[serde(default)]
+    pub size_bits: Option<u64>,
+    #[serde(default)]
+    pub align_bits: Option<u64>,
+    #[serde(default)]
+    pub path_error: Option<String>,
+    #[serde(default)]
+    pub scalar_class: Option<ScalarTypeClass>,
+    #[serde(default)]
+    pub signed: Option<bool>,
     /// Names of other global values (functions and global variables) referenced by this
     /// global's constant initializer, walked recursively through struct/array/expr
     /// constants. Mirrors cclyzer's `global_initializer_references` (constant-init.dl) and
     /// feeds the `cc2json` client. Names are bare (no leading `@`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub init_refs: Vec<String>,
+}
+
+impl Default for Global {
+    fn default() -> Self {
+        Self {
+            key: String::new(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            exported: false,
+            is_definition: true,
+            linkage: SymbolLinkage::External,
+            type_spelling: None,
+            size_bits: None,
+            align_bits: None,
+            path_error: None,
+            scalar_class: None,
+            signed: None,
+            init_refs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolLinkage {
+    Internal,
+    #[default]
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScalarTypeClass {
+    Integer,
+    Boolean,
+    Enum,
+    Pointer,
 }
 
 fn default_true() -> bool {

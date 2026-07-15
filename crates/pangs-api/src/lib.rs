@@ -5,10 +5,11 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use pangs_pag::{BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts};
-use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, Stmt};
+use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, ScalarTypeClass, Stmt, SymbolLinkage};
 use pangs_solve::{
-    debug_assert_narrows, solve_andersen_with_overrides, solve_steensgaard, IndirectCallResolution,
-    NodeResolution,
+    debug_assert_narrows, solve_andersen_with_overrides,
+    solve_andersen_with_overrides_and_target_points_to, solve_steensgaard,
+    solve_steensgaard_with_target_points_to, IndirectCallResolution, NodeResolution,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -52,6 +53,8 @@ pub struct Opts {
     pub enable_b2_simple: bool,
     pub enable_b3_confined: bool,
     pub b2_context_depth: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disposition_registries: Vec<RegistryApi>,
 }
 
 impl Default for Opts {
@@ -65,6 +68,7 @@ impl Default for Opts {
             enable_b2_simple: true,
             enable_b3_confined: true,
             b2_context_depth: DEFAULT_CONTEXT_DEPTH,
+            disposition_registries: Vec::new(),
         }
     }
 }
@@ -106,6 +110,17 @@ pub struct GlobalInfo {
     pub stationary: bool,
     pub never_written: bool,
     pub escape: EscapeStatus,
+    pub address_escaped: bool,
+    pub escape_witness: Option<String>,
+    pub exported: bool,
+    pub is_definition: bool,
+    pub linkage: SymbolLinkage,
+    pub type_spelling: Option<String>,
+    pub size_bits: Option<u64>,
+    pub align_bits: Option<u64>,
+    pub path_error: Option<String>,
+    pub scalar_class: Option<ScalarTypeClass>,
+    pub signed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +244,36 @@ pub struct Finding {
     pub effect: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(skip)]
+    pub function: Option<FuncId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryKind {
+    Spawn,
+    Signal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryApi {
+    pub name: String,
+    pub kind: RegistryKind,
+    pub entry: RegistryEntryOperand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RegistryEntryOperand {
+    Arg { arg: usize },
+    PointeeOfArg { pointee_of_arg: usize },
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistryEntryResolution {
+    pub kind: RegistryKind,
+    pub targets: Vec<FuncId>,
+    pub unresolved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -591,11 +636,30 @@ pub struct Analysis {
     func_lookup: HashMap<String, FuncId>,
     #[serde(skip)]
     global_lookup: HashMap<String, GlobalId>,
+    #[serde(skip)]
+    registry_entries: BTreeMap<CallsiteId, RegistryEntryResolution>,
 }
 
 impl Analysis {
     pub fn run(module: &Pir, opts: &Opts) -> Result<Self, AnalysisError> {
+        Self::run_internal(module, opts, false)
+    }
+
+    pub fn run_with_disposition(module: &Pir, opts: &Opts) -> Result<Self, AnalysisError> {
+        Self::run_internal(module, opts, true)
+    }
+
+    fn run_internal(
+        module: &Pir,
+        opts: &Opts,
+        disposition_facts: bool,
+    ) -> Result<Self, AnalysisError> {
         let analysis_started = Instant::now();
+        let registry_apis = if disposition_facts {
+            effective_registry_apis(&opts.disposition_registries)
+        } else {
+            Vec::new()
+        };
         let setup_scan_started = Instant::now();
         let mut func_lookup = HashMap::new();
         let mut functions = Vec::new();
@@ -646,6 +710,17 @@ impl Analysis {
                 } else {
                     EscapeStatus::Module
                 },
+                address_escaped: false,
+                escape_witness: None,
+                exported,
+                is_definition: global.is_definition,
+                linkage: global.linkage,
+                type_spelling: global.type_spelling.clone(),
+                size_bits: global.size_bits,
+                align_bits: global.align_bits,
+                path_error: global.path_error.clone(),
+                scalar_class: global.scalar_class,
+                signed: global.signed,
             });
         }
 
@@ -658,6 +733,7 @@ impl Analysis {
         let mut indirect_callsites = Vec::new();
         let mut simple_icall_queries = Vec::new();
         let mut solver_metrics = None;
+        let mut registry_entries = BTreeMap::new();
         let mut pag_build_us = 0;
         let mut solve_us = 0;
         let address_taken: Vec<_> = module
@@ -963,8 +1039,24 @@ impl Analysis {
                     },
                 );
                 pag_build_us = pag_started.elapsed().as_micros() as u64;
+                let registry_labels = if disposition_facts {
+                    direct_registry_target_labels(&pag, &registry_apis)
+                } else {
+                    BTreeSet::new()
+                };
                 let solve_started = Instant::now();
                 let mut solved = match opts.stage {
+                    Stage::Andersen if !registry_labels.is_empty() => {
+                        solve_andersen_with_overrides_and_target_points_to(
+                            module,
+                            &pag,
+                            opts.build_mode.into(),
+                            opts.partition_budget,
+                            &simple_exact_targets,
+                            confined_functions,
+                            &registry_labels,
+                        )
+                    }
                     Stage::Andersen => solve_andersen_with_overrides(
                         module,
                         &pag,
@@ -972,6 +1064,12 @@ impl Analysis {
                         opts.partition_budget,
                         &simple_exact_targets,
                         confined_functions,
+                    ),
+                    _ if !registry_labels.is_empty() => solve_steensgaard_with_target_points_to(
+                        module,
+                        &pag,
+                        opts.build_mode.into(),
+                        &registry_labels,
                     ),
                     _ => solve_steensgaard(module, &pag, opts.build_mode.into()),
                 };
@@ -989,8 +1087,24 @@ impl Analysis {
                         },
                     );
                     pag_build_us += pag_started.elapsed().as_micros() as u64;
+                    let registry_labels = if disposition_facts {
+                        direct_registry_target_labels(&pag, &registry_apis)
+                    } else {
+                        BTreeSet::new()
+                    };
                     let solve_started = Instant::now();
                     solved = match opts.stage {
+                        Stage::Andersen if !registry_labels.is_empty() => {
+                            solve_andersen_with_overrides_and_target_points_to(
+                                module,
+                                &pag,
+                                opts.build_mode.into(),
+                                opts.partition_budget,
+                                &simple_exact_targets,
+                                confined_functions,
+                                &registry_labels,
+                            )
+                        }
                         Stage::Andersen => solve_andersen_with_overrides(
                             module,
                             &pag,
@@ -999,12 +1113,24 @@ impl Analysis {
                             &simple_exact_targets,
                             confined_functions,
                         ),
+                        _ if !registry_labels.is_empty() => {
+                            solve_steensgaard_with_target_points_to(
+                                module,
+                                &pag,
+                                opts.build_mode.into(),
+                                &registry_labels,
+                            )
+                        }
                         _ => solve_steensgaard(module, &pag, opts.build_mode.into()),
                     };
                     solve_us += solve_started.elapsed().as_micros() as u64;
                 }
                 let safe_indirect_varargs =
                     safe_indirect_vararg_callsites(module, &indirect_vararg_keys, &solved);
+                if disposition_facts {
+                    registry_entries =
+                        resolve_registry_entries(&pag, &solved, &func_lookup, &registry_apis);
+                }
                 solver_metrics = Some(solved.metrics.clone());
                 let solver_postprocess_started = Instant::now();
                 emit_deferred_steens_audits(
@@ -1131,6 +1257,12 @@ impl Analysis {
                         } else {
                             EscapeStatus::Module
                         };
+                        global.address_escaped = state.address_escape;
+                        global.escape_witness = state
+                            .escape_sources
+                            .iter()
+                            .find(|source| !source.starts_with("exported-symbol:"))
+                            .cloned();
                         global.never_written = state.never_written;
                     }
                 }
@@ -1434,6 +1566,7 @@ impl Analysis {
             metrics,
             func_lookup,
             global_lookup,
+            registry_entries,
         })
     }
 
@@ -1475,6 +1608,10 @@ impl Analysis {
 
     pub fn audit_findings(&self) -> &[Finding] {
         &self.findings
+    }
+
+    pub fn registry_entry(&self, callsite: CallsiteId) -> Option<&RegistryEntryResolution> {
+        self.registry_entries.get(&callsite)
     }
 
     pub fn metrics(&self) -> &Metrics {
@@ -2744,6 +2881,7 @@ fn push_audit_finding_with_detail(
         affected,
         effect: "omega_taint".to_string(),
         detail,
+        function: Some(caller),
     });
     audit_taints.entry(caller).or_default().push(Taint {
         kind: kind.to_string(),
@@ -3323,6 +3461,127 @@ fn transitive_modref_high_fanout_limit() -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(16_384)
+}
+
+fn effective_registry_apis(extensions: &[RegistryApi]) -> Vec<RegistryApi> {
+    let mut entries = vec![
+        RegistryApi {
+            name: "pthread_create".into(),
+            kind: RegistryKind::Spawn,
+            entry: RegistryEntryOperand::Arg { arg: 2 },
+        },
+        RegistryApi {
+            name: "thrd_create".into(),
+            kind: RegistryKind::Spawn,
+            entry: RegistryEntryOperand::Arg { arg: 1 },
+        },
+        RegistryApi {
+            name: "signal".into(),
+            kind: RegistryKind::Signal,
+            entry: RegistryEntryOperand::Arg { arg: 1 },
+        },
+        RegistryApi {
+            name: "sigaction".into(),
+            kind: RegistryKind::Signal,
+            entry: RegistryEntryOperand::PointeeOfArg { pointee_of_arg: 1 },
+        },
+    ];
+    for extension in extensions {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|entry| entry.name == extension.name)
+        {
+            *existing = extension.clone();
+        } else {
+            entries.push(extension.clone());
+        }
+    }
+    entries
+}
+
+fn registry_spec(name: &str, registries: &[RegistryApi]) -> Option<(RegistryKind, usize, bool)> {
+    let name = name.strip_prefix('@').unwrap_or(name);
+    let entry = registries.iter().find(|entry| entry.name == name)?;
+    Some(match entry.entry {
+        RegistryEntryOperand::Arg { arg } => (entry.kind, arg, false),
+        RegistryEntryOperand::PointeeOfArg { pointee_of_arg } => (entry.kind, pointee_of_arg, true),
+    })
+}
+
+fn direct_registry_target_labels(pag: &Pag, registries: &[RegistryApi]) -> BTreeSet<String> {
+    pag.callsites
+        .iter()
+        .filter_map(|callsite| {
+            let (_, index, pointee) = registry_spec(callsite.callee.as_deref()?, registries)?;
+            (!pointee)
+                .then(|| callsite.args.get(index))
+                .flatten()
+                .map(|node| pag.nodes[node.0 as usize].label.clone())
+        })
+        .collect()
+}
+
+fn resolve_registry_entries(
+    pag: &Pag,
+    solved: &pangs_solve::SolveResult,
+    func_lookup: &HashMap<String, FuncId>,
+    registries: &[RegistryApi],
+) -> BTreeMap<CallsiteId, RegistryEntryResolution> {
+    let mut entries = BTreeMap::new();
+    for (index, callsite) in pag.callsites.iter().enumerate() {
+        let mut specs = callsite
+            .callee
+            .as_deref()
+            .and_then(|name| registry_spec(name, registries))
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(resolution) = solved
+            .indirect_calls
+            .iter()
+            .find(|resolution| resolution.callsite_key == callsite.key)
+        {
+            for target in &resolution.targets {
+                if let Some(spec) = registry_spec(target, registries) {
+                    if !specs.contains(&spec) {
+                        specs.push(spec);
+                    }
+                }
+            }
+        }
+        for (kind, arg_index, pointee) in specs {
+            let node = callsite.args.get(arg_index);
+            let label = node.map(|node| pag.nodes[node.0 as usize].label.as_str());
+            let allocations = label.and_then(|label| solved.node_points_to.get(label));
+            let mut targets = allocations
+                .into_iter()
+                .flatten()
+                .filter_map(|name| func_lookup.get(name).copied())
+                .collect::<Vec<_>>();
+            targets.sort();
+            targets.dedup();
+            let external = label
+                .and_then(|label| solved.nodes.get(label))
+                .is_some_and(|node| node.external);
+            let directly_targeted = callsite
+                .callee
+                .as_deref()
+                .and_then(|name| registry_spec(name, registries))
+                .is_some()
+                && !pointee
+                && node.is_some();
+            entries.insert(
+                CallsiteId(index as u32),
+                RegistryEntryResolution {
+                    kind,
+                    targets,
+                    unresolved: pointee
+                        || external
+                        || (!directly_targeted && allocations.is_none()),
+                },
+            );
+        }
+    }
+    entries
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

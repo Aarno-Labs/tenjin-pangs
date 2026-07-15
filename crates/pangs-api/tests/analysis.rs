@@ -93,6 +93,7 @@ fn unknown_caller_seeds_only_exported_external_and_address_taken_functions() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "helper".to_string(),
@@ -709,6 +710,7 @@ fn absence_only_initval_is_stationary_without_runtime_writers() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![Func {
             key: "reader".to_string(),
             sig: sig(AbiClass::Void, vec![]),
@@ -732,6 +734,7 @@ fn absence_only_initval_is_stationary_without_runtime_writers() {
             mutable: true,
             init_refs: Vec::new(),
             exported: false,
+            ..Global::default()
         }],
         global_init: vec![],
     };
@@ -775,6 +778,7 @@ fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![Func {
             key: "reader".to_string(),
             sig: sig(AbiClass::Void, vec![]),
@@ -816,6 +820,7 @@ fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
                 mutable: false,
                 init_refs: Vec::new(),
                 exported: false,
+                ..Global::default()
             },
             Global {
                 key: "__PRETTY_FUNCTION__.reader".to_string(),
@@ -825,6 +830,7 @@ fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
                 mutable: false,
                 init_refs: Vec::new(),
                 exported: false,
+                ..Global::default()
             },
             Global {
                 key: "__const.reader.table".to_string(),
@@ -834,6 +840,7 @@ fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
                 mutable: false,
                 init_refs: Vec::new(),
                 exported: false,
+                ..Global::default()
             },
             Global {
                 key: "@Tracked".to_string(),
@@ -843,6 +850,7 @@ fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
                 mutable: true,
                 init_refs: Vec::new(),
                 exported: false,
+                ..Global::default()
             },
         ],
         global_init: vec![],
@@ -934,6 +942,7 @@ fn indirect_call_component_taint_uses_callsite_witness_and_matches_external_targ
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "driver".to_string(),
@@ -972,6 +981,7 @@ fn indirect_call_component_taint_uses_callsite_witness_and_matches_external_targ
             mutable: true,
             init_refs: Vec::new(),
             exported: true,
+            ..Global::default()
         }],
         global_init: vec![],
     };
@@ -1004,6 +1014,7 @@ fn direct_global_modref_marks_never_written_and_preserves_direct_witness() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![Func {
             key: "writer".to_string(),
             sig: sig(AbiClass::Void, vec![]),
@@ -1034,6 +1045,7 @@ fn direct_global_modref_marks_never_written_and_preserves_direct_witness() {
             mutable: true,
             init_refs: Vec::new(),
             exported: false,
+            ..Global::default()
         }],
         global_init: vec![],
     };
@@ -1063,6 +1075,7 @@ fn modref_api_closes_over_direct_calls_but_export_rows_stay_local() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "entry".to_string(),
@@ -1105,6 +1118,7 @@ fn modref_api_closes_over_direct_calls_but_export_rows_stay_local() {
             mutable: true,
             init_refs: Vec::new(),
             exported: false,
+            ..Global::default()
         }],
         global_init: vec![],
     };
@@ -1134,6 +1148,7 @@ fn transitive_modref_api_collapses_duplicate_witnesses() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "entry".to_string(),
@@ -1183,6 +1198,7 @@ fn transitive_modref_api_collapses_duplicate_witnesses() {
             mutable: true,
             init_refs: Vec::new(),
             exported: false,
+            ..Global::default()
         }],
         global_init: vec![],
     };
@@ -1203,6 +1219,7 @@ fn modref_api_closes_over_fsa_indirect_targets() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "driver".to_string(),
@@ -1245,6 +1262,7 @@ fn modref_api_closes_over_fsa_indirect_targets() {
             mutable: true,
             init_refs: Vec::new(),
             exported: false,
+            ..Global::default()
         }],
         global_init: vec![],
     };
@@ -1270,6 +1288,7 @@ fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "main".to_string(),
@@ -1312,6 +1331,7 @@ fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
             mutable: true,
             init_refs: Vec::new(),
             exported: false,
+            ..Global::default()
         }],
         global_init: vec![],
     };
@@ -1344,6 +1364,7 @@ fn direct_external_call_taints_only_the_connected_component() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "main".to_string(),
@@ -1411,6 +1432,7 @@ fn direct_external_call_taints_only_the_connected_component() {
                 mutable: true,
                 init_refs: Vec::new(),
                 exported: false,
+                ..Global::default()
             },
             Global {
                 key: "@Glocal".to_string(),
@@ -1420,6 +1442,7 @@ fn direct_external_call_taints_only_the_connected_component() {
                 mutable: true,
                 init_refs: Vec::new(),
                 exported: false,
+                ..Global::default()
             },
         ],
         global_init: vec![],
@@ -1481,6 +1504,7 @@ fn build_mode_changes_default_export_and_escape_behavior() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "main".to_string(),
@@ -1513,6 +1537,7 @@ fn build_mode_changes_default_export_and_escape_behavior() {
             mutable: true,
             init_refs: Vec::new(),
             exported: true,
+            ..Global::default()
         }],
         global_init: vec![],
     };
@@ -1533,6 +1558,15 @@ fn build_mode_changes_default_export_and_escape_behavior() {
         },
     )
     .unwrap();
+    let library_solved = Analysis::run_with_disposition(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
 
     let lib_main = library.lookup_func("main").unwrap();
     let lib_helper = library.lookup_func("helper").unwrap();
@@ -1546,6 +1580,12 @@ fn build_mode_changes_default_export_and_escape_behavior() {
     assert!(!library.callers(lib_main).any(unknown_caller));
     assert!(library.callers(lib_helper).any(unknown_caller));
     assert_eq!(library.escape(lib_global), EscapeStatus::External);
+    let solved_global = library_solved.lookup_global("@Pub").unwrap();
+    assert_eq!(library_solved.escape(solved_global), EscapeStatus::External);
+    assert!(!library_solved.globals()[solved_global].address_escaped);
+    assert!(library_solved.globals()[solved_global]
+        .escape_witness
+        .is_none());
 
     assert!(executable.functions()[exe_main].exported);
     assert!(!executable.functions()[exe_helper].exported);
@@ -1560,6 +1600,7 @@ fn explicit_exports_override_build_mode_defaults() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![Func {
             key: "helper".to_string(),
             sig: sig(AbiClass::Void, vec![]),
@@ -1579,6 +1620,7 @@ fn explicit_exports_override_build_mode_defaults() {
             mutable: true,
             init_refs: Vec::new(),
             exported: false,
+            ..Global::default()
         }],
         global_init: vec![],
     };
@@ -1753,6 +1795,12 @@ fn steens_external_call_escapes_only_passed_pointer_targets() {
     assert!(analysis.callers(ext_decl).any(unknown_caller));
     assert_eq!(analysis.escape(esc), EscapeStatus::External);
     assert_eq!(analysis.escape(local), EscapeStatus::Module);
+    assert!(analysis.globals()[esc].address_escaped);
+    assert!(analysis.globals()[esc]
+        .escape_witness
+        .as_deref()
+        .is_some_and(|source| source.starts_with("external-call:")));
+    assert!(!analysis.globals()[local].address_escaped);
     assert!(!analysis.globals()[esc].never_written);
     assert!(analysis.globals()[local].never_written);
 }
@@ -1896,6 +1944,7 @@ fn audit_inline_asm_freezes_an_otherwise_local_component() {
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![Func {
             key: "asm_only".to_string(),
             sig: sig(AbiClass::Void, vec![]),
@@ -1975,6 +2024,7 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
         module: "m4_vararg_taxonomy".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "external_sink".to_string(),
@@ -2212,6 +2262,7 @@ fn indirect_vararg_filtering_uses_complete_safe_target_sets() {
         module: "m4_4_safe_indirect_vararg".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             safe_a.clone(),
             safe_b.clone(),
@@ -2243,6 +2294,7 @@ fn indirect_vararg_filtering_uses_complete_safe_target_sets() {
         module: "m4_4_unsafe_indirect_vararg".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             safe_a.clone(),
             safe_b.clone(),
@@ -2274,6 +2326,7 @@ fn indirect_vararg_filtering_uses_complete_safe_target_sets() {
         module: "m4_4_unknown_indirect_vararg".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             safe_a,
             safe_b,
@@ -2399,6 +2452,7 @@ fn audit_memops_on_fnptr_aggregates_are_reported_but_scalar_fnptr_memops_are_not
         module: "m".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![Func {
             key: "driver".to_string(),
             sig: sig(AbiClass::Void, vec![]),
@@ -2990,6 +3044,7 @@ fn transitive_modrefs_preserve_recursive_call_closure() {
         module: "m1_7_cycle".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "main".to_string(),
@@ -3058,6 +3113,7 @@ fn transitive_modrefs_preserve_recursive_call_closure() {
             mutable: true,
             init_refs: Vec::new(),
             exported: false,
+            ..Global::default()
         }],
         global_init: vec![],
     };

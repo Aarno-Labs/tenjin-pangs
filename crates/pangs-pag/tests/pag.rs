@@ -185,6 +185,7 @@ fn direct_internal_vararg_boundary_requires_visible_vararg_consumption() {
         module: "m4_vararg_boundary".to_string(),
         source: None,
         lowering: Default::default(),
+        target: None,
         functions: vec![
             Func {
                 key: "safe_sink".to_string(),

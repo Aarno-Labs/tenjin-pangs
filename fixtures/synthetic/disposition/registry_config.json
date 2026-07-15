@@ -1,0 +1,7 @@
+[
+  {
+    "name": "register_worker",
+    "kind": "spawn",
+    "entry": { "arg": 0 }
+  }
+]

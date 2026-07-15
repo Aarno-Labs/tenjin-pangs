@@ -13,6 +13,7 @@ mod andersen;
 mod cfl;
 pub use andersen::{
     solve_andersen, solve_andersen_with_global_points_to, solve_andersen_with_overrides,
+    solve_andersen_with_overrides_and_target_points_to,
 };
 
 // Experimental tier-E prototype APIs. These are intentionally kept out of the
@@ -141,6 +142,10 @@ pub struct IndirectCallResolution {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlobalResolution {
     pub escape_external: bool,
+    #[serde(default)]
+    pub address_escape: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escape_sources: Vec<String>,
     pub never_written: bool,
 }
 
@@ -257,6 +262,22 @@ pub fn solve_steensgaard_with_global_points_to(
     solver.finish()
 }
 
+/// Like [`solve_steensgaard`] but materializes allocation-level points-to only for the
+/// requested PAG node labels. This is intended for narrow analysis consumers such as
+/// spawn/signal registry operands; it does not turn the normal solve into an all-node export.
+pub fn solve_steensgaard_with_target_points_to(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: BuildMode,
+    labels: &BTreeSet<String>,
+) -> SolveResult {
+    let mut solver = Solver::new(pir, pag, build_mode);
+    solver.points_to_materialization = PointsToMaterialization::Targeted;
+    solver.points_to_labels = labels.clone();
+    solver.run();
+    solver.finish()
+}
+
 /// Run Steensgaard and also export the final union-find class structure, which the
 /// Andersen pass (`andersen::solve_andersen`) consumes as Kahlon partitions plus the
 /// round-0 escape/pointee facts. The two are produced from one solve so the partition
@@ -280,6 +301,21 @@ pub(crate) fn solve_steensgaard_classes_materialized(
 ) -> (SolveResult, SteensClasses) {
     let mut solver = Solver::new(pir, pag, build_mode);
     solver.points_to_materialization = materialization;
+    solver.run();
+    let classes = solver.export_classes();
+    let result = solver.finish();
+    (result, classes)
+}
+
+pub(crate) fn solve_steensgaard_classes_targeted(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: BuildMode,
+    labels: &BTreeSet<String>,
+) -> (SolveResult, SteensClasses) {
+    let mut solver = Solver::new(pir, pag, build_mode);
+    solver.points_to_materialization = PointsToMaterialization::Targeted;
+    solver.points_to_labels = labels.clone();
     solver.run();
     let classes = solver.export_classes();
     let result = solver.finish();
@@ -325,6 +361,7 @@ struct ClassData {
     pointee: Option<usize>,
     ext: bool,
     esc: bool,
+    escape_sources: BTreeSet<String>,
     icall_sites: HashSet<usize>,
     fn_objs: HashSet<usize>,
     processed_icall_sites: HashSet<usize>,
@@ -365,6 +402,7 @@ struct Solver<'a> {
     /// Controls optional `SolveResult::node_points_to` materialization. Off for the normal
     /// `analyze` pipeline so it pays nothing.
     points_to_materialization: PointsToMaterialization,
+    points_to_labels: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +410,7 @@ pub(crate) enum PointsToMaterialization {
     None,
     AllNodes,
     GlobalObjects,
+    Targeted,
 }
 
 #[derive(Debug, Clone)]
@@ -518,6 +557,7 @@ impl<'a> Solver<'a> {
             profile_interval_candidate_pairs: steens_profile_interval_candidate_pairs(),
             next_profile_candidate_pairs: steens_profile_interval_candidate_pairs(),
             points_to_materialization: PointsToMaterialization::None,
+            points_to_labels: BTreeSet::new(),
         }
     }
 
@@ -632,13 +672,22 @@ impl<'a> Solver<'a> {
                 (OmegaSeedKind::ExportedSymbol, SeedTarget::Node(id))
                 | (OmegaSeedKind::ImportedSymbol, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
-                    self.set_esc(class);
+                    let label = &self.pag.nodes[id.0 as usize].label;
+                    let source = if seed.kind == OmegaSeedKind::ExportedSymbol {
+                        format!("exported-symbol:{label}")
+                    } else {
+                        format!("imported-symbol:{label}")
+                    };
+                    self.set_esc_with_source(class, source);
                 }
                 (OmegaSeedKind::PtrToInt, SeedTarget::Node(id))
                 | (OmegaSeedKind::UnknownOperandEscape, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
                     let pointee = self.pointee_of(class);
-                    self.set_esc(pointee);
+                    self.set_esc_with_source(
+                        pointee,
+                        format!("{:?}:{}", seed.kind, self.pag.nodes[id.0 as usize].label),
+                    );
                 }
                 (OmegaSeedKind::IntToPtr, SeedTarget::Node(id))
                 | (OmegaSeedKind::UnknownResultExternal, SeedTarget::Node(id)) => {
@@ -735,11 +784,21 @@ impl<'a> Solver<'a> {
             };
             let root = self.find(class);
             let escape_external = self.classes[root].esc;
+            let escape_sources = self.classes[root]
+                .escape_sources
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let address_escape = escape_sources
+                .iter()
+                .any(|source| !source.starts_with("exported-symbol:"));
             let never_written = !escape_external && !stored_classes.contains(&root);
             globals.insert(
                 global.key.clone(),
                 GlobalResolution {
                     escape_external,
+                    address_escape,
+                    escape_sources,
                     never_written,
                 },
             );
@@ -873,6 +932,11 @@ impl<'a> Solver<'a> {
             {
                 continue;
             }
+            if mode == PointsToMaterialization::Targeted
+                && !self.points_to_labels.contains(&node.label)
+            {
+                continue;
+            }
             let root = self.find(node.id.0 as usize);
             let Some(pointee) = self.classes[root].pointee else {
                 continue;
@@ -903,11 +967,16 @@ impl<'a> Solver<'a> {
         let root = self.find(class);
         let ext = self.classes[root].ext;
         let esc = self.classes[root].esc;
+        let escape_sources = self.classes[root].escape_sources.clone();
 
         if ext || esc {
             if let Some(pointee) = self.classes[root].pointee {
                 self.set_ext(pointee);
-                self.set_esc(pointee);
+                if escape_sources.is_empty() {
+                    self.set_esc_with_source(pointee, "derived:external-pointee".into());
+                } else {
+                    self.set_esc_sources(pointee, &escape_sources);
+                }
             }
         }
 
@@ -934,7 +1003,7 @@ impl<'a> Solver<'a> {
                 if let Some(ret) = ret_node {
                     let class = self.class_of(ret);
                     let pointee = self.pointee_of(class);
-                    self.set_esc(pointee);
+                    self.set_esc_sources(pointee, &escape_sources);
                 }
             }
         }
@@ -1078,10 +1147,11 @@ impl<'a> Solver<'a> {
         }
         self.metrics.steens_external_call_applications += 1;
         let callsite = self.callsites_by_index[site_index];
+        let source = format!("external-call:{}", callsite.key);
         for arg in &callsite.args {
             let arg = self.class_of(*arg);
             let pointee = self.pointee_of(arg);
-            self.set_esc(pointee);
+            self.set_esc_with_source(pointee, source.clone());
         }
         if let Some(result) = callsite.result {
             let result = self.class_of(result);
@@ -1091,6 +1161,7 @@ impl<'a> Solver<'a> {
 
     fn apply_vararg_call(&mut self, site_index: usize) {
         let callsite = self.callsites_by_index[site_index];
+        let source = format!("vararg-call:{}", callsite.key);
         let fixed = callsite.sig.params.len();
         let extra_args = callsite
             .args
@@ -1104,7 +1175,7 @@ impl<'a> Solver<'a> {
             let Some(pointee) = self.classes[root].pointee else {
                 continue;
             };
-            self.set_esc(pointee);
+            self.set_esc_with_source(pointee, source.clone());
         }
     }
 
@@ -1154,9 +1225,22 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn set_esc(&mut self, class: usize) {
+    fn set_esc_with_source(&mut self, class: usize, source: String) {
         let root = self.find(class);
-        if !self.classes[root].esc {
+        let changed = self.classes[root].escape_sources.insert(source);
+        if !self.classes[root].esc || changed {
+            self.classes[root].esc = true;
+            self.enqueue(root);
+        }
+    }
+
+    fn set_esc_sources(&mut self, class: usize, sources: &BTreeSet<String>) {
+        let root = self.find(class);
+        let old_len = self.classes[root].escape_sources.len();
+        self.classes[root]
+            .escape_sources
+            .extend(sources.iter().cloned());
+        if !self.classes[root].esc || self.classes[root].escape_sources.len() != old_len {
             self.classes[root].esc = true;
             self.enqueue(root);
         }
@@ -1179,6 +1263,8 @@ impl<'a> Solver<'a> {
         self.classes[a].node_count += self.classes[b].node_count;
         self.classes[a].ext |= self.classes[b].ext;
         self.classes[a].esc |= self.classes[b].esc;
+        let other_escape_sources = std::mem::take(&mut self.classes[b].escape_sources);
+        self.classes[a].escape_sources.extend(other_escape_sources);
 
         let other_sites = std::mem::take(&mut self.classes[b].icall_sites);
         self.classes[a].icall_sites.extend(other_sites);
@@ -1385,6 +1471,7 @@ mod tests {
             module: "frontier_merge".to_string(),
             source: None,
             lowering: Default::default(),
+            target: None,
             functions: vec![frontier_test_func("f0"), frontier_test_func("f1")],
             globals: Vec::new(),
             global_init: Vec::new(),
@@ -1445,6 +1532,7 @@ mod tests {
             module: "external_frontier_merge".to_string(),
             source: None,
             lowering: Default::default(),
+            target: None,
             functions: Vec::new(),
             globals: Vec::new(),
             global_init: Vec::new(),
@@ -1566,6 +1654,24 @@ mod tests {
             .keys()
             .all(|key| key.starts_with("obj:global:")));
         assert!(with_global_pt.node_points_to.len() <= with_pt.node_points_to.len());
+
+        let target_label = with_pt
+            .node_points_to
+            .iter()
+            .find(|(_, allocs)| allocs.contains("cb"))
+            .map(|(label, _)| label.clone())
+            .unwrap();
+        let targeted = solve_steensgaard_with_target_points_to(
+            &pir,
+            &pag,
+            BuildMode::Library,
+            &BTreeSet::from([target_label.clone()]),
+        );
+        assert_eq!(targeted.node_points_to.len(), 1);
+        assert_eq!(
+            targeted.node_points_to[&target_label],
+            with_pt.node_points_to[&target_label]
+        );
     }
 
     #[test]

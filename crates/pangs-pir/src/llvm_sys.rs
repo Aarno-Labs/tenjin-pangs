@@ -1,23 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::ptr;
 
 #[allow(deprecated)]
 use llvm_sys::bit_reader::LLVMParseBitcodeInContext;
 use llvm_sys::core::*;
+use llvm_sys::debuginfo::*;
 use llvm_sys::ir_reader::LLVMParseIRInContext;
 use llvm_sys::prelude::*;
 use llvm_sys::target::{
-    LLVMABISizeOfType, LLVMGetModuleDataLayout, LLVMOffsetOfElement, LLVMTargetDataRef,
+    LLVMABIAlignmentOfType, LLVMABISizeOfType, LLVMGetModuleDataLayout, LLVMOffsetOfElement,
+    LLVMPointerSize, LLVMTargetDataRef,
 };
 use llvm_sys::{
     LLVMAtomicOrdering, LLVMDLLStorageClass, LLVMLinkage, LLVMOpcode, LLVMTypeKind, LLVMVisibility,
 };
 
 use crate::{
-    AbiClass, Access, Func, Global, Loc, LoweringStats, Param, Pir, PirError, Signature, Stmt,
+    AbiClass, Access, Func, Global, Loc, LoweringStats, Param, Pir, PirError, ScalarTypeClass,
+    Signature, Stmt, SymbolLinkage, TargetInfo,
 };
 
 type AliasMap = BTreeMap<String, AliasTarget>;
@@ -30,9 +33,66 @@ enum AliasTarget {
     Global(String),
 }
 
-pub fn lower_path(path: &Path) -> Result<Pir, PirError> {
+pub fn lower_path(path: &Path, repo_root: Option<&Path>) -> Result<Pir, PirError> {
+    let roots = repo_root.map(RepoRoots::new).transpose()?;
     let module = ParsedModule::from_path(path)?;
-    Ok(unsafe { lower_module(module.module) })
+    Ok(unsafe { lower_module(module.module, roots.as_ref()) })
+}
+
+struct RepoRoots {
+    resolved: PathBuf,
+    given_absolute: PathBuf,
+}
+
+impl RepoRoots {
+    fn new(path: &Path) -> Result<Self, PirError> {
+        let given_absolute = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            std::env::current_dir()
+                .map_err(|source| PirError::Read {
+                    path: path.display().to_string(),
+                    source,
+                })?
+                .join(path)
+        };
+        let resolved = std::fs::canonicalize(&given_absolute).map_err(|source| PirError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Ok(Self {
+            resolved: lexical_normalize(&resolved),
+            given_absolute: lexical_normalize(&given_absolute),
+        })
+    }
+
+    fn relative_source(&self, source: &Path) -> Option<String> {
+        if !source.is_absolute() {
+            return None;
+        }
+        let source = lexical_normalize(source);
+        source
+            .strip_prefix(&self.resolved)
+            .or_else(|_| source.strip_prefix(&self.given_absolute))
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .filter(|relative| !relative.contains("::"))
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 struct ParsedModule {
@@ -167,7 +227,7 @@ impl FunctionCtx {
     }
 }
 
-unsafe fn lower_module(module: LLVMModuleRef) -> Pir {
+unsafe fn lower_module(module: LLVMModuleRef, repo_roots: Option<&RepoRoots>) -> Pir {
     let functions = collect_functions(module);
     let globals = collect_globals(module);
     let aliases = collect_aliases(module);
@@ -235,6 +295,7 @@ unsafe fn lower_module(module: LLVMModuleRef) -> Pir {
                 function,
                 &address_taken,
                 &mut lowering,
+                repo_roots,
             ));
         }
     }
@@ -242,11 +303,15 @@ unsafe fn lower_module(module: LLVMModuleRef) -> Pir {
     let pir_globals = globals
         .iter()
         .map(|global| {
-            lowering.bump_missing_debug_location("global");
+            let ty = LLVMGlobalGetValueType(*global);
+            let debug = global_debug_info(module, *global, repo_roots);
+            if debug.is_none() {
+                lowering.bump_missing_debug_location("global");
+            }
             Global {
                 key: value_name(*global),
-                file: None,
-                line: None,
+                file: debug.as_ref().and_then(|debug| debug.file.clone()),
+                line: debug.as_ref().and_then(|debug| debug.line),
                 is_const: LLVMIsGlobalConstant(*global) != 0,
                 mutable: LLVMIsGlobalConstant(*global) == 0,
                 exported: is_exported(
@@ -254,6 +319,16 @@ unsafe fn lower_module(module: LLVMModuleRef) -> Pir {
                     LLVMGetVisibility(*global),
                     LLVMGetDLLStorageClass(*global),
                 ),
+                is_definition: LLVMIsDeclaration(*global) == 0,
+                linkage: symbol_linkage(LLVMGetLinkage(*global)),
+                type_spelling: debug.as_ref().and_then(|debug| debug.type_spelling.clone()),
+                size_bits: Some(LLVMABISizeOfType(ctx.data_layout, ty).saturating_mul(8)),
+                align_bits: Some(
+                    u64::from(LLVMABIAlignmentOfType(ctx.data_layout, ty)).saturating_mul(8),
+                ),
+                path_error: debug.as_ref().and_then(|debug| debug.path_error.clone()),
+                scalar_class: debug.as_ref().and_then(|debug| debug.scalar_class),
+                signed: debug.as_ref().and_then(|debug| debug.signed),
                 init_refs: collect_global_init_refs(*global),
             }
         })
@@ -264,10 +339,222 @@ unsafe fn lower_module(module: LLVMModuleRef) -> Pir {
         module: module_identifier(module),
         source: Some(module_source_file(module)),
         lowering,
+        target: Some(module_target_info(module, ctx.data_layout)),
         functions: pir_functions,
         globals: pir_globals,
         global_init,
     }
+}
+
+unsafe fn module_target_info(module: LLVMModuleRef, data_layout: LLVMTargetDataRef) -> TargetInfo {
+    let pointer_bits = u64::from(LLVMPointerSize(data_layout)).saturating_mul(8);
+    let mut supported_atomic_widths = vec![8, 16, 32];
+    if pointer_bits >= 64 {
+        supported_atomic_widths.push(64);
+    }
+    TargetInfo {
+        triple: c_string_or_empty(LLVMGetTarget(module)),
+        data_layout: c_string_or_empty(LLVMGetDataLayoutStr(module)),
+        supported_atomic_widths,
+    }
+}
+
+unsafe fn c_string_or_empty(value: *const c_char) -> String {
+    if value.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(value).to_string_lossy().into_owned()
+    }
+}
+
+fn symbol_linkage(linkage: LLVMLinkage) -> SymbolLinkage {
+    match linkage {
+        LLVMLinkage::LLVMInternalLinkage | LLVMLinkage::LLVMPrivateLinkage => {
+            SymbolLinkage::Internal
+        }
+        _ => SymbolLinkage::External,
+    }
+}
+
+struct GlobalDebugInfo {
+    file: Option<String>,
+    line: Option<u32>,
+    type_spelling: Option<String>,
+    path_error: Option<String>,
+    scalar_class: Option<ScalarTypeClass>,
+    signed: Option<bool>,
+}
+
+unsafe fn global_debug_info(
+    module: LLVMModuleRef,
+    global: LLVMValueRef,
+    repo_roots: Option<&RepoRoots>,
+) -> Option<GlobalDebugInfo> {
+    let mut count = 0usize;
+    let entries = LLVMGlobalCopyAllMetadata(global, &mut count);
+    if entries.is_null() {
+        return None;
+    }
+    let context = LLVMGetModuleContext(module);
+    let mut result = None;
+    for index in 0..count {
+        let metadata = LLVMValueMetadataEntriesGetMetadata(entries, index as u32);
+        if metadata.is_null()
+            || !matches!(
+                LLVMGetMetadataKind(metadata),
+                LLVMMetadataKind::LLVMDIGlobalVariableExpressionMetadataKind
+            )
+        {
+            continue;
+        }
+        let variable = LLVMDIGlobalVariableExpressionGetVariable(metadata);
+        if variable.is_null() {
+            continue;
+        }
+        let file = LLVMDIVariableGetFile(variable);
+        let Some(raw_file) = di_file_path(file) else {
+            continue;
+        };
+        let file = match repo_roots {
+            None => Some(raw_file.clone()),
+            Some(roots) => roots.relative_source(Path::new(&raw_file)),
+        };
+        let path_error = (file.is_none() && repo_roots.is_some()).then(|| raw_file.clone());
+        let line = LLVMDIVariableGetLine(variable);
+        let (type_spelling, scalar_class, signed) = metadata_operand(context, variable, 3)
+            .map(|ty| di_type_details(context, ty))
+            .unwrap_or((None, None, None));
+        result = Some(GlobalDebugInfo {
+            file,
+            line: (line != 0).then_some(line),
+            type_spelling,
+            path_error,
+            scalar_class,
+            signed,
+        });
+        break;
+    }
+    LLVMDisposeValueMetadataEntries(entries);
+    result
+}
+
+unsafe fn metadata_operand(
+    context: LLVMContextRef,
+    metadata: LLVMMetadataRef,
+    index: usize,
+) -> Option<LLVMMetadataRef> {
+    let value = LLVMMetadataAsValue(context, metadata);
+    let count = LLVMGetMDNodeNumOperands(value) as usize;
+    if index >= count {
+        return None;
+    }
+    let mut operands = vec![ptr::null_mut(); count];
+    LLVMGetMDNodeOperands(value, operands.as_mut_ptr());
+    let operand = operands[index];
+    if operand.is_null() {
+        None
+    } else {
+        Some(LLVMValueAsMetadata(operand))
+    }
+}
+
+unsafe fn di_type_name(metadata: LLVMMetadataRef) -> Option<String> {
+    match LLVMGetMetadataKind(metadata) {
+        LLVMMetadataKind::LLVMDIBasicTypeMetadataKind
+        | LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind
+        | LLVMMetadataKind::LLVMDICompositeTypeMetadataKind => {}
+        _ => return None,
+    }
+    let mut len = 0usize;
+    let ptr = LLVMDITypeGetName(metadata, &mut len);
+    (!ptr.is_null() && len != 0).then(|| {
+        String::from_utf8_lossy(std::slice::from_raw_parts(ptr.cast::<u8>(), len)).into_owned()
+    })
+}
+
+unsafe fn di_type_details(
+    context: LLVMContextRef,
+    metadata: LLVMMetadataRef,
+) -> (Option<String>, Option<ScalarTypeClass>, Option<bool>) {
+    let name = di_type_name(metadata);
+    let (class, signed) = di_type_class(context, metadata, 0);
+    (name, class, signed)
+}
+
+unsafe fn di_type_class(
+    context: LLVMContextRef,
+    metadata: LLVMMetadataRef,
+    depth: usize,
+) -> (Option<ScalarTypeClass>, Option<bool>) {
+    if depth >= 32 {
+        return (None, None);
+    }
+    let printed = value_string(LLVMMetadataAsValue(context, metadata));
+    match LLVMGetMetadataKind(metadata) {
+        LLVMMetadataKind::LLVMDIBasicTypeMetadataKind if printed.contains("DW_ATE_boolean") => {
+            (Some(ScalarTypeClass::Boolean), None)
+        }
+        LLVMMetadataKind::LLVMDIBasicTypeMetadataKind if printed.contains("DW_ATE_unsigned") => {
+            (Some(ScalarTypeClass::Integer), Some(false))
+        }
+        LLVMMetadataKind::LLVMDIBasicTypeMetadataKind if printed.contains("DW_ATE_signed") => {
+            (Some(ScalarTypeClass::Integer), Some(true))
+        }
+        LLVMMetadataKind::LLVMDICompositeTypeMetadataKind
+            if printed.contains("DW_TAG_enumeration_type") =>
+        {
+            let signed = metadata_operand(context, metadata, 3)
+                .and_then(|base| di_type_class(context, base, depth + 1).1);
+            (Some(ScalarTypeClass::Enum), signed)
+        }
+        LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind
+            if printed.contains("DW_TAG_pointer_type") =>
+        {
+            (Some(ScalarTypeClass::Pointer), None)
+        }
+        LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind => metadata_operand(context, metadata, 3)
+            .map(|base| di_type_class(context, base, depth + 1))
+            .unwrap_or((None, None)),
+        _ => (None, None),
+    }
+}
+
+unsafe fn di_file_path(file: LLVMMetadataRef) -> Option<String> {
+    if file.is_null()
+        || !matches!(
+            LLVMGetMetadataKind(file),
+            LLVMMetadataKind::LLVMDIFileMetadataKind
+        )
+    {
+        return None;
+    }
+    let mut filename_len = 0u32;
+    let filename = LLVMDIFileGetFilename(file, &mut filename_len);
+    if filename.is_null() || filename_len == 0 {
+        return None;
+    }
+    let filename = String::from_utf8_lossy(std::slice::from_raw_parts(
+        filename.cast::<u8>(),
+        filename_len as usize,
+    ));
+    if Path::new(filename.as_ref()).is_absolute() {
+        return Some(filename.into_owned());
+    }
+    let mut directory_len = 0u32;
+    let directory = LLVMDIFileGetDirectory(file, &mut directory_len);
+    if directory.is_null() || directory_len == 0 {
+        return Some(filename.into_owned());
+    }
+    let directory = String::from_utf8_lossy(std::slice::from_raw_parts(
+        directory.cast::<u8>(),
+        directory_len as usize,
+    ));
+    Some(
+        Path::new(directory.as_ref())
+            .join(filename.as_ref())
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 unsafe fn lower_function(
@@ -275,8 +562,12 @@ unsafe fn lower_function(
     function: LLVMValueRef,
     address_taken: &BTreeSet<String>,
     lowering: &mut LoweringStats,
+    repo_roots: Option<&RepoRoots>,
 ) -> Func {
-    lowering.bump_missing_debug_location("function");
+    let debug = function_debug_info(function, repo_roots);
+    if debug.is_none() {
+        lowering.bump_missing_debug_location("function");
+    }
     let key = value_name(function);
     let mut body = Vec::new();
     let mut fctx = FunctionCtx::new(key.clone());
@@ -304,8 +595,8 @@ unsafe fn lower_function(
         key: key.clone(),
         sig: function_signature(ctx, function, lowering),
         param_names,
-        file: None,
-        line: None,
+        file: debug.as_ref().and_then(|debug| debug.0.clone()),
+        line: debug.and_then(|debug| debug.1),
         external: false,
         exported: is_exported(
             LLVMGetLinkage(function),
@@ -315,6 +606,23 @@ unsafe fn lower_function(
         address_taken: address_taken.contains(&key),
         body,
     }
+}
+
+unsafe fn function_debug_info(
+    function: LLVMValueRef,
+    repo_roots: Option<&RepoRoots>,
+) -> Option<(Option<String>, Option<u32>)> {
+    let subprogram = LLVMGetSubprogram(function);
+    if subprogram.is_null() {
+        return None;
+    }
+    let raw_file = di_file_path(LLVMDIScopeGetFile(subprogram))?;
+    let file = match repo_roots {
+        None => Some(raw_file),
+        Some(roots) => roots.relative_source(Path::new(&raw_file)),
+    };
+    let line = LLVMDISubprogramGetLine(subprogram);
+    Some((file, (line != 0).then_some(line)))
 }
 
 unsafe fn lower_decl(

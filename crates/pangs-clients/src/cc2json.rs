@@ -1481,6 +1481,7 @@ mod tests {
             mutable: true,
             init_refs: Vec::new(),
             exported: false,
+            ..Global::default()
         }
     }
 
@@ -1551,6 +1552,7 @@ mod tests {
             module: "returned_inline_constexpr".to_string(),
             source: None,
             lowering: Default::default(),
+            target: None,
             functions: vec![Func {
                 key: "main".to_string(),
                 sig: Signature {
@@ -1603,6 +1605,7 @@ mod tests {
             module: "returned_inline_constexpr_internal_use".to_string(),
             source: None,
             lowering: Default::default(),
+            target: None,
             functions: vec![
                 Func {
                     key: "producer".to_string(),
@@ -1699,6 +1702,7 @@ mod tests {
             module: "returned_inline_constexpr_external_use".to_string(),
             source: None,
             lowering: Default::default(),
+            target: None,
             functions: vec![
                 Func {
                     key: "producer".to_string(),
@@ -1790,6 +1794,7 @@ mod tests {
             module: "direct_returned_global".to_string(),
             source: None,
             lowering: Default::default(),
+            target: None,
             functions: vec![Func {
                 key: "main".to_string(),
                 sig: Signature {
@@ -1837,6 +1842,7 @@ mod tests {
             module: "readonly_search".to_string(),
             source: None,
             lowering: Default::default(),
+            target: None,
             functions: vec![Func {
                 key: "main".to_string(),
                 sig: void_sig(),
@@ -1927,6 +1933,7 @@ mod tests {
             module: "indirect_global_arg".to_string(),
             source: None,
             lowering: Default::default(),
+            target: None,
             functions: vec![Func {
                 key: "main".to_string(),
                 sig: void_sig(),
@@ -2037,6 +2044,7 @@ mod tests {
             mutable: false,
             init_refs: Vec::new(),
             exported: false,
+            ..Global::default()
         });
         let global_init = (0..=16)
             .map(|idx| Stmt::GlobalRef {
@@ -2049,6 +2057,7 @@ mod tests {
             module: "high_fanout_string_collapse".to_string(),
             source: None,
             lowering: Default::default(),
+            target: None,
             functions: vec![Func {
                 key: "main".to_string(),
                 sig: void_sig(),
@@ -2080,6 +2089,7 @@ mod tests {
             module: "executable_exported_fp_root".to_string(),
             source: None,
             lowering: Default::default(),
+            target: None,
             functions: vec![
                 Func {
                     key: "main".to_string(),
@@ -2116,6 +2126,7 @@ mod tests {
                 mutable: true,
                 init_refs: Vec::new(),
                 exported: true,
+                ..Global::default()
             }],
             global_init: vec![Stmt::GlobalRef {
                 global: "Dispatch".to_string(),

@@ -76,6 +76,32 @@ pub fn solve_andersen_with_overrides(
     )
 }
 
+/// Andersen refinement with Steensgaard allocation-level points-to retained only for the
+/// requested PAG node labels. The targeted rows are a sound fallback for partitions Andersen
+/// does not currently materialize as standalone operand sets.
+pub fn solve_andersen_with_overrides_and_target_points_to(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: BuildMode,
+    partition_budget: u64,
+    exact_targets: &BTreeMap<String, Vec<String>>,
+    confined_targets: &BTreeSet<String>,
+    labels: &BTreeSet<String>,
+) -> SolveResult {
+    let (base, classes) = crate::solve_steensgaard_classes_targeted(pir, pag, build_mode, labels);
+    finish_andersen(
+        pir,
+        pag,
+        &classes,
+        base,
+        build_mode,
+        partition_budget,
+        exact_targets,
+        confined_targets,
+        false,
+    )
+}
+
 /// Solve Andersen and materialize allocation-level points-to for *global memory objects*
 /// (`SolveResult::node_points_to`, keyed `obj:global:<name>`), refining the partitions below the
 /// budget and falling back to the Steensgaard global points-to for the rest. This is the cc2json

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use pangs_pir::{Param, Pir, Stmt};
+use pangs_pir::{Param, Pir, ScalarTypeClass, Stmt};
 use tempfile::TempDir;
 
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
@@ -15,6 +15,33 @@ fn m1_1_fixture(name: &str) -> PathBuf {
 
 fn pir_from_llvm_sys(path: &Path) -> Pir {
     Pir::from_path(path).unwrap()
+}
+
+#[test]
+fn lowers_typedef_pointer_spelling_and_resolved_scalar_class() {
+    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
+    let tmp = TempDir::new().unwrap();
+    let bc_path = tmp.path().join("typedef.bc");
+    let c_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/synthetic/m1_8/icall_exec.c");
+    assert!(Command::new(CLANG_14)
+        .arg("-O0")
+        .arg("-g")
+        .arg("-emit-llvm")
+        .arg("-c")
+        .arg(c_path)
+        .arg("-o")
+        .arg(&bc_path)
+        .status()
+        .unwrap()
+        .success());
+
+    let pir = Pir::from_path(&bc_path).unwrap();
+    let global = pir.globals.iter().find(|global| global.key == "g").unwrap();
+    assert_eq!(global.type_spelling.as_deref(), Some("fn"));
+    assert_eq!(global.scalar_class, Some(ScalarTypeClass::Pointer));
+    assert_eq!(global.signed, None);
+    assert_eq!(global.size_bits, Some(64));
 }
 
 #[test]
@@ -66,10 +93,49 @@ fn lowers_llvm14_bitcode_function_pointer_smoke() {
         .iter()
         .any(|stmt| matches!(stmt, Stmt::CallIndirect { .. })));
 
-    assert!(pir
+    let counter = pir
         .globals
         .iter()
-        .any(|global| global.key == "g_counter" && global.mutable));
+        .find(|global| global.key == "g_counter")
+        .unwrap();
+    assert!(counter.mutable);
+    assert!(counter.is_definition);
+    assert_eq!(counter.linkage, pangs_pir::SymbolLinkage::External);
+    assert_eq!(counter.size_bits, Some(32));
+    assert_eq!(counter.align_bits, Some(32));
+    assert_eq!(counter.type_spelling.as_deref(), Some("int"));
+    assert_eq!(counter.scalar_class, Some(ScalarTypeClass::Integer));
+    assert_eq!(counter.signed, Some(true));
+    assert!(counter
+        .file
+        .as_deref()
+        .is_some_and(|file| file.ends_with("fp_smoke.c")));
+    let target_info = pir.target.as_ref().unwrap();
+    assert!(!target_info.triple.is_empty());
+    assert!(!target_info.data_layout.is_empty());
+    assert!(target_info.supported_atomic_widths.contains(&32));
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let rooted = Pir::from_path_with_repo_root(&bc_path, &repo_root).unwrap();
+    let rooted_counter = rooted
+        .globals
+        .iter()
+        .find(|global| global.key == "g_counter")
+        .unwrap();
+    assert_eq!(
+        rooted_counter.file.as_deref(),
+        Some("fixtures/synthetic/m1_1/fp_smoke.c")
+    );
+    assert!(rooted_counter.path_error.is_none());
+    let rooted_driver = rooted
+        .functions
+        .iter()
+        .find(|function| function.key == "driver")
+        .unwrap();
+    assert_eq!(
+        rooted_driver.file.as_deref(),
+        Some("fixtures/synthetic/m1_1/fp_smoke.c")
+    );
     assert!(pir.lowering.instruction_counts["alloca"] >= 1);
     assert!(pir.lowering.modeled_counts["load"] >= 1);
     assert!(pir.lowering.modeled_counts["store"] >= 1);

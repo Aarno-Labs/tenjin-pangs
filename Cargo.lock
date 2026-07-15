@@ -908,10 +908,13 @@ dependencies = [
  "clap",
  "pangs-api",
  "pangs-clients",
+ "pangs-dispose",
+ "pangs-manifest",
  "pangs-pag",
  "pangs-pir",
  "pangs-solve",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -922,6 +925,7 @@ dependencies = [
  "anyhow",
  "jsonschema",
  "pangs-api",
+ "pangs-manifest",
  "pangs-pag",
  "pangs-pir",
  "pangs-solve",

@@ -11,8 +11,16 @@ mod cc2json;
 pub use cc2json::{run_cc2json, Cc2jsonOpts};
 
 use pangs_api::{
-    Analysis, CallEdge, Callee, Caller, ComponentInfo, FuncId, GlobalId, GlobalTarget, ModRef,
-    Opts, StationarityVerdict, StationarityWriter,
+    Analysis, BuildMode, CallEdge, Callee, Caller, ComponentInfo, FuncId, GlobalId, GlobalTarget,
+    ModRef, Opts, RegistryKind, StationarityVerdict, StationarityWriter,
+};
+use pangs_manifest::{
+    canonicalize_audit, AlwaysFalse, AnalysisRun, AuditRecord, AuditScope, AuditSource,
+    CouplingGroup, EvidenceEdge, EvidenceKind, EvidencedBool, Extra, Facts,
+    GlobalRecord as DispositionGlobal, GroupStrategySupport, Key, Linkage, Localization,
+    LocalizationBlocker, LocalizationVerdict, Manifest as DispositionManifest, Meta,
+    OnceLockGroupSupport, RunHeader, ScalarClass, Site, UnkeyedGlobal, Witness, WordSizedScalar,
+    SCHEMA_VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -98,6 +106,717 @@ pub fn export_analysis(
         validate_export_dir(outdir)?;
     }
     Ok(())
+}
+
+pub fn assemble_disposition_artifacts(
+    analysis: &Analysis,
+    module: &pangs_pir::Pir,
+    opts: &Opts,
+    input_path: &Path,
+    repo_root: &Path,
+    target: &pangs_pir::TargetInfo,
+) -> Result<(DispositionManifest, Vec<AuditRecord>)> {
+    let repo_root = fs::canonicalize(repo_root)
+        .with_context(|| format!("resolve repo root {}", repo_root.display()))?;
+    let registry_facts = registry_access_facts(analysis, module);
+    let mut globals = Vec::new();
+    let mut unkeyed_globals = Vec::new();
+    for (index, info) in analysis.globals().iter().enumerate() {
+        if !info.mutable || !info.is_definition {
+            continue;
+        }
+        let llvm_name = info.key.clone();
+        let Some(file) = info.file.as_deref() else {
+            unkeyed_globals.push(UnkeyedGlobal {
+                llvm_name,
+                witness: Witness {
+                    kind: if info.path_error.is_some() {
+                        "unnormalizable-path".into()
+                    } else {
+                        "missing-debug-metadata".into()
+                    },
+                    site: None,
+                    symbol: None,
+                    note: info.path_error.clone(),
+                    extra: Extra::new(),
+                },
+                extra: Extra::new(),
+            });
+            continue;
+        };
+        let symbol = info.key.strip_prefix('@').unwrap_or(&info.key);
+        let key = match Key::new(file, symbol) {
+            Ok(key) => key,
+            Err(_) => {
+                unkeyed_globals.push(UnkeyedGlobal {
+                    llvm_name,
+                    witness: Witness {
+                        kind: "unnormalizable-path".into(),
+                        site: None,
+                        symbol: None,
+                        note: Some(file.into()),
+                        extra: Extra::new(),
+                    },
+                    extra: Extra::new(),
+                });
+                continue;
+            }
+        };
+        let gid = GlobalId(index as u32);
+        let omega_escaped = info.address_escaped;
+        let omega_witness = omega_escaped.then(|| omega_escape_witness(analysis, &key, info));
+        let written = !info.never_written;
+        let write_witness =
+            written.then(|| written_witness(analysis, gid, info, omega_witness.as_ref()));
+        let violation_witness = violation_witness(analysis, gid);
+        let violation_taint = violation_witness.is_some();
+        let access_failure = access_set_failure(
+            analysis,
+            &info.key,
+            omega_witness.as_ref(),
+            opts.build_mode,
+            info.exported,
+            violation_witness.as_ref(),
+        );
+        let localization = localization_for(analysis, gid);
+        globals.push(DispositionGlobal {
+            key,
+            meta: Meta {
+                linkage: match info.linkage {
+                    pangs_pir::SymbolLinkage::Internal => Linkage::Internal,
+                    pangs_pir::SymbolLinkage::External => Linkage::External,
+                },
+                type_spelling: info.type_spelling.clone(),
+                size_bits: info.size_bits,
+                align_bits: info.align_bits,
+                llvm_name: info.key.clone(),
+                file: info.file.clone(),
+                line: info.line,
+                extra: Extra::new(),
+            },
+            facts: Facts {
+                written: evidenced(written, true, write_witness),
+                omega_escaped_address: evidenced(omega_escaped, true, omega_witness.clone()),
+                violation_taint: evidenced(violation_taint, true, violation_witness.clone()),
+                thread_visible: evidenced(
+                    registry_facts.thread_visible.contains_key(&gid),
+                    true,
+                    registry_facts.thread_visible.get(&gid).cloned(),
+                ),
+                signal_context_access: evidenced(
+                    registry_facts.signal_context_access.contains_key(&gid),
+                    true,
+                    registry_facts.signal_context_access.get(&gid).cloned(),
+                ),
+                access_set_complete: evidenced(access_failure.is_none(), false, access_failure),
+                word_sized_scalar: word_sized_scalar(info, target),
+                phase_stationarity: None,
+                atomic_eligibility: None,
+                mutex_eligibility: None,
+                coupling_group: None,
+                localization,
+                extra: Extra::new(),
+            },
+            disposition: None,
+            extra: Extra::new(),
+        });
+    }
+
+    let coupling_groups = assemble_coupling_groups(analysis, &mut globals);
+    let mut manifest = DispositionManifest {
+        schema_version: SCHEMA_VERSION,
+        run: RunHeader {
+            analysis: AnalysisRun {
+                pangs_git: option_env!("VERGEN_GIT_SHA")
+                    .unwrap_or("unknown")
+                    .to_string(),
+                llvm_version: "14".into(),
+                input_path: input_path.display().to_string(),
+                input_sha256: sha256_file(input_path)?,
+                opts: serde_json::to_value(opts)?,
+                repo_root: repo_root.display().to_string(),
+                target_triple: target.triple.clone(),
+                data_layout: target.data_layout.clone(),
+                supported_atomic_widths: target.supported_atomic_widths.clone(),
+                entry_spine: None,
+                extra: Extra::new(),
+            },
+            dispose: None,
+            extra: Extra::new(),
+        },
+        globals,
+        unkeyed_globals,
+        coupling_groups,
+        override_report: None,
+        materialization: None,
+        extra: Extra::new(),
+    };
+    manifest.canonicalize();
+    manifest.validate()?;
+    let mut ledger = vec![AuditRecord {
+        id: String::new(),
+        kind: "run-assumption".into(),
+        scope: AuditScope::Run {
+            extra: Extra::new(),
+        },
+        source: AuditSource::Analysis,
+        text: "function-scope static uniquification runs before PANGS analysis".into(),
+        witness: None,
+        failures: None,
+        extra: Extra::new(),
+    }];
+    canonicalize_audit(&mut ledger)?;
+    Ok((manifest, ledger))
+}
+
+#[derive(Default)]
+struct RegistryAccessFacts {
+    thread_visible: BTreeMap<GlobalId, Witness>,
+    signal_context_access: BTreeMap<GlobalId, Witness>,
+}
+
+fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> RegistryAccessFacts {
+    let mut result = RegistryAccessFacts::default();
+    let mut callsite_index = 0_u32;
+    for (caller_index, function) in module.functions.iter().enumerate() {
+        let caller = FuncId(caller_index as u32);
+        for stmt in &function.body {
+            let (direct_callee, args, loc) = match stmt {
+                pangs_pir::Stmt::CallDirect {
+                    callee, args, loc, ..
+                } => (Some(callee.as_str()), args, loc.as_ref()),
+                pangs_pir::Stmt::CallIndirect { args, loc, .. } => (None, args, loc.as_ref()),
+                _ => continue,
+            };
+            let callsite = pangs_api::CallsiteId(callsite_index);
+            callsite_index += 1;
+            let analyzed_registry = analysis.registry_entry(callsite);
+            let mut specs = if let Some(entry) = analyzed_registry {
+                vec![(entry.kind, 0, false)]
+            } else {
+                direct_callee
+                    .and_then(registry_spec)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
+            if analyzed_registry.is_none() {
+                for callee in analysis.callees(callsite) {
+                    let Callee::Func(callee) = callee else {
+                        continue;
+                    };
+                    if let Some(spec) = registry_spec(&analysis.functions()[*callee].key) {
+                        if !specs.contains(&spec) {
+                            specs.push(spec);
+                        }
+                    }
+                }
+            }
+            for (kind, arg_index, pointee) in specs {
+                let operand = args.get(arg_index);
+                let direct_entry = operand.and_then(|operand| {
+                    let operand = operand.strip_prefix('@').unwrap_or(operand);
+                    module
+                        .functions
+                        .iter()
+                        .position(|candidate| {
+                            candidate.key.strip_prefix('@').unwrap_or(&candidate.key) == operand
+                        })
+                        .map(|index| FuncId(index as u32))
+                });
+                let solved_entry = analysis
+                    .registry_entry(callsite)
+                    .filter(|entry| entry.kind == kind);
+                let unresolved = solved_entry
+                    .map(|entry| entry.unresolved)
+                    .unwrap_or(pointee || direct_entry.is_none());
+                let precise_entries = solved_entry
+                    .map(|entry| entry.targets.clone())
+                    .unwrap_or_else(|| direct_entry.into_iter().collect());
+                let widened_entries = if unresolved {
+                    analysis
+                        .functions()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, candidate)| candidate.address_taken && !candidate.external)
+                        .map(|(index, _)| FuncId(index as u32))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let entries = precise_entries.into_iter().chain(widened_entries);
+                let witness = registry_witness(analysis, caller, loc, kind, unresolved);
+                for entry in entries {
+                    for row in analysis.modref(entry) {
+                        let affected = match &row.global {
+                            GlobalTarget::Name(global) => vec![*global],
+                            GlobalTarget::Unknown(_) if row.pointee_globals.is_empty() => (0
+                                ..analysis.globals().len())
+                                .map(|index| GlobalId(index as u32))
+                                .collect(),
+                            GlobalTarget::Unknown(_) => analysis
+                                .globals()
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, global)| row.pointee_globals.contains(&global.key))
+                                .map(|(index, _)| GlobalId(index as u32))
+                                .collect(),
+                        };
+                        let facts = match kind {
+                            RegistryKind::Spawn => &mut result.thread_visible,
+                            RegistryKind::Signal => &mut result.signal_context_access,
+                        };
+                        for global in affected {
+                            facts.entry(global).or_insert_with(|| witness.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn registry_spec(name: &str) -> Option<(RegistryKind, usize, bool)> {
+    match name.strip_prefix('@').unwrap_or(name) {
+        "pthread_create" => Some((RegistryKind::Spawn, 2, false)),
+        "thrd_create" => Some((RegistryKind::Spawn, 1, false)),
+        "signal" => Some((RegistryKind::Signal, 1, false)),
+        "sigaction" => Some((RegistryKind::Signal, 1, true)),
+        _ => None,
+    }
+}
+
+fn registry_witness(
+    analysis: &Analysis,
+    caller: FuncId,
+    loc: Option<&pangs_pir::Loc>,
+    kind: RegistryKind,
+    unresolved: bool,
+) -> Witness {
+    let caller_info = &analysis.functions()[caller];
+    let symbol = caller_info
+        .file
+        .as_deref()
+        .and_then(|file| Key::new(file, &caller_info.key).ok())
+        .map(|key| key.to_string())
+        .unwrap_or_else(|| caller_info.key.clone());
+    Witness {
+        kind: match kind {
+            RegistryKind::Spawn => "spawn-reachability",
+            RegistryKind::Signal => "signal-registration",
+        }
+        .into(),
+        site: caller_info.file.as_ref().map(|file| Site {
+            file: file.clone(),
+            line: loc.map_or(caller_info.line.unwrap_or(0), |loc| loc.line),
+            col: loc.map(|loc| loc.col),
+            function: Some(symbol.clone()),
+            extra: Extra::new(),
+        }),
+        symbol: Some(symbol),
+        note: unresolved
+            .then(|| "registry operand unresolved; widened to every address-taken function".into()),
+        extra: Extra::new(),
+    }
+}
+
+fn assemble_coupling_groups(
+    analysis: &Analysis,
+    globals: &mut [DispositionGlobal],
+) -> Vec<CouplingGroup> {
+    let key_by_global = globals
+        .iter()
+        .map(|global| (global.meta.llvm_name.clone(), global.key.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut writes_by_function = BTreeMap::<FuncId, BTreeSet<Key>>::new();
+    for row in analysis
+        .modrefs()
+        .iter()
+        .filter(|row| row.access == pangs_pir::Access::Mod)
+    {
+        let GlobalTarget::Name(global) = row.global else {
+            continue;
+        };
+        let raw_name = &analysis.globals()[global].key;
+        if let Some(key) = key_by_global.get(raw_name) {
+            writes_by_function
+                .entry(row.func)
+                .or_default()
+                .insert(key.clone());
+        }
+    }
+
+    let mut adjacency = BTreeMap::<Key, BTreeSet<Key>>::new();
+    let mut pair_sites = BTreeMap::<(Key, Key), Vec<Site>>::new();
+    for (function, written) in writes_by_function {
+        let written = written.into_iter().collect::<Vec<_>>();
+        for left in 0..written.len() {
+            for right in left + 1..written.len() {
+                let a = written[left].clone();
+                let b = written[right].clone();
+                adjacency.entry(a.clone()).or_default().insert(b.clone());
+                adjacency.entry(b.clone()).or_default().insert(a.clone());
+                if let Some(site) = function_site(analysis, function) {
+                    pair_sites.entry((a, b)).or_default().push(site);
+                } else {
+                    pair_sites.entry((a, b)).or_default();
+                }
+            }
+        }
+    }
+
+    let mut groups = Vec::new();
+    let mut visited = BTreeSet::new();
+    for start in adjacency.keys() {
+        if !visited.insert(start.clone()) {
+            continue;
+        }
+        let mut members = BTreeSet::from([start.clone()]);
+        let mut pending = vec![start.clone()];
+        while let Some(member) = pending.pop() {
+            if let Some(neighbors) = adjacency.get(&member) {
+                for neighbor in neighbors.iter().rev() {
+                    if visited.insert(neighbor.clone()) {
+                        members.insert(neighbor.clone());
+                        pending.push(neighbor.clone());
+                    }
+                }
+            }
+        }
+        let members = members.into_iter().collect::<Vec<_>>();
+        let id = format!("grp-{:08x}", fnv1a32(members[0].to_string().as_bytes()));
+        let evidence = pair_sites
+            .iter()
+            .filter(|((a, b), _)| {
+                members.binary_search(a).is_ok() && members.binary_search(b).is_ok()
+            })
+            .map(|((a, b), sites)| EvidenceEdge {
+                kind: EvidenceKind::CoWrite,
+                members: vec![a.clone(), b.clone()],
+                sites: sites.clone(),
+                extra: Extra::new(),
+            })
+            .collect();
+        for global in globals
+            .iter_mut()
+            .filter(|global| members.contains(&global.key))
+        {
+            global.facts.coupling_group = Some(id.clone());
+        }
+        groups.push(CouplingGroup {
+            id,
+            members: members.clone(),
+            evidence,
+            strategy_support: GroupStrategySupport {
+                once_lock: Some(OnceLockGroupSupport::Unsupported {
+                    supported: AlwaysFalse(false),
+                    witness: Witness {
+                        kind: "phase-stationarity-not-computed".into(),
+                        site: None,
+                        symbol: Some(members[0].to_string()),
+                        note: Some(
+                            "common publication support requires every member certificate".into(),
+                        ),
+                        extra: Extra::new(),
+                    },
+                    extra: Extra::new(),
+                }),
+                mutex: None,
+                extra: Extra::new(),
+            },
+            group_disposition: None,
+            group_provenance: None,
+            r#override: None,
+            extra: Extra::new(),
+        });
+    }
+    groups
+}
+
+fn function_site(analysis: &Analysis, function: FuncId) -> Option<Site> {
+    let info = &analysis.functions()[function];
+    let file = info.file.clone()?;
+    let line = info.line?;
+    let function = Key::new(&file, info.key.strip_prefix('@').unwrap_or(&info.key))
+        .ok()
+        .map(|key| key.to_string());
+    Some(Site {
+        file,
+        line,
+        col: None,
+        function,
+        extra: Extra::new(),
+    })
+}
+
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c9dc5, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x01000193)
+    })
+}
+
+fn evidenced(value: bool, polarity: bool, witness: Option<Witness>) -> EvidencedBool {
+    debug_assert_eq!(witness.is_some(), value == polarity);
+    EvidencedBool {
+        value,
+        witness,
+        extra: Extra::new(),
+    }
+}
+
+fn word_sized_scalar(
+    info: &pangs_api::GlobalInfo,
+    target: &pangs_pir::TargetInfo,
+) -> WordSizedScalar {
+    let class = info.scalar_class.map(|class| match class {
+        pangs_pir::ScalarTypeClass::Integer => ScalarClass::Integer,
+        pangs_pir::ScalarTypeClass::Boolean => ScalarClass::Boolean,
+        pangs_pir::ScalarTypeClass::Enum => ScalarClass::Enum,
+        pangs_pir::ScalarTypeClass::Pointer => ScalarClass::Pointer,
+    });
+    let signedness_known =
+        !matches!(class, Some(ScalarClass::Integer | ScalarClass::Enum)) || info.signed.is_some();
+    let value = info.type_spelling.is_some()
+        && info
+            .size_bits
+            .is_some_and(|width| width != 0 && target.supported_atomic_widths.contains(&width))
+        && info.align_bits == info.size_bits
+        && class.is_some()
+        && signedness_known;
+
+    WordSizedScalar {
+        value,
+        type_spelling: value.then(|| info.type_spelling.clone()).flatten(),
+        size_bits: value.then_some(info.size_bits).flatten(),
+        class: value.then_some(class).flatten(),
+        signed: value.then_some(info.signed).flatten(),
+        extra: Extra::new(),
+    }
+}
+
+fn omega_escape_witness(analysis: &Analysis, key: &Key, info: &pangs_api::GlobalInfo) -> Witness {
+    if let Some(source) = &info.escape_witness {
+        return escape_source_witness(analysis, key, source);
+    }
+    if let Some(row) = analysis.modrefs().iter().find(|row| {
+        matches!(row.global, GlobalTarget::Unknown(_))
+            && (row.pointee_globals.is_empty() || row.pointee_globals.contains(&info.key))
+    }) {
+        let mut witness =
+            function_witness(analysis, row.func, "external-escape", row.witness.clone());
+        witness.symbol = Some(key.to_string());
+        return witness;
+    }
+    Witness {
+        kind: "external-escape".into(),
+        site: None,
+        symbol: Some(key.to_string()),
+        note: Some("analysis escape class reaches the external boundary".into()),
+        extra: Extra::new(),
+    }
+}
+
+fn escape_source_witness(analysis: &Analysis, key: &Key, source: &str) -> Witness {
+    let site = source
+        .strip_prefix("external-call:")
+        .or_else(|| source.strip_prefix("vararg-call:"))
+        .and_then(|callsite| {
+            let (function, location) = callsite.split_once('@')?;
+            let location = location.rsplit_once('#')?.0;
+            let mut pieces = location.rsplitn(3, ':');
+            let col = pieces.next()?.parse().ok()?;
+            let line = pieces.next()?.parse().ok()?;
+            let file = pieces.next()?.to_owned();
+            let function = analysis
+                .lookup_func(function)
+                .and_then(|id| {
+                    let info = &analysis.functions()[id];
+                    info.file.as_deref().and_then(|file| {
+                        Key::new(file, info.key.strip_prefix('@').unwrap_or(&info.key)).ok()
+                    })
+                })
+                .map(|key| key.to_string());
+            Some(Site {
+                file,
+                line,
+                col: Some(col),
+                function,
+                extra: Extra::new(),
+            })
+        });
+    Witness {
+        kind: "external-escape".into(),
+        site,
+        symbol: Some(key.to_string()),
+        note: Some(source.into()),
+        extra: Extra::new(),
+    }
+}
+
+fn written_witness(
+    analysis: &Analysis,
+    global: GlobalId,
+    info: &pangs_api::GlobalInfo,
+    escape_witness: Option<&Witness>,
+) -> Witness {
+    if let Some(row) = analysis.modrefs().iter().find(|row| {
+        row.access == pangs_pir::Access::Mod && row.global == GlobalTarget::Name(global)
+    }) {
+        return function_witness(analysis, row.func, "write-site", row.witness.clone());
+    }
+    if let Some(witness) = escape_witness {
+        return witness.clone();
+    }
+    Witness {
+        kind: if info.exported {
+            "external-name-reachability"
+        } else {
+            "write-site"
+        }
+        .into(),
+        site: info.file.as_ref().zip(info.line).map(|(file, line)| Site {
+            file: file.clone(),
+            line,
+            col: None,
+            function: None,
+            extra: Extra::new(),
+        }),
+        symbol: Some(info.key.clone()),
+        note: Some(if info.exported {
+            "exported storage may be written by an external library client".into()
+        } else {
+            "write is attributable to global initialization or synthesized module code".into()
+        }),
+        extra: Extra::new(),
+    }
+}
+
+fn function_witness(
+    analysis: &Analysis,
+    function: FuncId,
+    kind: &str,
+    note: Option<String>,
+) -> Witness {
+    let info = &analysis.functions()[function];
+    let qualified = info.file.as_deref().and_then(|file| {
+        Key::new(file, info.key.strip_prefix('@').unwrap_or(&info.key))
+            .ok()
+            .map(|key| key.to_string())
+    });
+    let symbol = qualified.clone().unwrap_or_else(|| info.key.clone());
+    Witness {
+        kind: kind.into(),
+        site: info.file.as_ref().zip(info.line).map(|(file, line)| Site {
+            file: file.clone(),
+            line,
+            col: None,
+            function: Some(symbol.clone()),
+            extra: Extra::new(),
+        }),
+        symbol: Some(symbol),
+        note,
+        extra: Extra::new(),
+    }
+}
+
+fn violation_witness(analysis: &Analysis, global: GlobalId) -> Option<Witness> {
+    analysis.audit_findings().iter().find_map(|finding| {
+        let function = finding.function?;
+        analysis
+            .modrefs()
+            .iter()
+            .any(|row| row.func == function && row.global == GlobalTarget::Name(global))
+            .then(|| {
+                function_witness(
+                    analysis,
+                    function,
+                    "violation-finding",
+                    Some(finding.kind.clone()),
+                )
+            })
+    })
+}
+
+fn access_set_failure(
+    analysis: &Analysis,
+    llvm_name: &str,
+    omega: Option<&Witness>,
+    mode: BuildMode,
+    exported: bool,
+    violation: Option<&Witness>,
+) -> Option<Witness> {
+    if let Some(row) = analysis.modrefs().iter().find(|row| {
+        (matches!(row.global, GlobalTarget::Name(global) if analysis.globals()[global].key == llvm_name)
+            && row.via == pangs_api::Via::Unknown)
+            || (matches!(row.global, GlobalTarget::Unknown(_))
+                && (row.pointee_globals.is_empty()
+                    || row.pointee_globals.iter().any(|name| name == llvm_name)))
+    }) {
+        return Some(function_witness(
+            analysis,
+            row.func,
+            "omega-access-path",
+            row.witness.clone(),
+        ));
+    }
+    if let Some(witness) = omega {
+        return Some(witness.clone());
+    }
+    if mode == BuildMode::Library && exported {
+        return Some(Witness {
+            kind: "external-escape".into(),
+            site: None,
+            symbol: Some(llvm_name.into()),
+            note: Some("global is reachable by name from external library clients".into()),
+            extra: Extra::new(),
+        });
+    }
+    violation.cloned()
+}
+
+fn localization_for(analysis: &Analysis, global: GlobalId) -> Option<Localization> {
+    let mut containing = analysis
+        .components()
+        .iter()
+        .filter(|component| component.mutable_globals.contains(&global))
+        .collect::<Vec<_>>();
+    if containing.is_empty() {
+        return None;
+    }
+    containing.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut blockers = Vec::new();
+    for component in containing.iter().filter(|component| component.frozen) {
+        for taint in &component.taint {
+            let code = match taint.kind.as_str() {
+                "unknown_caller" => "unknown-caller-taint",
+                "unknown_callee" => "unknown-callee-taint",
+                _ => "frozen-component",
+            };
+            blockers.push(LocalizationBlocker {
+                code: code.into(),
+                witness: Witness {
+                    kind: code.into(),
+                    site: None,
+                    symbol: None,
+                    note: Some(taint.witness.clone().unwrap_or_else(|| taint.kind.clone())),
+                    extra: Extra::new(),
+                },
+                extra: Extra::new(),
+            });
+        }
+    }
+    blockers.sort_by(|a, b| a.code.cmp(&b.code));
+    blockers.dedup_by(|a, b| a.code == b.code && a.witness.note == b.witness.note);
+    Some(Localization {
+        component: containing[0].id.clone(),
+        verdict: if blockers.is_empty() {
+            LocalizationVerdict::Ok
+        } else {
+            LocalizationVerdict::Blocked
+        },
+        blockers,
+        extra: Extra::new(),
+    })
 }
 
 pub fn validate_export_dir(outdir: &Path) -> Result<()> {

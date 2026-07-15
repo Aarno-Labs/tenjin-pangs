@@ -998,6 +998,8 @@ pub fn expected_markers(manifest: &Manifest) -> Result<Vec<ExpectedMarker>, Erro
 pub enum InventoryError {
     #[error("marker inventory differs from the disposition-derived inventory")]
     InventoryMismatch,
+    #[error("expected marker is missing from translated input: {0}")]
+    MissingMarker(String),
     #[error("orphan marker symbol in translated input: {0}")]
     OrphanMarker(String),
     #[error(transparent)]
@@ -1034,7 +1036,13 @@ pub fn validate_marker_inventory<'a>(
         .iter()
         .map(|entry| entry.marker.as_str())
         .collect::<BTreeSet<_>>();
-    for symbol in observed_marker_symbols {
+    let observed = observed_marker_symbols.into_iter().collect::<BTreeSet<_>>();
+    for symbol in &symbols {
+        if !observed.contains(symbol) {
+            return Err(InventoryError::MissingMarker((*symbol).to_owned()));
+        }
+    }
+    for symbol in observed {
         if symbol.starts_with("pangs_") && !symbols.contains(symbol) {
             return Err(InventoryError::OrphanMarker(symbol.to_owned()));
         }

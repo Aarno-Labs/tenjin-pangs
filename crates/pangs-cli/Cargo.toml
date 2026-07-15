@@ -13,10 +13,13 @@ anyhow.workspace = true
 clap.workspace = true
 pangs-api = { path = "../pangs-api" }
 pangs-clients = { path = "../pangs-clients" }
+pangs-dispose = { path = "../pangs-dispose" }
+pangs-manifest = { path = "../pangs-manifest" }
 pangs-pag = { path = "../pangs-pag" }
 pangs-pir = { path = "../pangs-pir" }
 pangs-solve = { path = "../pangs-solve" }
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
