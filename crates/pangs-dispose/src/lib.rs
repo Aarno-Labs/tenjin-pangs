@@ -1,0 +1,1452 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use pangs_manifest::{
+    canonicalize_audit, to_canonical_json, AuditRecord, AuditScope, AuditSource, CascadeSkip,
+    Certificate, DisposeMode, DisposeRun, Disposition, DispositionProvenance, Extra, Facts,
+    GroupProvenance, GuardFailure, Key, LocalizationVerdict, Manifest, OnceLockGroupSupport,
+    OverrideCounts, OverrideEcho, OverrideOutcome, OverrideReport, OverrideReportEntry,
+    OverrideRequested, OverrideScope, SkipReason, Strategy, Witness,
+};
+use serde::Deserialize;
+use tempfile::NamedTempFile;
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ConfigError {
+    #[error("cascade order contains duplicate strategy {0}")]
+    Duplicate(String),
+    #[error("unhandled is implicit and may not appear in the cascade order")]
+    ExplicitUnhandled,
+    #[error("localize may not appear in a library-mode cascade")]
+    LocalizeInLibrary,
+}
+
+#[derive(Debug, Error)]
+pub enum DisposeError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Manifest(#[from] pangs_manifest::Error),
+    #[error("disposition ledger is missing: {0}")]
+    MissingLedger(PathBuf),
+    #[error("invalid overrides: {0}")]
+    InvalidOverrides(String),
+    #[error("one or more overrides were rejected or unmatched (artifacts were written)")]
+    OverrideProblems,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Overrides {
+    pub globals: BTreeMap<String, OverrideSpec>,
+    pub groups: BTreeMap<String, OverrideSpec>,
+    pub cascade: Option<CascadeOverride>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverrideSpec {
+    pub disposition: Strategy,
+    #[serde(default)]
+    pub accept_risk: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CascadeOverride {
+    pub order: Vec<Strategy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyOutcome {
+    pub override_problems: bool,
+}
+
+pub fn parse_overrides(text: &str) -> Result<Overrides, DisposeError> {
+    toml::from_str(text).map_err(|error| DisposeError::InvalidOverrides(error.to_string()))
+}
+
+pub fn config_with_overrides(
+    mode: DisposeMode,
+    overrides: Option<&Overrides>,
+) -> Result<CascadeConfig, DisposeError> {
+    let mut config = CascadeConfig::default_for(mode);
+    if let Some(order) = overrides.and_then(|value| value.cascade.as_ref()) {
+        config.order = order.order.clone();
+    }
+    config.validate()?;
+    Ok(config)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CascadeConfig {
+    pub mode: DisposeMode,
+    pub order: Vec<Strategy>,
+}
+
+impl CascadeConfig {
+    pub fn default_for(mode: DisposeMode) -> Self {
+        let order = match mode {
+            DisposeMode::Application => Strategy::DEFAULT_APPLICATION.to_vec(),
+            DisposeMode::Library => Strategy::DEFAULT_LIBRARY.to_vec(),
+        };
+        Self { mode, order }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let mut seen = BTreeSet::new();
+        for strategy in &self.order {
+            if *strategy == Strategy::Unhandled {
+                return Err(ConfigError::ExplicitUnhandled);
+            }
+            if !seen.insert(*strategy) {
+                return Err(ConfigError::Duplicate(strategy.as_str().to_owned()));
+            }
+            if self.mode == DisposeMode::Library && *strategy == Strategy::Localize {
+                return Err(ConfigError::LocalizeInLibrary);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn cascade(
+    facts: &Facts,
+    config: &CascadeConfig,
+) -> Result<(Strategy, Vec<CascadeSkip>), ConfigError> {
+    config.validate()?;
+    let mut trace = Vec::new();
+    for strategy in &config.order {
+        match evaluate(*strategy, facts) {
+            GuardResult::Applicable => return Ok((*strategy, trace)),
+            GuardResult::Failed(failed) => trace.push(CascadeSkip {
+                strategy: *strategy,
+                reason: SkipReason::GuardFailed {
+                    failed,
+                    extra: Extra::new(),
+                },
+                extra: Extra::new(),
+            }),
+            GuardResult::NotComputed(fact) => trace.push(CascadeSkip {
+                strategy: *strategy,
+                reason: SkipReason::FactNotComputed {
+                    fact: fact.to_owned(),
+                    extra: Extra::new(),
+                },
+                extra: Extra::new(),
+            }),
+        }
+    }
+    Ok((Strategy::Unhandled, trace))
+}
+
+/// Apply only the independent cascade. D2 layers overrides and group resolution over this
+/// output without changing `cascade_chosen` or `cascade_trace`.
+pub fn apply_independent_cascade(
+    manifest: &mut Manifest,
+    config: &CascadeConfig,
+    overrides_file: Option<String>,
+    overrides_sha256: Option<String>,
+) -> Result<(), DisposeError> {
+    config.validate()?;
+    if manifest.materialization.take().is_some() {
+        eprintln!("warning: dropping stale disposition materialization section");
+    }
+    for global in &mut manifest.globals {
+        let (chosen, cascade_trace) = cascade(&global.facts, config)?;
+        global.disposition = Some(Disposition {
+            chosen,
+            cascade_chosen: chosen,
+            provenance: DispositionProvenance::Cascade,
+            cascade_trace,
+            r#override: None,
+            demotion: None,
+            extra: Extra::new(),
+        });
+    }
+    manifest.run.dispose = Some(DisposeRun {
+        mode: config.mode,
+        cascade: config.order.clone(),
+        overrides_file,
+        overrides_sha256,
+        extra: Extra::new(),
+    });
+    manifest.override_report = Some(OverrideReport {
+        entries: Vec::new(),
+        counts: OverrideCounts::default(),
+        extra: Extra::new(),
+    });
+    manifest.canonicalize();
+    Ok(())
+}
+
+pub fn apply_policy(
+    manifest: &mut Manifest,
+    ledger: &mut Vec<AuditRecord>,
+    config: &CascadeConfig,
+    overrides: Option<&Overrides>,
+    overrides_file: Option<String>,
+    overrides_sha256: Option<String>,
+) -> Result<PolicyOutcome, DisposeError> {
+    apply_independent_cascade(manifest, config, overrides_file, overrides_sha256)?;
+    ledger.retain(|record| record.source != AuditSource::Override);
+    let mut entries = Vec::new();
+
+    if let Some(overrides) = overrides {
+        resolve_groups(manifest, overrides, config, &mut entries, ledger)?;
+        for (raw_key, spec) in &overrides.globals {
+            let key = Key::parse(raw_key)?;
+            let Some(index) = manifest.globals.iter().position(|global| global.key == key) else {
+                entries.push(report_entry(
+                    OverrideScope::Global,
+                    Some(raw_key.clone()),
+                    spec,
+                    OverrideOutcome::UnmatchedKey,
+                    Some("no manifest global has this key".into()),
+                    None,
+                ));
+                continue;
+            };
+            let group_disposition = global_group_disposition(manifest, &key);
+            apply_global_override(
+                &mut manifest.globals[index],
+                spec,
+                config,
+                group_disposition,
+                &mut entries,
+                ledger,
+            )?;
+        }
+        if let Some(cascade_override) = &overrides.cascade {
+            entries.push(OverrideReportEntry {
+                scope: OverrideScope::Cascade,
+                key: None,
+                requested: OverrideRequested::Order(cascade_override.order.clone()),
+                accept_risk: false,
+                outcome: OverrideOutcome::Honored,
+                reason: None,
+                witness: None,
+                failures: None,
+                extra: Extra::new(),
+            });
+        }
+    } else {
+        resolve_groups(
+            manifest,
+            &Overrides::default(),
+            config,
+            &mut entries,
+            ledger,
+        )?;
+    }
+
+    entries.sort_by(|a, b| {
+        (
+            format!("{:?}", a.scope),
+            &a.key,
+            format!("{:?}", a.requested),
+        )
+            .cmp(&(
+                format!("{:?}", b.scope),
+                &b.key,
+                format!("{:?}", b.requested),
+            ))
+    });
+    let counts = count_outcomes(&entries);
+    let override_problems = counts.rejected > 0
+        || counts.rejected_strategy_disabled > 0
+        || counts.rejected_strategy_unavailable > 0
+        || counts.rejected_no_recipe > 0
+        || counts.unmatched_key > 0;
+    manifest.override_report = Some(OverrideReport {
+        entries,
+        counts,
+        extra: Extra::new(),
+    });
+    canonicalize_audit(ledger)?;
+    manifest.canonicalize();
+    Ok(PolicyOutcome { override_problems })
+}
+
+fn apply_global_override(
+    global: &mut pangs_manifest::GlobalRecord,
+    spec: &OverrideSpec,
+    config: &CascadeConfig,
+    group_disposition: Option<Strategy>,
+    entries: &mut Vec<OverrideReportEntry>,
+    ledger: &mut Vec<AuditRecord>,
+) -> Result<(), DisposeError> {
+    let key = global.key.to_string();
+    let disposition = global
+        .disposition
+        .as_mut()
+        .expect("independent cascade populated disposition");
+    if group_disposition.is_some_and(|group| group != spec.disposition) {
+        entries.push(report_entry(
+            OverrideScope::Global,
+            Some(key),
+            spec,
+            OverrideOutcome::Rejected,
+            Some("member pin conflicts with the resolved coupling-group disposition".into()),
+            None,
+        ));
+        return Ok(());
+    }
+    if spec.disposition != Strategy::Unhandled && !config.order.contains(&spec.disposition) {
+        entries.push(report_entry(
+            OverrideScope::Global,
+            Some(key),
+            spec,
+            OverrideOutcome::RejectedStrategyDisabled,
+            Some("strategy is omitted from the configured cascade".into()),
+            None,
+        ));
+        return Ok(());
+    }
+    if spec.disposition == Strategy::Unhandled {
+        honor_override(disposition, spec, false);
+        entries.push(report_entry(
+            OverrideScope::Global,
+            Some(key),
+            spec,
+            OverrideOutcome::Honored,
+            None,
+            None,
+        ));
+        return Ok(());
+    }
+
+    if let Some(outcome) = unavailable_outcome(spec.disposition, &global.facts) {
+        entries.push(report_entry(
+            OverrideScope::Global,
+            Some(key),
+            spec,
+            outcome,
+            Some(match outcome {
+                OverrideOutcome::RejectedNoRecipe => {
+                    "eligibility failed and supplied no materialization recipe".into()
+                }
+                _ => "strategy inputs were not computed".into(),
+            }),
+            None,
+        ));
+        return Ok(());
+    }
+
+    match evaluate(spec.disposition, &global.facts) {
+        GuardResult::Applicable => {
+            honor_override(disposition, spec, false);
+            entries.push(report_entry(
+                OverrideScope::Global,
+                Some(key),
+                spec,
+                OverrideOutcome::Honored,
+                None,
+                None,
+            ));
+        }
+        GuardResult::NotComputed(_) => {
+            entries.push(report_entry(
+                OverrideScope::Global,
+                Some(key),
+                spec,
+                OverrideOutcome::RejectedStrategyUnavailable,
+                Some("strategy inputs were not computed".into()),
+                None,
+            ));
+        }
+        GuardResult::Failed(guards) => {
+            let failures = guard_failures(&global.key, &global.facts, &guards);
+            if spec.accept_risk {
+                honor_override(disposition, spec, true);
+                entries.push(report_entry(
+                    OverrideScope::Global,
+                    Some(key.clone()),
+                    spec,
+                    OverrideOutcome::HonoredAcceptedRisk,
+                    None,
+                    Some(failures.clone()),
+                ));
+                ledger.push(AuditRecord {
+                    id: String::new(),
+                    kind: "accepted-risk".into(),
+                    scope: AuditScope::Global {
+                        key: global.key.clone(),
+                        extra: Extra::new(),
+                    },
+                    source: AuditSource::Override,
+                    text: spec.reason.clone().unwrap_or_else(|| {
+                        format!("accepted risk for {} on {key}", spec.disposition.as_str())
+                    }),
+                    witness: None,
+                    failures: Some(failures),
+                    extra: Extra::new(),
+                });
+            } else {
+                entries.push(report_entry(
+                    OverrideScope::Global,
+                    Some(key),
+                    spec,
+                    OverrideOutcome::Rejected,
+                    Some("strategy guard failed and accept_risk was not set".into()),
+                    Some(failures),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn global_group_disposition(manifest: &Manifest, key: &Key) -> Option<Strategy> {
+    manifest
+        .coupling_groups
+        .iter()
+        .find(|group| group.members.contains(key))
+        .and_then(|group| group.group_disposition)
+}
+
+fn resolve_groups(
+    manifest: &mut Manifest,
+    overrides: &Overrides,
+    config: &CascadeConfig,
+    entries: &mut Vec<OverrideReportEntry>,
+    ledger: &mut Vec<AuditRecord>,
+) -> Result<(), DisposeError> {
+    let mut matched = BTreeSet::new();
+    for group_index in 0..manifest.coupling_groups.len() {
+        let group_id = manifest.coupling_groups[group_index].id.clone();
+        let member_keys = manifest.coupling_groups[group_index].members.clone();
+        manifest.coupling_groups[group_index].group_provenance = Some(GroupProvenance::Cascade);
+        manifest.coupling_groups[group_index].r#override = None;
+        let override_spec = overrides.groups.get(&group_id);
+        if override_spec.is_some() {
+            matched.insert(group_id.clone());
+        }
+
+        let chosen = if let Some(spec) = override_spec {
+            if spec.disposition != Strategy::Unhandled && !config.order.contains(&spec.disposition)
+            {
+                entries.push(report_entry(
+                    OverrideScope::Group,
+                    Some(group_id.clone()),
+                    spec,
+                    OverrideOutcome::RejectedStrategyDisabled,
+                    Some("strategy is omitted from the configured cascade".into()),
+                    None,
+                ));
+                first_supported_group_strategy(manifest, group_index, config)
+            } else if spec.disposition == Strategy::Unhandled {
+                record_honored_group(&mut manifest.coupling_groups[group_index], spec, false);
+                entries.push(report_entry(
+                    OverrideScope::Group,
+                    Some(group_id.clone()),
+                    spec,
+                    OverrideOutcome::Honored,
+                    None,
+                    None,
+                ));
+                Strategy::Unhandled
+            } else {
+                let availability = group_availability(manifest, group_index, spec.disposition);
+                if let Some(outcome) = availability {
+                    entries.push(report_entry(
+                        OverrideScope::Group,
+                        Some(group_id.clone()),
+                        spec,
+                        outcome,
+                        Some(if outcome == OverrideOutcome::RejectedNoRecipe {
+                            "group strategy has no joint materialization recipe".into()
+                        } else {
+                            "group strategy inputs were not computed".into()
+                        }),
+                        None,
+                    ));
+                    first_supported_group_strategy(manifest, group_index, config)
+                } else {
+                    let failures = group_failures(manifest, group_index, spec.disposition);
+                    if failures.is_empty() {
+                        record_honored_group(
+                            &mut manifest.coupling_groups[group_index],
+                            spec,
+                            false,
+                        );
+                        entries.push(report_entry(
+                            OverrideScope::Group,
+                            Some(group_id.clone()),
+                            spec,
+                            OverrideOutcome::Honored,
+                            None,
+                            None,
+                        ));
+                        spec.disposition
+                    } else if spec.accept_risk {
+                        record_honored_group(
+                            &mut manifest.coupling_groups[group_index],
+                            spec,
+                            true,
+                        );
+                        entries.push(report_entry(
+                            OverrideScope::Group,
+                            Some(group_id.clone()),
+                            spec,
+                            OverrideOutcome::HonoredAcceptedRisk,
+                            None,
+                            Some(failures.clone()),
+                        ));
+                        ledger.push(AuditRecord {
+                            id: String::new(),
+                            kind: "accepted-risk".into(),
+                            scope: AuditScope::Group {
+                                key: group_id.clone(),
+                                extra: Extra::new(),
+                            },
+                            source: AuditSource::Override,
+                            text: spec.reason.clone().unwrap_or_else(|| {
+                                format!(
+                                    "accepted risk for {} on group {group_id}",
+                                    spec.disposition.as_str()
+                                )
+                            }),
+                            witness: None,
+                            failures: Some(failures),
+                            extra: Extra::new(),
+                        });
+                        spec.disposition
+                    } else {
+                        entries.push(report_entry(
+                            OverrideScope::Group,
+                            Some(group_id.clone()),
+                            spec,
+                            OverrideOutcome::Rejected,
+                            Some("group strategy guard failed and accept_risk was not set".into()),
+                            Some(failures),
+                        ));
+                        first_supported_group_strategy(manifest, group_index, config)
+                    }
+                }
+            }
+        } else {
+            let chosen = first_supported_group_strategy(manifest, group_index, config);
+            let group = &mut manifest.coupling_groups[group_index];
+            group.group_provenance = Some(GroupProvenance::Cascade);
+            group.r#override = None;
+            chosen
+        };
+
+        manifest.coupling_groups[group_index].group_disposition = Some(chosen);
+        for key in member_keys {
+            if let Some(global) = manifest.globals.iter_mut().find(|global| global.key == key) {
+                let disposition = global
+                    .disposition
+                    .as_mut()
+                    .expect("independent cascade populated disposition");
+                disposition.chosen = chosen;
+                disposition.r#override = None;
+                disposition.provenance = if chosen == disposition.cascade_chosen {
+                    DispositionProvenance::Cascade
+                } else {
+                    DispositionProvenance::GroupConstraint
+                };
+            }
+        }
+    }
+
+    for (group, spec) in &overrides.groups {
+        if !matched.contains(group) {
+            entries.push(report_entry(
+                OverrideScope::Group,
+                Some(group.clone()),
+                spec,
+                OverrideOutcome::UnmatchedKey,
+                Some("no coupling group has this id".into()),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn record_honored_group(
+    group: &mut pangs_manifest::CouplingGroup,
+    spec: &OverrideSpec,
+    accepted_risk: bool,
+) {
+    group.group_provenance = Some(if accepted_risk {
+        GroupProvenance::OverrideAcceptedRisk
+    } else {
+        GroupProvenance::Override
+    });
+    group.r#override = Some(OverrideEcho {
+        disposition: spec.disposition,
+        accept_risk: spec.accept_risk,
+        reason: spec.reason.clone(),
+        extra: Extra::new(),
+    });
+}
+
+fn first_supported_group_strategy(
+    manifest: &Manifest,
+    group_index: usize,
+    config: &CascadeConfig,
+) -> Strategy {
+    config
+        .order
+        .iter()
+        .copied()
+        .find(|strategy| group_failures(manifest, group_index, *strategy).is_empty())
+        .unwrap_or(Strategy::Unhandled)
+}
+
+fn group_availability(
+    manifest: &Manifest,
+    group_index: usize,
+    strategy: Strategy,
+) -> Option<OverrideOutcome> {
+    let group = &manifest.coupling_groups[group_index];
+    for key in &group.members {
+        let Some(global) = manifest.globals.iter().find(|global| &global.key == key) else {
+            return Some(OverrideOutcome::RejectedStrategyUnavailable);
+        };
+        if let Some(outcome) = unavailable_outcome(strategy, &global.facts) {
+            return Some(outcome);
+        }
+    }
+    match strategy {
+        Strategy::OnceLock => match &group.strategy_support.once_lock {
+            None => Some(OverrideOutcome::RejectedStrategyUnavailable),
+            Some(OnceLockGroupSupport::Unsupported { .. }) => {
+                Some(OverrideOutcome::RejectedNoRecipe)
+            }
+            Some(_) => None,
+        },
+        Strategy::Mutex if group.strategy_support.mutex.is_none() => {
+            Some(OverrideOutcome::RejectedStrategyUnavailable)
+        }
+        _ => None,
+    }
+}
+
+fn group_failures(
+    manifest: &Manifest,
+    group_index: usize,
+    strategy: Strategy,
+) -> Vec<GuardFailure> {
+    let group = &manifest.coupling_groups[group_index];
+    let mut failures = Vec::new();
+    for key in &group.members {
+        let Some(global) = manifest.globals.iter().find(|global| &global.key == key) else {
+            continue;
+        };
+        match evaluate(strategy, &global.facts) {
+            GuardResult::Applicable => {}
+            GuardResult::Failed(guards) => {
+                failures.extend(guard_failures(key, &global.facts, &guards));
+            }
+            GuardResult::NotComputed(fact) => failures.push(GuardFailure {
+                member: key.clone(),
+                guard: fact.into(),
+                witness: Witness {
+                    kind: "fact-not-computed".into(),
+                    site: None,
+                    symbol: None,
+                    note: Some(fact.into()),
+                    extra: Extra::new(),
+                },
+                extra: Extra::new(),
+            }),
+        }
+    }
+    match strategy {
+        Strategy::OnceLock => match &group.strategy_support.once_lock {
+            Some(OnceLockGroupSupport::Unsupported { witness, .. }) => {
+                if let Some(member) = group.members.first() {
+                    failures.push(GuardFailure {
+                        member: member.clone(),
+                        guard: "group_once_lock_common_p".into(),
+                        witness: witness.clone(),
+                        extra: Extra::new(),
+                    });
+                }
+            }
+            None => {
+                if let Some(member) = group.members.first() {
+                    failures.push(missing_group_failure(member, "group_once_lock_common_p"));
+                }
+            }
+            Some(_) => {}
+        },
+        Strategy::Atomic if group.members.len() > 1 => {
+            for member in &group.members {
+                failures.push(GuardFailure {
+                    member: member.clone(),
+                    guard: "multi_member_atomic".into(),
+                    witness: Witness {
+                        kind: "coupling-group".into(),
+                        site: None,
+                        symbol: None,
+                        note: Some(group.id.clone()),
+                        extra: Extra::new(),
+                    },
+                    extra: Extra::new(),
+                });
+            }
+        }
+        Strategy::Mutex => {
+            let certified = group
+                .strategy_support
+                .mutex
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("certified");
+            if !certified {
+                if let Some(member) = group.members.first() {
+                    failures.push(missing_group_failure(member, "group_mutex_reentrancy"));
+                }
+            }
+        }
+        _ => {}
+    }
+    failures.sort_by(|a, b| (a.member.clone(), &a.guard).cmp(&(b.member.clone(), &b.guard)));
+    failures
+}
+
+fn missing_group_failure(member: &Key, guard: &str) -> GuardFailure {
+    GuardFailure {
+        member: member.clone(),
+        guard: guard.into(),
+        witness: Witness {
+            kind: "fact-not-computed".into(),
+            site: None,
+            symbol: None,
+            note: Some(guard.into()),
+            extra: Extra::new(),
+        },
+        extra: Extra::new(),
+    }
+}
+
+fn unavailable_outcome(strategy: Strategy, facts: &Facts) -> Option<OverrideOutcome> {
+    let slot = match strategy {
+        Strategy::OnceLock => Some(&facts.phase_stationarity),
+        Strategy::Atomic => Some(&facts.atomic_eligibility),
+        Strategy::Mutex => Some(&facts.mutex_eligibility),
+        Strategy::Localize if facts.localization.is_none() => {
+            return Some(OverrideOutcome::RejectedStrategyUnavailable)
+        }
+        _ => None,
+    }?;
+    match slot {
+        None => Some(OverrideOutcome::RejectedStrategyUnavailable),
+        Some(value) if !value.has_recipe() => Some(OverrideOutcome::RejectedNoRecipe),
+        Some(_) => None,
+    }
+}
+
+fn honor_override(disposition: &mut Disposition, spec: &OverrideSpec, accepted_risk: bool) {
+    disposition.chosen = spec.disposition;
+    disposition.provenance = if accepted_risk {
+        DispositionProvenance::OverrideAcceptedRisk
+    } else {
+        DispositionProvenance::Override
+    };
+    disposition.r#override = Some(OverrideEcho {
+        disposition: spec.disposition,
+        accept_risk: spec.accept_risk,
+        reason: spec.reason.clone(),
+        extra: Extra::new(),
+    });
+}
+
+fn report_entry(
+    scope: OverrideScope,
+    key: Option<String>,
+    spec: &OverrideSpec,
+    outcome: OverrideOutcome,
+    reason: Option<String>,
+    failures: Option<Vec<GuardFailure>>,
+) -> OverrideReportEntry {
+    OverrideReportEntry {
+        scope,
+        key,
+        requested: OverrideRequested::Strategy(spec.disposition),
+        accept_risk: spec.accept_risk,
+        outcome,
+        reason,
+        witness: None,
+        failures,
+        extra: Extra::new(),
+    }
+}
+
+fn count_outcomes(entries: &[OverrideReportEntry]) -> OverrideCounts {
+    let mut counts = OverrideCounts::default();
+    for entry in entries {
+        match entry.outcome {
+            OverrideOutcome::Honored => counts.honored += 1,
+            OverrideOutcome::HonoredAcceptedRisk => counts.honored_accepted_risk += 1,
+            OverrideOutcome::Rejected => counts.rejected += 1,
+            OverrideOutcome::RejectedStrategyDisabled => counts.rejected_strategy_disabled += 1,
+            OverrideOutcome::RejectedStrategyUnavailable => {
+                counts.rejected_strategy_unavailable += 1
+            }
+            OverrideOutcome::RejectedNoRecipe => counts.rejected_no_recipe += 1,
+            OverrideOutcome::UnmatchedKey => counts.unmatched_key += 1,
+        }
+    }
+    counts
+}
+
+fn guard_failures(key: &Key, facts: &Facts, guards: &[String]) -> Vec<GuardFailure> {
+    let mut failures = guards
+        .iter()
+        .map(|guard| GuardFailure {
+            member: key.clone(),
+            guard: guard.clone(),
+            witness: witness_for_guard(facts, guard),
+            extra: Extra::new(),
+        })
+        .collect::<Vec<_>>();
+    failures.sort_by(|a, b| (a.member.clone(), &a.guard).cmp(&(b.member.clone(), &b.guard)));
+    failures
+}
+
+fn witness_for_guard(facts: &Facts, guard: &str) -> Witness {
+    let evidenced = match guard {
+        "written" => facts.written.witness.as_ref(),
+        "omega_escaped_address" => facts.omega_escaped_address.witness.as_ref(),
+        "violation_taint" => facts.violation_taint.witness.as_ref(),
+        _ => None,
+    };
+    if let Some(witness) = evidenced {
+        return witness.clone();
+    }
+    let certificate = match guard {
+        "phase_stationarity" => facts.phase_stationarity.as_ref(),
+        "atomic_eligibility" => facts.atomic_eligibility.as_ref(),
+        "mutex_eligibility" => facts.mutex_eligibility.as_ref(),
+        _ => None,
+    };
+    if let Some(Certificate::Failed { witnesses, .. }) = certificate {
+        if let Some(witness) = witnesses.first() {
+            return witness.clone();
+        }
+    }
+    if guard == "localization" {
+        if let Some(witness) = facts
+            .localization
+            .as_ref()
+            .and_then(|value| value.blockers.first())
+            .map(|blocker| &blocker.witness)
+        {
+            return witness.clone();
+        }
+    }
+    Witness {
+        kind: "guard-failed".into(),
+        site: None,
+        symbol: None,
+        note: Some(format!("{guard} failed without a more specific witness")),
+        extra: Extra::new(),
+    }
+}
+
+pub fn read_ledger(path: &Path) -> Result<Vec<AuditRecord>, DisposeError> {
+    if !path.exists() {
+        return Err(DisposeError::MissingLedger(path.to_owned()));
+    }
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+pub fn regenerate_override_records(records: &mut Vec<AuditRecord>) -> Result<(), DisposeError> {
+    records.retain(|record| record.source != AuditSource::Override);
+    canonicalize_audit(records)?;
+    Ok(())
+}
+
+/// Replace the ledger first and the manifest last; the manifest is the pair's commit point.
+pub fn write_artifact_pair(
+    output_dir: &Path,
+    manifest: &Manifest,
+    ledger: &[AuditRecord],
+) -> Result<(), DisposeError> {
+    fs::create_dir_all(output_dir)?;
+    write_artifact_pair_to(
+        &output_dir.join("pangs-manifest.json"),
+        &output_dir.join("pangs-audit.json"),
+        manifest,
+        ledger,
+    )
+}
+
+pub fn write_artifact_pair_to(
+    manifest_path: &Path,
+    ledger_path: &Path,
+    manifest: &Manifest,
+    ledger: &[AuditRecord],
+) -> Result<(), DisposeError> {
+    let manifest_bytes = to_canonical_json(manifest)?;
+    let ledger_bytes = to_canonical_json(&ledger)?;
+    let ledger_dir = ledger_path.parent().unwrap_or_else(|| Path::new("."));
+    let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(ledger_dir)?;
+    fs::create_dir_all(manifest_dir)?;
+    let mut ledger_tmp = NamedTempFile::new_in(ledger_dir)?;
+    ledger_tmp.write_all(&ledger_bytes)?;
+    ledger_tmp.as_file().sync_all()?;
+    let mut manifest_tmp = NamedTempFile::new_in(manifest_dir)?;
+    manifest_tmp.write_all(&manifest_bytes)?;
+    manifest_tmp.as_file().sync_all()?;
+    ledger_tmp
+        .persist(ledger_path)
+        .map_err(|error| error.error)?;
+    manifest_tmp
+        .persist(manifest_path)
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GuardResult {
+    Applicable,
+    Failed(Vec<String>),
+    NotComputed(&'static str),
+}
+
+fn evaluate(strategy: Strategy, facts: &Facts) -> GuardResult {
+    if facts.violation_taint.value {
+        let mut failed = vec!["violation_taint".to_owned()];
+        match strategy {
+            Strategy::Immutable => {
+                if facts.written.value {
+                    failed.push("written".to_owned());
+                }
+                if facts.omega_escaped_address.value {
+                    failed.push("omega_escaped_address".to_owned());
+                }
+            }
+            Strategy::OnceLock => push_failed_certificate(
+                &mut failed,
+                "phase_stationarity",
+                facts.phase_stationarity.as_ref(),
+            ),
+            Strategy::Atomic => push_failed_certificate(
+                &mut failed,
+                "atomic_eligibility",
+                facts.atomic_eligibility.as_ref(),
+            ),
+            Strategy::Mutex => push_failed_certificate(
+                &mut failed,
+                "mutex_eligibility",
+                facts.mutex_eligibility.as_ref(),
+            ),
+            Strategy::Localize => {
+                if facts
+                    .localization
+                    .as_ref()
+                    .is_some_and(|value| value.verdict != LocalizationVerdict::Ok)
+                {
+                    failed.push("localization".to_owned());
+                }
+            }
+            Strategy::Unhandled => unreachable!("unhandled is not evaluated"),
+        }
+        return GuardResult::Failed(failed);
+    }
+
+    match strategy {
+        Strategy::Immutable => {
+            let mut failed = Vec::new();
+            if facts.written.value {
+                failed.push("written".to_owned());
+            }
+            if facts.omega_escaped_address.value {
+                failed.push("omega_escaped_address".to_owned());
+            }
+            failed_result(failed)
+        }
+        Strategy::OnceLock => certificate_guard("phase_stationarity", &facts.phase_stationarity),
+        Strategy::Atomic => certificate_guard("atomic_eligibility", &facts.atomic_eligibility),
+        Strategy::Mutex => certificate_guard("mutex_eligibility", &facts.mutex_eligibility),
+        Strategy::Localize => match &facts.localization {
+            None => GuardResult::NotComputed("localization"),
+            Some(value) if value.verdict == LocalizationVerdict::Ok => GuardResult::Applicable,
+            Some(_) => GuardResult::Failed(vec!["localization".to_owned()]),
+        },
+        Strategy::Unhandled => unreachable!("unhandled is not evaluated"),
+    }
+}
+
+fn push_failed_certificate(failed: &mut Vec<String>, name: &str, slot: Option<&Certificate>) {
+    if !slot.is_some_and(Certificate::is_certified) {
+        failed.push(name.to_owned());
+    }
+}
+
+fn certificate_guard(name: &'static str, slot: &Option<Certificate>) -> GuardResult {
+    match slot {
+        None => GuardResult::NotComputed(name),
+        Some(value) if value.is_certified() => GuardResult::Applicable,
+        Some(_) => GuardResult::Failed(vec![name.to_owned()]),
+    }
+}
+
+fn failed_result(failed: Vec<String>) -> GuardResult {
+    if failed.is_empty() {
+        GuardResult::Applicable
+    } else {
+        GuardResult::Failed(failed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pangs_manifest::{
+        AnalysisRun, AuditRecord, CouplingGroup, EvidencedBool, GlobalRecord, GroupStrategySupport,
+        Linkage, Localization, Manifest, Meta, RunHeader, UnkeyedGlobal, WordSizedScalar,
+    };
+    use serde_json::json;
+
+    use super::*;
+
+    fn bool_fact(value: bool) -> EvidencedBool {
+        EvidencedBool {
+            value,
+            witness: None,
+            extra: Extra::new(),
+        }
+    }
+
+    fn base_facts() -> Facts {
+        Facts {
+            written: bool_fact(false),
+            omega_escaped_address: bool_fact(false),
+            violation_taint: bool_fact(false),
+            thread_visible: bool_fact(false),
+            signal_context_access: bool_fact(false),
+            access_set_complete: bool_fact(true),
+            word_sized_scalar: WordSizedScalar {
+                value: false,
+                type_spelling: None,
+                size_bits: None,
+                class: None,
+                signed: None,
+                extra: Extra::new(),
+            },
+            phase_stationarity: None,
+            atomic_eligibility: None,
+            mutex_eligibility: None,
+            coupling_group: None,
+            localization: None,
+            extra: Extra::new(),
+        }
+    }
+
+    fn certified() -> Certificate {
+        Certificate::Certified {
+            certificate: json!({}),
+            extra: Extra::new(),
+        }
+    }
+
+    #[test]
+    fn first_applicable_wins_and_trace_stops() {
+        let mut facts = base_facts();
+        facts.written.value = true;
+        facts.phase_stationarity = Some(certified());
+        let config = CascadeConfig::default_for(DisposeMode::Application);
+        let (chosen, trace) = cascade(&facts, &config).unwrap();
+        assert_eq!(chosen, Strategy::OnceLock);
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].strategy, Strategy::Immutable);
+    }
+
+    #[test]
+    fn null_and_failed_certificate_are_distinct() {
+        let mut facts = base_facts();
+        facts.written.value = true;
+        let config = CascadeConfig {
+            mode: DisposeMode::Library,
+            order: vec![Strategy::Atomic],
+        };
+        let (_, trace) = cascade(&facts, &config).unwrap();
+        assert!(matches!(
+            trace[0].reason,
+            SkipReason::FactNotComputed { .. }
+        ));
+
+        facts.atomic_eligibility = Some(Certificate::Failed {
+            codes: vec!["bad-access".into()],
+            witnesses: Vec::new(),
+            recipe: None,
+            diagnostics: None,
+            extra: Extra::new(),
+        });
+        let (_, trace) = cascade(&facts, &config).unwrap();
+        assert!(matches!(trace[0].reason, SkipReason::GuardFailed { .. }));
+    }
+
+    #[test]
+    fn violation_taint_forces_every_strategy_to_guard_failed() {
+        let mut facts = base_facts();
+        facts.violation_taint.value = true;
+        let config = CascadeConfig::default_for(DisposeMode::Application);
+        let (chosen, trace) = cascade(&facts, &config).unwrap();
+        assert_eq!(chosen, Strategy::Unhandled);
+        assert_eq!(trace.len(), config.order.len());
+        for skip in trace {
+            let SkipReason::GuardFailed { failed, .. } = skip.reason else {
+                panic!("taint must dominate null slots");
+            };
+            assert_eq!(failed.first().map(String::as_str), Some("violation_taint"));
+        }
+    }
+
+    #[test]
+    fn localization_is_fact_composed() {
+        let mut facts = base_facts();
+        facts.localization = Some(Localization {
+            component: "comp-1".into(),
+            verdict: LocalizationVerdict::Ok,
+            blockers: Vec::new(),
+            extra: Extra::new(),
+        });
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Localize],
+        };
+        assert_eq!(cascade(&facts, &config).unwrap().0, Strategy::Localize);
+    }
+
+    #[test]
+    fn rejects_invalid_orders() {
+        assert_eq!(
+            CascadeConfig {
+                mode: DisposeMode::Library,
+                order: vec![Strategy::Localize],
+            }
+            .validate(),
+            Err(ConfigError::LocalizeInLibrary)
+        );
+        assert_eq!(
+            CascadeConfig {
+                mode: DisposeMode::Application,
+                order: vec![Strategy::Atomic, Strategy::Atomic],
+            }
+            .validate(),
+            Err(ConfigError::Duplicate("atomic".into()))
+        );
+    }
+
+    #[test]
+    fn generated_boolean_grid_preserves_trace_invariant() {
+        for written in [false, true] {
+            for escaped in [false, true] {
+                for tainted in [false, true] {
+                    for phase in 0..3 {
+                        let mut facts = base_facts();
+                        facts.written.value = written;
+                        facts.omega_escaped_address.value = escaped;
+                        facts.violation_taint.value = tainted;
+                        facts.phase_stationarity = match phase {
+                            0 => None,
+                            1 => Some(certified()),
+                            _ => Some(Certificate::Failed {
+                                codes: vec!["failed".into()],
+                                witnesses: Vec::new(),
+                                recipe: None,
+                                diagnostics: None,
+                                extra: Extra::new(),
+                            }),
+                        };
+                        let config = CascadeConfig::default_for(DisposeMode::Application);
+                        let (chosen, trace) = cascade(&facts, &config).unwrap();
+                        let chosen_index = config.order.iter().position(|s| *s == chosen);
+                        let expected = chosen_index.unwrap_or(config.order.len());
+                        assert_eq!(trace.len(), expected);
+                        assert!(trace
+                            .iter()
+                            .zip(&config.order)
+                            .all(|(skip, strategy)| { skip.strategy == *strategy }));
+                    }
+                }
+            }
+        }
+    }
+
+    fn manifest_with(facts: Facts) -> Manifest {
+        Manifest {
+            schema_version: pangs_manifest::SCHEMA_VERSION,
+            run: RunHeader {
+                analysis: AnalysisRun {
+                    pangs_git: "test".into(),
+                    llvm_version: "14".into(),
+                    input_path: "test.bc".into(),
+                    input_sha256: "00".into(),
+                    opts: json!({"build_mode": "executable"}),
+                    repo_root: "/repo".into(),
+                    target_triple: "x86_64-unknown-linux-gnu".into(),
+                    data_layout: "e-p:64:64".into(),
+                    supported_atomic_widths: vec![8, 16, 32, 64],
+                    entry_spine: None,
+                    extra: Extra::new(),
+                },
+                dispose: None,
+                extra: Extra::new(),
+            },
+            globals: vec![GlobalRecord {
+                key: Key::parse("src/a.c::g").unwrap(),
+                meta: Meta {
+                    linkage: Linkage::Internal,
+                    type_spelling: None,
+                    size_bits: None,
+                    align_bits: None,
+                    llvm_name: "g".into(),
+                    file: Some("src/a.c".into()),
+                    line: Some(1),
+                    extra: Extra::new(),
+                },
+                facts,
+                disposition: None,
+                extra: Extra::new(),
+            }],
+            unkeyed_globals: Vec::<UnkeyedGlobal>::new(),
+            coupling_groups: Vec::new(),
+            override_report: None,
+            materialization: None,
+            extra: Extra::new(),
+        }
+    }
+
+    fn global_override(strategy: Strategy, accept_risk: bool) -> Overrides {
+        Overrides {
+            globals: BTreeMap::from([(
+                "src/a.c::g".into(),
+                OverrideSpec {
+                    disposition: strategy,
+                    accept_risk,
+                    reason: Some("test".into()),
+                },
+            )]),
+            groups: BTreeMap::new(),
+            cascade: None,
+        }
+    }
+
+    #[test]
+    fn override_enablement_and_availability_precede_risk() {
+        let mut manifest = manifest_with(base_facts());
+        let mut ledger = Vec::<AuditRecord>::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Localize],
+        };
+        let overrides = global_override(Strategy::Atomic, true);
+        let outcome = apply_policy(
+            &mut manifest,
+            &mut ledger,
+            &config,
+            Some(&overrides),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(outcome.override_problems);
+        assert_eq!(
+            manifest.override_report.as_ref().unwrap().entries[0].outcome,
+            OverrideOutcome::RejectedStrategyDisabled
+        );
+
+        let mut manifest = manifest_with(base_facts());
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Atomic],
+        };
+        apply_policy(
+            &mut manifest,
+            &mut ledger,
+            &config,
+            Some(&overrides),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.override_report.as_ref().unwrap().entries[0].outcome,
+            OverrideOutcome::RejectedStrategyUnavailable
+        );
+    }
+
+    #[test]
+    fn failed_certificate_needs_recipe_then_accept_risk() {
+        let witness = Witness {
+            kind: "bad-access".into(),
+            site: None,
+            symbol: None,
+            note: None,
+            extra: Extra::new(),
+        };
+        let mut facts = base_facts();
+        facts.atomic_eligibility = Some(Certificate::Failed {
+            codes: vec!["bad-access".into()],
+            witnesses: vec![witness],
+            recipe: Some(json!({"sites": []})),
+            diagnostics: None,
+            extra: Extra::new(),
+        });
+        let mut manifest = manifest_with(facts);
+        let mut ledger = Vec::<AuditRecord>::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Atomic],
+        };
+        let overrides = global_override(Strategy::Atomic, true);
+        let outcome = apply_policy(
+            &mut manifest,
+            &mut ledger,
+            &config,
+            Some(&overrides),
+            Some("overrides.toml".into()),
+            Some("hash".into()),
+        )
+        .unwrap();
+        assert!(!outcome.override_problems);
+        let disposition = manifest.globals[0].disposition.as_ref().unwrap();
+        assert_eq!(disposition.chosen, Strategy::Atomic);
+        assert_eq!(
+            disposition.provenance,
+            DispositionProvenance::OverrideAcceptedRisk
+        );
+        assert_eq!(ledger.len(), 1);
+        assert!(ledger[0].id.starts_with("ar-"));
+    }
+
+    #[test]
+    fn unhandled_is_always_pinnable() {
+        let mut facts = base_facts();
+        facts.violation_taint.value = true;
+        let mut manifest = manifest_with(facts);
+        let mut ledger = Vec::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: Vec::new(),
+        };
+        let overrides = global_override(Strategy::Unhandled, false);
+        let outcome = apply_policy(
+            &mut manifest,
+            &mut ledger,
+            &config,
+            Some(&overrides),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!outcome.override_problems);
+        assert_eq!(
+            manifest.globals[0].disposition.as_ref().unwrap().provenance,
+            DispositionProvenance::Override
+        );
+    }
+
+    fn add_two_member_group(manifest: &mut Manifest) {
+        let mut second = manifest.globals[0].clone();
+        second.key = Key::parse("src/a.c::h").unwrap();
+        second.meta.llvm_name = "h".into();
+        second.facts.coupling_group = Some("grp-test".into());
+        manifest.globals[0].facts.coupling_group = Some("grp-test".into());
+        manifest.globals.push(second);
+        manifest.coupling_groups.push(CouplingGroup {
+            id: "grp-test".into(),
+            members: vec![
+                Key::parse("src/a.c::g").unwrap(),
+                Key::parse("src/a.c::h").unwrap(),
+            ],
+            evidence: Vec::new(),
+            strategy_support: GroupStrategySupport {
+                once_lock: None,
+                mutex: None,
+                extra: Extra::new(),
+            },
+            group_disposition: None,
+            group_provenance: None,
+            r#override: None,
+            extra: Extra::new(),
+        });
+    }
+
+    #[test]
+    fn group_pin_is_echoed_once_and_member_conflict_is_rejected() {
+        let mut manifest = manifest_with(base_facts());
+        add_two_member_group(&mut manifest);
+        let mut overrides = Overrides::default();
+        overrides.groups.insert(
+            "grp-test".into(),
+            OverrideSpec {
+                disposition: Strategy::Unhandled,
+                accept_risk: false,
+                reason: Some("opt out together".into()),
+            },
+        );
+        overrides.globals.insert(
+            "src/a.c::g".into(),
+            OverrideSpec {
+                disposition: Strategy::Immutable,
+                accept_risk: false,
+                reason: None,
+            },
+        );
+        let mut ledger = Vec::new();
+        let config = CascadeConfig::default_for(DisposeMode::Application);
+        let outcome = apply_policy(
+            &mut manifest,
+            &mut ledger,
+            &config,
+            Some(&overrides),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(outcome.override_problems);
+        let group = &manifest.coupling_groups[0];
+        assert_eq!(group.group_disposition, Some(Strategy::Unhandled));
+        assert_eq!(group.group_provenance, Some(GroupProvenance::Override));
+        assert!(group.r#override.is_some());
+        for global in &manifest.globals {
+            let disposition = global.disposition.as_ref().unwrap();
+            assert_eq!(disposition.chosen, Strategy::Unhandled);
+            assert!(disposition.r#override.is_none());
+            assert_eq!(
+                disposition.provenance,
+                DispositionProvenance::GroupConstraint
+            );
+        }
+        assert!(manifest
+            .override_report
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .any(|entry| entry.scope == OverrideScope::Global
+                && entry.outcome == OverrideOutcome::Rejected));
+    }
+
+    #[test]
+    fn marker_artifacts_follow_final_dispositions() {
+        let mut manifest = manifest_with(base_facts());
+        let mut ledger = Vec::new();
+        let config = CascadeConfig::default_for(DisposeMode::Application);
+        apply_policy(&mut manifest, &mut ledger, &config, None, None, None).unwrap();
+        let (header, source) = pangs_manifest::marker_artifacts(&manifest).unwrap();
+        assert!(header.contains("pangs_disposition_immutable__src_a_c__g__"));
+        assert!(source.contains("#include \"pangs_markers.h\""));
+        assert!(!header.contains("static inline"));
+    }
+}

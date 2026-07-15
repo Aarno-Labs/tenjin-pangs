@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PANGS disposition soundness ledger",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["id", "kind", "scope", "source", "text"],
+    "properties": {
+      "id": { "type": "string", "pattern": "^ar-[0-9a-f]{32}$" },
+      "kind": { "type": "string" },
+      "scope": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "enum": ["run", "global", "group"] },
+          "key": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "source": { "enum": ["analysis", "override", "entry-spine"] },
+      "text": { "type": "string" },
+      "witness": { "type": "object" },
+      "failures": { "type": "array" }
+    },
+    "additionalProperties": true
+  }
+}

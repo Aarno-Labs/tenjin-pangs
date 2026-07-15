@@ -1,0 +1,272 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PANGS disposition manifest",
+  "type": "object",
+  "required": ["schema_version", "run", "globals", "unkeyed_globals", "coupling_groups"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "run": { "$ref": "#/definitions/run" },
+    "globals": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/global" }
+    },
+    "unkeyed_globals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["llvm_name", "witness"],
+        "properties": {
+          "llvm_name": { "type": "string" },
+          "witness": { "$ref": "#/definitions/witness" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "coupling_groups": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/coupling_group" }
+    },
+    "override_report": { "type": "object" },
+    "materialization": { "$ref": "#/definitions/materialization" }
+  },
+  "additionalProperties": true,
+  "definitions": {
+    "key": {
+      "type": "string",
+      "pattern": "^(?!/|\\./)(?!.*::.*::)(?!.*(?:^|/)\\.{1,2}(?:/|$))[^\\\\]+::[A-Za-z0-9_.$]+$"
+    },
+    "strategy": {
+      "enum": ["immutable", "once-lock", "atomic", "mutex", "localize", "unhandled"]
+    },
+    "site": {
+      "type": "object",
+      "required": ["file", "line"],
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 },
+        "col": { "type": "integer", "minimum": 1 },
+        "function": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "witness": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "site": { "$ref": "#/definitions/site" },
+        "symbol": { "type": "string" },
+        "note": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "evidenced_bool_true": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["value", "witness"],
+          "properties": {
+            "value": { "const": true },
+            "witness": { "$ref": "#/definitions/witness" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["value"],
+          "not": { "required": ["witness"] },
+          "properties": { "value": { "const": false } },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "evidenced_bool_false": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["value", "witness"],
+          "properties": {
+            "value": { "const": false },
+            "witness": { "$ref": "#/definitions/witness" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["value"],
+          "not": { "required": ["witness"] },
+          "properties": { "value": { "const": true } },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "word_sized_scalar": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["value"],
+          "properties": { "value": { "const": false } },
+          "not": {
+            "anyOf": [
+              { "required": ["type_spelling"] }, { "required": ["size_bits"] },
+              { "required": ["class"] }, { "required": ["signed"] }
+            ]
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["value", "type_spelling", "size_bits", "class"],
+          "properties": {
+            "value": { "const": true },
+            "type_spelling": { "type": "string" },
+            "size_bits": { "type": "integer", "minimum": 1 },
+            "class": { "enum": ["integer", "boolean", "enum", "pointer"] },
+            "signed": { "type": "boolean" }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "certificate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status", "certificate"],
+          "properties": { "status": { "const": "certified" } },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["status", "codes", "witnesses"],
+          "properties": {
+            "status": { "const": "failed" },
+            "codes": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+            "witnesses": { "type": "array", "items": { "$ref": "#/definitions/witness" } }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "certificate_slot": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/definitions/certificate" }]
+    },
+    "localization": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["component", "verdict", "blockers"],
+          "properties": {
+            "component": { "type": "string" },
+            "verdict": { "enum": ["ok", "blocked"] },
+            "blockers": { "type": "array" }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "facts": {
+      "type": "object",
+      "required": [
+        "written", "omega_escaped_address", "violation_taint", "thread_visible",
+        "signal_context_access", "access_set_complete", "word_sized_scalar",
+        "phase_stationarity", "atomic_eligibility", "mutex_eligibility",
+        "coupling_group", "localization"
+      ],
+      "properties": {
+        "written": { "$ref": "#/definitions/evidenced_bool_true" },
+        "omega_escaped_address": { "$ref": "#/definitions/evidenced_bool_true" },
+        "violation_taint": { "$ref": "#/definitions/evidenced_bool_true" },
+        "thread_visible": { "$ref": "#/definitions/evidenced_bool_true" },
+        "signal_context_access": { "$ref": "#/definitions/evidenced_bool_true" },
+        "access_set_complete": { "$ref": "#/definitions/evidenced_bool_false" },
+        "word_sized_scalar": { "$ref": "#/definitions/word_sized_scalar" },
+        "phase_stationarity": { "$ref": "#/definitions/certificate_slot" },
+        "atomic_eligibility": { "$ref": "#/definitions/certificate_slot" },
+        "mutex_eligibility": { "$ref": "#/definitions/certificate_slot" },
+        "coupling_group": { "type": ["string", "null"] },
+        "localization": { "$ref": "#/definitions/localization" }
+      },
+      "additionalProperties": true
+    },
+    "meta": {
+      "type": "object",
+      "required": ["linkage", "type_spelling", "size_bits", "align_bits", "llvm_name", "file", "line"],
+      "properties": {
+        "linkage": { "enum": ["internal", "external"] },
+        "type_spelling": { "type": ["string", "null"] },
+        "size_bits": { "type": ["integer", "null"] },
+        "align_bits": { "type": ["integer", "null"] },
+        "llvm_name": { "type": "string" },
+        "file": { "type": ["string", "null"] },
+        "line": { "type": ["integer", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "disposition": {
+      "type": "object",
+      "required": ["chosen", "cascade_chosen", "provenance", "cascade_trace", "override"],
+      "properties": {
+        "chosen": { "$ref": "#/definitions/strategy" },
+        "cascade_chosen": { "$ref": "#/definitions/strategy" },
+        "provenance": {
+          "enum": ["cascade", "override", "override-accepted-risk", "group-constraint", "demoted"]
+        },
+        "cascade_trace": { "type": "array" },
+        "override": { "type": ["object", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "global": {
+      "type": "object",
+      "required": ["key", "meta", "facts"],
+      "properties": {
+        "key": { "$ref": "#/definitions/key" },
+        "meta": { "$ref": "#/definitions/meta" },
+        "facts": { "$ref": "#/definitions/facts" },
+        "disposition": { "$ref": "#/definitions/disposition" }
+      },
+      "additionalProperties": true
+    },
+    "coupling_group": {
+      "type": "object",
+      "required": ["id", "members", "evidence", "strategy_support"],
+      "properties": {
+        "id": { "type": "string" },
+        "members": { "type": "array", "items": { "$ref": "#/definitions/key" } },
+        "evidence": { "type": "array" },
+        "strategy_support": { "type": "object" },
+        "group_disposition": { "$ref": "#/definitions/strategy" },
+        "group_provenance": { "enum": ["cascade", "override", "override-accepted-risk"] },
+        "override": { "type": ["object", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "run": {
+      "type": "object",
+      "required": ["analysis"],
+      "properties": {
+        "analysis": {
+          "type": "object",
+          "required": [
+            "pangs_git", "llvm_version", "input_path", "input_sha256", "opts",
+            "repo_root", "target_triple", "data_layout", "supported_atomic_widths", "entry_spine"
+          ],
+          "additionalProperties": true
+        },
+        "dispose": {
+          "type": "object",
+          "required": ["mode", "cascade", "overrides_file", "overrides_sha256"],
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "materialization": {
+      "type": "object",
+      "required": ["tool", "marker_inventory", "demotions"],
+      "additionalProperties": true
+    }
+  }
+}
