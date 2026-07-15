@@ -64,16 +64,20 @@ configured repo root — nowhere else.
 ### 1.2 Marker name mangling
 
 ```
-marker      := "pangs_" kind "__" mangled-key "__" hash8
+marker      := "pangs_" kind "__" mangled-id "__" hash8
 kind        := "publish" | "disposition_" strategy
-mangled-key := key with every byte outside [A-Za-z0-9] replaced by "_"
-hash8       := lowercase hex FNV-1a-32 of the *raw* key bytes
+mangled-id  := (key | group-id) with every byte outside [A-Za-z0-9] replaced by "_"
+hash8       := lowercase hex FNV-1a-32 of the *raw* key (or group-id) bytes
 ```
 
-Example: `pangs_publish__src_commands_c__cmd_table__9f3a01c4`. The hash suffix makes
-the lossy mangling injective in practice; D5 still emits a hard error on collision
-(paranoia is cheap here). The codec lives in one shared crate (§2) — analysis, C→C
-tool, and Rust rewriter must never reimplement it.
+Example: `pangs_publish__src_commands_c__cmd_table__9f3a01c4`. A coupled once-lock
+group's shared publication marker is named by its **group id**, not a member key
+(`pangs_publish__grp_cmd__<hash8>`, hash over the raw group-id bytes); all other
+markers are named by global key. Cardinality and inventory-validation rules are in
+`DISPOSITION.md` §5.2. The hash suffix makes the lossy mangling injective in practice;
+D5 still emits a hard error on collision (paranoia is cheap here). The codec lives in
+one shared crate (§2) — analysis, C→C tool, and Rust rewriter must never reimplement
+it.
 
 ### 1.3 `pangs-dispose` exit codes
 
@@ -96,6 +100,142 @@ text, witness? }`. Accepted-risk overrides (D2) append `kind: "accepted-risk"` r
 The human-readable inventory sections in `DESIGN.md` §8 remain the catalog of *kinds*;
 the JSON is the per-run instantiation.
 
+Record ids are deterministic:
+`id = "ar-" + hash8(canonical JSON of { kind, scope, source, text })`, using the same
+FNV-1a-32 as §1.2. Two distinct records hashing to the same id after generation is a
+hard error (which also catches emitting the same assumption twice). Ownership on
+re-run follows `DISPOSITION.md` §3.3: `pangs-dispose` deletes and regenerates exactly
+the `source: "override"` records and preserves `analysis`/`entry-spine` records
+byte-for-byte, so the D2 idempotence test covers this artifact too.
+
+### 1.5 Fact and certificate encodings (schema v2, frozen by D1a's golden)
+
+These shapes complete `DISPOSITION.md` §2/§3.
+
+**Evidenced bool** — every boolean fact:
+
+```jsonc
+{ "value": <bool>, "witness": <Witness> }   // witness present iff value is the
+                                            // fact's *blocking* polarity
+```
+
+Blocking polarity per fact (the direction that removes strategies): `written`,
+`omega_escaped_address`, `violation_taint`, `thread_visible`, `signal_context_access`
+block when **true**; `access_set_complete` blocks when **false**. Fact assembly
+asserts the witness-iff-blocking invariant; the schema validator re-checks it.
+
+**Witness:**
+
+```jsonc
+{ "kind": "<registry string>",
+  "site":   { "file": "...", "line": 1, "col": 1?, "function": "..."? }?,  // this-run
+  "symbol": "<function or value key>"?,                                    // evidence,
+  "note":   "<free text>"? }                                               // never identity
+```
+
+`kind` is an open string registry (additive evolution: consumers tolerate unknown
+kinds). Initial entries: `write-site`, `escape-site`, `violation-finding`,
+`spawn-reachability`, `signal-registration`, `omega-access-path`.
+
+**word_sized_scalar:**
+
+```jsonc
+{ "value": <bool>, "type_spelling": "<C spelling>"?, "size_bits": <int>? }
+// type_spelling and size_bits present iff value is true
+```
+
+**Certificate slot** (`phase_stationarity`, `atomic_eligibility`, `mutex_eligibility`):
+
+```jsonc
+  null                                                       // not computed
+| { "status": "certified", "certificate": { ... } }          // pass-specific payload
+| { "status": "failed",
+    "codes": ["never-quiescent", ...],                       // ≥1, pass-owned registry
+    "witnesses": [ <Witness>, ... ] }
+```
+
+The certified `phase_stationarity` payload is `ONCELOCK.md` §2's per-global object
+verbatim; D3/D4 define their payloads when built. Failure-code registries are owned by
+the producing pass.
+
+**Localization verdict:**
+
+```jsonc
+  null                                                       // client didn't run
+| { "component": "<component id>",
+    "verdict": "ok" | "blocked",
+    "blockers": [ { "code": "<registry>", "witness": <Witness> }, ... ] }
+// blockers non-empty iff blocked; initial code registry: unknown-caller-taint,
+// unknown-callee-taint, frozen-component
+```
+
+The cascade guard "localization verdict OK" is `verdict == "ok"`.
+
+**Cascade skip reason** (`cascade_trace[].reason`):
+
+```jsonc
+  { "kind": "guard-failed", "failed": ["<guard name>", ...] }  // every failing conjunct,
+                                                               // in the strategy's
+                                                               // documented guard order
+| { "kind": "fact-not-computed", "fact": "<fact name>" }
+```
+
+Guard names are the fact names of the strategy's conjuncts (`DISPOSITION.md` §1) plus
+`violation_taint`, the implicit conjunct of every guard: a tainted global skips every
+configured entry with `guard-failed: ["violation_taint", ...]` and lands on
+`unhandled`. `cascade_trace` covers exactly the configured order — a strategy disabled
+by config appears nowhere in the trace (the order itself is recorded in
+`run.dispose`).
+
+Rust-side these are `EvidencedBool`, `Witness`, `WordSizedScalar`,
+`CertificateSlot<C>` (an `Option` around a two-variant `status`-tagged enum),
+`Localization`, and `SkipReason` in `pangs-manifest`, each carrying the
+`#[serde(flatten)]` unknown-field map like every other record type (D1a).
+
+### 1.6 Cascade configuration
+
+```
+CascadeConfig { mode: application | library, order: [strategy, ...] }
+```
+
+- **`order` is exhaustive**: the complete list of enabled strategies, evaluated left
+  to right. A strategy not listed is disabled for the run — nothing is implicitly
+  appended. "Capping the cascade" means supplying a shorter list; uniformity mode
+  "everything localizes" is `order = ["localize"]`. (The earlier "per-strategy
+  enable/cap" phrasing is retired: enablement *is* list membership.)
+- **Defaults** when no `[cascade]` block is present: application =
+  `["immutable", "once-lock", "atomic", "mutex", "localize"]`; library = the same
+  without `localize`.
+- `unhandled` is the implicit last entry and may not be listed. Duplicates and unknown
+  strategy names are config errors. `localize` under `mode = library` is a config
+  error — the applications-only rule is enforced loudly here, never skipped silently.
+- Strategies whose producing pass has not run **may** be listed (the defaults include
+  `atomic`/`mutex` from day one): a `null` fact slot skips per-global as
+  `fact-not-computed` (ground rule 6), keeping the default order stable across pass
+  availability.
+- An invalid `[cascade]` block exits with code **1**, not 2: it poisons every
+  disposition rather than a single key, so no manifest is written and there is no
+  silent fallback to the default order.
+
+### 1.7 Re-run semantics
+
+`DISPOSITION.md` §3.3 fixes stage ownership of manifest sections. Operationally for
+`pangs-dispose`:
+
+- **reads** only analysis-owned sections: `run.analysis`,
+  `globals[].{key, meta, facts}`, `coupling_groups` minus `group_disposition`;
+- **discards and regenerates**: `run.dispose` (wholesale — no stale dispose-time
+  config survives), every `disposition` block, every `group_disposition`,
+  `override_report`;
+- **drops** any `materialization` section with a stderr warning — a stale marker
+  inventory or demotion record must not survive a re-dispose; the C→C stage runs
+  again;
+- in `pangs-audit.json`, regenerates `source: "override"` records only (§1.4).
+
+The D2 idempotence test is therefore exact: `pangs-dispose` on its own output with the
+same config and overrides is a byte-level no-op across both artifacts, and changing
+only the overrides file changes only dispose-owned content.
+
 ## 2. Code layout
 
 New crates in the PANGS workspace (names final unless the workspace has conflicting
@@ -108,12 +248,20 @@ conventions):
 | (existing analysis crate, phase F) | fact-assembly post-pass, coupling post-pass (D2b), marker-inventory schema checks | — |
 
 Design point worth locking in: **the policy stage is re-runnable offline.**
-`pangs-dispose` reads a manifest (using only its `facts`/`meta`/run header, discarding
-any prior `disposition` blocks), applies cascade + overrides, and rewrites the
-manifest. Changing an override never requires re-analysis; the run header records both
-the analysis provenance and the dispose-time config, so a manifest is always
-self-describing. The analysis binary calls the same library in-process for the initial
-emission — one code path, two invocation modes.
+`pangs-dispose` reads a manifest using only its analysis-owned sections, applies
+cascade + overrides, and rewrites the manifest under the §1.7 / `DISPOSITION.md` §3.3
+ownership rules. Changing an override never requires re-analysis; the run header
+records both the analysis provenance (`run.analysis`) and the dispose-time config
+(`run.dispose`), so a manifest is always self-describing. The analysis binary calls
+the same library in-process for the initial emission — one code path, two invocation
+modes.
+
+Naming note: the repo already ships an unrelated artifact called the "PANGS manifest"
+(`schemas/manifest.schema.json`, `schema_version: 1` — the analysis *export* index of
+files + hashes). The disposition manifest is a different document with its own version
+counter; its JSON Schema lands as `schemas/disposition-manifest.schema.json`, and
+prose should say "export manifest" vs. "disposition manifest" wherever both are in
+scope.
 
 ## 3. Work items
 
@@ -131,6 +279,11 @@ placement rules the C→C tool must obey. If the spike *fails*, the fallback (so
 emission by the C→C tool, `DISPOSITION.md` §5.2's alternative) gets promoted before D5
 is built — that decision reverses cheaply now and expensively later.
 
+**Blocked (as of 2026-07-15):** the project's C→Rust translator is not present in this
+workspace and no in-repo note records its command, repository, or supported flags. D0
+cannot run until the project owner supplies that (record it here when known). Nothing
+else is held up: per §4, D1a/D1b/D1c/D2/D2b have no dependency on D0 — only D5 does.
+
 ### D1 — manifest, fact assembly, cascade (~400 lines + crate scaffolding)
 
 Split for independent landing:
@@ -144,22 +297,41 @@ Split for independent landing:
   calling `serde_json` emission directly. Golden test: a checked-in canonical v2
   manifest parses and re-emits byte-identically; a deliberately non-canonical fixture
   canonicalizes once and is byte-identical on the second pass.
-- **D1b — fact assembly (phase-F post-pass, ~200 lines).** One scan assembling the
-  `DISPOSITION.md` §2 vector per client-relevant global. New-but-cheap facts built
-  here: `signal_context_access` (reader/writer functions whose addresses flow to
-  signal-registration sites — the Ω escape-site scan already walks these);
-  `access_set_complete` (factored from the ONCELOCK kill-rule conjunction so both
-  consumers share one definition); `thread_visible` (promotion of the existing
-  spawn-reachability bit); `word_sized_scalar` (from O1b type metadata).
+- **D1b — fact assembly (phase-F post-pass, ~200 lines + lowering plumbing below).**
+  One scan assembling the `DISPOSITION.md` §2 vector per client-relevant global.
+  New-but-cheap facts built here: `signal_context_access` (reader/writer functions
+  whose addresses flow to signal-registration sites — the Ω escape-site scan already
+  walks these); `access_set_complete` (factored from the ONCELOCK kill-rule
+  conjunction so both consumers share one definition); `thread_visible` (spawn-entry
+  TransRef/TransMod reachability); `word_sized_scalar` (from O1b type metadata).
   `phase_stationarity` and `coupling_group` are wired in when O6/D2b land — until
   then the slots are `null`, which the cascade already tolerates (ground rule 6).
+
+  **Repository readiness (audited 2026-07-15):** D1b is *not* pure assembly over
+  currently exported facts. `GlobalInfo` (`crates/pangs-api/src/lib.rs`) today
+  carries only `is_const`/`mutable`/`stationary`/`never_written`/`escape` — no
+  linkage, no C type spelling or size, and no spawn-reachability, signal-context, or
+  access-completeness scans exist anywhere in phase F yet — and keys are raw symbol
+  names from lowering (`value_name`), not the §1.1 TU-qualified grammar. D1b
+  therefore includes lowering/pangs-api plumbing (still zero solver changes, ground
+  rule 1), split so it lands safely:
+  - **D1b-pre (lowering, land first and alone):** TU-qualified keys per §1.1
+    (defining-TU capture + path normalization at the `pangs-pir` boundary) — this
+    renames every key in every existing export stream, so it is one atomic change
+    with a full golden-file refresh; plus `linkage` and C type spelling / size
+    metadata on globals (the O1b dependency, pulled forward into `meta` and
+    `word_sized_scalar`).
+  - **D1b proper:** the three new F scans and the assembly pass, as above.
+
+  Revised estimate: ~200 lines assembly + ~250 lines lowering plumbing.
 - **D1c — cascade evaluator (in `pangs-dispose`, ~150 lines).** Pure function:
   `fn dispose(&Facts, &CascadeConfig) -> (Disposition, Vec<CascadeSkip>)`. Guards
-  exactly as `DISPOSITION.md` §1 and are evaluated independently — support for one
-  strategy never implies support for another; config = ordered strategy list + per-strategy
-  enable/cap; `unhandled` is always the implicit last entry and cannot be configured
-  away. Every skip records `{strategy, reason}` where reason names the failing guard
-  or `fact-not-computed`.
+  exactly as `DISPOSITION.md` §1 (including the implicit `¬violation_taint` conjunct
+  on every guard) and are evaluated independently — support for one strategy never
+  implies support for another; config = `CascadeConfig` per §1.6; `unhandled` is
+  always the implicit last entry and cannot be configured away. Every skip records
+  `{strategy, reason}` with the §1.5 `SkipReason` shape (every failing conjunct, or
+  `fact-not-computed`).
 
 **Acceptance:** golden manifest for a hand-built fact fixture; property test over a
 generated grid of fact vectors (all boolean combinations × certificate
@@ -342,6 +514,7 @@ schedule D3/D4; negligible ⇒ record the numbers and close the slots (they rema
 | Risk | Mitigation |
 |---|---|
 | Marker calls don't survive the translator (whole §5 contract collapses) | D0 spike first; documented fallback = C→C-emitted source map; decision recorded here |
+| Translator not available to this repo (D0 cannot run at all) | D0 marked blocked with what's needed from the project owner; D5 is the only dependent item; everything else proceeds |
 | Key instability across runs (path spelling, harness rename scheme drifting) breaks overrides | grammar + normalization fixed in §1.1, owned by lowering; uniqueness asserted at fact assembly; parse/format property tests; `unmatched-key` is loud by design |
 | Schema churn while O6 and the C→C tool are being written against it | D1a lands first and freezes v2 via golden tests; additive-only rule; unknown-field preservation protects mixed-version tooling |
 | Coupling heuristic too permissive/strict | advisory for all consumers except D3, which re-derives; threshold is config; over-grouping documented in tests as intended v1 behavior |

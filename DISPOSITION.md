@@ -79,6 +79,15 @@ strategy: for example, phase-stationarity does not prove atomic access-shape
 compatibility or mutex reentrancy safety. "First applicable" is sound because every
 entry evaluates its own guard; order affects preference only.
 
+One fact gates the whole cascade rather than any single entry: **every strategy guard
+implicitly conjoins `¬violation_taint`**. A tainted global's fact vector was computed
+under violated analysis assumptions, so no certificate about it is trustworthy; it
+falls through to `unhandled` with every configured strategy skipped as
+`guard-failed: violation_taint`. Any override pinned onto a tainted global is a
+contradiction under §4.2 and requires `accept_risk`. If the skip histogram (§10.2)
+shows taint dominating the `unhandled` bucket, the remedy is analysis-side (narrow the
+violation), never a policy-side exception.
+
 Two knobs, both policy-level (never analysis-level):
 
 - **`localize` vs `mutex` preference.** Applications default to the order above
@@ -86,8 +95,13 @@ Two knobs, both policy-level (never analysis-level):
   may become the preferred default if context-struct bloat dominates). Libraries have
   no `localize`; the "applications only" restriction of the original client lives
   *here*, in the cascade config, and nowhere in the analysis.
-- **Uniformity mode** (`DESIGN.md` §11.4 discussion): a client may cap the cascade
-  (e.g., "no statics at all — everything localizes") without touching facts.
+- **Uniformity mode** (`DESIGN.md` §11.4 discussion): a client may shrink the
+  configured order (e.g., `order = ["localize"]` — "no statics at all — everything
+  localizes") without touching facts. Earlier strategies are disabled by *omission*:
+  the configured order is the exhaustive list of enabled strategies.
+
+Both knobs live in one concrete config, `{ mode, order }` — TOML surface in §4.1, full
+semantics (defaults, exhaustiveness, error cases) in `DISPOSITION_PLAN.md` §1.6.
 
 The cascade, its knob settings, and the manifest schema version are recorded in the
 manifest header so a run is reproducible from its output.
@@ -105,21 +119,26 @@ Per-global facts, with producers:
 
 | Fact | Type | Producer | Status |
 |---|---|---|---|
-| `written` | bool | F `writers(o)` scan | exists |
-| `omega_escaped_address` | bool | Ω machinery | exists |
-| `violation_taint` | bool | A′ detection | exists |
-| `thread_visible` | bool (reachable from any spawn-entry's TransRef/TransMod) | F scan over spawn sites | exists (promoted from internal kill-rule input to first-class manifest fact) |
-| `signal_context_access` | bool (accessed under a registered signal handler) | F scan over Ω escape sites of handlers | new, cheap |
-| `access_set_complete` | bool (every access site enumerated; no Ω-tainted path can access `g`) | F scan | mostly exists (it is the ONCELOCK kill-rule conjunction, factored out) |
-| `word_sized_scalar` | bool + type spelling | lowering metadata (O1b) | exists after O1b |
-| `phase_stationarity` | certificate \| failure codes | ONCELOCK pass | specified |
-| `atomic_eligibility` | certificate \| failure codes | future pass (§9 D3) | reserved slot |
-| `mutex_eligibility` | certificate \| failure codes | future pass (§9 D4) | reserved slot |
+| `written` | evidenced bool (witness when true: a writing site) | F `writers(o)` scan | exists (`never_written`) |
+| `omega_escaped_address` | evidenced bool (witness when true: the escape site) | Ω machinery | exists |
+| `violation_taint` | evidenced bool (witness when true: the violation finding) — gates every strategy, §1 | A′ detection | exists |
+| `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) | F scan over spawn sites | specified (ONCELOCK kill-rule input); exported by D1b |
+| `signal_context_access` | evidenced bool (true iff accessed under a registered signal handler; witness when true: registration site + accessing function) | F scan over Ω escape sites of handlers | new, cheap |
+| `access_set_complete` | evidenced bool (true iff every access site enumerated; **witness when false**: the Ω-tainted path) | F scan | specified (the ONCELOCK kill-rule conjunction, factored out); built by D1b |
+| `word_sized_scalar` | `{ value, type_spelling?, size_bits? }` | lowering metadata (O1b) | exists after O1b |
+| `phase_stationarity` | certificate slot (null \| certified \| failed+codes+witnesses) | ONCELOCK pass | specified |
+| `atomic_eligibility` | certificate slot | future pass (§9 D3) | reserved slot |
+| `mutex_eligibility` | certificate slot | future pass (§9 D4) | reserved slot |
 | `coupling_group` | group id | shared coupling analysis (§6) | generalizes ONCELOCK §2.3 |
-| `localization` | component verdict | existing client (`DESIGN.md` §7) | exists |
+| `localization` | localization verdict (null \| ok \| blocked+blockers) | existing client (`DESIGN.md` §7) | exists |
 
 Rule of construction: every fact is either derivable from the materialized solution in
 one scan, or it does not belong in the vector. Nothing here re-enters the solver.
+
+The concrete JSON/Rust encodings of these types — the evidenced-bool object and its
+per-fact blocking polarity, witness records, the certificate-slot union, the
+localization verdict, and cascade skip reasons — are fixed in `DISPOSITION_PLAN.md`
+§1.5 and are part of what D1a's golden test freezes as schema v2.
 
 ## 3. The manifest
 
@@ -157,10 +176,16 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
 {
   "schema_version": 2,
   "run": {
-    "mode": "application",               // "application" | "library"
-    "cascade": ["immutable","once-lock","atomic","mutex","localize"],
-    "overrides_file": "pangs-overrides.toml",   // null if none
-    "entry_spine": { ... }               // as ONCELOCK.md §2.1
+    "analysis": {                        // analysis-owned (§3.3): provenance fields
+      "entry_spine": { ... },            //   (pangs git, input hash, opts) +
+      ...                                //   entry spine as ONCELOCK.md §2.1
+    },
+    "dispose": {                         // dispose-owned; replaced wholesale on every
+      "mode": "application",             //   pangs-dispose run ("application"|"library")
+      "cascade": ["immutable","once-lock","atomic","mutex","localize"],
+      "overrides_file": "pangs-overrides.toml",   // null if none
+      "overrides_sha256": "..."          // null if none
+    }
   },
   "globals": [
     {
@@ -168,26 +193,31 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
       "meta": { "linkage": "internal", "type": "struct cmd_entry [512]" },
 
       "facts": {
-        "written": true,
-        "omega_escaped_address": false,
-        "violation_taint": false,
-        "thread_visible": false,
-        "signal_context_access": false,
-        "access_set_complete": true,
-        "word_sized_scalar": false,
-        "phase_stationarity": { /* ONCELOCK certificate or failure, verbatim */ },
+        "written": { "value": true,
+                     "witness": { "kind": "write-site",
+                                  "site": { "file": "src/commands.c", "line": 210 },
+                                  "symbol": "src/commands.c::cmd_init" } },
+        "omega_escaped_address": { "value": false },
+        "violation_taint": { "value": false },
+        "thread_visible": { "value": false },
+        "signal_context_access": { "value": false },
+        "access_set_complete": { "value": true },
+        "word_sized_scalar": { "value": false },
+        "phase_stationarity": { "status": "certified",
+                                "certificate": { /* ONCELOCK payload, verbatim */ } },
         "atomic_eligibility": null,      // pass not yet built; null ≠ failed
         "mutex_eligibility": null,
         "coupling_group": "grp-cmd",
-        "localization": { /* component verdict, existing client */ }
+        "localization": { "component": "comp-17", "verdict": "ok", "blockers": [] }
       },
 
       "disposition": {
         "chosen": "once-lock",
         "provenance": "cascade",         // "cascade" | "override" | "override-accepted-risk"
-                                         // | "group-constraint" (§6)
-        "cascade_trace": [               // why each earlier entry was skipped
-          { "strategy": "immutable", "skipped": "written" }
+                                         // | "group-constraint" (§6) | "demoted" (§5.3)
+        "cascade_trace": [               // why each earlier *configured* entry was skipped
+          { "strategy": "immutable",
+            "reason": { "kind": "guard-failed", "failed": ["written"] } }
         ],
         "override": null                 // §4: echo of the applied override record, if any
       }
@@ -195,14 +225,40 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
   ],
   "coupling_groups": [ { "id": "grp-cmd", "members": [...], "evidence": {...},
                          "group_disposition": "once-lock" } ],
-  "override_report": { ... }             // §4.3
+  "override_report": { ... },            // §4.3; dispose-owned
+  "materialization": { ... }             // §5: C→C-tool-owned — marker inventory (§5.2)
+                                         //   and demotion records (§5.3); absent until
+                                         //   that stage runs
 }
 ```
 
 Field discipline (inherited from the lite provenance philosophy): additive evolution
-only; every negative fact carries a witness; `null` means *not computed*, and is
-distinct from a present-but-failed certificate — the cascade treats `null` as
-"skip this entry" and the gap is visible in `cascade_trace`.
+only; every boolean fact carries a witness on its *blocking* polarity (the direction
+that removes strategies — `DISPOSITION_PLAN.md` §1.5 fixes the polarity per fact);
+`null` means *not computed*, and is distinct from a present-but-failed certificate —
+the cascade treats `null` as "skip this entry" and the gap is visible in
+`cascade_trace`.
+
+### 3.3 Stage ownership and re-runs
+
+The manifest flows strictly forward through three stages, each owning named sections:
+
+| Stage | Owns |
+|---|---|
+| analysis | `run.analysis`; `globals[].key`, `.meta`, `.facts`; `coupling_groups[].{id, members, evidence}` |
+| `pangs-dispose` | `run.dispose`; `globals[].disposition`; `coupling_groups[].group_disposition`; `override_report` |
+| C→C tool | `materialization` (marker inventory §5.2, demotion records §5.3) |
+
+**Re-running a stage regenerates its own sections and deletes every later stage's
+sections** (with a warning when it deletes any): re-disposing discards prior
+dispositions, the old override report, and any marker inventory or demotion records —
+after a re-dispose, the C→C stage must run again before its outputs can be trusted.
+Earlier stages' sections are read-only inputs, preserved verbatim. This rule is what
+makes `pangs-dispose` a pure function of (analysis-owned sections, config, overrides)
+and gives the idempotence test its exact meaning. The same ownership discipline
+applies to `pangs-audit.json`: dispose regenerates only records with
+`source: "override"` and preserves all others byte-for-byte (deterministic record ids:
+`DISPOSITION_PLAN.md` §1.4).
 
 ## 4. User overrides
 
@@ -223,8 +279,11 @@ accept_risk = true               # REQUIRED when the pin contradicts facts (§4.
 [groups."grp-cmd"]
 disposition = "once-lock"        # pin a whole coupling group
 
-[cascade]                        # optional: reorder/cap the default cascade
+[cascade]                        # optional: REPLACES the mode's default order entirely
 order = ["immutable", "once-lock", "mutex", "localize"]   # e.g., no atomics anywhere
+# exhaustive list: an omitted strategy is disabled, never implicitly appended.
+# duplicates, unknown names, "unhandled", or "localize" in library mode = config error.
+# full semantics: DISPOSITION_PLAN.md §1.6
 ```
 
 ### 4.2 Validation rules
@@ -293,11 +352,44 @@ pangs_disposition__atomic__src_state_c__g_stats();
 - For `atomic`/`mutex`/`immutable`, markers at the definition site are strictly a
   robustness aid — the Rust rewriter primarily matches translated `static` items by
   symbol name; the marker disambiguates when translation renames.
-- The C→C tool emits a **marker inventory** (key → marker symbol) appended to the
-  manifest, closing the loop: the Rust side fails loudly on any manifest disposition
-  whose marker is missing from the translated source.
+- The C→C tool emits a **marker inventory** (rows of
+  `{ key, kind, marker, group?, insertion-site }`, the site being evidence-only per
+  §3.1) into the manifest's `materialization` section, closing the loop: the Rust side
+  fails loudly on any manifest disposition whose marker is missing from the translated
+  source.
 - The Rust-side rewriter deletes all marker calls and the marker header as its final
   step; a surviving `pangs_*` symbol in the output is a build error by design.
+
+Cardinality and linkage rules (validated by the `pangs-manifest` inventory helper, D5):
+
+- Marker kinds are exactly two: `publish` (once-lock publication point) and
+  `disposition_<strategy>` (definition site, for `immutable`/`atomic`/`mutex`).
+- A `once-lock` global gets **exactly one publication marker and no definition
+  marker**: the ONCELOCK certificate names a single publication point P — multiple
+  publication points are unsupported in v1 (that program shape fails certification as
+  `no-single-P`) — and static definitions are matched by symbol name like every other
+  strategy's.
+- A coupled once-lock group gets **one shared publication marker named by group id**
+  (e.g. `pangs_publish__grp_cmd__<hash8>`; the group id occupies the mangled-key slot
+  of the `DISPOSITION_PLAN.md` §1.2 grammar). The inventory maps *every member key* to
+  that one symbol via the `group` field.
+- `immutable`/`atomic`/`mutex` globals get exactly one definition-site marker whose
+  embedded strategy must match the manifest disposition; `localize`/`unhandled`
+  globals get no markers. No global carries more than one marker.
+- Inventory validation: one `publish` row per once-lock global (shared symbol across a
+  group's rows); strategy match on every `disposition_*` row; no rows for
+  `localize`/`unhandled`; no marker symbol under two keys except group-shared
+  `publish`; every row's key present in the manifest; and no `pangs_*` symbol in the
+  translated source that is absent from the inventory (orphan markers are a rewriter
+  error).
+- Linkage: `pangs_markers.h` contains plain `void pangs_…(void);` declarations only;
+  the empty definitions live in a single generated `pangs_markers.c` TU, so any number
+  of TUs may call any marker with no multiple-definition hazard. Never `static
+  inline` (per-TU copies would translate into per-crate-module duplicates, and a
+  compiler may elide uncalled inline definitions). Call-site elimination is not a
+  concern where it matters: the translator consumes unoptimized source, and all
+  markers are deleted before any optimized Rust build exists — the object-code fate of
+  the intermediate C is irrelevant to the contract.
 
 ### 5.3 What the C→C stage does per disposition
 
@@ -310,7 +402,10 @@ pangs_disposition__atomic__src_state_c__g_stats();
 
 The C→C tool never makes a disposition decision; it executes the manifest. If it cannot
 execute one (e.g., publication point inside a macro expansion it cannot rewrite), it
-demotes that global to `unhandled` in its output manifest copy with a witness —
+demotes that global to `unhandled` in its output manifest copy — concretely: it sets
+`disposition.chosen = "unhandled"`, `provenance: "demoted"`, and a
+`demotion: { from: "<original strategy>", witness: {...} }` record, and lists the
+demotion in the `materialization` section —
 demotion is always safe (coverage loss, never corruption), promotion is forbidden. If
 the failed materialization is a joint `once-lock` or `mutex` representation, the tool
 demotes the entire coupling group; it must not leave a partially materialized joint
