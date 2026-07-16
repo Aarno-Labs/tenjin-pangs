@@ -333,6 +333,41 @@ pub struct LoweringStats {
     pub missing_debug_locations: BTreeMap<String, u64>,
     #[serde(default)]
     pub non_ccc_calling_conventions: BTreeMap<String, u64>,
+    /// Statement-boundary CFGs used by the phase-stationarity post-pass. Kept in the in-process
+    /// PIR but omitted when `LoweringStats` is embedded in exported analysis metrics; hand-written
+    /// PIR fixtures may still deserialize this field.
+    #[serde(default, skip_serializing)]
+    pub statement_cfgs: BTreeMap<String, StatementCfg>,
+}
+
+/// Source-oriented CFG for one defined function. Each node is the boundary immediately before
+/// one contiguous debug-location statement group. Its `stmt_indices` refer to `Func::body`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatementCfg {
+    pub entry: u32,
+    #[serde(default)]
+    pub boundaries: Vec<StatementBoundary>,
+    /// True when the function has debug information and at least one unambiguous insertion point.
+    /// Individual ambiguous boundaries remain in the CFG but carry `insertable: false`.
+    #[serde(default)]
+    pub source_mapping_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatementBoundary {
+    pub id: u32,
+    pub block: u32,
+    pub ordinal: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loc: Option<Loc>,
+    #[serde(default)]
+    pub insertable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stmt_indices: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub successors: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predecessors: Vec<u32>,
 }
 
 impl LoweringStats {

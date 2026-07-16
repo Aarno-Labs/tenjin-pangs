@@ -18,6 +18,73 @@ fn pir_from_llvm_sys(path: &Path) -> Pir {
 }
 
 #[test]
+fn lowers_statement_boundary_cfg_with_insertability_and_bidirectional_edges() {
+    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
+    let tmp = TempDir::new().unwrap();
+    let bc_path = tmp.path().join("phase-cfg.bc");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = repo_root.join("fixtures/synthetic/disposition/phase_cfg.c");
+    assert!(Command::new(CLANG_14)
+        .args(["-O0", "-g", "-emit-llvm", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&bc_path)
+        .status()
+        .unwrap()
+        .success());
+
+    let pir = Pir::from_path_with_repo_root(&bc_path, &repo_root).unwrap();
+    let main = pir
+        .functions
+        .iter()
+        .find(|function| function.key == "main")
+        .unwrap();
+    let cfg = &pir.lowering.statement_cfgs["main"];
+    assert!(cfg.source_mapping_available);
+    assert_eq!(cfg.entry, 0);
+    assert!(cfg
+        .boundaries
+        .iter()
+        .any(|boundary| boundary.successors.len() == 2));
+
+    let mut covered_statements = cfg
+        .boundaries
+        .iter()
+        .flat_map(|boundary| boundary.stmt_indices.iter().copied())
+        .collect::<Vec<_>>();
+    covered_statements.sort_unstable();
+    assert_eq!(
+        covered_statements,
+        (0..main.body.len() as u32).collect::<Vec<_>>()
+    );
+    for (expected_id, boundary) in cfg.boundaries.iter().enumerate() {
+        assert_eq!(boundary.id as usize, expected_id);
+        for &successor in &boundary.successors {
+            assert!(cfg.boundaries[successor as usize]
+                .predecessors
+                .contains(&boundary.id));
+        }
+        for &predecessor in &boundary.predecessors {
+            assert!(cfg.boundaries[predecessor as usize]
+                .successors
+                .contains(&boundary.id));
+        }
+        if let Some(location) = &boundary.loc {
+            assert_eq!(location.file, "fixtures/synthetic/disposition/phase_cfg.c");
+        }
+    }
+
+    // Two source statements share line 14, so neither boundary is source-insertable.
+    let ambiguous = cfg
+        .boundaries
+        .iter()
+        .filter(|boundary| boundary.loc.as_ref().is_some_and(|loc| loc.line == 14))
+        .collect::<Vec<_>>();
+    assert!(ambiguous.len() >= 2);
+    assert!(ambiguous.iter().all(|boundary| !boundary.insertable));
+}
+
+#[test]
 fn lowers_typedef_pointer_spelling_and_resolved_scalar_class() {
     assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();

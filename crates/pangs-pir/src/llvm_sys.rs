@@ -20,7 +20,7 @@ use llvm_sys::{
 
 use crate::{
     AbiClass, Access, Func, Global, Loc, LoweringStats, Param, Pir, PirError, ScalarTypeClass,
-    Signature, Stmt, SymbolLinkage, TargetInfo,
+    Signature, StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo,
 };
 
 type AliasMap = BTreeMap<String, AliasTarget>;
@@ -565,6 +565,7 @@ unsafe fn lower_function(
     repo_roots: Option<&RepoRoots>,
 ) -> Func {
     let debug = function_debug_info(function, repo_roots);
+    let has_function_debug = debug.is_some();
     if debug.is_none() {
         lowering.bump_missing_debug_location("function");
     }
@@ -574,8 +575,16 @@ unsafe fn lower_function(
     let param_names = function_param_names(function, &mut fctx);
     lower_personality_function(ctx, function, lowering);
 
+    let mut blocks = Vec::new();
     let mut block = LLVMGetFirstBasicBlock(function);
     while !block.is_null() {
+        blocks.push(block);
+        block = LLVMGetNextBasicBlock(block);
+    }
+
+    let mut raw_boundaries = Vec::with_capacity(blocks.len());
+    for &block in &blocks {
+        let mut groups = Vec::<RawStatementBoundary>::new();
         let mut inst = LLVMGetFirstInstruction(block);
         while !inst.is_null() {
             let opcode = LLVMGetInstructionOpcode(inst);
@@ -585,11 +594,28 @@ unsafe fn lower_function(
             } else {
                 lowering.bump_terminator(key);
             }
+            let statement_loc = normalized_statement_loc(inst, repo_roots);
+            let first_stmt = body.len();
             lower_instruction(ctx, &mut fctx, inst, opcode, &mut body, lowering);
+            let stmt_indices = (first_stmt..body.len()).map(|index| index as u32);
+            if let Some(group) = groups.last_mut().filter(|group| group.loc == statement_loc) {
+                group.stmt_indices.extend(stmt_indices);
+            } else {
+                groups.push(RawStatementBoundary {
+                    loc: statement_loc,
+                    stmt_indices: stmt_indices.collect(),
+                });
+            }
             inst = LLVMGetNextInstruction(inst);
         }
-        block = LLVMGetNextBasicBlock(block);
+        if groups.is_empty() {
+            groups.push(RawStatementBoundary::default());
+        }
+        raw_boundaries.push(groups);
     }
+
+    let statement_cfg = build_statement_cfg(&blocks, raw_boundaries, has_function_debug);
+    lowering.statement_cfgs.insert(key.clone(), statement_cfg);
 
     Func {
         key: key.clone(),
@@ -606,6 +632,147 @@ unsafe fn lower_function(
         address_taken: address_taken.contains(&key),
         body,
     }
+}
+
+#[derive(Default)]
+struct RawStatementBoundary {
+    loc: Option<Loc>,
+    stmt_indices: Vec<u32>,
+}
+
+unsafe fn normalized_statement_loc(
+    instruction: LLVMValueRef,
+    repo_roots: Option<&RepoRoots>,
+) -> Option<Loc> {
+    let mut location = loc(instruction)?;
+    if let Some(roots) = repo_roots {
+        if let Some(relative) = roots.relative_source(Path::new(&location.file)) {
+            location.file = relative;
+        }
+    }
+    Some(location)
+}
+
+unsafe fn build_statement_cfg(
+    blocks: &[LLVMBasicBlockRef],
+    raw_blocks: Vec<Vec<RawStatementBoundary>>,
+    has_function_debug: bool,
+) -> StatementCfg {
+    let mut first_boundary = Vec::with_capacity(raw_blocks.len());
+    let mut next_id = 0_u32;
+    for groups in &raw_blocks {
+        first_boundary.push(next_id);
+        next_id += groups.len() as u32;
+    }
+
+    let mut boundaries = Vec::with_capacity(next_id as usize);
+    for (block_index, groups) in raw_blocks.into_iter().enumerate() {
+        let group_count = groups.len();
+        for (ordinal, group) in groups.into_iter().enumerate() {
+            let id = first_boundary[block_index] + ordinal as u32;
+            let mut successors = if ordinal + 1 < group_count {
+                vec![id + 1]
+            } else {
+                llvm_block_successors(blocks, block_index, &first_boundary)
+            };
+            successors.sort_unstable();
+            successors.dedup();
+            boundaries.push(StatementBoundary {
+                id,
+                block: block_index as u32,
+                ordinal: ordinal as u32,
+                insertable: group.loc.is_some(),
+                loc: group.loc,
+                stmt_indices: group.stmt_indices,
+                successors,
+                predecessors: Vec::new(),
+            });
+        }
+    }
+
+    let edges = boundaries
+        .iter()
+        .flat_map(|boundary| {
+            boundary
+                .successors
+                .iter()
+                .map(move |successor| (boundary.id, *successor))
+        })
+        .collect::<Vec<_>>();
+    for (predecessor, successor) in edges {
+        if let Some(boundary) = boundaries.get_mut(successor as usize) {
+            boundary.predecessors.push(predecessor);
+        }
+    }
+    for boundary in &mut boundaries {
+        boundary.predecessors.sort_unstable();
+        boundary.predecessors.dedup();
+    }
+
+    // More than one statement group on a source line is not a unique source insertion point.
+    let mut by_line = BTreeMap::<(String, u32), Vec<usize>>::new();
+    for (index, boundary) in boundaries.iter().enumerate() {
+        if let Some(location) = &boundary.loc {
+            by_line
+                .entry((location.file.clone(), location.line))
+                .or_default()
+                .push(index);
+        }
+    }
+    for indices in by_line.values().filter(|indices| indices.len() > 1) {
+        for &index in indices {
+            boundaries[index].insertable = false;
+        }
+    }
+
+    // Debug locations that move backwards inside one LLVM block cannot identify a stable source
+    // statement boundary. Keep the CFG node for dataflow, but refuse it as a publication site.
+    for block_index in 0..blocks.len() as u32 {
+        let mut previous: Option<(String, u32, u32)> = None;
+        for boundary in boundaries
+            .iter_mut()
+            .filter(|boundary| boundary.block == block_index)
+        {
+            let Some(location) = &boundary.loc else {
+                continue;
+            };
+            let current = (location.file.clone(), location.line, location.col);
+            if previous
+                .as_ref()
+                .is_some_and(|previous| current <= *previous)
+            {
+                boundary.insertable = false;
+            }
+            previous = Some(current);
+        }
+    }
+
+    StatementCfg {
+        entry: first_boundary.first().copied().unwrap_or(0),
+        source_mapping_available: has_function_debug
+            && boundaries.iter().any(|boundary| boundary.insertable),
+        boundaries,
+    }
+}
+
+unsafe fn llvm_block_successors(
+    blocks: &[LLVMBasicBlockRef],
+    block_index: usize,
+    first_boundary: &[u32],
+) -> Vec<u32> {
+    let terminator = LLVMGetBasicBlockTerminator(blocks[block_index]);
+    if terminator.is_null() {
+        return Vec::new();
+    }
+    (0..LLVMGetNumSuccessors(terminator))
+        .filter_map(|index| {
+            let successor = LLVMGetSuccessor(terminator, index);
+            blocks
+                .iter()
+                .position(|candidate| *candidate == successor)
+                .map(|successor_index| first_boundary[successor_index])
+        })
+        .collect()
 }
 
 unsafe fn function_debug_info(

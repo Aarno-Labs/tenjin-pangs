@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use jsonschema::JSONSchema;
 
 mod cc2json;
+mod phase_stationarity;
 pub use cc2json::{run_cc2json, Cc2jsonOpts};
 
 use pangs_api::{
