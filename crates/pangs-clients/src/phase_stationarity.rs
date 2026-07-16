@@ -588,6 +588,12 @@ pub(crate) fn assemble_spine_inputs(
                 let Some(&callsite) = callsites_by_statement.get(&(function, statement)) else {
                     continue;
                 };
+                // A resolved spawn/signal registry call has an explicit callback model below.
+                // Treating its external declaration as Ω as well would contradict that model and
+                // make every reader registration look like a writer of every global.
+                let modeled_registry_call = pseudo_read_callsites
+                    .values()
+                    .any(|callsites| callsites.contains(&callsite));
                 let mut has_unknown = false;
                 let mut has_callee = false;
                 for callee in analysis.callees(callsite) {
@@ -595,7 +601,7 @@ pub(crate) fn assemble_spine_inputs(
                     match callee {
                         Callee::Func(callee) => {
                             if analysis.functions()[*callee].external {
-                                has_unknown = true;
+                                has_unknown |= !modeled_registry_call;
                                 continue;
                             }
                             for row in analysis.modref(*callee) {
@@ -813,7 +819,7 @@ pub(crate) fn certificate_slots(
     spawn_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
     escape_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
     thread_writers: &BTreeMap<GlobalId, Witness>,
-) -> (Option<Value>, BTreeMap<GlobalId, Certificate>) {
+) -> (Option<Value>, BTreeMap<GlobalId, Certificate>, Value) {
     let main = (opts.build_mode == BuildMode::Executable
         && opts.stage != pangs_api::Stage::Conservative)
         .then(|| analysis.lookup_func("main"))
@@ -827,6 +833,8 @@ pub(crate) fn certificate_slots(
     });
     let kills = evaluate_kill_rules(analysis, thread_writers);
     let mut slots = BTreeMap::new();
+    let mut descent_depths = BTreeMap::new();
+    let mut descent_exhausted = BTreeSet::new();
     for index in 0..analysis.globals().len() {
         let global = GlobalId(index as u32);
         let Some(main) = main else {
@@ -851,6 +859,10 @@ pub(crate) fn certificate_slots(
             );
             continue;
         };
+        descent_depths.insert(global, evaluation.path.len());
+        if evaluation.exhausted {
+            descent_exhausted.insert(global);
+        }
         let mut codes = kills
             .get(&global)
             .into_iter()
@@ -908,7 +920,284 @@ pub(crate) fn certificate_slots(
             },
         );
     }
-    (entry_spine, slots)
+    let report = phase_report(analysis, &slots, &descent_depths, &descent_exhausted);
+    (entry_spine, slots, report)
+}
+
+fn phase_report(
+    analysis: &Analysis,
+    slots: &BTreeMap<GlobalId, Certificate>,
+    descent_depths: &BTreeMap<GlobalId, usize>,
+    descent_exhausted: &BTreeSet<GlobalId>,
+) -> Value {
+    let relevant = analysis
+        .globals()
+        .iter()
+        .enumerate()
+        .filter(|(_, global)| global.mutable && global.is_definition)
+        .map(|(index, _)| GlobalId(index as u32))
+        .collect::<Vec<_>>();
+    let mut certified = 0_u64;
+    let mut failure_codes = BTreeMap::<String, u64>::new();
+    let mut quiescence_profile = Vec::<(String, Value)>::new();
+    let mut no_single_p = Vec::new();
+    let mut both_phase_histogram = BTreeMap::<usize, u64>::new();
+    let mut both_phase_functions_total = 0_u64;
+    let mut both_phase_globals_nonempty = 0_u64;
+    let mut both_phase_not_computed = 0_u64;
+    let mut depth_histogram = BTreeMap::<usize, u64>::new();
+    let mut not_computed = 0_u64;
+
+    for &global in &relevant {
+        let Some(slot) = slots.get(&global) else {
+            not_computed += 1;
+            let name = analysis.globals()[global].key.clone();
+            quiescence_profile.push((
+                format!("2|{name}"),
+                json!({"global": name, "status": "not-computed"}),
+            ));
+            continue;
+        };
+        let payload = match slot {
+            Certificate::Certified { certificate, .. } => {
+                certified += 1;
+                let point = &certificate["publication"]["publication_point"];
+                let name = analysis.globals()[global].key.clone();
+                quiescence_profile.push((
+                    format!(
+                        "0|{}|{:010}|{:010}|{}",
+                        point["file"].as_str().unwrap_or(""),
+                        point["line"].as_u64().unwrap_or(0),
+                        point["col"].as_u64().unwrap_or(0),
+                        name
+                    ),
+                    json!({
+                        "global": name,
+                        "status": "certified",
+                        "publication_point": point,
+                        "publication_interval": certificate["publication"]["publication_interval"]
+                    }),
+                ));
+                Some(certificate)
+            }
+            Certificate::Failed {
+                codes,
+                witnesses,
+                recipe,
+                ..
+            } => {
+                for code in codes {
+                    *failure_codes.entry(code.clone()).or_default() += 1;
+                }
+                if codes.iter().any(|code| code == "no-single-P") {
+                    no_single_p.push(json!({
+                        "global": analysis.globals()[global].key,
+                        "witnesses": witnesses
+                    }));
+                }
+                let name = analysis.globals()[global].key.clone();
+                quiescence_profile.push((
+                    format!("1|{}|{name}", codes.first().map_or("", String::as_str)),
+                    json!({"global": name, "status": "failed", "codes": codes}),
+                ));
+                recipe.as_ref()
+            }
+        };
+        if let Some(payload) = payload {
+            let both_size = payload["readers"]["both_phase"]
+                .as_array()
+                .map_or(0, Vec::len);
+            *both_phase_histogram.entry(both_size).or_default() += 1;
+            both_phase_functions_total += both_size as u64;
+            both_phase_globals_nonempty += u64::from(both_size != 0);
+        } else {
+            both_phase_not_computed += 1;
+        }
+        if let Some(&depth) = descent_depths.get(&global) {
+            *depth_histogram.entry(depth).or_default() += 1;
+        } else {
+            not_computed += 1;
+        }
+    }
+    no_single_p.sort_by_key(Value::to_string);
+    quiescence_profile.sort_by(|left, right| left.0.cmp(&right.0));
+    let quiescence_profile = quiescence_profile
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect::<Vec<_>>();
+
+    json!({
+        "coverage": {
+            "certified_globals": certified,
+            "client_relevant_mutable_globals": relevant.len()
+        },
+        "quiescence_profile": quiescence_profile,
+        "failure_code_counts": failure_codes,
+        "no_single_p": {
+            "count": no_single_p.len(),
+            "witnesses": no_single_p
+        },
+        "both_phase_bucket_sizes": {
+            "histogram": both_phase_histogram,
+            "globals_nonempty": both_phase_globals_nonempty,
+            "functions_total": both_phase_functions_total,
+            "not_computed": both_phase_not_computed
+        },
+        "spine_descent_depth": {
+            "max_depth": 4,
+            "histogram": depth_histogram,
+            "exhausted": relevant.iter().filter(|global| descent_exhausted.contains(global)).count(),
+            "not_computed": not_computed
+        }
+    })
+}
+
+#[derive(Default)]
+struct PhaseReachability {
+    pre: BTreeSet<FuncId>,
+    post: BTreeSet<FuncId>,
+    incomparable: BTreeSet<FuncId>,
+    /// Only direct targets of a pre-publication spine call carry that outer callsite. Functions
+    /// reached below them remain in the init subtree with an empty `spine_call_sites` list.
+    pre_entry_sites: BTreeMap<FuncId, BTreeSet<CallsiteId>>,
+    internal_edges: BTreeMap<FuncId, BTreeSet<FuncId>>,
+}
+
+fn phase_reachability(
+    analysis: &Analysis,
+    module: &Pir,
+    spine: &SplicedSpine,
+    selection: &PublicationSelection,
+    dom: &[Vec<bool>],
+) -> PhaseReachability {
+    let spine_functions = spine
+        .origins
+        .iter()
+        .map(|origin| origin.function)
+        .collect::<BTreeSet<_>>();
+    let callsites = callsites_by_statement(module);
+    let mut result = PhaseReachability::default();
+    for edge in analysis.call_edges() {
+        let (Caller::Func(caller), Callee::Func(callee)) = (&edge.caller, &edge.callee) else {
+            continue;
+        };
+        if !analysis.functions()[*callee].external {
+            result
+                .internal_edges
+                .entry(*caller)
+                .or_default()
+                .insert(*callee);
+        }
+    }
+
+    for (composite, origin) in spine.origins.iter().enumerate() {
+        let Some(local_cfg) = module
+            .functions
+            .get(origin.function.0 as usize)
+            .and_then(|function| module.lowering.statement_cfgs.get(&function.key))
+        else {
+            continue;
+        };
+        let Some(boundary) = local_cfg.boundaries.get(origin.boundary as usize) else {
+            continue;
+        };
+        let before =
+            composite as u32 != selection.chosen && dom[selection.chosen as usize][composite];
+        let after = dom[composite][selection.chosen as usize];
+        for callsite in boundary
+            .stmt_indices
+            .iter()
+            .filter_map(|statement| callsites.get(&(origin.function, *statement)).copied())
+        {
+            let roots = analysis
+                .callees(callsite)
+                .filter_map(|callee| match callee {
+                    Callee::Func(function)
+                        if !analysis.functions()[*function].external
+                            && !spine_functions.contains(function) =>
+                    {
+                        Some(*function)
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            if before {
+                for &root in &roots {
+                    result
+                        .pre_entry_sites
+                        .entry(root)
+                        .or_default()
+                        .insert(callsite);
+                }
+                extend_reachable(
+                    &mut result.pre,
+                    &roots,
+                    &result.internal_edges,
+                    &spine_functions,
+                );
+            } else if after {
+                extend_reachable(
+                    &mut result.post,
+                    &roots,
+                    &result.internal_edges,
+                    &spine_functions,
+                );
+            } else {
+                extend_reachable(
+                    &mut result.incomparable,
+                    &roots,
+                    &result.internal_edges,
+                    &spine_functions,
+                );
+            }
+        }
+    }
+    result
+}
+
+fn extend_reachable(
+    reached: &mut BTreeSet<FuncId>,
+    roots: &BTreeSet<FuncId>,
+    edges: &BTreeMap<FuncId, BTreeSet<FuncId>>,
+    excluded: &BTreeSet<FuncId>,
+) {
+    let mut pending = roots.iter().copied().collect::<Vec<_>>();
+    while let Some(function) = pending.pop() {
+        if excluded.contains(&function) || !reached.insert(function) {
+            continue;
+        }
+        pending.extend(edges.get(&function).into_iter().flatten().copied());
+    }
+}
+
+fn init_subtree_functions(
+    reachability: &PhaseReachability,
+    relevant: &BTreeSet<FuncId>,
+    excluded: &BTreeSet<FuncId>,
+) -> BTreeSet<FuncId> {
+    let mut reverse = BTreeMap::<FuncId, BTreeSet<FuncId>>::new();
+    for (&caller, callees) in &reachability.internal_edges {
+        if !reachability.pre.contains(&caller) || excluded.contains(&caller) {
+            continue;
+        }
+        for &callee in callees {
+            if reachability.pre.contains(&callee) && !excluded.contains(&callee) {
+                reverse.entry(callee).or_default().insert(caller);
+            }
+        }
+    }
+    let mut result = BTreeSet::new();
+    let mut pending = relevant
+        .iter()
+        .filter(|function| reachability.pre.contains(function) && !excluded.contains(function))
+        .copied()
+        .collect::<Vec<_>>();
+    while let Some(function) = pending.pop() {
+        if result.insert(function) {
+            pending.extend(reverse.get(&function).into_iter().flatten().copied());
+        }
+    }
+    result
 }
 
 #[allow(clippy::result_large_err)]
@@ -925,28 +1214,50 @@ fn build_payload(
     let earliest = boundary_site(analysis, &evaluation.spine, selection.earliest)?;
     let latest = boundary_site(analysis, &evaluation.spine, selection.latest)?;
     let dom = dominators(&evaluation.spine.cfg);
+    let reachability = phase_reachability(analysis, module, &evaluation.spine, selection, &dom);
+    let spine_functions = evaluation
+        .spine
+        .origins
+        .iter()
+        .map(|origin| origin.function)
+        .collect::<BTreeSet<_>>();
     let mut writers = Vec::new();
     let mut pre_readers = Vec::new();
-    let mut pre_functions = BTreeSet::new();
-    let mut post_functions = BTreeSet::new();
+    let mut pre_functions = BTreeSet::<FuncId>::new();
+    let mut post_functions = BTreeSet::<FuncId>::new();
     for access in analysis
         .access_sites()
         .iter()
         .filter(|site| site.global == global)
     {
-        let boundary = access_boundary(module, &evaluation.spine, access).ok_or_else(|| {
+        let (before, after, incomparable) = if spine_functions.contains(&access.func) {
+            let boundary = access_boundary(module, &evaluation.spine, access).ok_or_else(|| {
+                (
+                    "no-entry-spine",
+                    access_witness(
+                        analysis,
+                        access,
+                        "spine access site cannot be mapped to a statement boundary",
+                    ),
+                )
+            })?;
+            let before =
+                boundary != selection.chosen && dom[selection.chosen as usize][boundary as usize];
+            let after = dom[boundary as usize][selection.chosen as usize];
+            (before, after, !before && !after)
+        } else {
+            let escaped = analysis.functions()[access.func].address_escaped;
             (
-                "no-entry-spine",
-                access_witness(
-                    analysis,
-                    access,
-                    "access site is not on the source-mapped spine",
-                ),
+                reachability.pre.contains(&access.func),
+                reachability.post.contains(&access.func) || escaped,
+                reachability.incomparable.contains(&access.func),
             )
-        })?;
-        let before =
-            boundary != selection.chosen && dom[selection.chosen as usize][boundary as usize];
-        let after = dom[boundary as usize][selection.chosen as usize];
+        };
+        // Accesses in functions unreachable from the executable entry do not constrain its
+        // publication recipe. Address-escaped functions are covered independently by O4.
+        if !before && !after && !incomparable {
+            continue;
+        }
         let site = access_site(analysis, access).ok_or_else(|| {
             (
                 "no-entry-spine",
@@ -956,23 +1267,16 @@ fn build_payload(
         let function = analysis.functions()[access.func].key.clone();
         match access.access {
             Access::Mod => {
-                if !before {
+                if !before || after || incomparable {
                     return Err((
                         "never-quiescent",
                         access_witness(analysis, access, "writer is not provably pre-publication"),
                     ));
                 }
-                pre_functions.insert(function.clone());
+                pre_functions.insert(access.func);
                 writers.push(json!({"function": function, "site": site, "kind": if access.via == Via::Direct {"direct"} else {"via-pointer"}}));
             }
-            Access::Ref if before => {
-                pre_functions.insert(function.clone());
-                pre_readers.push(json!({"function": function, "site": site}));
-            }
-            Access::Ref if after => {
-                post_functions.insert(function);
-            }
-            Access::Ref => {
+            Access::Ref if incomparable => {
                 return Err((
                     "no-single-P",
                     access_witness(
@@ -982,42 +1286,41 @@ fn build_payload(
                     ),
                 ))
             }
+            Access::Ref => {
+                if before {
+                    pre_functions.insert(access.func);
+                    pre_readers.push(json!({"function": function, "site": site}));
+                }
+                if after {
+                    post_functions.insert(access.func);
+                }
+            }
         }
     }
     writers.sort_by_key(|value| value.to_string());
     pre_readers.sort_by_key(|value| value.to_string());
     let both_phase = pre_functions
         .intersection(&post_functions)
-        .cloned()
+        .map(|function| analysis.functions()[*function].key.clone())
         .collect::<Vec<_>>();
-    let post_sample = post_functions.iter().take(16).cloned().collect::<Vec<_>>();
-    let mut spine_functions = Vec::new();
-    for function in evaluation
-        .spine
-        .origins
+    let post_sample = post_functions
         .iter()
-        .map(|origin| origin.function)
-    {
-        if !spine_functions.contains(&function) {
-            spine_functions.push(function);
-        }
-    }
-    let init_subtree = pre_functions
-        .iter()
+        .take(16)
+        .map(|function| analysis.functions()[*function].key.clone())
+        .collect::<Vec<_>>();
+    let init_functions = init_subtree_functions(&reachability, &pre_functions, &spine_functions);
+    let init_subtree = init_functions
+        .into_iter()
         .map(|function| {
-            let function_id = analysis.lookup_func(function);
-            let position = function_id.and_then(|function_id| {
-                spine_functions
-                    .iter()
-                    .position(|candidate| *candidate == function_id)
-            });
-            let sites = position
-                .filter(|position| *position > 0)
-                .and_then(|position| evaluation.path.get(position - 1))
-                .and_then(|callsite| analysis.callsites()[*callsite].loc.as_ref())
-                .map(|loc| vec![json!({"file":loc.file,"line":loc.line,"col":loc.col})])
-                .unwrap_or_default();
-            json!({"function": function, "spine_call_sites": sites})
+            let sites = reachability
+                .pre_entry_sites
+                .get(&function)
+                .into_iter()
+                .flatten()
+                .filter_map(|callsite| analysis.callsites()[*callsite].loc.as_ref())
+                .map(|loc| json!({"file":loc.file,"line":loc.line,"col":loc.col}))
+                .collect::<Vec<_>>();
+            json!({"function": analysis.functions()[function].key, "spine_call_sites": sites})
         })
         .collect::<Vec<_>>();
     let path = evaluation
@@ -1734,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_rules_report_omega_thread_taint_and_recursive_main_in_fixed_order() {
+    fn kill_rules_report_atexit_thread_taint_and_recursive_main_in_fixed_order() {
         let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
         let callback_signature = || {
             json!({
@@ -1749,7 +2052,7 @@ mod tests {
                 {
                     "key":"main", "sig":signature(),
                     "body":[
-                        {"kind":"call_direct", "callee":"sink", "sig":signature(),
+                        {"kind":"call_direct", "callee":"atexit", "sig":signature(),
                          "args":["writer"]},
                         {"kind":"call_direct", "callee":"pthread_create", "sig":signature(),
                          "args":["null", "null", "worker", "null"]},
@@ -1771,7 +2074,7 @@ mod tests {
                         {"kind":"unknown", "op":"asm", "reason":"inline_asm:test"}
                     ]
                 },
-                {"key":"sink", "sig":signature(), "external":true},
+                {"key":"atexit", "sig":signature(), "external":true},
                 {"key":"pthread_create", "sig":signature(), "external":true}
             ],
             "globals":[
@@ -1786,6 +2089,12 @@ mod tests {
             ..Opts::default()
         };
         let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let writer = analysis.lookup_func("writer").unwrap();
+        assert!(analysis.functions()[writer].address_escaped);
+        assert!(analysis.functions()[writer]
+            .escape_sources
+            .iter()
+            .any(|source| source.starts_with("external-call:main@")));
         let registry = crate::registry_access_facts(&analysis, &pir);
         let kills = evaluate_kill_rules(&analysis, &registry.thread_writers);
         let codes = |name: &str| {
@@ -2221,7 +2530,7 @@ mod tests {
         };
         let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
         let global = analysis.lookup_global("@g").unwrap();
-        let (entry, slots) = certificate_slots(
+        let (entry, slots, report) = certificate_slots(
             &analysis,
             &pir,
             &opts,
@@ -2238,5 +2547,274 @@ mod tests {
         assert_eq!(certificate["publication"]["publication_point"]["line"], 2);
         assert_eq!(certificate["writers"].as_array().unwrap().len(), 1);
         assert_eq!(certificate["readers"]["post_p_functions_count"], 1);
+        assert_eq!(report["coverage"]["certified_globals"], 1);
+        assert_eq!(report["coverage"]["client_relevant_mutable_globals"], 1);
+        assert_eq!(report["spine_descent_depth"]["histogram"]["0"], 1);
+    }
+
+    #[test]
+    fn o6_attributes_ordinary_pre_publication_helper_subtrees() {
+        let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
+        let loc = |line| json!({"file":"helpers.c","line":line,"col":1});
+        let mut pir: pangs_pir::Pir = serde_json::from_value(json!({
+            "module":"phase-helper-subtree",
+            "functions":[
+                {"key":"main", "sig":signature(), "body":[
+                    {"kind":"call_direct", "callee":"initialize", "sig":signature(),
+                     "args":[], "loc":loc(1)},
+                    {"kind":"global_ref", "global":"@g", "access":"ref", "loc":loc(4)}
+                ]},
+                {"key":"initialize", "sig":signature(), "body":[
+                    {"kind":"call_direct", "callee":"register", "sig":signature(),
+                     "args":[], "loc":loc(2)}
+                ]},
+                {"key":"register", "sig":signature(), "body":[
+                    {"kind":"global_ref", "global":"@g", "access":"mod", "loc":loc(3)},
+                    {"kind":"global_ref", "global":"@g", "access":"ref", "loc":loc(3)}
+                ]}
+            ],
+            "globals":[{"key":"@g"}]
+        }))
+        .unwrap();
+        let cfg_loc = |line| pangs_pir::Loc {
+            file: "helpers.c".into(),
+            line,
+            col: 1,
+            dir: None,
+            filename: None,
+        };
+        pir.lowering.statement_cfgs.insert(
+            "main".into(),
+            StatementCfg {
+                entry: 0,
+                boundaries: vec![
+                    StatementBoundary {
+                        loc: Some(cfg_loc(1)),
+                        stmt_indices: vec![0],
+                        ..boundary(0, &[1], &[])
+                    },
+                    StatementBoundary {
+                        loc: Some(cfg_loc(4)),
+                        stmt_indices: vec![1],
+                        ..boundary(1, &[], &[0])
+                    },
+                ],
+                source_mapping_available: true,
+            },
+        );
+        let opts = Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let global = analysis.lookup_global("@g").unwrap();
+        let (_, slots, report) = certificate_slots(
+            &analysis,
+            &pir,
+            &opts,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        let Certificate::Certified { certificate, .. } = &slots[&global] else {
+            panic!(
+                "expected certified helper-subtree slot: {:#?}",
+                slots[&global]
+            );
+        };
+        assert_eq!(certificate["writers"][0]["function"], "register");
+        assert_eq!(certificate["readers"]["pre_p"][0]["function"], "register");
+        assert_eq!(certificate["readers"]["post_p_functions_count"], 1);
+        assert_eq!(certificate["readers"]["post_p_sample"][0], "main");
+        assert_eq!(
+            certificate["init_subtree"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["function"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["initialize", "register"]
+        );
+        assert_eq!(
+            certificate["init_subtree"][0]["spine_call_sites"][0]["line"],
+            1
+        );
+        assert_eq!(
+            certificate["init_subtree"][1]["spine_call_sites"],
+            json!([])
+        );
+        assert_eq!(report["both_phase_bucket_sizes"]["histogram"]["0"], 1);
+    }
+
+    #[test]
+    fn o6_reports_helpers_reached_from_both_phases_exhaustively() {
+        let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
+        let loc = |line| json!({"file":"both.c","line":line,"col":1});
+        let mut pir: pangs_pir::Pir = serde_json::from_value(json!({
+            "module":"phase-both-helper",
+            "functions":[
+                {"key":"main", "sig":signature(), "body":[
+                    {"kind":"call_direct", "callee":"initialize", "sig":signature(),
+                     "args":[], "loc":loc(1)},
+                    {"kind":"call_direct", "callee":"run", "sig":signature(),
+                     "args":[], "loc":loc(5)}
+                ]},
+                {"key":"initialize", "sig":signature(), "body":[
+                    {"kind":"global_ref", "global":"@g", "access":"mod", "loc":loc(2)},
+                    {"kind":"call_direct", "callee":"shared", "sig":signature(),
+                     "args":[], "loc":loc(3)}
+                ]},
+                {"key":"run", "sig":signature(), "body":[
+                    {"kind":"call_direct", "callee":"shared", "sig":signature(),
+                     "args":[], "loc":loc(6)}
+                ]},
+                {"key":"shared", "sig":signature(), "body":[
+                    {"kind":"global_ref", "global":"@g", "access":"ref", "loc":loc(4)}
+                ]}
+            ],
+            "globals":[{"key":"@g"}]
+        }))
+        .unwrap();
+        let cfg_loc = |line| pangs_pir::Loc {
+            file: "both.c".into(),
+            line,
+            col: 1,
+            dir: None,
+            filename: None,
+        };
+        pir.lowering.statement_cfgs.insert(
+            "main".into(),
+            StatementCfg {
+                entry: 0,
+                boundaries: vec![
+                    StatementBoundary {
+                        loc: Some(cfg_loc(1)),
+                        stmt_indices: vec![0],
+                        ..boundary(0, &[1], &[])
+                    },
+                    StatementBoundary {
+                        loc: Some(cfg_loc(5)),
+                        stmt_indices: vec![1],
+                        ..boundary(1, &[], &[0])
+                    },
+                ],
+                source_mapping_available: true,
+            },
+        );
+        let opts = Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let global = analysis.lookup_global("@g").unwrap();
+        let (_, slots, _) = certificate_slots(
+            &analysis,
+            &pir,
+            &opts,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        let Certificate::Certified { certificate, .. } = &slots[&global] else {
+            panic!("expected certified both-phase slot: {:#?}", slots[&global]);
+        };
+        assert_eq!(certificate["readers"]["both_phase"], json!(["shared"]));
+        assert_eq!(certificate["readers"]["pre_p"][0]["function"], "shared");
+        assert_eq!(certificate["readers"]["post_p_sample"], json!(["shared"]));
+        assert_eq!(
+            certificate["init_subtree"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["function"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["initialize", "shared"]
+        );
+    }
+
+    #[test]
+    fn signal_reader_registration_constrains_publication_and_is_post_phase() {
+        let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
+        let loc = |line| json!({"file":"signal.c","line":line,"col":1});
+        let mut pir: pangs_pir::Pir = serde_json::from_value(json!({
+            "module":"phase-signal-reader",
+            "functions":[
+                {"key":"main", "sig":signature(), "body":[
+                    {"kind":"global_ref", "global":"@g", "access":"mod", "loc":loc(1)},
+                    {"kind":"call_direct", "callee":"signal", "sig":signature(),
+                     "args":["2", "handler"], "loc":loc(2)}
+                ]},
+                {"key":"handler", "sig":signature(), "address_taken":true, "body":[
+                    {"kind":"global_ref", "global":"@g", "access":"ref", "loc":loc(3)}
+                ]},
+                {"key":"signal", "sig":signature(), "external":true}
+            ],
+            "globals":[{"key":"@g"}]
+        }))
+        .unwrap();
+        let cfg_loc = |line| pangs_pir::Loc {
+            file: "signal.c".into(),
+            line,
+            col: 1,
+            dir: None,
+            filename: None,
+        };
+        pir.lowering.statement_cfgs.insert(
+            "main".into(),
+            StatementCfg {
+                entry: 0,
+                boundaries: vec![
+                    StatementBoundary {
+                        loc: Some(cfg_loc(1)),
+                        stmt_indices: vec![0],
+                        ..boundary(0, &[1], &[])
+                    },
+                    StatementBoundary {
+                        loc: Some(cfg_loc(2)),
+                        stmt_indices: vec![1],
+                        ..boundary(1, &[], &[0])
+                    },
+                ],
+                source_mapping_available: true,
+            },
+        );
+        let opts = Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let facts = crate::registry_access_facts(&analysis, &pir);
+        let global = analysis.lookup_global("@g").unwrap();
+        assert_eq!(
+            facts.escape_read_callsites[&global],
+            BTreeSet::from([CallsiteId(0)])
+        );
+        let (_, slots, _) = certificate_slots(
+            &analysis,
+            &pir,
+            &opts,
+            &facts.pseudo_read_callsites,
+            &facts.spawn_read_callsites,
+            &facts.escape_read_callsites,
+            &facts.thread_writers,
+        );
+        let Certificate::Certified { certificate, .. } = &slots[&global] else {
+            panic!(
+                "expected certified signal-reader slot: {:#?}",
+                slots[&global]
+            );
+        };
+        assert_eq!(certificate["publication"]["publication_point"]["line"], 2);
+        assert_eq!(certificate["readers"]["post_p_sample"], json!(["handler"]));
+        assert_eq!(certificate["readers"]["pre_p"], json!([]));
+        assert_eq!(
+            certificate["observations"]["escape_sites"][0]["function"],
+            "main"
+        );
     }
 }

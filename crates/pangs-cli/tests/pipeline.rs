@@ -2076,6 +2076,15 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
     assert_eq!(counter["facts"]["word_sized_scalar"]["value"], true);
     assert_eq!(counter["facts"]["word_sized_scalar"]["class"], "integer");
     assert_eq!(counter["facts"]["word_sized_scalar"]["signed"], true);
+    let phase_report = &disposition["run"]["analysis"]["phase_stationarity_report"];
+    assert!(phase_report["coverage"]["client_relevant_mutable_globals"]
+        .as_u64()
+        .is_some());
+    assert!(phase_report["quiescence_profile"].is_array());
+    assert!(phase_report["failure_code_counts"].is_object());
+    assert!(phase_report["no_single_p"]["witnesses"].is_array());
+    assert!(phase_report["both_phase_bucket_sizes"]["histogram"].is_object());
+    assert!(phase_report["spine_descent_depth"]["histogram"].is_object());
     assert!(out.join("pangs-audit.json").exists());
     let export_index: Value =
         serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
@@ -2110,7 +2119,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "f9ffbcd787c8486b129c04ed19b45d2ef9db54bcdb41ebd73a5069dcfde02861"
+        "192d9acf5bf28aa2ffb4b4a806fd408366bca8e63c3cea1b483723600e101698"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(
@@ -2266,6 +2275,63 @@ fn analyze_dispose_reports_registry_reachability_and_coupling() {
         .any(|edge| {
             edge["kind"] == "co-write" && edge["members"].as_array().unwrap().len() == 2
         }));
+}
+
+#[test]
+fn analyze_dispose_certifies_a_source_mapped_once_lock_candidate() {
+    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
+    let tmp = TempDir::new().unwrap();
+    let bc = tmp.path().join("phase-once-lock.bc");
+    let out = tmp.path().join("out");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = repo_root.join("fixtures/synthetic/disposition/phase_once_lock.c");
+    assert!(Command::new(CLANG_14)
+        .args(["-O0", "-g", "-emit-llvm", "-c"])
+        .arg(source)
+        .arg("-o")
+        .arg(&bc)
+        .status()
+        .unwrap()
+        .success());
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(&bc)
+        .arg("--out")
+        .arg(&out)
+        .arg("--build-mode")
+        .arg("executable")
+        .arg("--dispose")
+        .arg("--repo-root")
+        .arg(&repo_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
+    let configured = manifest["globals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|global| global["meta"]["llvm_name"] == "configured")
+        .expect("configured disposition record");
+    assert_eq!(
+        configured["facts"]["phase_stationarity"]["status"],
+        "certified"
+    );
+    let certificate = &configured["facts"]["phase_stationarity"]["certificate"];
+    assert_eq!(certificate["publication"]["publication_function"], "main");
+    assert_eq!(certificate["writers"][0]["function"], "initialize");
+    assert_eq!(certificate["init_subtree"][0]["function"], "initialize");
+    assert_eq!(configured["disposition"]["chosen"], "once-lock");
+    assert_eq!(
+        manifest["run"]["analysis"]["phase_stationarity_report"]["coverage"]["certified_globals"],
+        1
+    );
 }
 
 fn workspace_path(rel: &str) -> PathBuf {

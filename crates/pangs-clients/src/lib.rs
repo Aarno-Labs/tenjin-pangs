@@ -121,7 +121,7 @@ pub fn assemble_disposition_artifacts(
     let repo_root = fs::canonicalize(repo_root)
         .with_context(|| format!("resolve repo root {}", repo_root.display()))?;
     let registry_facts = registry_access_facts(analysis, module);
-    let (entry_spine, phase_slots) = phase_stationarity::certificate_slots(
+    let (entry_spine, phase_slots, phase_report) = phase_stationarity::certificate_slots(
         analysis,
         module,
         opts,
@@ -250,7 +250,7 @@ pub fn assemble_disposition_artifacts(
                 data_layout: target.data_layout.clone(),
                 supported_atomic_widths: target.supported_atomic_widths.clone(),
                 entry_spine,
-                extra: Extra::new(),
+                extra: BTreeMap::from([("phase_stationarity_report".into(), phase_report)]),
             },
             dispose: None,
             extra: Extra::new(),
