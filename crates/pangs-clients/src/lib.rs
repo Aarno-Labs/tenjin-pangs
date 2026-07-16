@@ -275,6 +275,7 @@ pub fn assemble_disposition_artifacts(
 struct RegistryAccessFacts {
     thread_visible: BTreeMap<GlobalId, Witness>,
     signal_context_access: BTreeMap<GlobalId, Witness>,
+    thread_writers: BTreeMap<GlobalId, Witness>,
 }
 
 fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> RegistryAccessFacts {
@@ -371,6 +372,12 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                         };
                         for global in affected {
                             facts.entry(global).or_insert_with(|| witness.clone());
+                            if kind == RegistryKind::Spawn && row.access == pangs_pir::Access::Mod {
+                                result
+                                    .thread_writers
+                                    .entry(global)
+                                    .or_insert_with(|| witness.clone());
+                            }
                         }
                     }
                 }

@@ -110,6 +110,8 @@ pub struct SolveResult {
     pub indirect_calls: Vec<IndirectCallResolution>,
     #[serde(default)]
     pub unknown_callers: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub function_escapes: BTreeMap<String, FunctionResolution>,
     #[serde(default)]
     pub globals: BTreeMap<String, GlobalResolution>,
     #[serde(default)]
@@ -134,6 +136,13 @@ pub struct SolveResult {
     pub node_pointee_external: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub metrics: SolveMetrics,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FunctionResolution {
+    pub address_escape: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escape_sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -776,6 +785,7 @@ impl<'a> Solver<'a> {
         }
 
         let mut unknown_callers = BTreeSet::new();
+        let mut function_escapes = BTreeMap::new();
         for func_index in 0..self.function_meta.len() {
             let Some(class) = self.function_object_class(func_index) else {
                 continue;
@@ -784,6 +794,22 @@ impl<'a> Solver<'a> {
             if self.classes[root].esc {
                 unknown_callers.insert(self.function_keys[func_index].clone());
             }
+            let escape_sources = self.classes[root]
+                .escape_sources
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let own_export = format!(
+                "exported-symbol:obj:function:{}",
+                self.function_keys[func_index]
+            );
+            function_escapes.insert(
+                self.function_keys[func_index].clone(),
+                FunctionResolution {
+                    address_escape: escape_sources.iter().any(|source| source != &own_export),
+                    escape_sources,
+                },
+            );
         }
 
         let mut stored_classes = BTreeSet::new();
@@ -808,9 +834,8 @@ impl<'a> Solver<'a> {
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let address_escape = escape_sources
-                .iter()
-                .any(|source| !source.starts_with("exported-symbol:"));
+            let own_export = format!("exported-symbol:obj:global:{}", global.key);
+            let address_escape = escape_sources.iter().any(|source| source != &own_export);
             let never_written = !escape_external && !stored_classes.contains(&root);
             globals.insert(
                 global.key.clone(),
@@ -922,6 +947,7 @@ impl<'a> Solver<'a> {
         SolveResult {
             indirect_calls,
             unknown_callers,
+            function_escapes,
             globals,
             nodes,
             node_points_to: materialized.direct,

@@ -96,6 +96,10 @@ pub struct FuncInfo {
     pub external: bool,
     pub exported: bool,
     pub address_taken: bool,
+    #[serde(skip)]
+    pub address_escaped: bool,
+    #[serde(skip)]
+    pub escape_witness: Option<String>,
     pub vararg: bool,
     pub sig: String,
 }
@@ -679,6 +683,8 @@ impl Analysis {
                 external: func.external,
                 exported: is_exported_func(func.exported, &func.key, opts),
                 address_taken: func.address_taken,
+                address_escaped: false,
+                escape_witness: None,
                 vararg: func.vararg(),
                 sig: signature_text(&func.sig),
             });
@@ -1022,6 +1028,10 @@ impl Analysis {
                             tier: Tier::Fsa,
                         });
                     }
+                    if functions[idx].address_taken && !func.external {
+                        functions[idx].address_escaped = true;
+                        functions[idx].escape_witness = Some("conservative-address-taken".into());
+                    }
                 }
             }
             Stage::Steens | Stage::Andersen => {
@@ -1287,6 +1297,18 @@ impl Analysis {
                     }
                 }
 
+                for function in &mut functions {
+                    if let Some(state) = solved.function_escapes.get(&function.key) {
+                        function.address_escaped = state.address_escape;
+                        let own_export = format!("exported-symbol:obj:function:{}", function.key);
+                        function.escape_witness = state
+                            .escape_sources
+                            .iter()
+                            .find(|source| *source != &own_export)
+                            .cloned();
+                    }
+                }
+
                 for global in &mut globals {
                     if let Some(state) = solved.globals.get(&global.key) {
                         global.escape = if state.escape_external {
@@ -1295,10 +1317,11 @@ impl Analysis {
                             EscapeStatus::Module
                         };
                         global.address_escaped = state.address_escape;
+                        let own_export = format!("exported-symbol:obj:global:{}", global.key);
                         global.escape_witness = state
                             .escape_sources
                             .iter()
-                            .find(|source| !source.starts_with("exported-symbol:"))
+                            .find(|source| *source != &own_export)
                             .cloned();
                         global.never_written = state.never_written;
                     }
@@ -2517,6 +2540,8 @@ mod callgraph_sort_tests {
                 external: false,
                 exported: false,
                 address_taken: false,
+                address_escaped: false,
+                escape_witness: None,
                 vararg: false,
                 sig: "void()".to_string(),
             },
@@ -2527,6 +2552,8 @@ mod callgraph_sort_tests {
                 external: false,
                 exported: false,
                 address_taken: false,
+                address_escaped: false,
+                escape_witness: None,
                 vararg: false,
                 sig: "void()".to_string(),
             },
