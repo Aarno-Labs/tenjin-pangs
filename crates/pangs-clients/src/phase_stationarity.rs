@@ -256,6 +256,127 @@ pub(crate) struct SplicedSpine {
     pub(crate) origins: Vec<BoundaryOrigin>,
 }
 
+pub(crate) struct DescentEvaluation {
+    pub(crate) spine: SplicedSpine,
+    pub(crate) selection: Result<PublicationSelection, SelectionFailure>,
+    pub(crate) path: Vec<CallsiteId>,
+    pub(crate) exhausted: bool,
+}
+
+/// Runs O2/O3 on `root`, repeatedly splicing the uniquely called current leaf up to `max_depth`.
+/// `exhausted` is set only when another sound descent was available after consuming the bound;
+/// callers map that case to `spine-descent-exhausted` instead of the provisional O3 failure.
+pub(crate) fn evaluate_with_descent(
+    analysis: &Analysis,
+    module: &Pir,
+    root: FuncId,
+    global: GlobalId,
+    pseudo_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
+    max_depth: usize,
+) -> Option<DescentEvaluation> {
+    let root_info = &analysis.functions()[root];
+    let root_cfg = module.lowering.statement_cfgs.get(&root_info.key)?;
+    let root_inputs =
+        assemble_spine_inputs(analysis, module, root, root_cfg, pseudo_read_callsites);
+    let mut spine = SplicedSpine {
+        cfg: root_cfg.clone(),
+        generated_writes: root_inputs.generated_writes,
+        observations: root_inputs
+            .observations
+            .get(&global)
+            .cloned()
+            .unwrap_or_default(),
+        origins: root_cfg
+            .boundaries
+            .iter()
+            .map(|boundary| BoundaryOrigin {
+                function: root,
+                boundary: boundary.id,
+            })
+            .collect(),
+    };
+    let mut leaf = root;
+    let mut path = Vec::new();
+    loop {
+        let selection = Quiescence::compute(
+            &spine.cfg,
+            analysis.globals().len(),
+            &spine.generated_writes,
+        )
+        .map_err(|_| SelectionFailure::NoEntrySpine)
+        .and_then(|quiescence| {
+            select_publication(&spine.cfg, &quiescence, global, &spine.observations)
+        });
+        if selection.is_ok() {
+            return Some(DescentEvaluation {
+                spine,
+                selection,
+                path,
+                exhausted: false,
+            });
+        }
+
+        let leaf_info = &analysis.functions()[leaf];
+        let Some(leaf_cfg) = module.lowering.statement_cfgs.get(&leaf_info.key) else {
+            return Some(DescentEvaluation {
+                spine,
+                selection,
+                path,
+                exhausted: false,
+            });
+        };
+        let Some(candidate) = descent_candidate(analysis, module, leaf, leaf_cfg, global) else {
+            return Some(DescentEvaluation {
+                spine,
+                selection,
+                path,
+                exhausted: false,
+            });
+        };
+        if path.len() == max_depth {
+            return Some(DescentEvaluation {
+                spine,
+                selection,
+                path,
+                exhausted: true,
+            });
+        }
+        let composite_boundary =
+            spine.origins.iter().position(|origin| {
+                origin.function == leaf && origin.boundary == candidate.boundary
+            })? as u32;
+        let child_info = &analysis.functions()[candidate.callee];
+        let Some(child_cfg) = module.lowering.statement_cfgs.get(&child_info.key) else {
+            return Some(DescentEvaluation {
+                spine,
+                selection,
+                path,
+                exhausted: false,
+            });
+        };
+        let child_inputs = assemble_spine_inputs(
+            analysis,
+            module,
+            candidate.callee,
+            child_cfg,
+            pseudo_read_callsites,
+        );
+        let Ok(next) = splice_into_spine(
+            spine,
+            composite_boundary,
+            candidate.callee,
+            child_cfg,
+            &child_inputs,
+            global,
+        ) else {
+            return None;
+        };
+        spine = next;
+        path.push(candidate.callsite);
+        leaf = candidate.callee;
+    }
+}
+
 pub(crate) fn splice_unique_call(
     parent_function: FuncId,
     parent_cfg: &StatementCfg,
@@ -271,17 +392,51 @@ pub(crate) fn splice_unique_call(
     {
         return Err("statement CFG and gen vector lengths differ");
     }
+    let parent = SplicedSpine {
+        cfg: parent_cfg.clone(),
+        generated_writes: parent_inputs.generated_writes.clone(),
+        observations: parent_inputs
+            .observations
+            .get(&global)
+            .cloned()
+            .unwrap_or_default(),
+        origins: parent_cfg
+            .boundaries
+            .iter()
+            .map(|boundary| BoundaryOrigin {
+                function: parent_function,
+                boundary: boundary.id,
+            })
+            .collect(),
+    };
+    splice_into_spine(
+        parent,
+        call_boundary,
+        child_function,
+        child_cfg,
+        child_inputs,
+        global,
+    )
+}
+
+fn splice_into_spine(
+    parent: SplicedSpine,
+    call_boundary: u32,
+    child_function: FuncId,
+    child_cfg: &StatementCfg,
+    child_inputs: &SpineInputs,
+    global: GlobalId,
+) -> Result<SplicedSpine, &'static str> {
     let call_index = call_boundary as usize;
-    let Some(call) = parent_cfg.boundaries.get(call_index) else {
+    let Some(call) = parent.cfg.boundaries.get(call_index) else {
         return Err("descent call boundary is out of range");
     };
     if child_cfg.boundaries.is_empty() || child_cfg.entry as usize >= child_cfg.boundaries.len() {
         return Err("descent child has no entry spine");
     }
-
-    let child_offset = parent_cfg.boundaries.len() as u32;
+    let child_offset = parent.cfg.boundaries.len() as u32;
     let return_successors = call.successors.clone();
-    let mut boundaries = parent_cfg.boundaries.clone();
+    let mut boundaries = parent.cfg.boundaries.clone();
     boundaries[call_index].successors = vec![child_offset + child_cfg.entry];
     // Publication immediately before a still-executing call is not a valid replacement for a
     // boundary after it, so the gateway itself is never source-insertable.
@@ -303,18 +458,15 @@ pub(crate) fn splice_unique_call(
     }
     rebuild_predecessors(&mut boundaries)?;
 
-    let mut generated_writes = parent_inputs.generated_writes.clone();
+    let mut generated_writes = parent.generated_writes;
     // Eligibility establishes that the global's effect at this boundary came only from the
     // descended call. Other globals remain conservative because this splice is per-global.
     generated_writes[call_index].retain(|candidate| *candidate != global);
     generated_writes.extend(child_inputs.generated_writes.iter().cloned());
 
-    let mut observations = parent_inputs
+    let mut observations = parent
         .observations
-        .get(&global)
         .into_iter()
-        .flatten()
-        .copied()
         // Attributed reads at the replaced call are now represented inside the child. A
         // non-routable registration observation remains attached to the call gateway.
         .filter(|observation| observation.boundary != call_boundary || !observation.routable_pre_p)
@@ -333,14 +485,7 @@ pub(crate) fn splice_unique_call(
     observations.sort();
     observations.dedup();
 
-    let mut origins = parent_cfg
-        .boundaries
-        .iter()
-        .map(|boundary| BoundaryOrigin {
-            function: parent_function,
-            boundary: boundary.id,
-        })
-        .collect::<Vec<_>>();
+    let mut origins = parent.origins;
     origins.extend(child_cfg.boundaries.iter().map(|boundary| BoundaryOrigin {
         function: child_function,
         boundary: boundary.id,
@@ -348,8 +493,8 @@ pub(crate) fn splice_unique_call(
 
     Ok(SplicedSpine {
         cfg: StatementCfg {
-            entry: parent_cfg.entry,
-            source_mapping_available: parent_cfg.source_mapping_available
+            entry: parent.cfg.entry,
+            source_mapping_available: parent.cfg.source_mapping_available
                 && child_cfg.source_mapping_available,
             boundaries,
         },
@@ -993,8 +1138,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        assemble_spine_inputs, descent_candidate, evaluate_kill_rules, select_publication,
-        splice_unique_call, FuncId, GlobalId, Observation, Quiescence, SelectionFailure,
+        assemble_spine_inputs, descent_candidate, evaluate_kill_rules, evaluate_with_descent,
+        select_publication, splice_unique_call, FuncId, GlobalId, Observation, Quiescence,
+        SelectionFailure,
     };
 
     fn boundary(id: u32, successors: &[u32], predecessors: &[u32]) -> StatementBoundary {
@@ -1471,6 +1617,89 @@ mod tests {
         assert_eq!(
             descent_candidate(&analysis, &pir, FuncId(0), &cfg, global),
             None
+        );
+    }
+
+    #[test]
+    fn bounded_descent_repeats_and_reports_true_exhaustion() {
+        let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
+        let mut pir: pangs_pir::Pir = serde_json::from_value(json!({
+            "module":"phase-deep-descent",
+            "functions":[
+                {"key":"main", "sig":signature(), "body":[
+                    {"kind":"call_direct", "callee":"wrapper", "sig":signature(), "args":[]}
+                ]},
+                {"key":"wrapper", "sig":signature(), "body":[
+                    {"kind":"call_direct", "callee":"run", "sig":signature(), "args":[]}
+                ]},
+                {"key":"run", "sig":signature(), "body":[
+                    {"kind":"global_ref", "global":"@g", "access":"mod"},
+                    {"kind":"global_ref", "global":"@g", "access":"ref"}
+                ]}
+            ],
+            "globals":[{"key":"@g"}]
+        }))
+        .unwrap();
+        let shell_cfg = || StatementCfg {
+            entry: 0,
+            boundaries: vec![StatementBoundary {
+                stmt_indices: vec![0],
+                ..boundary(0, &[], &[])
+            }],
+            source_mapping_available: true,
+        };
+        pir.lowering
+            .statement_cfgs
+            .insert("main".into(), shell_cfg());
+        pir.lowering
+            .statement_cfgs
+            .insert("wrapper".into(), shell_cfg());
+        pir.lowering.statement_cfgs.insert(
+            "run".into(),
+            StatementCfg {
+                entry: 0,
+                boundaries: vec![
+                    StatementBoundary {
+                        stmt_indices: vec![0],
+                        ..boundary(0, &[1], &[])
+                    },
+                    StatementBoundary {
+                        stmt_indices: vec![1],
+                        ..boundary(1, &[], &[0])
+                    },
+                ],
+                source_mapping_available: true,
+            },
+        );
+        let analysis = Analysis::run_with_disposition(
+            &pir,
+            &Opts {
+                stage: Stage::Steens,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let global = analysis.lookup_global("@g").unwrap();
+
+        let exhausted =
+            evaluate_with_descent(&analysis, &pir, FuncId(0), global, &BTreeMap::new(), 1).unwrap();
+        assert!(exhausted.exhausted);
+        assert_eq!(exhausted.path, vec![CallsiteId(0)]);
+        assert!(exhausted.selection.is_err());
+
+        let completed =
+            evaluate_with_descent(&analysis, &pir, FuncId(0), global, &BTreeMap::new(), 2).unwrap();
+        assert!(!completed.exhausted);
+        assert_eq!(completed.path, vec![CallsiteId(0), CallsiteId(1)]);
+        let selection = completed.selection.unwrap();
+        assert_eq!(
+            completed.spine.origins[selection.chosen as usize].function,
+            FuncId(2)
+        );
+        assert_eq!(
+            completed.spine.origins[selection.chosen as usize].boundary,
+            1
         );
     }
 }
