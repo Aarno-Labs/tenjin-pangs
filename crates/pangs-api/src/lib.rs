@@ -638,6 +638,8 @@ pub struct Analysis {
     global_lookup: HashMap<String, GlobalId>,
     #[serde(skip)]
     registry_entries: BTreeMap<CallsiteId, RegistryEntryResolution>,
+    #[serde(skip)]
+    registry_apis: Vec<RegistryApi>,
 }
 
 impl Analysis {
@@ -1039,8 +1041,8 @@ impl Analysis {
                     },
                 );
                 pag_build_us = pag_started.elapsed().as_micros() as u64;
-                let registry_labels = if disposition_facts {
-                    direct_registry_target_labels(&pag, &registry_apis)
+                let mut registry_labels = if disposition_facts {
+                    registry_target_labels(&pag, None, &registry_apis)
                 } else {
                     BTreeSet::new()
                 };
@@ -1087,8 +1089,8 @@ impl Analysis {
                         },
                     );
                     pag_build_us += pag_started.elapsed().as_micros() as u64;
-                    let registry_labels = if disposition_facts {
-                        direct_registry_target_labels(&pag, &registry_apis)
+                    registry_labels = if disposition_facts {
+                        registry_target_labels(&pag, None, &registry_apis)
                     } else {
                         BTreeSet::new()
                     };
@@ -1125,11 +1127,46 @@ impl Analysis {
                     };
                     solve_us += solve_started.elapsed().as_micros() as u64;
                 }
+                if disposition_facts {
+                    // Direct calls identify their designated operands before solving. An
+                    // indirect call can only be recognized as a registry call from the final
+                    // call graph, so perform one bounded narrow re-solve when that discovers
+                    // additional operand labels. No all-node points-to export is involved.
+                    let expanded_labels =
+                        registry_target_labels(&pag, Some(&solved), &registry_apis);
+                    if expanded_labels != registry_labels {
+                        registry_labels = expanded_labels;
+                        let solve_started = Instant::now();
+                        solved = match opts.stage {
+                            Stage::Andersen => solve_andersen_with_overrides_and_target_points_to(
+                                module,
+                                &pag,
+                                opts.build_mode.into(),
+                                opts.partition_budget,
+                                &simple_exact_targets,
+                                confined_functions,
+                                &registry_labels,
+                            ),
+                            _ => solve_steensgaard_with_target_points_to(
+                                module,
+                                &pag,
+                                opts.build_mode.into(),
+                                &registry_labels,
+                            ),
+                        };
+                        solve_us += solve_started.elapsed().as_micros() as u64;
+                    }
+                }
                 let safe_indirect_varargs =
                     safe_indirect_vararg_callsites(module, &indirect_vararg_keys, &solved);
                 if disposition_facts {
-                    registry_entries =
-                        resolve_registry_entries(&pag, &solved, &func_lookup, &registry_apis);
+                    registry_entries = resolve_registry_entries(
+                        &pag,
+                        &solved,
+                        &func_lookup,
+                        &registry_apis,
+                        &registry_labels,
+                    );
                 }
                 solver_metrics = Some(solved.metrics.clone());
                 let solver_postprocess_started = Instant::now();
@@ -1567,6 +1604,7 @@ impl Analysis {
             func_lookup,
             global_lookup,
             registry_entries,
+            registry_apis,
         })
     }
 
@@ -1612,6 +1650,13 @@ impl Analysis {
 
     pub fn registry_entry(&self, callsite: CallsiteId) -> Option<&RegistryEntryResolution> {
         self.registry_entries.get(&callsite)
+    }
+
+    /// Effective spawn/signal registry definitions for this analysis run (built-ins with
+    /// configured replacements/extensions applied). Policy clients use this single registry
+    /// source rather than duplicating names or operand conventions.
+    pub fn registry_apis(&self) -> &[RegistryApi] {
+        &self.registry_apis
     }
 
     pub fn metrics(&self) -> &Metrics {
@@ -3508,17 +3553,40 @@ fn registry_spec(name: &str, registries: &[RegistryApi]) -> Option<(RegistryKind
     })
 }
 
-fn direct_registry_target_labels(pag: &Pag, registries: &[RegistryApi]) -> BTreeSet<String> {
-    pag.callsites
-        .iter()
-        .filter_map(|callsite| {
-            let (_, index, pointee) = registry_spec(callsite.callee.as_deref()?, registries)?;
-            (!pointee)
-                .then(|| callsite.args.get(index))
-                .flatten()
-                .map(|node| pag.nodes[node.0 as usize].label.clone())
-        })
-        .collect()
+fn registry_target_labels(
+    pag: &Pag,
+    solved: Option<&pangs_solve::SolveResult>,
+    registries: &[RegistryApi],
+) -> BTreeSet<String> {
+    let mut labels = BTreeSet::new();
+    for callsite in &pag.callsites {
+        let mut specs = callsite
+            .callee
+            .as_deref()
+            .and_then(|name| registry_spec(name, registries))
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(resolution) = solved.and_then(|solved| {
+            solved
+                .indirect_calls
+                .iter()
+                .find(|resolution| resolution.callsite_key == callsite.key)
+        }) {
+            for target in &resolution.targets {
+                if let Some(spec) = registry_spec(target, registries) {
+                    if !specs.contains(&spec) {
+                        specs.push(spec);
+                    }
+                }
+            }
+        }
+        for (_, index, _) in specs {
+            if let Some(node) = callsite.args.get(index) {
+                labels.insert(pag.nodes[node.0 as usize].label.clone());
+            }
+        }
+    }
+    labels
 }
 
 fn resolve_registry_entries(
@@ -3526,6 +3594,7 @@ fn resolve_registry_entries(
     solved: &pangs_solve::SolveResult,
     func_lookup: &HashMap<String, FuncId>,
     registries: &[RegistryApi],
+    targeted_labels: &BTreeSet<String>,
 ) -> BTreeMap<CallsiteId, RegistryEntryResolution> {
     let mut entries = BTreeMap::new();
     for (index, callsite) in pag.callsites.iter().enumerate() {
@@ -3551,7 +3620,13 @@ fn resolve_registry_entries(
         for (kind, arg_index, pointee) in specs {
             let node = callsite.args.get(arg_index);
             let label = node.map(|node| pag.nodes[node.0 as usize].label.as_str());
-            let allocations = label.and_then(|label| solved.node_points_to.get(label));
+            let allocations = label.and_then(|label| {
+                if pointee {
+                    solved.node_pointee_points_to.get(label)
+                } else {
+                    solved.node_points_to.get(label)
+                }
+            });
             let mut targets = allocations
                 .into_iter()
                 .flatten()
@@ -3559,29 +3634,37 @@ fn resolve_registry_entries(
                 .collect::<Vec<_>>();
             targets.sort();
             targets.dedup();
-            let external = label
-                .and_then(|label| solved.nodes.get(label))
-                .is_some_and(|node| node.external);
-            let directly_targeted = callsite
-                .callee
-                .as_deref()
-                .and_then(|name| registry_spec(name, registries))
-                .is_some()
-                && !pointee
-                && node.is_some();
+            let external = label.is_some_and(|label| {
+                if pointee {
+                    pointee_operand_external(solved, label, &callsite.key)
+                } else {
+                    solved.nodes.get(label).is_some_and(|node| node.external)
+                }
+            });
+            let targeted = label.is_some_and(|label| targeted_labels.contains(label));
             entries.insert(
                 CallsiteId(index as u32),
                 RegistryEntryResolution {
                     kind,
                     targets,
-                    unresolved: pointee
-                        || external
-                        || (!directly_targeted && allocations.is_none()),
+                    unresolved: external || !targeted,
                 },
             );
         }
     }
     entries
+}
+
+fn pointee_operand_external(
+    solved: &pangs_solve::SolveResult,
+    label: &str,
+    callsite_key: &str,
+) -> bool {
+    let own_boundary = format!("external-call:{callsite_key}");
+    solved
+        .node_pointee_external
+        .get(label)
+        .is_some_and(|sources| sources.iter().any(|source| source != &own_boundary))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -5418,4 +5501,32 @@ fn find(parent: &mut [usize], x: usize) -> usize {
         parent[x] = find(parent, parent[x]);
     }
     parent[x]
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use std::collections::BTreeSet;
+
+    use pangs_solve::SolveResult;
+
+    use super::pointee_operand_external;
+
+    #[test]
+    fn pointee_registry_ignores_only_its_own_boundary_uncertainty() {
+        let label = "val:install:%action";
+        let site = "install@file.c:10:3#0";
+        let mut solved = SolveResult::default();
+        solved.node_pointee_external.insert(
+            label.into(),
+            BTreeSet::from([format!("external-call:{site}")]),
+        );
+        assert!(!pointee_operand_external(&solved, label, site));
+
+        solved
+            .node_pointee_external
+            .get_mut(label)
+            .unwrap()
+            .insert("external-call:earlier@file.c:9:3#0".into());
+        assert!(pointee_operand_external(&solved, label, site));
+    }
 }

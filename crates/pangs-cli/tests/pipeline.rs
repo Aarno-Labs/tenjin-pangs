@@ -2220,6 +2220,14 @@ fn analyze_dispose_reports_registry_reachability_and_coupling() {
         .iter()
         .find(|global| global["meta"]["llvm_name"] == "custom_state")
         .unwrap();
+    let indirect_worker = globals
+        .iter()
+        .find(|global| global["meta"]["llvm_name"] == "indirect_worker_state")
+        .unwrap();
+    let sigaction_handler = globals
+        .iter()
+        .find(|global| global["meta"]["llvm_name"] == "sigaction_handler_state")
+        .unwrap();
     assert_eq!(left["facts"]["thread_visible"]["value"], true);
     assert_eq!(left["facts"]["signal_context_access"]["value"], false);
     assert_eq!(right["facts"]["thread_visible"]["value"], true);
@@ -2231,6 +2239,16 @@ fn analyze_dispose_reports_registry_reachability_and_coupling() {
     );
     assert_eq!(custom["facts"]["thread_visible"]["value"], true);
     assert_eq!(custom["facts"]["signal_context_access"]["value"], false);
+    assert_eq!(indirect_worker["facts"]["thread_visible"]["value"], true);
+    assert_eq!(
+        indirect_worker["facts"]["signal_context_access"]["value"],
+        false
+    );
+    assert_eq!(sigaction_handler["facts"]["thread_visible"]["value"], false);
+    assert_eq!(
+        sigaction_handler["facts"]["signal_context_access"]["value"],
+        true
+    );
     assert_eq!(
         manifest["run"]["analysis"]["opts"]["disposition_registries"][0]["name"],
         "register_worker"

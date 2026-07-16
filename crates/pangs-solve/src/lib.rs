@@ -120,6 +120,18 @@ pub struct SolveResult {
     /// `var_points_to` over named allocations, and — for object nodes — `ptr_points_to`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub node_points_to: BTreeMap<String, BTreeSet<String>>,
+    /// Named allocations reachable by loading from memory designated by a targeted node:
+    /// node -> pointee memory -> stored pointer target. This is populated only for the same
+    /// narrow label set as `node_points_to`, for registry operands such as `sigaction`'s
+    /// `struct sigaction *` argument.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_pointee_points_to: BTreeMap<String, BTreeSet<String>>,
+    /// Targeted nodes whose reachable pointee memory may contain an external/unknown pointer,
+    /// with the boundary sources that caused that uncertainty. A registry consumer can exclude
+    /// its own call boundary: passing a local input struct to `sigaction` makes the struct escape
+    /// at that call, but does not make its entry-time handler value unknown.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_pointee_external: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub metrics: SolveMetrics,
 }
@@ -411,6 +423,13 @@ pub(crate) enum PointsToMaterialization {
     AllNodes,
     GlobalObjects,
     Targeted,
+}
+
+#[derive(Default)]
+struct MaterializedPointsTo {
+    direct: BTreeMap<String, BTreeSet<String>>,
+    through_memory: BTreeMap<String, BTreeSet<String>>,
+    through_memory_external: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -895,8 +914,8 @@ impl<'a> Solver<'a> {
         self.metrics.rounds = 1;
         let metrics = self.metrics.clone();
 
-        let node_points_to = match self.points_to_materialization {
-            PointsToMaterialization::None => BTreeMap::new(),
+        let materialized = match self.points_to_materialization {
+            PointsToMaterialization::None => MaterializedPointsTo::default(),
             mode => self.materialize_points_to(mode),
         };
 
@@ -905,7 +924,9 @@ impl<'a> Solver<'a> {
             unknown_callers,
             globals,
             nodes,
-            node_points_to,
+            node_points_to: materialized.direct,
+            node_pointee_points_to: materialized.through_memory,
+            node_pointee_external: materialized.through_memory_external,
             metrics,
         }
     }
@@ -914,12 +935,11 @@ impl<'a> Solver<'a> {
     /// `global_objs ∪ fn_objs` of `find(pointee(class_of(node)))`. Object nodes thus expose
     /// `ptr_points_to` (what a memory cell holds); value/param/return nodes expose
     /// `operand_points_to`. Memoized per pointee-class root, so this is O(#nodes).
-    fn materialize_points_to(
-        &mut self,
-        mode: PointsToMaterialization,
-    ) -> BTreeMap<String, BTreeSet<String>> {
+    fn materialize_points_to(&mut self, mode: PointsToMaterialization) -> MaterializedPointsTo {
         let mut by_pointee_root: Vec<Option<BTreeSet<String>>> = vec![None; self.classes.len()];
         let mut out = BTreeMap::new();
+        let mut pointee_out = BTreeMap::new();
+        let mut pointee_external = BTreeMap::new();
         for node in &self.pag.nodes {
             if mode == PointsToMaterialization::GlobalObjects
                 && !matches!(
@@ -958,8 +978,56 @@ impl<'a> Solver<'a> {
             if !allocs.is_empty() {
                 out.insert(node.label.clone(), allocs);
             }
+
+            // A field-insensitive load through the designated pointer. The first pointee is
+            // the reachable memory object/class; its pointee is what that memory may store.
+            // This is registry-only targeted output: the existing diagnostic/global accessors
+            // retain their original output shape and cost.
+            if mode == PointsToMaterialization::Targeted && self.classes[pointee].ext {
+                pointee_external
+                    .entry(node.label.clone())
+                    .or_insert_with(BTreeSet::new)
+                    .insert("omega:reachable-memory".to_string());
+            }
+            if mode == PointsToMaterialization::Targeted {
+                let Some(contents) = self.classes[pointee].pointee else {
+                    continue;
+                };
+                let contents = self.find(contents);
+                if self.classes[contents].ext {
+                    let sources = if self.classes[pointee].escape_sources.is_empty() {
+                        BTreeSet::from(["omega:reachable-contents".to_string()])
+                    } else {
+                        self.classes[pointee].escape_sources.clone()
+                    };
+                    pointee_external
+                        .entry(node.label.clone())
+                        .or_insert_with(BTreeSet::new)
+                        .extend(sources);
+                }
+                let contents_allocs = if let Some(cached) = &by_pointee_root[contents] {
+                    cached.clone()
+                } else {
+                    let mut allocs = BTreeSet::new();
+                    for &g in &self.classes[contents].global_objs {
+                        allocs.insert(self.global_keys[g].clone());
+                    }
+                    for &f in &self.classes[contents].fn_objs {
+                        allocs.insert(self.function_keys[f].clone());
+                    }
+                    by_pointee_root[contents] = Some(allocs.clone());
+                    allocs
+                };
+                if !contents_allocs.is_empty() {
+                    pointee_out.insert(node.label.clone(), contents_allocs);
+                }
+            }
         }
-        out
+        MaterializedPointsTo {
+            direct: out,
+            through_memory: pointee_out,
+            through_memory_external: pointee_external,
+        }
     }
 
     fn process_class(&mut self, class: usize) {

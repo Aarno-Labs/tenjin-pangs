@@ -12,7 +12,8 @@ pub use cc2json::{run_cc2json, Cc2jsonOpts};
 
 use pangs_api::{
     Analysis, BuildMode, CallEdge, Callee, Caller, ComponentInfo, FuncId, GlobalId, GlobalTarget,
-    ModRef, Opts, RegistryKind, StationarityVerdict, StationarityWriter,
+    ModRef, Opts, RegistryApi, RegistryEntryOperand, RegistryKind, StationarityVerdict,
+    StationarityWriter,
 };
 use pangs_manifest::{
     canonicalize_audit, AlwaysFalse, AnalysisRun, AuditRecord, AuditScope, AuditSource,
@@ -295,7 +296,7 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                 vec![(entry.kind, 0, false)]
             } else {
                 direct_callee
-                    .and_then(registry_spec)
+                    .and_then(|name| registry_spec(name, analysis.registry_apis()))
                     .into_iter()
                     .collect::<Vec<_>>()
             };
@@ -304,7 +305,9 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                     let Callee::Func(callee) = callee else {
                         continue;
                     };
-                    if let Some(spec) = registry_spec(&analysis.functions()[*callee].key) {
+                    if let Some(spec) =
+                        registry_spec(&analysis.functions()[*callee].key, analysis.registry_apis())
+                    {
                         if !specs.contains(&spec) {
                             specs.push(spec);
                         }
@@ -376,14 +379,15 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
     result
 }
 
-fn registry_spec(name: &str) -> Option<(RegistryKind, usize, bool)> {
-    match name.strip_prefix('@').unwrap_or(name) {
-        "pthread_create" => Some((RegistryKind::Spawn, 2, false)),
-        "thrd_create" => Some((RegistryKind::Spawn, 1, false)),
-        "signal" => Some((RegistryKind::Signal, 1, false)),
-        "sigaction" => Some((RegistryKind::Signal, 1, true)),
-        _ => None,
-    }
+fn registry_spec(name: &str, registries: &[RegistryApi]) -> Option<(RegistryKind, usize, bool)> {
+    let name = name.strip_prefix('@').unwrap_or(name);
+    let registry = registries.iter().find(|registry| registry.name == name)?;
+    Some(match registry.entry {
+        RegistryEntryOperand::Arg { arg } => (registry.kind, arg, false),
+        RegistryEntryOperand::PointeeOfArg { pointee_of_arg } => {
+            (registry.kind, pointee_of_arg, true)
+        }
+    })
 }
 
 fn registry_witness(
