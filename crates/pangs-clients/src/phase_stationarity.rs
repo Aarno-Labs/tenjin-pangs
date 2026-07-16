@@ -627,23 +627,43 @@ pub(crate) fn assemble_spine_inputs(
         }
     }
 
-    // Function-coalesced alias rows cannot safely be located from their preferred witness.
-    for row in analysis
-        .modrefs()
+    // The unaggregated site ledger is authoritative for pointer accesses. A statement index is
+    // exact; otherwise every boundary at the same debug location is used. Missing/unmatched
+    // locations conservatively affect the whole function.
+    for site in analysis
+        .access_sites()
         .iter()
-        .filter(|row| row.func == function && row.via != Via::Direct)
+        .filter(|site| site.func == function && site.via != Via::Direct)
     {
-        for global in affected_globals(analysis, row) {
-            for boundary in &cfg.boundaries {
-                add_access(
-                    &mut generated[boundary.id as usize],
-                    &mut observations,
-                    boundary.id,
-                    global,
-                    row.access,
-                    true,
-                );
+        let mut boundaries = site
+            .statement_index
+            .and_then(|statement| statement_boundary.get(&statement).copied())
+            .into_iter()
+            .collect::<Vec<_>>();
+        if boundaries.is_empty() {
+            if let Some(loc) = &site.loc {
+                boundaries.extend(cfg.boundaries.iter().filter_map(|boundary| {
+                    boundary.loc.as_ref().and_then(|candidate| {
+                        (candidate.file == loc.file
+                            && candidate.line == loc.line
+                            && candidate.col == loc.col)
+                            .then_some(boundary.id)
+                    })
+                }));
             }
+        }
+        if boundaries.is_empty() {
+            boundaries.extend(cfg.boundaries.iter().map(|boundary| boundary.id));
+        }
+        for boundary in boundaries {
+            add_access(
+                &mut generated[boundary as usize],
+                &mut observations,
+                boundary,
+                site.global,
+                site.access,
+                true,
+            );
         }
     }
 
@@ -1492,6 +1512,50 @@ mod tests {
                     routable_pre_p: true,
                 }]
         }));
+    }
+
+    #[test]
+    fn pointer_site_ledger_maps_alias_and_top_writes_to_exact_boundaries() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/m1_6/aliased_unknown_modref.pir.json");
+        let pir = pangs_pir::Pir::from_path(fixture).unwrap();
+        let analysis = Analysis::run_with_disposition(
+            &pir,
+            &Opts {
+                stage: Stage::Steens,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let boundaries = (0..7)
+            .map(|id| {
+                let mut result = boundary(id, &[], &[]);
+                result.loc = Some(pangs_pir::Loc {
+                    file: "m1_6.c".into(),
+                    line: id + 1,
+                    col: 1,
+                    dir: None,
+                    filename: None,
+                });
+                result.stmt_indices = vec![id];
+                result.successors = if id == 6 { vec![] } else { vec![id + 1] };
+                result.predecessors = if id == 0 { vec![] } else { vec![id - 1] };
+                result
+            })
+            .collect();
+        let cfg = StatementCfg {
+            entry: 0,
+            boundaries,
+            source_mapping_available: true,
+        };
+        let inputs = assemble_spine_inputs(&analysis, &pir, FuncId(0), &cfg, &BTreeMap::new());
+        let direct = analysis.lookup_global("@Direct").unwrap();
+        let aliased = analysis.lookup_global("@Aliased").unwrap();
+        assert_eq!(inputs.generated_writes[3], vec![aliased]);
+        assert_eq!(inputs.generated_writes[6], vec![direct, aliased]);
+        assert!(inputs.generated_writes[..3].iter().all(Vec::is_empty));
+        assert!(inputs.generated_writes[4..6].iter().all(Vec::is_empty));
     }
 
     #[test]

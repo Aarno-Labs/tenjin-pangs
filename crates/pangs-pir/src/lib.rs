@@ -419,7 +419,7 @@ fn bump(map: &mut BTreeMap<String, u64>, key: impl Into<String>) {
     *map.entry(key.into()).or_default() += 1;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Access {
     Ref,

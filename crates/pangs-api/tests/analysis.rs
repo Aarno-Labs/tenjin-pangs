@@ -1032,6 +1032,11 @@ fn direct_global_modref_marks_never_written_and_preserves_direct_witness() {
                 },
                 Stmt::GlobalRef {
                     global: "@G".to_string(),
+                    access: Access::Mod,
+                    loc: None,
+                },
+                Stmt::GlobalRef {
+                    global: "@G".to_string(),
                     access: Access::Ref,
                     loc: None,
                 },
@@ -1066,7 +1071,20 @@ fn direct_global_modref_marks_never_written_and_preserves_direct_witness() {
         .any(|mr| mr.access == Access::Mod && mr.witness.as_deref() == Some("writer@!noloc#0")));
     assert!(modrefs
         .iter()
-        .any(|mr| mr.access == Access::Ref && mr.witness.as_deref() == Some("writer@!noloc#1")));
+        .any(|mr| mr.access == Access::Ref && mr.witness.as_deref() == Some("writer@!noloc#2")));
+    assert_eq!(
+        analysis
+            .access_sites()
+            .iter()
+            .filter(|site| site.func == writer && site.global == global)
+            .map(|site| (site.statement_index, site.access))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(0), Access::Mod),
+            (Some(1), Access::Mod),
+            (Some(2), Access::Ref),
+        ]
+    );
 }
 
 #[test]
@@ -2628,6 +2646,25 @@ fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
             && mr.witness.as_deref() == Some("main@m1_6.c:7:1#0")
             && mr.detail.as_deref() == Some("edge:store|omega:steens_external|pointee_count=0")
     }));
+    assert!(steens.access_sites().iter().any(|site| {
+        site.func == main
+            && site.global == aliased
+            && site.access == Access::Mod
+            && site.via == pangs_api::Via::Aliased
+            && site
+                .loc
+                .as_ref()
+                .is_some_and(|loc| loc.file == "m1_6.c" && loc.line == 4)
+    }));
+    for global in [direct, aliased] {
+        assert!(steens.access_sites().iter().any(|site| {
+            site.func == main
+                && site.global == global
+                && site.access == Access::Mod
+                && site.via == pangs_api::Via::Unknown
+                && site.loc.as_ref().is_some_and(|loc| loc.line == 7)
+        }));
+    }
 
     let component = steens
         .components()
