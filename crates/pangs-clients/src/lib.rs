@@ -276,6 +276,8 @@ struct RegistryAccessFacts {
     thread_visible: BTreeMap<GlobalId, Witness>,
     signal_context_access: BTreeMap<GlobalId, Witness>,
     thread_writers: BTreeMap<GlobalId, Witness>,
+    /// Registration/spawn statements that act as non-routable phase-stationarity reads.
+    pseudo_read_callsites: BTreeMap<GlobalId, BTreeSet<pangs_api::CallsiteId>>,
 }
 
 fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> RegistryAccessFacts {
@@ -366,12 +368,28 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                                 .map(|(index, _)| GlobalId(index as u32))
                                 .collect(),
                         };
-                        let facts = match kind {
-                            RegistryKind::Spawn => &mut result.thread_visible,
-                            RegistryKind::Signal => &mut result.signal_context_access,
-                        };
                         for global in affected {
-                            facts.entry(global).or_insert_with(|| witness.clone());
+                            match kind {
+                                RegistryKind::Spawn => {
+                                    result
+                                        .thread_visible
+                                        .entry(global)
+                                        .or_insert_with(|| witness.clone());
+                                }
+                                RegistryKind::Signal => {
+                                    result
+                                        .signal_context_access
+                                        .entry(global)
+                                        .or_insert_with(|| witness.clone());
+                                }
+                            }
+                            if row.access == pangs_pir::Access::Ref {
+                                result
+                                    .pseudo_read_callsites
+                                    .entry(global)
+                                    .or_default()
+                                    .insert(callsite);
+                            }
                             if kind == RegistryKind::Spawn && row.access == pangs_pir::Access::Mod {
                                 result
                                     .thread_writers

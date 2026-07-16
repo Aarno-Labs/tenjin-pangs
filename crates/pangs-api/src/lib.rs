@@ -100,6 +100,11 @@ pub struct FuncInfo {
     pub address_escaped: bool,
     #[serde(skip)]
     pub escape_witness: Option<String>,
+    /// Every non-own-export source by which the function object reaches external code. Kept
+    /// in-process for phase-stationarity pseudo-read placement; the ordinary analysis JSON
+    /// continues to expose neither this nor the preferred `escape_witness`.
+    #[serde(skip)]
+    pub escape_sources: Vec<String>,
     pub vararg: bool,
     pub sig: String,
 }
@@ -685,6 +690,7 @@ impl Analysis {
                 address_taken: func.address_taken,
                 address_escaped: false,
                 escape_witness: None,
+                escape_sources: Vec::new(),
                 vararg: func.vararg(),
                 sig: signature_text(&func.sig),
             });
@@ -1031,6 +1037,7 @@ impl Analysis {
                     if functions[idx].address_taken && !func.external {
                         functions[idx].address_escaped = true;
                         functions[idx].escape_witness = Some("conservative-address-taken".into());
+                        functions[idx].escape_sources = vec!["conservative-address-taken".into()];
                     }
                 }
             }
@@ -1306,6 +1313,12 @@ impl Analysis {
                             .iter()
                             .find(|source| *source != &own_export)
                             .cloned();
+                        function.escape_sources = state
+                            .escape_sources
+                            .iter()
+                            .filter(|source| *source != &own_export)
+                            .cloned()
+                            .collect();
                     }
                 }
 
@@ -2542,6 +2555,7 @@ mod callgraph_sort_tests {
                 address_taken: false,
                 address_escaped: false,
                 escape_witness: None,
+                escape_sources: Vec::new(),
                 vararg: false,
                 sig: "void()".to_string(),
             },
@@ -2554,6 +2568,7 @@ mod callgraph_sort_tests {
                 address_taken: false,
                 address_escaped: false,
                 escape_witness: None,
+                escape_sources: Vec::new(),
                 vararg: false,
                 sig: "void()".to_string(),
             },
