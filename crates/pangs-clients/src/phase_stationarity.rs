@@ -153,6 +153,240 @@ pub(crate) struct SpineInputs {
     pub(crate) observations: BTreeMap<GlobalId, Vec<Observation>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BoundaryOrigin {
+    pub(crate) function: FuncId,
+    pub(crate) boundary: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DescentCandidate {
+    pub(crate) callsite: CallsiteId,
+    pub(crate) boundary: u32,
+    pub(crate) callee: FuncId,
+}
+
+/// Applies O5's uniqueness gate to a source boundary. The call must have one internal target,
+/// that function must have exactly this one incoming call site and no unknown caller, and no
+/// coalesced pointer write may make removal of the parent's call summary ambiguous.
+pub(crate) fn descent_candidate(
+    analysis: &Analysis,
+    module: &Pir,
+    function: FuncId,
+    cfg: &StatementCfg,
+    global: GlobalId,
+) -> Option<DescentCandidate> {
+    if analysis
+        .modrefs()
+        .iter()
+        .filter(|row| row.func == function && row.access == Access::Mod && row.via != Via::Direct)
+        .any(|row| affected_globals(analysis, row).contains(&global))
+    {
+        return None;
+    }
+    let body = &module.functions.get(function.0 as usize)?.body;
+    let callsites = callsites_by_statement(module);
+    let mut candidates = Vec::new();
+    for boundary in &cfg.boundaries {
+        let calls = boundary
+            .stmt_indices
+            .iter()
+            .filter_map(|statement| {
+                let stmt = body.get(*statement as usize)?;
+                matches!(stmt, Stmt::CallDirect { .. } | Stmt::CallIndirect { .. })
+                    .then(|| callsites.get(&(function, *statement)).copied())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        if calls.len() != 1
+            || boundary.stmt_indices.iter().any(|statement| {
+                matches!(
+                    body.get(*statement as usize),
+                    Some(Stmt::GlobalRef {
+                        global: name,
+                        access: Access::Mod,
+                        ..
+                    }) if analysis.lookup_global(name) == Some(global)
+                )
+            })
+        {
+            continue;
+        }
+        let callsite = calls[0];
+        let targets = analysis.callees(callsite).cloned().collect::<BTreeSet<_>>();
+        let targets = targets.into_iter().collect::<Vec<_>>();
+        let [Callee::Func(callee)] = targets.as_slice() else {
+            continue;
+        };
+        if analysis.functions()[*callee].external
+            || !transitive_accessed_globals(analysis, *callee, Access::Mod).contains(&global)
+        {
+            continue;
+        }
+        let incoming = analysis
+            .call_edges()
+            .iter()
+            .filter(|edge| edge.callee == Callee::Func(*callee))
+            .collect::<Vec<_>>();
+        if incoming.len() != 1
+            || incoming[0].caller != Caller::Func(function)
+            || incoming[0].callsite != Some(callsite)
+        {
+            continue;
+        }
+        candidates.push(DescentCandidate {
+            callsite,
+            boundary: boundary.id,
+            callee: *callee,
+        });
+    }
+    match candidates.as_slice() {
+        [candidate] => Some(*candidate),
+        _ => None,
+    }
+}
+
+/// One source-level spine after replacing a call boundary's outgoing edge with the uniquely
+/// called child's CFG. The call boundary remains as a non-insertable gateway; child exits return
+/// to its former successors. Keeping a real node for the call makes repeated descent mechanical.
+pub(crate) struct SplicedSpine {
+    pub(crate) cfg: StatementCfg,
+    pub(crate) generated_writes: Vec<Vec<GlobalId>>,
+    pub(crate) observations: Vec<Observation>,
+    pub(crate) origins: Vec<BoundaryOrigin>,
+}
+
+pub(crate) fn splice_unique_call(
+    parent_function: FuncId,
+    parent_cfg: &StatementCfg,
+    parent_inputs: &SpineInputs,
+    call_boundary: u32,
+    child_function: FuncId,
+    child_cfg: &StatementCfg,
+    child_inputs: &SpineInputs,
+    global: GlobalId,
+) -> Result<SplicedSpine, &'static str> {
+    if parent_cfg.boundaries.len() != parent_inputs.generated_writes.len()
+        || child_cfg.boundaries.len() != child_inputs.generated_writes.len()
+    {
+        return Err("statement CFG and gen vector lengths differ");
+    }
+    let call_index = call_boundary as usize;
+    let Some(call) = parent_cfg.boundaries.get(call_index) else {
+        return Err("descent call boundary is out of range");
+    };
+    if child_cfg.boundaries.is_empty() || child_cfg.entry as usize >= child_cfg.boundaries.len() {
+        return Err("descent child has no entry spine");
+    }
+
+    let child_offset = parent_cfg.boundaries.len() as u32;
+    let return_successors = call.successors.clone();
+    let mut boundaries = parent_cfg.boundaries.clone();
+    boundaries[call_index].successors = vec![child_offset + child_cfg.entry];
+    // Publication immediately before a still-executing call is not a valid replacement for a
+    // boundary after it, so the gateway itself is never source-insertable.
+    boundaries[call_index].insertable = false;
+    for child in &child_cfg.boundaries {
+        let mut lowered = child.clone();
+        lowered.id += child_offset;
+        lowered.successors = if child.successors.is_empty() {
+            return_successors.clone()
+        } else {
+            child
+                .successors
+                .iter()
+                .map(|successor| child_offset + successor)
+                .collect()
+        };
+        lowered.predecessors.clear();
+        boundaries.push(lowered);
+    }
+    rebuild_predecessors(&mut boundaries)?;
+
+    let mut generated_writes = parent_inputs.generated_writes.clone();
+    // Eligibility establishes that the global's effect at this boundary came only from the
+    // descended call. Other globals remain conservative because this splice is per-global.
+    generated_writes[call_index].retain(|candidate| *candidate != global);
+    generated_writes.extend(child_inputs.generated_writes.iter().cloned());
+
+    let mut observations = parent_inputs
+        .observations
+        .get(&global)
+        .into_iter()
+        .flatten()
+        .copied()
+        // Attributed reads at the replaced call are now represented inside the child. A
+        // non-routable registration observation remains attached to the call gateway.
+        .filter(|observation| observation.boundary != call_boundary || !observation.routable_pre_p)
+        .collect::<Vec<_>>();
+    observations.extend(
+        child_inputs
+            .observations
+            .get(&global)
+            .into_iter()
+            .flatten()
+            .map(|observation| Observation {
+                boundary: child_offset + observation.boundary,
+                routable_pre_p: observation.routable_pre_p,
+            }),
+    );
+    observations.sort();
+    observations.dedup();
+
+    let mut origins = parent_cfg
+        .boundaries
+        .iter()
+        .map(|boundary| BoundaryOrigin {
+            function: parent_function,
+            boundary: boundary.id,
+        })
+        .collect::<Vec<_>>();
+    origins.extend(child_cfg.boundaries.iter().map(|boundary| BoundaryOrigin {
+        function: child_function,
+        boundary: boundary.id,
+    }));
+
+    Ok(SplicedSpine {
+        cfg: StatementCfg {
+            entry: parent_cfg.entry,
+            source_mapping_available: parent_cfg.source_mapping_available
+                && child_cfg.source_mapping_available,
+            boundaries,
+        },
+        generated_writes,
+        observations,
+        origins,
+    })
+}
+
+fn rebuild_predecessors(
+    boundaries: &mut [pangs_pir::StatementBoundary],
+) -> Result<(), &'static str> {
+    for boundary in boundaries.iter_mut() {
+        boundary.predecessors.clear();
+    }
+    let edges = boundaries
+        .iter()
+        .flat_map(|boundary| {
+            boundary
+                .successors
+                .iter()
+                .map(move |successor| (boundary.id, *successor))
+        })
+        .collect::<Vec<_>>();
+    for (predecessor, successor) in edges {
+        let Some(boundary) = boundaries.get_mut(successor as usize) else {
+            return Err("spliced statement CFG edge is out of range");
+        };
+        boundary.predecessors.push(predecessor);
+    }
+    for boundary in boundaries {
+        boundary.predecessors.sort_unstable();
+        boundary.predecessors.dedup();
+    }
+    Ok(())
+}
+
 pub(crate) fn assemble_spine_inputs(
     analysis: &Analysis,
     module: &Pir,
@@ -759,8 +993,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        assemble_spine_inputs, evaluate_kill_rules, select_publication, FuncId, GlobalId,
-        Observation, Quiescence, SelectionFailure,
+        assemble_spine_inputs, descent_candidate, evaluate_kill_rules, select_publication,
+        splice_unique_call, FuncId, GlobalId, Observation, Quiescence, SelectionFailure,
     };
 
     fn boundary(id: u32, successors: &[u32], predecessors: &[u32]) -> StatementBoundary {
@@ -1112,5 +1346,131 @@ mod tests {
                     routable_pre_p: true,
                 }]
         }));
+    }
+
+    #[test]
+    fn unique_call_descent_splices_child_quiescence_and_origin() {
+        let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
+        let pir: pangs_pir::Pir = serde_json::from_value(json!({
+            "module":"phase-descent",
+            "functions":[
+                {"key":"main", "sig":signature(), "body":[
+                    {"kind":"call_direct", "callee":"run", "sig":signature(), "args":[]}
+                ]},
+                {"key":"run", "sig":signature(), "body":[
+                    {"kind":"global_ref", "global":"@g", "access":"mod"},
+                    {"kind":"global_ref", "global":"@g", "access":"ref"}
+                ]}
+            ],
+            "globals":[{"key":"@g"}]
+        }))
+        .unwrap();
+        let analysis = Analysis::run_with_disposition(
+            &pir,
+            &Opts {
+                stage: Stage::Steens,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let parent_cfg = StatementCfg {
+            entry: 0,
+            boundaries: vec![StatementBoundary {
+                stmt_indices: vec![0],
+                ..boundary(0, &[], &[])
+            }],
+            source_mapping_available: true,
+        };
+        let child_cfg = StatementCfg {
+            entry: 0,
+            boundaries: vec![
+                StatementBoundary {
+                    stmt_indices: vec![0],
+                    ..boundary(0, &[1], &[])
+                },
+                StatementBoundary {
+                    stmt_indices: vec![1],
+                    ..boundary(1, &[], &[0])
+                },
+            ],
+            source_mapping_available: true,
+        };
+        let global = analysis.lookup_global("@g").unwrap();
+        let parent_inputs =
+            assemble_spine_inputs(&analysis, &pir, FuncId(0), &parent_cfg, &BTreeMap::new());
+        let child_inputs =
+            assemble_spine_inputs(&analysis, &pir, FuncId(1), &child_cfg, &BTreeMap::new());
+        let candidate = descent_candidate(&analysis, &pir, FuncId(0), &parent_cfg, global).unwrap();
+        assert_eq!(candidate.boundary, 0);
+        assert_eq!(candidate.callee, FuncId(1));
+
+        let spine = splice_unique_call(
+            FuncId(0),
+            &parent_cfg,
+            &parent_inputs,
+            candidate.boundary,
+            candidate.callee,
+            &child_cfg,
+            &child_inputs,
+            global,
+        )
+        .unwrap();
+        assert_eq!(spine.cfg.boundaries[0].successors, vec![1]);
+        assert_eq!(spine.cfg.boundaries[1].successors, vec![2]);
+        assert_eq!(spine.origins[2].function, FuncId(1));
+        assert_eq!(spine.origins[2].boundary, 1);
+        let quiescence = Quiescence::compute(
+            &spine.cfg,
+            analysis.globals().len(),
+            &spine.generated_writes,
+        )
+        .unwrap();
+        let selection =
+            select_publication(&spine.cfg, &quiescence, global, &spine.observations).unwrap();
+        assert_eq!(selection.chosen, 2);
+    }
+
+    #[test]
+    fn descent_rejects_a_child_with_a_second_live_callsite() {
+        let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
+        let pir: pangs_pir::Pir = serde_json::from_value(json!({
+            "module":"phase-descent-shared",
+            "functions":[
+                {"key":"main", "sig":signature(), "body":[
+                    {"kind":"call_direct", "callee":"run", "sig":signature(), "args":[]}
+                ]},
+                {"key":"other", "sig":signature(), "body":[
+                    {"kind":"call_direct", "callee":"run", "sig":signature(), "args":[]}
+                ]},
+                {"key":"run", "sig":signature(), "body":[
+                    {"kind":"global_ref", "global":"@g", "access":"mod"}
+                ]}
+            ],
+            "globals":[{"key":"@g"}]
+        }))
+        .unwrap();
+        let analysis = Analysis::run_with_disposition(
+            &pir,
+            &Opts {
+                stage: Stage::Steens,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let cfg = StatementCfg {
+            entry: 0,
+            boundaries: vec![StatementBoundary {
+                stmt_indices: vec![0],
+                ..boundary(0, &[], &[])
+            }],
+            source_mapping_available: true,
+        };
+        let global = analysis.lookup_global("@g").unwrap();
+        assert_eq!(
+            descent_candidate(&analysis, &pir, FuncId(0), &cfg, global),
+            None
+        );
     }
 }
