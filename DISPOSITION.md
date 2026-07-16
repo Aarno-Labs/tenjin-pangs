@@ -531,7 +531,12 @@ consumes it differently:
 Therefore coupling detection moves out of the ONCELOCK work items into a shared
 F-layer post-pass: cluster globals by co-occurrence in writer functions/regions and
 (where computed) overlapping publication intervals; emit `coupling_groups` with
-evidence (the co-writing sites). Detection is heuristic-completeness-asymmetric in the
+deterministic spanning evidence (the co-writing sites). The evidence list is a proof
+forest for group connectivity, not an exhaustive quadratic dump of every implied pair:
+a function that writes `k` globals proposes a stable star, and only successful union
+edges are retained; redundant co-write and ONCELOCK-compatible pairs are omitted once
+their component is connected. Detection is
+heuristic-completeness-asymmetric in the
 usual direction: a *missed* group is dangerous only for `atomic` (hence atomic
 eligibility must itself re-derive co-write evidence conservatively — its certificate,
 not the shared heuristic, is what licenses the rewrite), while a spurious group merely

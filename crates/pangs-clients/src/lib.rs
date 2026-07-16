@@ -144,6 +144,15 @@ pub fn assemble_disposition_artifacts(
             disposition_started.elapsed().as_millis()
         );
     }
+    let fact_indexes_started = Instant::now();
+    let fact_rows = DispositionFactRows::new(analysis);
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing fact-row-indexes={}ms",
+            fact_indexes_started.elapsed().as_millis()
+        );
+    }
+    let global_facts_started = Instant::now();
     let mut globals = Vec::new();
     let mut unkeyed_globals = Vec::new();
     for (index, info) in analysis.globals().iter().enumerate() {
@@ -189,11 +198,18 @@ pub fn assemble_disposition_artifacts(
         };
         let gid = GlobalId(index as u32);
         let omega_escaped = info.address_escaped;
-        let omega_witness = omega_escaped.then(|| omega_escape_witness(analysis, &key, info));
+        let omega_witness = omega_escaped
+            .then(|| omega_escape_witness(analysis, &key, info, fact_rows.escape[index]));
         let written = !info.never_written;
-        let write_witness =
-            written.then(|| written_witness(analysis, gid, info, omega_witness.as_ref()));
-        let violation_witness = violation_witness(analysis, gid);
+        let write_witness = written.then(|| {
+            written_witness(
+                analysis,
+                info,
+                omega_witness.as_ref(),
+                fact_rows.written[index],
+            )
+        });
+        let violation_witness = fact_rows.violation[index].clone();
         let violation_taint = violation_witness.is_some();
         let access_failure = access_set_failure(
             analysis,
@@ -202,8 +218,9 @@ pub fn assemble_disposition_artifacts(
             opts.build_mode,
             info.exported,
             violation_witness.as_ref(),
+            fact_rows.access_failure[index],
         );
-        let localization = localization_for(analysis, gid);
+        let localization = fact_rows.localization[index].clone();
         globals.push(DispositionGlobal {
             key,
             meta: Meta {
@@ -246,8 +263,28 @@ pub fn assemble_disposition_artifacts(
             extra: Extra::new(),
         });
     }
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing global-fact-assembly={}ms keyed={} unkeyed={}",
+            global_facts_started.elapsed().as_millis(),
+            globals.len(),
+            unkeyed_globals.len()
+        );
+    }
 
+    let coupling_started = Instant::now();
     let coupling_groups = assemble_coupling_groups(analysis, &mut globals);
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing coupling-groups={}ms groups={} evidence-edges={}",
+            coupling_started.elapsed().as_millis(),
+            coupling_groups.len(),
+            coupling_groups
+                .iter()
+                .map(|group| group.evidence.len())
+                .sum::<usize>()
+        );
+    }
     if let Some(report) = phase_report.as_object_mut() {
         let summaries = coupling_groups
             .iter()
@@ -519,47 +556,75 @@ fn assemble_coupling_groups(
     analysis: &Analysis,
     globals: &mut [DispositionGlobal],
 ) -> Vec<CouplingGroup> {
+    let coupling_started = Instant::now();
+    let keys = globals
+        .iter()
+        .map(|global| global.key.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let index_by_key = keys
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, key)| (key, index))
+        .collect::<BTreeMap<_, _>>();
+    let global_position_by_key = globals
+        .iter()
+        .enumerate()
+        .map(|(index, global)| (global.key.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut components = CouplingComponents::new(keys.len());
     let key_by_global = globals
         .iter()
-        .map(|global| (global.meta.llvm_name.clone(), global.key.clone()))
+        .map(|global| (global.meta.llvm_name.clone(), index_by_key[&global.key]))
         .collect::<BTreeMap<_, _>>();
-    let mut writes_by_function = BTreeMap::<FuncId, BTreeSet<Key>>::new();
-    for row in analysis
-        .modrefs()
+    let key_index_by_global = analysis
+        .globals()
         .iter()
-        .filter(|row| row.access == pangs_pir::Access::Mod && row.via == pangs_api::Via::Direct)
-    {
-        let GlobalTarget::Name(global) = row.global else {
+        .map(|global| key_by_global.get(&global.key).copied())
+        .collect::<Vec<_>>();
+    let co_written_count = analysis
+        .directly_written_globals()
+        .iter()
+        .filter_map(|global| key_index_by_global[global.0 as usize])
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mut co_write_sites = BTreeMap::<(usize, usize), Vec<Site>>::new();
+    for function in (0..analysis.functions().len()).map(|index| FuncId(index as u32)) {
+        let mut written = analysis
+            .direct_writes(function)
+            .iter()
+            .filter_map(|global| key_index_by_global[global.0 as usize])
+            .collect::<Vec<_>>();
+        written.sort_unstable();
+        written.dedup();
+        let site = function_site(analysis, function);
+        let Some((&a, rest)) = written.split_first() else {
             continue;
         };
-        let raw_name = &analysis.globals()[global].key;
-        if let Some(key) = key_by_global.get(raw_name) {
-            writes_by_function
-                .entry(row.func)
-                .or_default()
-                .insert(key.clone());
-        }
-    }
-
-    let mut adjacency = BTreeMap::<Key, BTreeSet<Key>>::new();
-    let mut co_write_sites = BTreeMap::<(Key, Key), Vec<Site>>::new();
-    for (function, written) in writes_by_function {
-        let written = written.into_iter().collect::<Vec<_>>();
-        for left in 0..written.len() {
-            for right in left + 1..written.len() {
-                let a = written[left].clone();
-                let b = written[right].clone();
-                adjacency.entry(a.clone()).or_default().insert(b.clone());
-                adjacency.entry(b.clone()).or_default().insert(a.clone());
-                if let Some(site) = function_site(analysis, function) {
-                    co_write_sites.entry((a, b)).or_default().push(site);
+        for &b in rest {
+            if components.union(a, b) {
+                if let Some(site) = &site {
+                    co_write_sites.entry((a, b)).or_default().push(site.clone());
                 } else {
                     co_write_sites.entry((a, b)).or_default();
                 }
             }
         }
+        if components.component_size(a) == co_written_count {
+            break;
+        }
+    }
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing coupling-co-write={}ms evidence-edges={}",
+            coupling_started.elapsed().as_millis(),
+            co_write_sites.len()
+        );
     }
 
+    let once_lock_started = Instant::now();
     let phase_by_key = globals
         .iter()
         .filter_map(|global| {
@@ -567,83 +632,98 @@ fn assemble_coupling_groups(
         })
         .collect::<BTreeMap<_, _>>();
     let phase_keys = phase_by_key.keys().cloned().collect::<Vec<_>>();
-    let mut once_lock_pairs = BTreeMap::<(Key, Key), OnceLockPairEvidence>::new();
+    let mut once_lock_pairs = Vec::<(usize, usize, OnceLockPairEvidence)>::new();
+    let mut once_lock_components = CouplingComponents::new(keys.len());
     for left in 0..phase_keys.len() {
         for right in left + 1..phase_keys.len() {
-            let a = phase_keys[left].clone();
-            let b = phase_keys[right].clone();
-            let left_evidence = &phase_by_key[&a];
-            let right_evidence = &phase_by_key[&b];
-            let Some(pair) = once_lock_pair_evidence(left_evidence, right_evidence) else {
+            let a = &phase_keys[left];
+            let b = &phase_keys[right];
+            let left_evidence = &phase_by_key[a];
+            let right_evidence = &phase_by_key[b];
+            if !once_lock_pair_compatible(left_evidence, right_evidence) {
                 continue;
-            };
-            adjacency.entry(a.clone()).or_default().insert(b.clone());
-            adjacency.entry(b.clone()).or_default().insert(a.clone());
-            once_lock_pairs.insert((a, b), pair);
-        }
-    }
-
-    let mut groups = Vec::new();
-    let mut visited = BTreeSet::new();
-    for start in adjacency.keys() {
-        if !visited.insert(start.clone()) {
-            continue;
-        }
-        let mut members = BTreeSet::from([start.clone()]);
-        let mut pending = vec![start.clone()];
-        while let Some(member) = pending.pop() {
-            if let Some(neighbors) = adjacency.get(&member) {
-                for neighbor in neighbors.iter().rev() {
-                    if visited.insert(neighbor.clone()) {
-                        members.insert(neighbor.clone());
-                        pending.push(neighbor.clone());
-                    }
-                }
+            }
+            let a = index_by_key[a];
+            let b = index_by_key[b];
+            components.union(a, b);
+            if once_lock_components.union(a, b) {
+                let pair = once_lock_pair_evidence(left_evidence, right_evidence)
+                    .expect("compatible once-lock pair must produce evidence");
+                once_lock_pairs.push((a, b, pair));
             }
         }
-        let members = members.into_iter().collect::<Vec<_>>();
-        let id = coupling_group_id(&members);
-        let mut evidence = co_write_sites
-            .iter()
-            .filter(|((a, b), _)| {
-                members.binary_search(a).is_ok() && members.binary_search(b).is_ok()
-            })
-            .map(|((a, b), sites)| EvidenceEdge {
-                kind: EvidenceKind::CoWrite,
-                members: vec![a.clone(), b.clone()],
-                sites: sites.clone(),
-                extra: Extra::new(),
-            })
-            .collect::<Vec<_>>();
-        evidence.extend(
-            once_lock_pairs
-                .iter()
-                .filter(|((a, b), _)| {
-                    members.binary_search(a).is_ok() && members.binary_search(b).is_ok()
-                })
-                .map(|((a, b), pair)| EvidenceEdge {
-                    kind: EvidenceKind::OncelockInterval,
-                    members: vec![a.clone(), b.clone()],
-                    sites: pair.sites.clone(),
-                    extra: pair.extra.clone(),
-                }),
+    }
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing coupling-once-lock={}ms certified-globals={} evidence-edges={}",
+            once_lock_started.elapsed().as_millis(),
+            phase_keys.len(),
+            once_lock_pairs.len()
         );
-        for global in globals
-            .iter_mut()
-            .filter(|global| members.contains(&global.key))
-        {
-            global.facts.coupling_group = Some(id.clone());
+    }
+
+    let mut member_indexes = BTreeMap::<usize, Vec<usize>>::new();
+    for index in 0..keys.len() {
+        if components.component_size(index) > 1 {
+            member_indexes
+                .entry(components.find(index))
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut member_indexes = member_indexes.into_values().collect::<Vec<_>>();
+    member_indexes.sort_by_key(|members| members[0]);
+    let mut group_by_key_index = vec![None; keys.len()];
+    for (group, members) in member_indexes.iter().enumerate() {
+        for member in members {
+            group_by_key_index[*member] = Some(group);
+        }
+    }
+    let mut evidence_by_group = (0..member_indexes.len())
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<EvidenceEdge>>>();
+    for ((a, b), sites) in co_write_sites {
+        let group =
+            group_by_key_index[a].expect("co-write evidence must belong to a coupling group");
+        evidence_by_group[group].push(EvidenceEdge {
+            kind: EvidenceKind::CoWrite,
+            members: vec![keys[a].clone(), keys[b].clone()],
+            sites,
+            extra: Extra::new(),
+        });
+    }
+    for (a, b, pair) in once_lock_pairs {
+        let group =
+            group_by_key_index[a].expect("once-lock evidence must belong to a coupling group");
+        evidence_by_group[group].push(EvidenceEdge {
+            kind: EvidenceKind::OncelockInterval,
+            members: vec![keys[a].clone(), keys[b].clone()],
+            sites: pair.sites,
+            extra: pair.extra,
+        });
+    }
+
+    let mut groups = Vec::with_capacity(member_indexes.len());
+    for (group_index, indexes) in member_indexes.into_iter().enumerate() {
+        let members = indexes
+            .iter()
+            .map(|index| keys[*index].clone())
+            .collect::<Vec<_>>();
+        let id = coupling_group_id(&members);
+        for index in indexes {
+            let key = &keys[index];
+            globals[global_position_by_key[key]].facts.coupling_group = Some(id.clone());
         }
         groups.push(CouplingGroup {
             id,
             members: members.clone(),
-            evidence,
+            evidence: std::mem::take(&mut evidence_by_group[group_index]),
             strategy_support: GroupStrategySupport {
                 once_lock: Some(common_once_lock_support(
                     analysis,
-                    globals,
                     &members,
                     &phase_by_key,
+                    &keys,
                 )),
                 mutex: None,
                 extra: Extra::new(),
@@ -655,6 +735,47 @@ fn assemble_coupling_groups(
         });
     }
     groups
+}
+
+struct CouplingComponents {
+    parent: Vec<usize>,
+    size: Vec<usize>,
+}
+
+impl CouplingComponents {
+    fn new(len: usize) -> Self {
+        Self {
+            parent: (0..len).collect(),
+            size: vec![1; len],
+        }
+    }
+
+    fn find(&mut self, mut index: usize) -> usize {
+        while self.parent[index] != index {
+            self.parent[index] = self.parent[self.parent[index]];
+            index = self.parent[index];
+        }
+        index
+    }
+
+    fn union(&mut self, left: usize, right: usize) -> bool {
+        let mut left = self.find(left);
+        let mut right = self.find(right);
+        if left == right {
+            return false;
+        }
+        if self.size[left] < self.size[right] {
+            std::mem::swap(&mut left, &mut right);
+        }
+        self.parent[right] = left;
+        self.size[left] += self.size[right];
+        true
+    }
+
+    fn component_size(&mut self, index: usize) -> usize {
+        let root = self.find(index);
+        self.size[root]
+    }
 }
 
 #[derive(Clone)]
@@ -736,11 +857,25 @@ fn once_lock_pair_evidence(
     Some(OnceLockPairEvidence { sites, extra })
 }
 
+fn once_lock_pair_compatible(
+    left: &CertifiedGroupEvidence,
+    right: &CertifiedGroupEvidence,
+) -> bool {
+    left.publication_function == right.publication_function
+        && left.descent_path == right.descent_path
+        && intersect_intervals(
+            (&left.earliest, &left.latest),
+            (&right.earliest, &right.latest),
+        )
+        .is_some()
+        && !left.init_functions.is_disjoint(&right.init_functions)
+}
+
 fn common_once_lock_support(
     analysis: &Analysis,
-    globals: &[DispositionGlobal],
     members: &[Key],
     phase_by_key: &BTreeMap<Key, CertifiedGroupEvidence>,
+    global_keys: &[Key],
 ) -> OnceLockGroupSupport {
     let unsupported = |kind: &str, member: &Key, note: &str| OnceLockGroupSupport::Unsupported {
         supported: AlwaysFalse(false),
@@ -758,7 +893,7 @@ fn common_once_lock_support(
     };
     let mut evidence = Vec::new();
     for member in members {
-        if !globals.iter().any(|global| &global.key == member) {
+        if global_keys.binary_search(member).is_err() {
             return unsupported(
                 "once-lock-group-member-missing",
                 member,
@@ -934,14 +1069,102 @@ fn word_sized_scalar(
     }
 }
 
-fn omega_escape_witness(analysis: &Analysis, key: &Key, info: &pangs_api::GlobalInfo) -> Witness {
+struct DispositionFactRows<'a> {
+    written: Vec<Option<&'a ModRef>>,
+    escape: Vec<Option<&'a ModRef>>,
+    access_failure: Vec<Option<&'a ModRef>>,
+    violation: Vec<Option<Witness>>,
+    localization: Vec<Option<Localization>>,
+}
+
+impl<'a> DispositionFactRows<'a> {
+    fn new(analysis: &'a Analysis) -> Self {
+        let global_count = analysis.globals().len();
+        let mut written = vec![None; global_count];
+        let mut escape = vec![None; global_count];
+        let mut access_failure = vec![None; global_count];
+        let mut violation_finding_by_function = vec![None; analysis.functions().len()];
+        for (ordinal, finding) in analysis.audit_findings().iter().enumerate() {
+            if let Some(function) = finding.function {
+                violation_finding_by_function[function.0 as usize]
+                    .get_or_insert((ordinal, finding));
+            }
+        }
+        let mut violation_candidates = vec![None; global_count];
+        for row in analysis.modrefs() {
+            match row.global {
+                GlobalTarget::Name(global) => {
+                    let index = global.0 as usize;
+                    if let Some((ordinal, finding)) =
+                        violation_finding_by_function[row.func.0 as usize]
+                    {
+                        let replace = match &violation_candidates[index] {
+                            Some((current, _, _)) => ordinal < *current,
+                            None => true,
+                        };
+                        if replace {
+                            violation_candidates[index] = Some((ordinal, row.func, finding));
+                        }
+                    }
+                    if row.access == pangs_pir::Access::Mod && written[index].is_none() {
+                        written[index] = Some(row);
+                    }
+                    if row.via == pangs_api::Via::Unknown && access_failure[index].is_none() {
+                        access_failure[index] = Some(row);
+                    }
+                }
+                GlobalTarget::Unknown(_) => {
+                    if row.pointee_globals.is_empty() {
+                        for index in 0..global_count {
+                            escape[index].get_or_insert(row);
+                            access_failure[index].get_or_insert(row);
+                        }
+                    } else {
+                        for name in &row.pointee_globals {
+                            let Some(global) = analysis.lookup_global(name) else {
+                                continue;
+                            };
+                            let index = global.0 as usize;
+                            escape[index].get_or_insert(row);
+                            access_failure[index].get_or_insert(row);
+                        }
+                    }
+                }
+            }
+        }
+        let mut violation = vec![None; global_count];
+        for (index, candidate) in violation_candidates.into_iter().enumerate() {
+            let Some((_, function, finding)) = candidate else {
+                continue;
+            };
+            violation[index] = Some(function_witness(
+                analysis,
+                function,
+                "violation-finding",
+                Some(finding.kind.clone()),
+            ));
+        }
+        let localization = localization_index(analysis);
+        Self {
+            written,
+            escape,
+            access_failure,
+            violation,
+            localization,
+        }
+    }
+}
+
+fn omega_escape_witness(
+    analysis: &Analysis,
+    key: &Key,
+    info: &pangs_api::GlobalInfo,
+    fallback: Option<&ModRef>,
+) -> Witness {
     if let Some(source) = &info.escape_witness {
         return escape_source_witness(analysis, key, source);
     }
-    if let Some(row) = analysis.modrefs().iter().find(|row| {
-        matches!(row.global, GlobalTarget::Unknown(_))
-            && (row.pointee_globals.is_empty() || row.pointee_globals.contains(&info.key))
-    }) {
+    if let Some(row) = fallback {
         let mut witness =
             function_witness(analysis, row.func, "external-escape", row.witness.clone());
         witness.symbol = Some(key.to_string());
@@ -995,13 +1218,11 @@ fn escape_source_witness(analysis: &Analysis, key: &Key, source: &str) -> Witnes
 
 fn written_witness(
     analysis: &Analysis,
-    global: GlobalId,
     info: &pangs_api::GlobalInfo,
     escape_witness: Option<&Witness>,
+    write_row: Option<&ModRef>,
 ) -> Witness {
-    if let Some(row) = analysis.modrefs().iter().find(|row| {
-        row.access == pangs_pir::Access::Mod && row.global == GlobalTarget::Name(global)
-    }) {
+    if let Some(row) = write_row {
         return function_witness(analysis, row.func, "write-site", row.witness.clone());
     }
     if let Some(witness) = escape_witness {
@@ -1059,24 +1280,6 @@ fn function_witness(
     }
 }
 
-fn violation_witness(analysis: &Analysis, global: GlobalId) -> Option<Witness> {
-    analysis.audit_findings().iter().find_map(|finding| {
-        let function = finding.function?;
-        analysis
-            .modrefs()
-            .iter()
-            .any(|row| row.func == function && row.global == GlobalTarget::Name(global))
-            .then(|| {
-                function_witness(
-                    analysis,
-                    function,
-                    "violation-finding",
-                    Some(finding.kind.clone()),
-                )
-            })
-    })
-}
-
 fn access_set_failure(
     analysis: &Analysis,
     llvm_name: &str,
@@ -1084,14 +1287,9 @@ fn access_set_failure(
     mode: BuildMode,
     exported: bool,
     violation: Option<&Witness>,
+    failure_row: Option<&ModRef>,
 ) -> Option<Witness> {
-    if let Some(row) = analysis.modrefs().iter().find(|row| {
-        (matches!(row.global, GlobalTarget::Name(global) if analysis.globals()[global].key == llvm_name)
-            && row.via == pangs_api::Via::Unknown)
-            || (matches!(row.global, GlobalTarget::Unknown(_))
-                && (row.pointee_globals.is_empty()
-                    || row.pointee_globals.iter().any(|name| name == llvm_name)))
-    }) {
+    if let Some(row) = failure_row {
         return Some(function_witness(
             analysis,
             row.func,
@@ -1114,49 +1312,90 @@ fn access_set_failure(
     violation.cloned()
 }
 
-fn localization_for(analysis: &Analysis, global: GlobalId) -> Option<Localization> {
-    let mut containing = analysis
-        .components()
-        .iter()
-        .filter(|component| component.mutable_globals.contains(&global))
-        .collect::<Vec<_>>();
-    if containing.is_empty() {
-        return None;
-    }
-    containing.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut blockers = Vec::new();
-    for component in containing.iter().filter(|component| component.frozen) {
-        for taint in &component.taint {
-            let code = match taint.kind.as_str() {
-                "unknown_caller" => "unknown-caller-taint",
-                "unknown_callee" => "unknown-callee-taint",
-                _ => "frozen-component",
+fn localization_index(analysis: &Analysis) -> Vec<Option<Localization>> {
+    let mut chosen_component: Vec<Option<usize>> = vec![None; analysis.globals().len()];
+    let mut blockers_by_global = (0..analysis.globals().len())
+        .map(|_| BTreeMap::new())
+        .collect::<Vec<BTreeMap<String, (LocalizationBlocker, u64)>>>();
+    for (component_index, component) in analysis.components().iter().enumerate() {
+        for global in &component.mutable_globals {
+            let index = global.0 as usize;
+            let replace = match chosen_component[index] {
+                Some(current) => component.id < analysis.components()[current].id,
+                None => true,
             };
-            blockers.push(LocalizationBlocker {
-                code: code.into(),
-                witness: Witness {
-                    kind: code.into(),
-                    site: None,
-                    symbol: None,
-                    note: Some(taint.witness.clone().unwrap_or_else(|| taint.kind.clone())),
-                    extra: Extra::new(),
-                },
-                extra: Extra::new(),
-            });
+            if replace {
+                chosen_component[index] = Some(component_index);
+            }
+            if !component.frozen {
+                continue;
+            }
+            for taint in &component.taint {
+                let code = match taint.kind.as_str() {
+                    "unknown_caller" => "unknown-caller-taint",
+                    "unknown_callee" => "unknown-callee-taint",
+                    _ => "frozen-component",
+                };
+                let note = taint.witness.as_deref().unwrap_or(&taint.kind);
+                match blockers_by_global[index].entry(code.into()) {
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let (representative, count) = entry.get_mut();
+                        *count += 1;
+                        if representative
+                            .witness
+                            .note
+                            .as_deref()
+                            .is_some_and(|old| note < old)
+                        {
+                            representative.witness.note = Some(note.into());
+                        }
+                    }
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((
+                            LocalizationBlocker {
+                                code: code.into(),
+                                witness: Witness {
+                                    kind: code.into(),
+                                    site: None,
+                                    symbol: None,
+                                    note: Some(note.into()),
+                                    extra: Extra::new(),
+                                },
+                                extra: Extra::new(),
+                            },
+                            1,
+                        ));
+                    }
+                }
+            }
         }
     }
-    blockers.sort_by(|a, b| a.code.cmp(&b.code));
-    blockers.dedup_by(|a, b| a.code == b.code && a.witness.note == b.witness.note);
-    Some(Localization {
-        component: containing[0].id.clone(),
-        verdict: if blockers.is_empty() {
-            LocalizationVerdict::Ok
-        } else {
-            LocalizationVerdict::Blocked
-        },
-        blockers,
-        extra: Extra::new(),
-    })
+    chosen_component
+        .into_iter()
+        .enumerate()
+        .map(|(index, component)| {
+            let component = &analysis.components()[component?];
+            let blockers = std::mem::take(&mut blockers_by_global[index])
+                .into_values()
+                .map(|(mut blocker, count)| {
+                    blocker
+                        .extra
+                        .insert("evidence_count".into(), serde_json::json!(count));
+                    blocker
+                })
+                .collect::<Vec<_>>();
+            Some(Localization {
+                component: component.id.clone(),
+                verdict: if blockers.is_empty() {
+                    LocalizationVerdict::Ok
+                } else {
+                    LocalizationVerdict::Blocked
+                },
+                blockers,
+                extra: Extra::new(),
+            })
+        })
+        .collect()
 }
 
 pub fn validate_export_dir(outdir: &Path) -> Result<()> {

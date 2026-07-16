@@ -653,6 +653,10 @@ pub struct Analysis {
     callers_by_function: Vec<Vec<Caller>>,
     modrefs: Vec<ModRef>,
     #[serde(skip)]
+    direct_writes_by_function: Vec<Vec<GlobalId>>,
+    #[serde(skip)]
+    directly_written_globals: Vec<GlobalId>,
+    #[serde(skip)]
     access_sites: Vec<AccessSite>,
     stationarity: Vec<StationarityVerdict>,
     #[serde(skip)]
@@ -1709,6 +1713,26 @@ impl Analysis {
                 callers_by_function[callee.0 as usize].push(edge.caller.clone());
             }
         }
+        let mut direct_writes_by_function = vec![Vec::new(); functions.len()];
+        let mut directly_written = vec![false; globals.len()];
+        for row in &modrefs {
+            if row.access == Access::Mod && row.via == Via::Direct {
+                let GlobalTarget::Name(global) = row.global else {
+                    continue;
+                };
+                direct_writes_by_function[row.func.0 as usize].push(global);
+                directly_written[global.0 as usize] = true;
+            }
+        }
+        for writes in &mut direct_writes_by_function {
+            writes.sort_unstable();
+            writes.dedup();
+        }
+        let directly_written_globals = directly_written
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, written)| written.then_some(GlobalId(index as u32)))
+            .collect();
 
         Ok(Self {
             functions: Table::new(functions),
@@ -1718,6 +1742,8 @@ impl Analysis {
             callees_by_callsite,
             callers_by_function,
             modrefs,
+            direct_writes_by_function,
+            directly_written_globals,
             access_sites,
             stationarity,
             transitive_modrefs,
@@ -1749,6 +1775,14 @@ impl Analysis {
 
     pub fn modrefs(&self) -> &[ModRef] {
         &self.modrefs
+    }
+
+    pub fn direct_writes(&self, function: FuncId) -> &[GlobalId] {
+        &self.direct_writes_by_function[function.0 as usize]
+    }
+
+    pub fn directly_written_globals(&self) -> &[GlobalId] {
+        &self.directly_written_globals
     }
 
     pub fn access_sites(&self) -> &[AccessSite] {

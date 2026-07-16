@@ -618,13 +618,15 @@ below is a shared record and is fixed here:
     component must be rewritable.
   - `component` field: the lexicographically smallest containing component id
     (evidence, not identity).
-  - `blockers`: the union of the frozen containing components' `taint` entries,
-    mapped by kind — `unknown_caller` → `unknown-caller-taint`, `unknown_callee` →
-    `unknown-callee-taint`, everything else (`unknown_global` and all audit-taint
-    kinds such as `inline_asm`, `fnptr_ptrtoint`) → `frozen-component` with the
-    original taint kind preserved in the blocker witness's `note` and the taint's
-    witness key parsed into its `site`. Deduplicated and sorted by the canonical
-    witness key.
+  - `blockers`: the categories in the union of the frozen containing components'
+    `taint` entries, mapped by kind — `unknown_caller` → `unknown-caller-taint`,
+    `unknown_callee` → `unknown-callee-taint`, everything else (`unknown_global`
+    and all audit-taint kinds such as `inline_asm`, `fnptr_ptrtoint`) →
+    `frozen-component` with the original taint kind preserved in the blocker
+    witness's `note` and the taint's witness key parsed into its `site`. To keep
+    artifacts corpus-bounded, emit one canonical representative witness per blocker
+    code and record the number of summarized taint entries as `evidence_count` in
+    that blocker's extension map; blockers are sorted by the canonical witness key.
   - `g` in no component at all ⇒ `localization: null` (the client did not cover
     it; surfaces as `fact-not-computed` in the trace rather than a fabricated
     verdict).
@@ -858,8 +860,12 @@ own evidence):
    needs.
 
 Cluster by union-find over evidence edges; group id = `"grp-" + hash8(smallest member
-key)` (stable across runs, ground rule 4); emit `coupling_groups` with the evidence
-edges as witnesses. **No evidence-strength threshold in v1**: clustering is
+key)` (stable across runs, ground rule 4); emit `coupling_groups` with a deterministic
+spanning subset of the evidence edges as witnesses. Co-writes from one function use a
+star rooted at the smallest member; both co-write and ONCELOCK evidence retain only
+successful union edges. This proves identical connectivity without a quadratic
+manifest. **No
+evidence-strength threshold in v1**: clustering is
 unconditional union-find over the two evidence kinds — the documented over-grouping
 below is the accepted cost, and a threshold (with a concrete shape and semantics) is
 a v2 follow-up if group statistics demand one.
@@ -1022,6 +1028,24 @@ From the fact vector alone, before either pass exists:
 Judge on Vim + PHP at M3, per `DESIGN_lite.md` §6's gate style: material counts ⇒
 schedule D3/D4; negligible ⇒ record the numbers and close the slots (they remain
 `null`, which the schema and cascade already handle).
+
+### M3 measurements (partial)
+
+Vim 9.2 (`b4ddc6c11e95`, Clang/LLVM 14, `-g -O1`, application mode) was measured
+on 2026-07-16. The run produced 3,204 keyed mutable globals and no unkeyed globals;
+1,340 disposed `immutable` and 1,864 `unhandled`. The free gate funnels were:
+
+| gate | candidate disposition | shape/safety input | access complete | eligible |
+|---|---:|---:|---:|---:|
+| atomic | 1,864 | 1,035 word-sized scalars; 0 singleton-group survivors | 0 | 0 |
+| mutex | 1,864 | 0 signal-context-safe survivors | 0 | 0 |
+
+All 3,204 access sets failed on `omega-access-path`, so Vim alone provides no case
+for scheduling D3 or D4. The decision remains open until the required PHP measurement
+is available. Corpus-scale validation also recorded 68 coupling groups (1,181 grouped
+globals) represented by 1,113 proof-forest edges; the optimized disposition portion
+completed in about 89 seconds (13.1 seconds fact indexing, 75.1 seconds phase facts,
+13 milliseconds coupling) within the analysis run's 23.2 GB peak RSS.
 
 ## 8. Risks and mitigations
 
