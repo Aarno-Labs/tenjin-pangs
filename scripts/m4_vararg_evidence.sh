@@ -97,7 +97,7 @@ for dir in "$@"; do
     | @tsv
   ' "$components" \
     | sort -nr \
-    | head -n 10 \
+    | sed -n '1,10p' \
     | awk -F '\t' '
         BEGIN { seen = 0 }
         {
@@ -122,7 +122,7 @@ for dir in "$@"; do
     | sort \
     | uniq -c \
     | sort -nr \
-    | head -n 20 \
+    | sed -n '1,20p' \
     | awk '
         BEGIN { seen = 0 }
         {
