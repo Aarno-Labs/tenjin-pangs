@@ -17,9 +17,9 @@ use pangs_api::{
     StationarityWriter,
 };
 use pangs_manifest::{
-    canonicalize_audit, AlwaysFalse, AnalysisRun, AuditRecord, AuditScope, AuditSource,
-    CouplingGroup, EvidenceEdge, EvidenceKind, EvidencedBool, Extra, Facts,
-    GlobalRecord as DispositionGlobal, GroupStrategySupport, Key, Linkage, Localization,
+    canonicalize_audit, AlwaysFalse, AlwaysTrue, AnalysisRun, AuditRecord, AuditScope, AuditSource,
+    Certificate, CommonInterval, CouplingGroup, EvidenceEdge, EvidenceKind, EvidencedBool, Extra,
+    Facts, GlobalRecord as DispositionGlobal, GroupStrategySupport, Key, Linkage, Localization,
     LocalizationBlocker, LocalizationVerdict, Manifest as DispositionManifest, Meta,
     OnceLockGroupSupport, RunHeader, ScalarClass, Site, UnkeyedGlobal, Witness, WordSizedScalar,
     SCHEMA_VERSION,
@@ -121,7 +121,7 @@ pub fn assemble_disposition_artifacts(
     let repo_root = fs::canonicalize(repo_root)
         .with_context(|| format!("resolve repo root {}", repo_root.display()))?;
     let registry_facts = registry_access_facts(analysis, module);
-    let (entry_spine, phase_slots, phase_report) = phase_stationarity::certificate_slots(
+    let (entry_spine, phase_slots, mut phase_report) = phase_stationarity::certificate_slots(
         analysis,
         module,
         opts,
@@ -234,6 +234,31 @@ pub fn assemble_disposition_artifacts(
     }
 
     let coupling_groups = assemble_coupling_groups(analysis, &mut globals);
+    if let Some(report) = phase_report.as_object_mut() {
+        let summaries = coupling_groups
+            .iter()
+            .map(|group| {
+                serde_json::json!({
+                    "id": group.id,
+                    "members": group.members.len(),
+                    "once_lock_supported": matches!(
+                        group.strategy_support.once_lock.as_ref(),
+                        Some(OnceLockGroupSupport::Supported { .. })
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        report.insert(
+            "coupling_groups".into(),
+            serde_json::json!({
+                "count": coupling_groups.len(),
+                "globals_grouped": coupling_groups.iter().map(|group| group.members.len()).sum::<usize>(),
+                "once_lock_supported": coupling_groups.iter().filter(|group| matches!(group.strategy_support.once_lock.as_ref(), Some(OnceLockGroupSupport::Supported { .. }))).count(),
+                "once_lock_evidence_edges": coupling_groups.iter().flat_map(|group| &group.evidence).filter(|edge| edge.kind == EvidenceKind::OncelockInterval).count(),
+                "groups": summaries
+            }),
+        );
+    }
     let mut manifest = DispositionManifest {
         schema_version: SCHEMA_VERSION,
         run: RunHeader {
@@ -478,7 +503,7 @@ fn assemble_coupling_groups(
     for row in analysis
         .modrefs()
         .iter()
-        .filter(|row| row.access == pangs_pir::Access::Mod)
+        .filter(|row| row.access == pangs_pir::Access::Mod && row.via == pangs_api::Via::Direct)
     {
         let GlobalTarget::Name(global) = row.global else {
             continue;
@@ -493,7 +518,7 @@ fn assemble_coupling_groups(
     }
 
     let mut adjacency = BTreeMap::<Key, BTreeSet<Key>>::new();
-    let mut pair_sites = BTreeMap::<(Key, Key), Vec<Site>>::new();
+    let mut co_write_sites = BTreeMap::<(Key, Key), Vec<Site>>::new();
     for (function, written) in writes_by_function {
         let written = written.into_iter().collect::<Vec<_>>();
         for left in 0..written.len() {
@@ -503,11 +528,34 @@ fn assemble_coupling_groups(
                 adjacency.entry(a.clone()).or_default().insert(b.clone());
                 adjacency.entry(b.clone()).or_default().insert(a.clone());
                 if let Some(site) = function_site(analysis, function) {
-                    pair_sites.entry((a, b)).or_default().push(site);
+                    co_write_sites.entry((a, b)).or_default().push(site);
                 } else {
-                    pair_sites.entry((a, b)).or_default();
+                    co_write_sites.entry((a, b)).or_default();
                 }
             }
+        }
+    }
+
+    let phase_by_key = globals
+        .iter()
+        .filter_map(|global| {
+            certified_group_evidence(global).map(|evidence| (global.key.clone(), evidence))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let phase_keys = phase_by_key.keys().cloned().collect::<Vec<_>>();
+    let mut once_lock_pairs = BTreeMap::<(Key, Key), OnceLockPairEvidence>::new();
+    for left in 0..phase_keys.len() {
+        for right in left + 1..phase_keys.len() {
+            let a = phase_keys[left].clone();
+            let b = phase_keys[right].clone();
+            let left_evidence = &phase_by_key[&a];
+            let right_evidence = &phase_by_key[&b];
+            let Some(pair) = once_lock_pair_evidence(left_evidence, right_evidence) else {
+                continue;
+            };
+            adjacency.entry(a.clone()).or_default().insert(b.clone());
+            adjacency.entry(b.clone()).or_default().insert(a.clone());
+            once_lock_pairs.insert((a, b), pair);
         }
     }
 
@@ -530,8 +578,8 @@ fn assemble_coupling_groups(
             }
         }
         let members = members.into_iter().collect::<Vec<_>>();
-        let id = format!("grp-{:08x}", fnv1a32(members[0].to_string().as_bytes()));
-        let evidence = pair_sites
+        let id = coupling_group_id(&members);
+        let mut evidence = co_write_sites
             .iter()
             .filter(|((a, b), _)| {
                 members.binary_search(a).is_ok() && members.binary_search(b).is_ok()
@@ -542,7 +590,20 @@ fn assemble_coupling_groups(
                 sites: sites.clone(),
                 extra: Extra::new(),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        evidence.extend(
+            once_lock_pairs
+                .iter()
+                .filter(|((a, b), _)| {
+                    members.binary_search(a).is_ok() && members.binary_search(b).is_ok()
+                })
+                .map(|((a, b), pair)| EvidenceEdge {
+                    kind: EvidenceKind::OncelockInterval,
+                    members: vec![a.clone(), b.clone()],
+                    sites: pair.sites.clone(),
+                    extra: pair.extra.clone(),
+                }),
+        );
         for global in globals
             .iter_mut()
             .filter(|global| members.contains(&global.key))
@@ -554,19 +615,12 @@ fn assemble_coupling_groups(
             members: members.clone(),
             evidence,
             strategy_support: GroupStrategySupport {
-                once_lock: Some(OnceLockGroupSupport::Unsupported {
-                    supported: AlwaysFalse(false),
-                    witness: Witness {
-                        kind: "phase-stationarity-not-computed".into(),
-                        site: None,
-                        symbol: Some(members[0].to_string()),
-                        note: Some(
-                            "common publication support requires every member certificate".into(),
-                        ),
-                        extra: Extra::new(),
-                    },
-                    extra: Extra::new(),
-                }),
+                once_lock: Some(common_once_lock_support(
+                    analysis,
+                    globals,
+                    &members,
+                    &phase_by_key,
+                )),
                 mutex: None,
                 extra: Extra::new(),
             },
@@ -577,6 +631,214 @@ fn assemble_coupling_groups(
         });
     }
     groups
+}
+
+#[derive(Clone)]
+struct CertifiedGroupEvidence {
+    publication_function: String,
+    descent_path: Value,
+    earliest: Site,
+    latest: Site,
+    init_functions: BTreeSet<String>,
+}
+
+struct OnceLockPairEvidence {
+    sites: Vec<Site>,
+    extra: Extra,
+}
+
+fn certified_group_evidence(global: &DispositionGlobal) -> Option<CertifiedGroupEvidence> {
+    let Certificate::Certified { certificate, .. } = global.facts.phase_stationarity.as_ref()?
+    else {
+        return None;
+    };
+    let publication = certificate.get("publication")?;
+    let publication_function = publication.get("publication_function")?.as_str()?.into();
+    let descent_path = publication.get("spine_descent_path")?.clone();
+    let interval = publication.get("publication_interval")?;
+    let earliest = serde_json::from_value(interval.get("earliest")?.clone()).ok()?;
+    let latest = serde_json::from_value(interval.get("latest")?.clone()).ok()?;
+    let init_functions = certificate
+        .get("init_subtree")?
+        .as_array()?
+        .iter()
+        .filter_map(|entry| entry.get("function")?.as_str().map(str::to_owned))
+        .collect();
+    Some(CertifiedGroupEvidence {
+        publication_function,
+        descent_path,
+        earliest,
+        latest,
+        init_functions,
+    })
+}
+
+fn once_lock_pair_evidence(
+    left: &CertifiedGroupEvidence,
+    right: &CertifiedGroupEvidence,
+) -> Option<OnceLockPairEvidence> {
+    if left.publication_function != right.publication_function
+        || left.descent_path != right.descent_path
+    {
+        return None;
+    }
+    let (earliest, latest) = intersect_intervals(
+        (&left.earliest, &left.latest),
+        (&right.earliest, &right.latest),
+    )?;
+    let shared_init_functions = left
+        .init_functions
+        .intersection(&right.init_functions)
+        .cloned()
+        .collect::<Vec<_>>();
+    if shared_init_functions.is_empty() {
+        return None;
+    }
+    let mut sites = vec![earliest.clone()];
+    if site_cmp(&earliest, &latest) != std::cmp::Ordering::Equal {
+        sites.push(latest.clone());
+    }
+    let extra = BTreeMap::from([
+        (
+            "common_interval".into(),
+            serde_json::json!({"earliest": earliest, "latest": latest}),
+        ),
+        (
+            "shared_init_functions".into(),
+            serde_json::json!(shared_init_functions),
+        ),
+        ("spine_descent_path".into(), left.descent_path.clone()),
+    ]);
+    Some(OnceLockPairEvidence { sites, extra })
+}
+
+fn common_once_lock_support(
+    analysis: &Analysis,
+    globals: &[DispositionGlobal],
+    members: &[Key],
+    phase_by_key: &BTreeMap<Key, CertifiedGroupEvidence>,
+) -> OnceLockGroupSupport {
+    let unsupported = |kind: &str, member: &Key, note: &str| OnceLockGroupSupport::Unsupported {
+        supported: AlwaysFalse(false),
+        witness: Witness {
+            kind: kind.into(),
+            site: None,
+            symbol: Some(member.to_string()),
+            note: Some(note.into()),
+            extra: Extra::new(),
+        },
+        extra: Extra::new(),
+    };
+    let Some(first_key) = members.first() else {
+        unreachable!("coupling groups are nonempty")
+    };
+    let mut evidence = Vec::new();
+    for member in members {
+        if !globals.iter().any(|global| &global.key == member) {
+            return unsupported(
+                "once-lock-group-member-missing",
+                member,
+                "group member has no disposition global record",
+            );
+        }
+        let Some(member_evidence) = phase_by_key.get(member) else {
+            return unsupported(
+                "phase-stationarity-not-certified",
+                member,
+                "common publication support requires every member certificate",
+            );
+        };
+        evidence.push((member, member_evidence));
+    }
+    let (_, first) = evidence[0];
+    for (member, candidate) in evidence.iter().skip(1) {
+        if candidate.publication_function != first.publication_function {
+            return unsupported(
+                "once-lock-publication-function-mismatch",
+                member,
+                "member publication functions differ",
+            );
+        }
+        if candidate.descent_path != first.descent_path {
+            return unsupported(
+                "once-lock-spine-path-mismatch",
+                member,
+                "member spine descent paths differ",
+            );
+        }
+    }
+    let mut earliest = first.earliest.clone();
+    let mut latest = first.latest.clone();
+    for (member, candidate) in evidence.iter().skip(1) {
+        let Some((next_earliest, next_latest)) = intersect_intervals(
+            (&earliest, &latest),
+            (&candidate.earliest, &candidate.latest),
+        ) else {
+            return unsupported(
+                "once-lock-publication-interval-disjoint",
+                member,
+                "member publication intervals have no common insertion point",
+            );
+        };
+        earliest = next_earliest;
+        latest = next_latest;
+    }
+    let Some(function) = analysis.lookup_func(&first.publication_function) else {
+        return unsupported(
+            "once-lock-publication-function-unkeyed",
+            first_key,
+            "publication function is absent from the final function table",
+        );
+    };
+    let info = &analysis.functions()[function];
+    let Some(file) = info.file.as_deref() else {
+        return unsupported(
+            "once-lock-publication-function-unkeyed",
+            first_key,
+            "publication function lacks a normalized source path",
+        );
+    };
+    let Ok(publication_function) = Key::new(file, info.key.strip_prefix('@').unwrap_or(&info.key))
+    else {
+        return unsupported(
+            "once-lock-publication-function-unkeyed",
+            first_key,
+            "publication function cannot be assigned a stable key",
+        );
+    };
+    OnceLockGroupSupport::Supported {
+        supported: AlwaysTrue(true),
+        publication_function,
+        common_interval: CommonInterval {
+            earliest: earliest.clone(),
+            latest,
+            extra: Extra::new(),
+        },
+        common_p: earliest,
+        extra: Extra::new(),
+    }
+}
+
+fn intersect_intervals(left: (&Site, &Site), right: (&Site, &Site)) -> Option<(Site, Site)> {
+    let earliest = if site_cmp(left.0, right.0).is_lt() {
+        right.0
+    } else {
+        left.0
+    };
+    let latest = if site_cmp(left.1, right.1).is_gt() {
+        right.1
+    } else {
+        left.1
+    };
+    (site_cmp(earliest, latest).is_le()).then(|| (earliest.clone(), latest.clone()))
+}
+
+fn site_cmp(left: &Site, right: &Site) -> std::cmp::Ordering {
+    (&left.file, left.line, left.col.unwrap_or(0)).cmp(&(
+        &right.file,
+        right.line,
+        right.col.unwrap_or(0),
+    ))
 }
 
 fn function_site(analysis: &Analysis, function: FuncId) -> Option<Site> {
@@ -599,6 +861,14 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
     bytes.iter().fold(0x811c9dc5, |hash, byte| {
         (hash ^ u32::from(*byte)).wrapping_mul(0x01000193)
     })
+}
+
+fn coupling_group_id(members: &[Key]) -> String {
+    let smallest = members
+        .iter()
+        .min()
+        .expect("coupling group ids require at least one member");
+    format!("grp-{:08x}", fnv1a32(smallest.to_string().as_bytes()))
 }
 
 fn evidenced(value: bool, polarity: bool, witness: Option<Witness>) -> EvidencedBool {
@@ -1655,10 +1925,56 @@ mod tests {
     use std::time::Instant;
 
     use pangs_api::{Analysis, Opts};
+    use pangs_manifest::{Extra, Key, Site};
     use pangs_pir::Pir;
+    use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{check_traces, export_analysis, report, validate_export_dir};
+    use super::{
+        check_traces, coupling_group_id, export_analysis, once_lock_pair_evidence, report,
+        validate_export_dir, CertifiedGroupEvidence,
+    };
+
+    fn group_site(line: u32) -> Site {
+        Site {
+            file: "group.c".into(),
+            line,
+            col: Some(1),
+            function: Some("main".into()),
+            extra: Extra::new(),
+        }
+    }
+
+    #[test]
+    fn once_lock_pair_evidence_requires_overlap_path_and_shared_init() {
+        let evidence = |earliest, latest, path: u64, init: &[&str]| CertifiedGroupEvidence {
+            publication_function: "main".into(),
+            descent_path: json!([path]),
+            earliest: group_site(earliest),
+            latest: group_site(latest),
+            init_functions: init.iter().map(|name| (*name).into()).collect(),
+        };
+        let left = evidence(10, 20, 1, &["initialize", "left"]);
+        let right = evidence(15, 25, 1, &["initialize", "right"]);
+        let pair = once_lock_pair_evidence(&left, &right).unwrap();
+        assert_eq!(pair.extra["common_interval"]["earliest"]["line"], 15);
+        assert_eq!(pair.extra["common_interval"]["latest"]["line"], 20);
+        assert_eq!(pair.extra["shared_init_functions"], json!(["initialize"]));
+
+        assert!(once_lock_pair_evidence(&left, &evidence(21, 25, 1, &["initialize"])).is_none());
+        assert!(once_lock_pair_evidence(&left, &evidence(15, 18, 2, &["initialize"])).is_none());
+        assert!(once_lock_pair_evidence(&left, &evidence(15, 18, 1, &["other"])).is_none());
+    }
+
+    #[test]
+    fn coupling_group_id_is_independent_of_member_order() {
+        let left = Key::new("group.c", "left").unwrap();
+        let right = Key::new("group.c", "right").unwrap();
+        assert_eq!(
+            coupling_group_id(&[left.clone(), right.clone()]),
+            coupling_group_id(&[right, left])
+        );
+    }
 
     #[test]
     fn check_traces_flags_a_target_outside_the_edge_set() {

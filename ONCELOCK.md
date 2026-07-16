@@ -343,7 +343,9 @@ the disposition facts are assembled. Its stable v1 fields are:
   first by publication point and then by failure code/name;
 - `failure_code_counts` and `no_single_p.{count,witnesses}`;
 - `both_phase_bucket_sizes.{histogram,globals_nonempty,functions_total,not_computed}`;
-- `spine_descent_depth.{max_depth,histogram,exhausted,not_computed}`.
+- `spine_descent_depth.{max_depth,histogram,exhausted,not_computed}`;
+- `coupling_groups`, the D2b group-id summary attached after clustering, including
+  supported-group and OnceLock-evidence-edge counts.
 
 - **Quiescence profile:** all globals sorted by publication point (or failure), i.e., a
   timeline of `main` showing where each global settles. Feeds the `DESIGN.md` §11.4-style

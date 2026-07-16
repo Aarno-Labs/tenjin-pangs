@@ -271,9 +271,191 @@ pub fn apply_policy(
         counts,
         extra: Extra::new(),
     });
+    emit_measurement_report(manifest);
     canonicalize_audit(ledger)?;
     manifest.canonicalize();
     Ok(PolicyOutcome { override_problems })
+}
+
+/// Emit the inexpensive M3 gate measurements from facts and finalized policy output. These are
+/// deliberately an observation of existing facts, not a partial implementation of D3 or D4.
+fn emit_measurement_report(manifest: &mut Manifest) {
+    let strategies = [
+        Strategy::Immutable,
+        Strategy::OnceLock,
+        Strategy::Atomic,
+        Strategy::Mutex,
+        Strategy::Localize,
+        Strategy::Unhandled,
+    ];
+    let mut distribution = BTreeMap::new();
+    for strategy in &strategies {
+        distribution.insert(strategy.as_str().to_owned(), 0_u64);
+    }
+
+    let mut skip_histogram = BTreeMap::<String, serde_json::Value>::new();
+    let mut skip_counts = strategies
+        .iter()
+        .map(|strategy| {
+            (
+                strategy.as_str().to_owned(),
+                (0_u64, BTreeMap::new(), BTreeMap::new()),
+            )
+        })
+        .collect::<BTreeMap<String, (u64, BTreeMap<String, u64>, BTreeMap<String, u64>)>>();
+    let mut atomic_candidates = 0_u64;
+    let mut atomic_word_sized = 0_u64;
+    let mut atomic_access_complete = 0_u64;
+    let mut atomic_singleton = 0_u64;
+    let mut mutex_candidates = 0_u64;
+    let mut mutex_access_complete = 0_u64;
+    let mut mutex_signal_safe = 0_u64;
+    let mut localized_globals = 0_u64;
+    let mut localized_known_size_bits = 0_u64;
+    let mut localized_unknown_size = 0_u64;
+    let mut localized_components = BTreeMap::<String, (u64, u64, u64)>::new();
+
+    for global in &manifest.globals {
+        let disposition = global
+            .disposition
+            .as_ref()
+            .expect("measurement report requires finalized dispositions");
+        *distribution
+            .get_mut(disposition.chosen.as_str())
+            .expect("all strategies have a distribution bucket") += 1;
+
+        for skip in &disposition.cascade_trace {
+            let entry = skip_counts
+                .entry(skip.strategy.as_str().to_owned())
+                .or_default();
+            entry.0 += 1;
+            match &skip.reason {
+                SkipReason::GuardFailed { failed, .. } => {
+                    for guard in failed {
+                        *entry.1.entry(guard.clone()).or_default() += 1;
+                    }
+                }
+                SkipReason::FactNotComputed { fact, .. } => {
+                    *entry.2.entry(fact.clone()).or_default() += 1;
+                }
+            }
+        }
+
+        let gate_candidate = matches!(disposition.chosen, Strategy::Localize | Strategy::Unhandled);
+        if gate_candidate {
+            atomic_candidates += 1;
+            if global.facts.word_sized_scalar.value {
+                atomic_word_sized += 1;
+                if global.facts.access_set_complete.value {
+                    atomic_access_complete += 1;
+                    if global.facts.coupling_group.is_none() {
+                        atomic_singleton += 1;
+                    }
+                }
+            }
+
+            mutex_candidates += 1;
+            if global.facts.access_set_complete.value {
+                mutex_access_complete += 1;
+                if !global.facts.signal_context_access.value {
+                    mutex_signal_safe += 1;
+                }
+            }
+        }
+
+        if disposition.chosen == Strategy::Localize {
+            localized_globals += 1;
+            let component = global
+                .facts
+                .localization
+                .as_ref()
+                .map(|localization| localization.component.clone())
+                .unwrap_or_else(|| "<missing>".into());
+            let component_counts = localized_components.entry(component).or_default();
+            component_counts.0 += 1;
+            if let Some(size_bits) = global.meta.size_bits {
+                localized_known_size_bits += size_bits;
+                component_counts.1 += size_bits;
+            } else {
+                localized_unknown_size += 1;
+                component_counts.2 += 1;
+            }
+        }
+    }
+
+    for (strategy, (total, guard_failed, fact_not_computed)) in skip_counts {
+        skip_histogram.insert(
+            strategy,
+            serde_json::json!({
+                "total": total,
+                "guard_failed": guard_failed,
+                "fact_not_computed": fact_not_computed,
+            }),
+        );
+    }
+    let components = localized_components
+        .into_iter()
+        .map(
+            |(component, (globals, known_size_bits, unknown_size_globals))| {
+                (
+                    component,
+                    serde_json::json!({
+                        "globals": globals,
+                        "known_size_bits": known_size_bits,
+                        "unknown_size_globals": unknown_size_globals,
+                    }),
+                )
+            },
+        )
+        .collect::<BTreeMap<_, _>>();
+    let override_usage = manifest
+        .override_report
+        .as_ref()
+        .map(|report| {
+            serde_json::json!({
+                "honored": report.counts.honored,
+                "accepted_risk": report.counts.honored_accepted_risk,
+                "rejected": report.counts.rejected
+                    + report.counts.rejected_strategy_disabled
+                    + report.counts.rejected_strategy_unavailable
+                    + report.counts.rejected_no_recipe,
+                "unmatched_key": report.counts.unmatched_key,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({}));
+    let report = serde_json::json!({
+        "disposition_distribution": distribution,
+        "cascade_skip_histogram": skip_histogram,
+        "would_be_eligibility": {
+            "atomic": {
+                "candidate_disposition": atomic_candidates,
+                "word_sized_scalar": atomic_word_sized,
+                "access_set_complete": atomic_access_complete,
+                "singleton_coupling_group": atomic_singleton,
+                "eligible": atomic_singleton,
+            },
+            "mutex": {
+                "candidate_disposition": mutex_candidates,
+                "access_set_complete": mutex_access_complete,
+                "signal_context_safe": mutex_signal_safe,
+                "eligible": mutex_signal_safe,
+            },
+        },
+        "context_struct_pressure": {
+            "localized_globals": localized_globals,
+            "known_size_bits": localized_known_size_bits,
+            "unknown_size_globals": localized_unknown_size,
+            "components": components,
+        },
+        "override_usage": override_usage,
+    });
+    manifest
+        .run
+        .dispose
+        .as_mut()
+        .expect("policy application creates dispose run metadata")
+        .extra
+        .insert("measurement_report".into(), report);
 }
 
 fn apply_global_override(
@@ -1448,5 +1630,50 @@ mod tests {
         assert!(header.contains("pangs_disposition_immutable__src_a_c__g__"));
         assert!(source.contains("#include \"pangs_markers.h\""));
         assert!(!header.contains("static inline"));
+    }
+
+    #[test]
+    fn policy_emits_free_d3_d4_gate_measurements() {
+        let mut facts = base_facts();
+        facts.written.value = true;
+        facts.word_sized_scalar = WordSizedScalar {
+            value: true,
+            type_spelling: Some("int".into()),
+            size_bits: Some(32),
+            class: Some(pangs_manifest::ScalarClass::Integer),
+            signed: Some(true),
+            extra: Extra::new(),
+        };
+        facts.localization = Some(Localization {
+            component: "component-main".into(),
+            verdict: LocalizationVerdict::Ok,
+            blockers: Vec::new(),
+            extra: Extra::new(),
+        });
+        let mut manifest = manifest_with(facts);
+        manifest.globals[0].meta.size_bits = Some(32);
+        let mut ledger = Vec::new();
+        let config = CascadeConfig::default_for(DisposeMode::Application);
+        apply_policy(&mut manifest, &mut ledger, &config, None, None, None).unwrap();
+
+        let report = &manifest.run.dispose.as_ref().unwrap().extra["measurement_report"];
+        assert_eq!(report["disposition_distribution"]["localize"], 1);
+        assert_eq!(report["disposition_distribution"]["unhandled"], 0);
+        assert_eq!(
+            report["cascade_skip_histogram"]["immutable"]["guard_failed"]["written"],
+            1
+        );
+        assert_eq!(
+            report["cascade_skip_histogram"]["atomic"]["fact_not_computed"]["atomic_eligibility"],
+            1
+        );
+        assert_eq!(report["would_be_eligibility"]["atomic"]["eligible"], 1);
+        assert_eq!(report["would_be_eligibility"]["mutex"]["eligible"], 1);
+        assert_eq!(report["context_struct_pressure"]["known_size_bits"], 32);
+        assert_eq!(
+            report["context_struct_pressure"]["components"]["component-main"]["globals"],
+            1
+        );
+        assert_eq!(report["override_usage"]["honored"], 0);
     }
 }

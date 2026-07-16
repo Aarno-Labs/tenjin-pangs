@@ -2085,6 +2085,21 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
     assert!(phase_report["no_single_p"]["witnesses"].is_array());
     assert!(phase_report["both_phase_bucket_sizes"]["histogram"].is_object());
     assert!(phase_report["spine_descent_depth"]["histogram"].is_object());
+    let measurements = &disposition["run"]["dispose"]["measurement_report"];
+    assert_eq!(
+        measurements["disposition_distribution"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|count| count.as_u64().unwrap())
+            .sum::<u64>(),
+        disposition["globals"].as_array().unwrap().len() as u64
+    );
+    assert!(measurements["cascade_skip_histogram"].is_object());
+    assert!(measurements["would_be_eligibility"]["atomic"]["eligible"].is_u64());
+    assert!(measurements["would_be_eligibility"]["mutex"]["eligible"].is_u64());
+    assert!(measurements["context_struct_pressure"]["components"].is_object());
+    assert_eq!(measurements["override_usage"]["honored"], 0);
     assert!(out.join("pangs-audit.json").exists());
     let export_index: Value =
         serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
@@ -2119,7 +2134,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "192d9acf5bf28aa2ffb4b4a806fd408366bca8e63c3cea1b483723600e101698"
+        "8d21e65afb959b6125d3d2f9242da2f49caed18510fd6d91c44aaf0fda37b881"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(
@@ -2268,6 +2283,14 @@ fn analyze_dispose_reports_registry_reachability_and_coupling() {
     );
     let groups = manifest["coupling_groups"].as_array().unwrap();
     assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0]["strategy_support"]["once_lock"]["supported"],
+        false
+    );
+    assert_eq!(
+        groups[0]["strategy_support"]["once_lock"]["witness"]["kind"],
+        "phase-stationarity-not-certified"
+    );
     assert!(groups[0]["evidence"]
         .as_array()
         .unwrap()
@@ -2332,6 +2355,77 @@ fn analyze_dispose_certifies_a_source_mapped_once_lock_candidate() {
         manifest["run"]["analysis"]["phase_stationarity_report"]["coverage"]["certified_globals"],
         1
     );
+}
+
+#[test]
+fn analyze_dispose_derives_common_once_lock_group_support() {
+    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
+    let tmp = TempDir::new().unwrap();
+    let bc = tmp.path().join("phase-once-lock-group.bc");
+    let out = tmp.path().join("out");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = repo_root.join("fixtures/synthetic/disposition/phase_once_lock_group.c");
+    assert!(Command::new(CLANG_14)
+        .args(["-O0", "-g", "-emit-llvm", "-c"])
+        .arg(source)
+        .arg("-o")
+        .arg(&bc)
+        .status()
+        .unwrap()
+        .success());
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(&bc)
+        .arg("--out")
+        .arg(&out)
+        .arg("--build-mode")
+        .arg("executable")
+        .arg("--dispose")
+        .arg("--repo-root")
+        .arg(&repo_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
+    let groups = manifest["coupling_groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    let group = &groups[0];
+    assert_eq!(group["members"].as_array().unwrap().len(), 2);
+    assert_eq!(group["strategy_support"]["once_lock"]["supported"], true);
+    assert!(
+        group["strategy_support"]["once_lock"]["publication_function"]
+            .as_str()
+            .unwrap()
+            .ends_with("::main")
+    );
+    assert_eq!(group["group_disposition"], "once-lock");
+    assert!(group["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|edge| edge["kind"] == "oncelock-interval"
+            && edge["shared_init_functions"] == serde_json::json!(["initialize"])));
+    assert!(!group["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|edge| edge["kind"] == "co-write"));
+    assert!(manifest["globals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|global| global["disposition"]["chosen"] == "once-lock"));
+    let report = &manifest["run"]["analysis"]["phase_stationarity_report"]["coupling_groups"];
+    assert_eq!(report["count"], 1);
+    assert_eq!(report["once_lock_supported"], 1);
+    assert_eq!(report["once_lock_evidence_edges"], 1);
+    assert_eq!(report["groups"][0]["id"], group["id"]);
 }
 
 fn workspace_path(rel: &str) -> PathBuf {

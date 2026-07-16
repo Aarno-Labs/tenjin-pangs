@@ -690,6 +690,15 @@ existing passes degenerates gracefully: `immutable` / `once-lock` / `localize` /
    use; a high accepted-risk rate is a signal that some fact is over-conservative and
    names exactly which one.
 
+These measurements are emitted after policy and override resolution at
+`run.dispose.measurement_report`. `disposition_distribution` counts final choices;
+`cascade_skip_histogram` retains separate guard-failed and fact-not-computed buckets;
+`would_be_eligibility` records cumulative cheap-filter funnels and the D3/D4 gate
+counts; `context_struct_pressure` reports localized globals and known/unknown size by
+localization component; and `override_usage` summarizes the detailed top-level
+`override_report`. The counters observe existing facts only: they do not populate the
+reserved eligibility certificate slots.
+
 ## 11. Open questions
 
 1. **Cascade position of `atomic` vs `once-lock` for phase-stationary scalars.** Both
