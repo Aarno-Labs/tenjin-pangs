@@ -1,11 +1,11 @@
-// O2 deliberately lands before O3/O6 wire the result into manifest assembly (ONCELOCK.md §3.2).
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use pangs_api::{Analysis, Callee, Caller, CallsiteId, FuncId, GlobalId, GlobalTarget, Via};
-use pangs_manifest::Witness;
+use pangs_api::{
+    Analysis, BuildMode, Callee, Caller, CallsiteId, FuncId, GlobalId, GlobalTarget, Opts, Via,
+};
+use pangs_manifest::{Certificate, Extra, Site, Witness};
 use pangs_pir::{Access, Pir, StatementCfg, Stmt};
+use serde_json::{json, Value};
 
 use crate::function_witness;
 
@@ -377,6 +377,7 @@ pub(crate) fn evaluate_with_descent(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn splice_unique_call(
     parent_function: FuncId,
     parent_cfg: &StatementCfg,
@@ -804,6 +805,412 @@ fn affected_globals(analysis: &Analysis, row: &pangs_api::ModRef) -> Vec<GlobalI
     }
 }
 
+pub(crate) fn certificate_slots(
+    analysis: &Analysis,
+    module: &Pir,
+    opts: &Opts,
+    pseudo_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
+    spawn_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
+    escape_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
+    thread_writers: &BTreeMap<GlobalId, Witness>,
+) -> (Option<Value>, BTreeMap<GlobalId, Certificate>) {
+    let main = (opts.build_mode == BuildMode::Executable
+        && opts.stage != pangs_api::Stage::Conservative)
+        .then(|| analysis.lookup_func("main"))
+        .flatten();
+    let entry_spine = main.map(|main| {
+        json!({
+            "root": analysis.functions()[main].key,
+            "max_descent_depth": 4,
+            "assumptions": []
+        })
+    });
+    let kills = evaluate_kill_rules(analysis, thread_writers);
+    let mut slots = BTreeMap::new();
+    for index in 0..analysis.globals().len() {
+        let global = GlobalId(index as u32);
+        let Some(main) = main else {
+            slots.insert(
+                global,
+                failed_slot(
+                    "no-entry-spine",
+                    run_witness("no-entry-spine", "v1 requires executable mode with main"),
+                ),
+            );
+            continue;
+        };
+        let Some(evaluation) =
+            evaluate_with_descent(analysis, module, main, global, pseudo_read_callsites, 4)
+        else {
+            slots.insert(
+                global,
+                failed_slot(
+                    "no-entry-spine",
+                    run_witness("no-entry-spine", "statement CFG metadata unavailable"),
+                ),
+            );
+            continue;
+        };
+        let mut codes = kills
+            .get(&global)
+            .into_iter()
+            .flatten()
+            .map(|kill| kill.code.to_string())
+            .collect::<Vec<_>>();
+        let mut witnesses = kills
+            .get(&global)
+            .into_iter()
+            .flatten()
+            .map(|kill| kill.witness.clone())
+            .collect::<Vec<_>>();
+        let payload = match &evaluation.selection {
+            Ok(selection) => build_payload(
+                analysis,
+                module,
+                global,
+                &evaluation,
+                selection,
+                spawn_read_callsites,
+                escape_read_callsites,
+            ),
+            Err(failure) => Err((selection_code(*failure), selection_witness(*failure))),
+        };
+        let recipe = match payload {
+            Ok(payload) if codes.is_empty() => {
+                slots.insert(
+                    global,
+                    Certificate::Certified {
+                        certificate: payload,
+                        extra: Extra::new(),
+                    },
+                );
+                continue;
+            }
+            Ok(payload) => Some(payload),
+            Err((code, witness)) => {
+                codes.push(if evaluation.exhausted {
+                    "spine-descent-exhausted".into()
+                } else {
+                    code.into()
+                });
+                witnesses.push(witness);
+                None
+            }
+        };
+        slots.insert(
+            global,
+            Certificate::Failed {
+                codes,
+                witnesses,
+                recipe,
+                diagnostics: None,
+                extra: Extra::new(),
+            },
+        );
+    }
+    (entry_spine, slots)
+}
+
+#[allow(clippy::result_large_err)]
+fn build_payload(
+    analysis: &Analysis,
+    module: &Pir,
+    global: GlobalId,
+    evaluation: &DescentEvaluation,
+    selection: &PublicationSelection,
+    spawn_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
+    escape_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
+) -> Result<Value, (&'static str, Witness)> {
+    let publication = boundary_site(analysis, &evaluation.spine, selection.chosen)?;
+    let earliest = boundary_site(analysis, &evaluation.spine, selection.earliest)?;
+    let latest = boundary_site(analysis, &evaluation.spine, selection.latest)?;
+    let dom = dominators(&evaluation.spine.cfg);
+    let mut writers = Vec::new();
+    let mut pre_readers = Vec::new();
+    let mut pre_functions = BTreeSet::new();
+    let mut post_functions = BTreeSet::new();
+    for access in analysis
+        .access_sites()
+        .iter()
+        .filter(|site| site.global == global)
+    {
+        let boundary = access_boundary(module, &evaluation.spine, access).ok_or_else(|| {
+            (
+                "no-entry-spine",
+                access_witness(
+                    analysis,
+                    access,
+                    "access site is not on the source-mapped spine",
+                ),
+            )
+        })?;
+        let before =
+            boundary != selection.chosen && dom[selection.chosen as usize][boundary as usize];
+        let after = dom[boundary as usize][selection.chosen as usize];
+        let site = access_site(analysis, access).ok_or_else(|| {
+            (
+                "no-entry-spine",
+                access_witness(analysis, access, "access site lacks source coordinates"),
+            )
+        })?;
+        let function = analysis.functions()[access.func].key.clone();
+        match access.access {
+            Access::Mod => {
+                if !before {
+                    return Err((
+                        "never-quiescent",
+                        access_witness(analysis, access, "writer is not provably pre-publication"),
+                    ));
+                }
+                pre_functions.insert(function.clone());
+                writers.push(json!({"function": function, "site": site, "kind": if access.via == Via::Direct {"direct"} else {"via-pointer"}}));
+            }
+            Access::Ref if before => {
+                pre_functions.insert(function.clone());
+                pre_readers.push(json!({"function": function, "site": site}));
+            }
+            Access::Ref if after => {
+                post_functions.insert(function);
+            }
+            Access::Ref => {
+                return Err((
+                    "no-single-P",
+                    access_witness(
+                        analysis,
+                        access,
+                        "reader is dominance-incomparable with publication",
+                    ),
+                ))
+            }
+        }
+    }
+    writers.sort_by_key(|value| value.to_string());
+    pre_readers.sort_by_key(|value| value.to_string());
+    let both_phase = pre_functions
+        .intersection(&post_functions)
+        .cloned()
+        .collect::<Vec<_>>();
+    let post_sample = post_functions.iter().take(16).cloned().collect::<Vec<_>>();
+    let mut spine_functions = Vec::new();
+    for function in evaluation
+        .spine
+        .origins
+        .iter()
+        .map(|origin| origin.function)
+    {
+        if !spine_functions.contains(&function) {
+            spine_functions.push(function);
+        }
+    }
+    let init_subtree = pre_functions
+        .iter()
+        .map(|function| {
+            let function_id = analysis.lookup_func(function);
+            let position = function_id.and_then(|function_id| {
+                spine_functions
+                    .iter()
+                    .position(|candidate| *candidate == function_id)
+            });
+            let sites = position
+                .filter(|position| *position > 0)
+                .and_then(|position| evaluation.path.get(position - 1))
+                .and_then(|callsite| analysis.callsites()[*callsite].loc.as_ref())
+                .map(|loc| vec![json!({"file":loc.file,"line":loc.line,"col":loc.col})])
+                .unwrap_or_default();
+            json!({"function": function, "spine_call_sites": sites})
+        })
+        .collect::<Vec<_>>();
+    let path = evaluation
+        .path
+        .iter()
+        .map(|callsite| callsite_json(analysis, *callsite))
+        .collect::<Vec<_>>();
+    let spawn_sites = spawn_read_callsites
+        .get(&global)
+        .into_iter()
+        .flatten()
+        .map(|callsite| callsite_json(analysis, *callsite))
+        .collect::<Vec<_>>();
+    let mut escape_sites = escape_read_callsites
+        .get(&global)
+        .into_iter()
+        .flatten()
+        .map(|callsite| callsite_json(analysis, *callsite))
+        .collect::<Vec<_>>();
+    for (index, function) in analysis.functions().iter().enumerate() {
+        if !function.address_escaped
+            || !transitive_accessed_globals(analysis, FuncId(index as u32), Access::Ref)
+                .contains(&global)
+        {
+            continue;
+        }
+        for source in &function.escape_sources {
+            let Some(key) = source
+                .strip_prefix("external-call:")
+                .or_else(|| source.strip_prefix("vararg-call:"))
+            else {
+                continue;
+            };
+            if let Some((index, _)) = analysis
+                .callsites()
+                .iter()
+                .enumerate()
+                .find(|(_, site)| site.key == key)
+            {
+                escape_sites.push(callsite_json(analysis, CallsiteId(index as u32)));
+            }
+        }
+    }
+    escape_sites.sort_by_key(Value::to_string);
+    escape_sites.dedup();
+    Ok(json!({
+        "publication": {
+            "publication_function": publication.function,
+            "publication_point": publication,
+            "publication_interval": {"earliest": earliest, "latest": latest},
+            "spine_descent_path": path,
+            "kill_rules_checked": KILL_CODE_ORDER,
+            "assumptions": []
+        },
+        "writers": writers,
+        "init_subtree": init_subtree,
+        "readers": {
+            "pre_p": pre_readers,
+            "post_p_functions_count": post_functions.len(),
+            "post_p_sample": post_sample,
+            "both_phase": both_phase
+        },
+        "observations": {"escape_sites": escape_sites, "spawn_sites": spawn_sites}
+    }))
+}
+
+#[allow(clippy::result_large_err)]
+fn boundary_site(
+    analysis: &Analysis,
+    spine: &SplicedSpine,
+    boundary: u32,
+) -> Result<Site, (&'static str, Witness)> {
+    let origin = spine.origins.get(boundary as usize).ok_or_else(|| {
+        (
+            "no-entry-spine",
+            run_witness("no-entry-spine", "publication boundary origin unavailable"),
+        )
+    })?;
+    let loc = spine
+        .cfg
+        .boundaries
+        .get(boundary as usize)
+        .and_then(|boundary| boundary.loc.as_ref())
+        .ok_or_else(|| {
+            (
+                "no-entry-spine",
+                run_witness(
+                    "no-entry-spine",
+                    "publication boundary lacks source coordinates",
+                ),
+            )
+        })?;
+    Ok(Site {
+        file: loc.file.clone(),
+        line: loc.line,
+        col: Some(loc.col),
+        function: Some(analysis.functions()[origin.function].key.clone()),
+        extra: Extra::new(),
+    })
+}
+
+fn access_boundary(
+    module: &Pir,
+    spine: &SplicedSpine,
+    access: &pangs_api::AccessSite,
+) -> Option<u32> {
+    spine
+        .origins
+        .iter()
+        .enumerate()
+        .find_map(|(index, origin)| {
+            if origin.function != access.func {
+                return None;
+            }
+            let cfg = module
+                .lowering
+                .statement_cfgs
+                .get(&module.functions[access.func.0 as usize].key)?;
+            let local = cfg.boundaries.get(origin.boundary as usize)?;
+            let statement_match = access
+                .statement_index
+                .is_some_and(|statement| local.stmt_indices.contains(&statement));
+            let loc_match =
+                access
+                    .loc
+                    .as_ref()
+                    .zip(local.loc.as_ref())
+                    .is_some_and(|(left, right)| {
+                        left.file == right.file && left.line == right.line && left.col == right.col
+                    });
+            (statement_match || loc_match).then_some(index as u32)
+        })
+}
+
+fn access_site(analysis: &Analysis, access: &pangs_api::AccessSite) -> Option<Site> {
+    let loc = access.loc.as_ref()?;
+    Some(Site {
+        file: loc.file.clone(),
+        line: loc.line,
+        col: Some(loc.col),
+        function: Some(analysis.functions()[access.func].key.clone()),
+        extra: Extra::new(),
+    })
+}
+
+fn access_witness(analysis: &Analysis, access: &pangs_api::AccessSite, note: &str) -> Witness {
+    Witness {
+        kind: "phase-access-site".into(),
+        site: access_site(analysis, access),
+        symbol: Some(analysis.globals()[access.global].key.clone()),
+        note: Some(note.into()),
+        extra: Extra::new(),
+    }
+}
+
+fn callsite_json(analysis: &Analysis, callsite: CallsiteId) -> Value {
+    let info = &analysis.callsites()[callsite];
+    json!({"function": analysis.functions()[info.caller].key, "site": info.loc.as_ref().map(|loc| json!({"file":loc.file,"line":loc.line,"col":loc.col}))})
+}
+
+fn selection_code(failure: SelectionFailure) -> &'static str {
+    match failure {
+        SelectionFailure::NoEntrySpine => "no-entry-spine",
+        SelectionFailure::NeverQuiescent => "never-quiescent",
+        SelectionFailure::ObservationBeforeQuiescence => "observation-before-quiescence",
+        SelectionFailure::NoSingleP => "no-single-P",
+    }
+}
+fn selection_witness(failure: SelectionFailure) -> Witness {
+    run_witness(
+        selection_code(failure),
+        "phase publication selection failed",
+    )
+}
+fn failed_slot(code: &str, witness: Witness) -> Certificate {
+    Certificate::Failed {
+        codes: vec![code.into()],
+        witnesses: vec![witness],
+        recipe: None,
+        diagnostics: None,
+        extra: Extra::new(),
+    }
+}
+fn run_witness(kind: &str, note: &str) -> Witness {
+    Witness {
+        kind: kind.into(),
+        site: None,
+        symbol: None,
+        note: Some(note.into()),
+        extra: Extra::new(),
+    }
+}
+
 /// O2 result at statement-boundary granularity. `writable_after[p]` includes the writes
 /// generated by the statement immediately following boundary `p` and every reachable successor.
 pub(crate) struct Quiescence {
@@ -1154,13 +1561,14 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use pangs_api::{Analysis, BuildMode, CallsiteId, Opts, Stage};
+    use pangs_manifest::Certificate;
     use pangs_pir::{StatementBoundary, StatementCfg};
     use serde_json::json;
 
     use super::{
-        assemble_spine_inputs, descent_candidate, evaluate_kill_rules, evaluate_with_descent,
-        select_publication, splice_unique_call, FuncId, GlobalId, Observation, Quiescence,
-        SelectionFailure,
+        assemble_spine_inputs, certificate_slots, descent_candidate, evaluate_kill_rules,
+        evaluate_with_descent, select_publication, splice_unique_call, FuncId, GlobalId,
+        Observation, Quiescence, SelectionFailure,
     };
 
     fn boundary(id: u32, successors: &[u32], predecessors: &[u32]) -> StatementBoundary {
@@ -1765,5 +2173,70 @@ mod tests {
             completed.spine.origins[selection.chosen as usize].boundary,
             1
         );
+    }
+
+    #[test]
+    fn o6_emits_complete_certified_slot_for_source_mapped_spine_accesses() {
+        let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
+        let loc = |line| json!({"file":"phase.c","line":line,"col":1});
+        let mut pir: pangs_pir::Pir = serde_json::from_value(json!({
+            "module":"phase-o6",
+            "functions":[{"key":"main", "sig":signature(), "body":[
+                {"kind":"global_ref", "global":"@g", "access":"mod", "loc":loc(1)},
+                {"kind":"global_ref", "global":"@g", "access":"ref", "loc":loc(2)}
+            ]}],
+            "globals":[{"key":"@g"}]
+        }))
+        .unwrap();
+        let cfg_loc = |line| pangs_pir::Loc {
+            file: "phase.c".into(),
+            line,
+            col: 1,
+            dir: None,
+            filename: None,
+        };
+        pir.lowering.statement_cfgs.insert(
+            "main".into(),
+            StatementCfg {
+                entry: 0,
+                boundaries: vec![
+                    StatementBoundary {
+                        loc: Some(cfg_loc(1)),
+                        stmt_indices: vec![0],
+                        ..boundary(0, &[1], &[])
+                    },
+                    StatementBoundary {
+                        loc: Some(cfg_loc(2)),
+                        stmt_indices: vec![1],
+                        ..boundary(1, &[], &[0])
+                    },
+                ],
+                source_mapping_available: true,
+            },
+        );
+        let opts = Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let global = analysis.lookup_global("@g").unwrap();
+        let (entry, slots) = certificate_slots(
+            &analysis,
+            &pir,
+            &opts,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(entry.unwrap()["root"], "main");
+        let Certificate::Certified { certificate, .. } = &slots[&global] else {
+            panic!("expected certified phase slot: {:#?}", slots[&global]);
+        };
+        assert_eq!(certificate["publication"]["publication_function"], "main");
+        assert_eq!(certificate["publication"]["publication_point"]["line"], 2);
+        assert_eq!(certificate["writers"].as_array().unwrap().len(), 1);
+        assert_eq!(certificate["readers"]["post_p_functions_count"], 1);
     }
 }

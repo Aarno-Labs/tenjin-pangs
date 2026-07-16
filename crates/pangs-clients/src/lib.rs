@@ -121,6 +121,15 @@ pub fn assemble_disposition_artifacts(
     let repo_root = fs::canonicalize(repo_root)
         .with_context(|| format!("resolve repo root {}", repo_root.display()))?;
     let registry_facts = registry_access_facts(analysis, module);
+    let (entry_spine, phase_slots) = phase_stationarity::certificate_slots(
+        analysis,
+        module,
+        opts,
+        &registry_facts.pseudo_read_callsites,
+        &registry_facts.spawn_read_callsites,
+        &registry_facts.escape_read_callsites,
+        &registry_facts.thread_writers,
+    );
     let mut globals = Vec::new();
     let mut unkeyed_globals = Vec::new();
     for (index, info) in analysis.globals().iter().enumerate() {
@@ -212,7 +221,7 @@ pub fn assemble_disposition_artifacts(
                 ),
                 access_set_complete: evidenced(access_failure.is_none(), false, access_failure),
                 word_sized_scalar: word_sized_scalar(info, target),
-                phase_stationarity: None,
+                phase_stationarity: phase_slots.get(&gid).cloned(),
                 atomic_eligibility: None,
                 mutex_eligibility: None,
                 coupling_group: None,
@@ -240,7 +249,7 @@ pub fn assemble_disposition_artifacts(
                 target_triple: target.triple.clone(),
                 data_layout: target.data_layout.clone(),
                 supported_atomic_widths: target.supported_atomic_widths.clone(),
-                entry_spine: None,
+                entry_spine,
                 extra: Extra::new(),
             },
             dispose: None,
@@ -278,6 +287,8 @@ struct RegistryAccessFacts {
     thread_writers: BTreeMap<GlobalId, Witness>,
     /// Registration/spawn statements that act as non-routable phase-stationarity reads.
     pseudo_read_callsites: BTreeMap<GlobalId, BTreeSet<pangs_api::CallsiteId>>,
+    spawn_read_callsites: BTreeMap<GlobalId, BTreeSet<pangs_api::CallsiteId>>,
+    escape_read_callsites: BTreeMap<GlobalId, BTreeSet<pangs_api::CallsiteId>>,
 }
 
 fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> RegistryAccessFacts {
@@ -389,6 +400,11 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                                     .entry(global)
                                     .or_default()
                                     .insert(callsite);
+                                let classified = match kind {
+                                    RegistryKind::Spawn => &mut result.spawn_read_callsites,
+                                    RegistryKind::Signal => &mut result.escape_read_callsites,
+                                };
+                                classified.entry(global).or_default().insert(callsite);
                             }
                             if kind == RegistryKind::Spawn && row.access == pangs_pir::Access::Mod {
                                 result
