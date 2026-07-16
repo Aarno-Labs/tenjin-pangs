@@ -120,7 +120,15 @@ pub fn assemble_disposition_artifacts(
 ) -> Result<(DispositionManifest, Vec<AuditRecord>)> {
     let repo_root = fs::canonicalize(repo_root)
         .with_context(|| format!("resolve repo root {}", repo_root.display()))?;
+    let disposition_started = Instant::now();
+    let registry_started = Instant::now();
     let registry_facts = registry_access_facts(analysis, module);
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing registry-facts={}ms",
+            registry_started.elapsed().as_millis()
+        );
+    }
     let (entry_spine, phase_slots, mut phase_report) = phase_stationarity::certificate_slots(
         analysis,
         module,
@@ -130,6 +138,12 @@ pub fn assemble_disposition_artifacts(
         &registry_facts.escape_read_callsites,
         &registry_facts.thread_writers,
     );
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing through-phase-certificates={}ms",
+            disposition_started.elapsed().as_millis()
+        );
+    }
     let mut globals = Vec::new();
     let mut unkeyed_globals = Vec::new();
     for (index, info) in analysis.globals().iter().enumerate() {
@@ -318,6 +332,7 @@ struct RegistryAccessFacts {
 
 fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> RegistryAccessFacts {
     let mut result = RegistryAccessFacts::default();
+    let mut entry_access_cache = BTreeMap::<FuncId, Vec<(GlobalId, pangs_pir::Access)>>::new();
     let mut callsite_index = 0_u32;
     for (caller_index, function) in module.functions.iter().enumerate() {
         let caller = FuncId(caller_index as u32);
@@ -389,54 +404,63 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                 let entries = precise_entries.into_iter().chain(widened_entries);
                 let witness = registry_witness(analysis, caller, loc, kind, unresolved);
                 for entry in entries {
-                    for row in analysis.modref(entry) {
-                        let affected = match &row.global {
-                            GlobalTarget::Name(global) => vec![*global],
-                            GlobalTarget::Unknown(_) if row.pointee_globals.is_empty() => (0
-                                ..analysis.globals().len())
-                                .map(|index| GlobalId(index as u32))
-                                .collect(),
-                            GlobalTarget::Unknown(_) => analysis
-                                .globals()
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, global)| row.pointee_globals.contains(&global.key))
-                                .map(|(index, _)| GlobalId(index as u32))
-                                .collect(),
-                        };
-                        for global in affected {
-                            match kind {
-                                RegistryKind::Spawn => {
-                                    result
-                                        .thread_visible
-                                        .entry(global)
-                                        .or_insert_with(|| witness.clone());
-                                }
-                                RegistryKind::Signal => {
-                                    result
-                                        .signal_context_access
-                                        .entry(global)
-                                        .or_insert_with(|| witness.clone());
-                                }
-                            }
-                            if row.access == pangs_pir::Access::Ref {
-                                result
-                                    .pseudo_read_callsites
-                                    .entry(global)
-                                    .or_default()
-                                    .insert(callsite);
-                                let classified = match kind {
-                                    RegistryKind::Spawn => &mut result.spawn_read_callsites,
-                                    RegistryKind::Signal => &mut result.escape_read_callsites,
+                    let accesses = entry_access_cache.entry(entry).or_insert_with(|| {
+                        analysis
+                            .modref(entry)
+                            .flat_map(|row| {
+                                let affected = match &row.global {
+                                    GlobalTarget::Name(global) => vec![*global],
+                                    GlobalTarget::Unknown(_) if row.pointee_globals.is_empty() => {
+                                        (0..analysis.globals().len())
+                                            .map(|index| GlobalId(index as u32))
+                                            .collect()
+                                    }
+                                    GlobalTarget::Unknown(_) => analysis
+                                        .globals()
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, global)| {
+                                            row.pointee_globals.contains(&global.key)
+                                        })
+                                        .map(|(index, _)| GlobalId(index as u32))
+                                        .collect(),
                                 };
-                                classified.entry(global).or_default().insert(callsite);
-                            }
-                            if kind == RegistryKind::Spawn && row.access == pangs_pir::Access::Mod {
+                                affected.into_iter().map(move |global| (global, row.access))
+                            })
+                            .collect()
+                    });
+                    for &(global, access) in accesses.iter() {
+                        match kind {
+                            RegistryKind::Spawn => {
                                 result
-                                    .thread_writers
+                                    .thread_visible
                                     .entry(global)
                                     .or_insert_with(|| witness.clone());
                             }
+                            RegistryKind::Signal => {
+                                result
+                                    .signal_context_access
+                                    .entry(global)
+                                    .or_insert_with(|| witness.clone());
+                            }
+                        }
+                        if access == pangs_pir::Access::Ref {
+                            result
+                                .pseudo_read_callsites
+                                .entry(global)
+                                .or_default()
+                                .insert(callsite);
+                            let classified = match kind {
+                                RegistryKind::Spawn => &mut result.spawn_read_callsites,
+                                RegistryKind::Signal => &mut result.escape_read_callsites,
+                            };
+                            classified.entry(global).or_default().insert(callsite);
+                        }
+                        if kind == RegistryKind::Spawn && access == pangs_pir::Access::Mod {
+                            result
+                                .thread_writers
+                                .entry(global)
+                                .or_insert_with(|| witness.clone());
                         }
                     }
                 }

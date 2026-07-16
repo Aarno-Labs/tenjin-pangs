@@ -699,6 +699,9 @@ localization component; and `override_usage` summarizes the detailed top-level
 `override_report`. The counters observe existing facts only: they do not populate the
 reserved eligibility certificate slots.
 
+For corpus-scale diagnostics, `PANGS_DISPOSITION_TIMINGS=1` emits phase checkpoints
+to stderr only; it does not alter either canonical artifact.
+
 ## 11. Open questions
 
 1. **Cascade position of `atomic` vs `once-lock` for phase-stationary scalars.** Both

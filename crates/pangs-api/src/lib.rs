@@ -647,6 +647,10 @@ pub struct Analysis {
     globals: Table<GlobalId, GlobalInfo>,
     callsites: Table<CallsiteId, CallsiteInfo>,
     call_edges: Vec<CallEdge>,
+    #[serde(skip)]
+    callees_by_callsite: Vec<Vec<Callee>>,
+    #[serde(skip)]
+    callers_by_function: Vec<Vec<Caller>>,
     modrefs: Vec<ModRef>,
     #[serde(skip)]
     access_sites: Vec<AccessSite>,
@@ -1695,11 +1699,24 @@ impl Analysis {
             ..metrics
         };
 
+        let mut callees_by_callsite = vec![Vec::new(); callsites.len()];
+        let mut callers_by_function = vec![Vec::new(); functions.len()];
+        for edge in &call_edges {
+            if let Some(callsite) = edge.callsite {
+                callees_by_callsite[callsite.0 as usize].push(edge.callee.clone());
+            }
+            if let Callee::Func(callee) = edge.callee {
+                callers_by_function[callee.0 as usize].push(edge.caller.clone());
+            }
+        }
+
         Ok(Self {
             functions: Table::new(functions),
             globals: Table::new(globals),
             callsites: Table::new(callsites),
             call_edges,
+            callees_by_callsite,
+            callers_by_function,
             modrefs,
             access_sites,
             stationarity,
@@ -1782,17 +1799,17 @@ impl Analysis {
     }
 
     pub fn callees(&self, cs: CallsiteId) -> impl Iterator<Item = &Callee> {
-        self.call_edges
-            .iter()
-            .filter(move |edge| edge.callsite == Some(cs))
-            .map(|edge| &edge.callee)
+        self.callees_by_callsite
+            .get(cs.0 as usize)
+            .into_iter()
+            .flatten()
     }
 
     pub fn callers(&self, func: FuncId) -> impl Iterator<Item = &Caller> {
-        self.call_edges
-            .iter()
-            .filter(move |edge| edge.callee == Callee::Func(func))
-            .map(|edge| &edge.caller)
+        self.callers_by_function
+            .get(func.0 as usize)
+            .into_iter()
+            .flatten()
     }
 
     pub fn modref(&self, func: FuncId) -> impl Iterator<Item = ModRef> + '_ {

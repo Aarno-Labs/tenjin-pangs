@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
+use std::time::Instant;
 
 use pangs_api::{
     Analysis, BuildMode, Callee, Caller, CallsiteId, FuncId, GlobalId, GlobalTarget, Opts, Via,
@@ -15,6 +17,15 @@ const KILL_CODE_ORDER: [&str; 4] = [
     "violation-taint",
     "recursive-main",
 ];
+
+fn trace_timing(label: &str, started: Instant) {
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing {label}={}ms",
+            started.elapsed().as_millis()
+        );
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct PhaseKill {
@@ -148,8 +159,9 @@ fn transitive_modified_globals(analysis: &Analysis, function: FuncId) -> Vec<Glo
 /// attributed to their exact statement group. The pointer-modref emitter currently coalesces
 /// aliased accesses by function, so those rows conservatively affect every boundary rather than
 /// trusting the one preferred witness retained after deduplication.
+#[derive(Clone)]
 pub(crate) struct SpineInputs {
-    pub(crate) generated_writes: Vec<Vec<GlobalId>>,
+    pub(crate) generated_writes: Arc<Vec<Vec<GlobalId>>>,
     pub(crate) observations: BTreeMap<GlobalId, Vec<Observation>>,
 }
 
@@ -166,9 +178,16 @@ pub(crate) struct DescentCandidate {
     pub(crate) callee: FuncId,
 }
 
+#[derive(Default)]
+struct DescentCache {
+    pointer_modified: BTreeMap<FuncId, BTreeSet<GlobalId>>,
+    transitively_modified: BTreeMap<FuncId, BTreeSet<GlobalId>>,
+}
+
 /// Applies O5's uniqueness gate to a source boundary. The call must have one internal target,
 /// that function must have exactly this one incoming call site and no unknown caller, and no
 /// coalesced pointer write may make removal of the parent's call summary ambiguous.
+#[cfg(test)]
 pub(crate) fn descent_candidate(
     analysis: &Analysis,
     module: &Pir,
@@ -176,16 +195,38 @@ pub(crate) fn descent_candidate(
     cfg: &StatementCfg,
     global: GlobalId,
 ) -> Option<DescentCandidate> {
-    if analysis
-        .modrefs()
-        .iter()
-        .filter(|row| row.func == function && row.access == Access::Mod && row.via != Via::Direct)
-        .any(|row| affected_globals(analysis, row).contains(&global))
-    {
+    descent_candidate_cached(
+        analysis,
+        module,
+        function,
+        cfg,
+        global,
+        &callsites_by_statement(module),
+        &mut DescentCache::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn descent_candidate_cached(
+    analysis: &Analysis,
+    module: &Pir,
+    function: FuncId,
+    cfg: &StatementCfg,
+    global: GlobalId,
+    callsites: &BTreeMap<(FuncId, u32), CallsiteId>,
+    cache: &mut DescentCache,
+) -> Option<DescentCandidate> {
+    let pointer_modified = cache.pointer_modified.entry(function).or_insert_with(|| {
+        analysis
+            .modref(function)
+            .filter(|row| row.access == Access::Mod && row.via != Via::Direct)
+            .flat_map(|row| affected_globals(analysis, &row))
+            .collect()
+    });
+    if pointer_modified.contains(&global) {
         return None;
     }
     let body = &module.functions.get(function.0 as usize)?.body;
-    let callsites = callsites_by_statement(module);
     let mut candidates = Vec::new();
     for boundary in &cfg.boundaries {
         let calls = boundary
@@ -218,9 +259,16 @@ pub(crate) fn descent_candidate(
         let [Callee::Func(callee)] = targets.as_slice() else {
             continue;
         };
-        if analysis.functions()[*callee].external
-            || !transitive_accessed_globals(analysis, *callee, Access::Mod).contains(&global)
-        {
+        let transitively_modified =
+            cache
+                .transitively_modified
+                .entry(*callee)
+                .or_insert_with(|| {
+                    transitive_accessed_globals(analysis, *callee, Access::Mod)
+                        .into_iter()
+                        .collect()
+                });
+        if analysis.functions()[*callee].external || !transitively_modified.contains(&global) {
             continue;
         }
         let incoming = analysis
@@ -251,7 +299,7 @@ pub(crate) fn descent_candidate(
 /// to its former successors. Keeping a real node for the call makes repeated descent mechanical.
 pub(crate) struct SplicedSpine {
     pub(crate) cfg: StatementCfg,
-    pub(crate) generated_writes: Vec<Vec<GlobalId>>,
+    pub(crate) generated_writes: Arc<Vec<Vec<GlobalId>>>,
     pub(crate) observations: Vec<Observation>,
     pub(crate) origins: Vec<BoundaryOrigin>,
 }
@@ -266,6 +314,7 @@ pub(crate) struct DescentEvaluation {
 /// Runs O2/O3 on `root`, repeatedly splicing the uniquely called current leaf up to `max_depth`.
 /// `exhausted` is set only when another sound descent was available after consuming the bound;
 /// callers map that case to `spine-descent-exhausted` instead of the provisional O3 failure.
+#[cfg(test)]
 pub(crate) fn evaluate_with_descent(
     analysis: &Analysis,
     module: &Pir,
@@ -278,9 +327,47 @@ pub(crate) fn evaluate_with_descent(
     let root_cfg = module.lowering.statement_cfgs.get(&root_info.key)?;
     let root_inputs =
         assemble_spine_inputs(analysis, module, root, root_cfg, pseudo_read_callsites);
+    let root_quiescence = Quiescence::compute(
+        root_cfg,
+        analysis.globals().len(),
+        &root_inputs.generated_writes,
+    )
+    .ok();
+    let callsites = callsites_by_statement(module);
+    evaluate_with_descent_cached(
+        analysis,
+        module,
+        root,
+        global,
+        pseudo_read_callsites,
+        max_depth,
+        root_cfg,
+        &root_inputs,
+        root_quiescence.as_ref(),
+        &mut BTreeMap::new(),
+        &callsites,
+        &mut DescentCache::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_with_descent_cached(
+    analysis: &Analysis,
+    module: &Pir,
+    root: FuncId,
+    global: GlobalId,
+    pseudo_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
+    max_depth: usize,
+    root_cfg: &StatementCfg,
+    root_inputs: &SpineInputs,
+    root_quiescence: Option<&Quiescence>,
+    input_cache: &mut BTreeMap<FuncId, SpineInputs>,
+    callsites: &BTreeMap<(FuncId, u32), CallsiteId>,
+    descent_cache: &mut DescentCache,
+) -> Option<DescentEvaluation> {
     let mut spine = SplicedSpine {
         cfg: root_cfg.clone(),
-        generated_writes: root_inputs.generated_writes,
+        generated_writes: Arc::clone(&root_inputs.generated_writes),
         observations: root_inputs
             .observations
             .get(&global)
@@ -298,15 +385,23 @@ pub(crate) fn evaluate_with_descent(
     let mut leaf = root;
     let mut path = Vec::new();
     loop {
-        let selection = Quiescence::compute(
-            &spine.cfg,
-            analysis.globals().len(),
-            &spine.generated_writes,
-        )
-        .map_err(|_| SelectionFailure::NoEntrySpine)
-        .and_then(|quiescence| {
-            select_publication(&spine.cfg, &quiescence, global, &spine.observations)
-        });
+        let selection = if path.is_empty() {
+            root_quiescence
+                .ok_or(SelectionFailure::NoEntrySpine)
+                .and_then(|quiescence| {
+                    select_publication(&spine.cfg, quiescence, global, &spine.observations)
+                })
+        } else {
+            Quiescence::compute(
+                &spine.cfg,
+                analysis.globals().len(),
+                &spine.generated_writes,
+            )
+            .map_err(|_| SelectionFailure::NoEntrySpine)
+            .and_then(|quiescence| {
+                select_publication(&spine.cfg, &quiescence, global, &spine.observations)
+            })
+        };
         if selection.is_ok() {
             return Some(DescentEvaluation {
                 spine,
@@ -325,7 +420,15 @@ pub(crate) fn evaluate_with_descent(
                 exhausted: false,
             });
         };
-        let Some(candidate) = descent_candidate(analysis, module, leaf, leaf_cfg, global) else {
+        let Some(candidate) = descent_candidate_cached(
+            analysis,
+            module,
+            leaf,
+            leaf_cfg,
+            global,
+            callsites,
+            descent_cache,
+        ) else {
             return Some(DescentEvaluation {
                 spine,
                 selection,
@@ -354,19 +457,24 @@ pub(crate) fn evaluate_with_descent(
                 exhausted: false,
             });
         };
-        let child_inputs = assemble_spine_inputs(
-            analysis,
-            module,
-            candidate.callee,
-            child_cfg,
-            pseudo_read_callsites,
-        );
+        input_cache.entry(candidate.callee).or_insert_with(|| {
+            assemble_spine_inputs(
+                analysis,
+                module,
+                candidate.callee,
+                child_cfg,
+                pseudo_read_callsites,
+            )
+        });
+        let child_inputs = input_cache
+            .get(&candidate.callee)
+            .expect("descent input was inserted");
         let Ok(next) = splice_into_spine(
             spine,
             composite_boundary,
             candidate.callee,
             child_cfg,
-            &child_inputs,
+            child_inputs,
             global,
         ) else {
             return None;
@@ -460,10 +568,11 @@ fn splice_into_spine(
     rebuild_predecessors(&mut boundaries)?;
 
     let mut generated_writes = parent.generated_writes;
+    let generated_writes_mut = Arc::make_mut(&mut generated_writes);
     // Eligibility establishes that the global's effect at this boundary came only from the
     // descended call. Other globals remain conservative because this splice is per-global.
-    generated_writes[call_index].retain(|candidate| *candidate != global);
-    generated_writes.extend(child_inputs.generated_writes.iter().cloned());
+    generated_writes_mut[call_index].retain(|candidate| *candidate != global);
+    generated_writes_mut.extend(child_inputs.generated_writes.iter().cloned());
 
     let mut observations = parent
         .observations
@@ -555,13 +664,18 @@ pub(crate) fn assemble_spine_inputs(
         }
     }
     let callsites_by_statement = callsites_by_statement(module);
+    let modeled_registry_callsites = pseudo_read_callsites
+        .values()
+        .flat_map(|callsites| callsites.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut callee_access_cache = BTreeMap::<FuncId, Vec<(GlobalId, Access)>>::new();
     let Some(body) = module
         .functions
         .get(function.0 as usize)
         .map(|function| &function.body)
     else {
         return SpineInputs {
-            generated_writes: vec![Vec::new(); cfg.boundaries.len()],
+            generated_writes: Arc::new(vec![Vec::new(); cfg.boundaries.len()]),
             observations: BTreeMap::new(),
         };
     };
@@ -591,11 +705,10 @@ pub(crate) fn assemble_spine_inputs(
                 // A resolved spawn/signal registry call has an explicit callback model below.
                 // Treating its external declaration as Ω as well would contradict that model and
                 // make every reader registration look like a writer of every global.
-                let modeled_registry_call = pseudo_read_callsites
-                    .values()
-                    .any(|callsites| callsites.contains(&callsite));
+                let modeled_registry_call = modeled_registry_callsites.contains(&callsite);
                 let mut has_unknown = false;
                 let mut has_callee = false;
+                let mut internal_callees = Vec::new();
                 for callee in analysis.callees(callsite) {
                     has_callee = true;
                     match callee {
@@ -604,18 +717,7 @@ pub(crate) fn assemble_spine_inputs(
                                 has_unknown |= !modeled_registry_call;
                                 continue;
                             }
-                            for row in analysis.modref(*callee) {
-                                for global in affected_globals(analysis, &row) {
-                                    add_access(
-                                        &mut generated[boundary as usize],
-                                        &mut observations,
-                                        boundary,
-                                        global,
-                                        row.access,
-                                        true,
-                                    );
-                                }
-                            }
+                            internal_callees.push(*callee);
                         }
                         Callee::Unknown(_) => has_unknown = true,
                     }
@@ -627,6 +729,29 @@ pub(crate) fn assemble_spine_inputs(
                             boundary,
                             routable_pre_p: true,
                         });
+                    }
+                    continue;
+                }
+                for callee in internal_callees {
+                    let accesses = callee_access_cache.entry(callee).or_insert_with(|| {
+                        analysis
+                            .modref(callee)
+                            .flat_map(|row| {
+                                affected_globals(analysis, &row)
+                                    .into_iter()
+                                    .map(move |global| (global, row.access))
+                            })
+                            .collect()
+                    });
+                    for &(global, access) in accesses.iter() {
+                        add_access(
+                            &mut generated[boundary as usize],
+                            &mut observations,
+                            boundary,
+                            global,
+                            access,
+                            true,
+                        );
                     }
                 }
             }
@@ -710,17 +835,35 @@ pub(crate) fn assemble_spine_inputs(
             continue;
         }
         let reader = FuncId(index as u32);
-        let read_globals = transitive_accessed_globals(analysis, reader, Access::Ref);
-        for global in read_globals {
-            for source in &escaped.escape_sources {
-                let key = source
+        let accesses = callee_access_cache.entry(reader).or_insert_with(|| {
+            analysis
+                .modref(reader)
+                .flat_map(|row| {
+                    affected_globals(analysis, &row)
+                        .into_iter()
+                        .map(move |global| (global, row.access))
+                })
+                .collect()
+        });
+        let read_globals = accesses
+            .iter()
+            .filter_map(|(global, access)| (*access == Access::Ref).then_some(*global))
+            .collect::<BTreeSet<_>>();
+        let escape_boundaries = escaped
+            .escape_sources
+            .iter()
+            .map(|source| {
+                source
                     .strip_prefix("external-call:")
-                    .or_else(|| source.strip_prefix("vararg-call:"));
-                let boundary = key
+                    .or_else(|| source.strip_prefix("vararg-call:"))
                     .and_then(|key| callsite_by_key.get(key))
                     .and_then(|callsite| boundary_by_callsite.get(callsite))
                     .copied()
-                    .unwrap_or(cfg.entry);
+                    .unwrap_or(cfg.entry)
+            })
+            .collect::<BTreeSet<_>>();
+        for global in read_globals {
+            for &boundary in &escape_boundaries {
                 observations.entry(global).or_default().insert(Observation {
                     boundary,
                     routable_pre_p: false,
@@ -730,10 +873,12 @@ pub(crate) fn assemble_spine_inputs(
     }
 
     SpineInputs {
-        generated_writes: generated
-            .into_iter()
-            .map(|globals| globals.into_iter().collect())
-            .collect(),
+        generated_writes: Arc::new(
+            generated
+                .into_iter()
+                .map(|globals| globals.into_iter().collect())
+                .collect(),
+        ),
         observations: observations
             .into_iter()
             .map(|(global, sites)| (global, sites.into_iter().collect()))
@@ -820,6 +965,7 @@ pub(crate) fn certificate_slots(
     escape_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
     thread_writers: &BTreeMap<GlobalId, Witness>,
 ) -> (Option<Value>, BTreeMap<GlobalId, Certificate>, Value) {
+    let certificate_started = Instant::now();
     let main = (opts.build_mode == BuildMode::Executable
         && opts.stage != pangs_api::Stage::Conservative)
         .then(|| analysis.lookup_func("main"))
@@ -831,10 +977,26 @@ pub(crate) fn certificate_slots(
             "assumptions": []
         })
     });
+    let stage_started = Instant::now();
     let kills = evaluate_kill_rules(analysis, thread_writers);
+    trace_timing("kill-rules", stage_started);
+    let stage_started = Instant::now();
+    let root = main.and_then(|main| {
+        let info = &analysis.functions()[main];
+        let cfg = module.lowering.statement_cfgs.get(&info.key)?;
+        let inputs = assemble_spine_inputs(analysis, module, main, cfg, pseudo_read_callsites);
+        let quiescence =
+            Quiescence::compute(cfg, analysis.globals().len(), &inputs.generated_writes).ok();
+        Some((main, cfg, inputs, quiescence))
+    });
+    trace_timing("root-inputs-and-quiescence", stage_started);
+    let mut input_cache = BTreeMap::new();
+    let callsites = callsites_by_statement(module);
+    let mut descent_cache = DescentCache::default();
     let mut slots = BTreeMap::new();
     let mut descent_depths = BTreeMap::new();
     let mut descent_exhausted = BTreeSet::new();
+    let stage_started = Instant::now();
     for index in 0..analysis.globals().len() {
         let global = GlobalId(index as u32);
         let Some(main) = main else {
@@ -847,9 +1009,30 @@ pub(crate) fn certificate_slots(
             );
             continue;
         };
-        let Some(evaluation) =
-            evaluate_with_descent(analysis, module, main, global, pseudo_read_callsites, 4)
-        else {
+        let Some((_, root_cfg, root_inputs, root_quiescence)) = root.as_ref() else {
+            slots.insert(
+                global,
+                failed_slot(
+                    "no-entry-spine",
+                    run_witness("no-entry-spine", "statement CFG metadata unavailable"),
+                ),
+            );
+            continue;
+        };
+        let Some(evaluation) = evaluate_with_descent_cached(
+            analysis,
+            module,
+            main,
+            global,
+            pseudo_read_callsites,
+            4,
+            root_cfg,
+            root_inputs,
+            root_quiescence.as_ref(),
+            &mut input_cache,
+            &callsites,
+            &mut descent_cache,
+        ) else {
             slots.insert(
                 global,
                 failed_slot(
@@ -920,7 +1103,9 @@ pub(crate) fn certificate_slots(
             },
         );
     }
+    trace_timing("per-global-certificates", stage_started);
     let report = phase_report(analysis, &slots, &descent_depths, &descent_exhausted);
+    trace_timing("certificate-slots-total", certificate_started);
     (entry_spine, slots, report)
 }
 
@@ -2162,7 +2347,7 @@ mod tests {
         };
         let global = analysis.lookup_global("@g").unwrap();
         let inputs = assemble_spine_inputs(&analysis, &pir, FuncId(0), &cfg, &BTreeMap::new());
-        assert_eq!(inputs.generated_writes, vec![vec![global], vec![]]);
+        assert_eq!(*inputs.generated_writes, vec![vec![global], vec![]]);
         assert_eq!(
             inputs.observations[&global],
             vec![Observation {
