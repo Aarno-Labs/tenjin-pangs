@@ -985,13 +985,31 @@ impl<'a> Builder<'a> {
                     .as_ref()
                     .map(|dest| self.value_node(func_index, owner_scope(&owner), dest));
                 let fresh_allocation = is_fresh_allocator(callee) && result.is_some();
+                let is_external = self
+                    .functions
+                    .get(callee)
+                    .and_then(|index| self.pir.functions.get(*index))
+                    .map(|func| func.external)
+                    .unwrap_or(true);
+                let return_alias = is_external
+                    .then(|| external_return_alias_arg(callee))
+                    .flatten()
+                    .and_then(|arg_index| {
+                        result
+                            .zip(arg_nodes.get(arg_index).copied())
+                            .map(|(result, arg)| (arg, result))
+                    });
                 let external_boundary = !fresh_allocation
+                    && return_alias.is_none()
                     && self
                         .functions
                         .get(callee)
                         .and_then(|index| self.pir.functions.get(*index))
                         .map(|func| func.external)
                         .unwrap_or(true);
+                if let Some((arg, result)) = return_alias {
+                    self.add_edge(EdgeKind::Assign, arg, result, owner.clone(), loc.clone());
+                }
                 if let Some(result) = result.filter(|_| fresh_allocation) {
                     let object = self.add_node(
                         NodeKey::HeapObject(func_index, stmt_index),
@@ -1308,6 +1326,17 @@ fn is_fresh_allocator(callee: &str) -> bool {
     )
 }
 
+/// Exact-name external functions whose nullable pointer result is derived from argument 0.
+/// These are pure searches: unlike a generic external call, they neither write through their
+/// pointer arguments nor manufacture an unrelated pointer result.
+fn external_return_alias_arg(callee: &str) -> Option<usize> {
+    matches!(
+        callee.strip_prefix('@').unwrap_or(callee),
+        "strchr" | "strrchr" | "strstr" | "strpbrk" | "memchr"
+    )
+    .then_some(0)
+}
+
 fn owner_scope(owner: &Owner) -> Scope {
     match owner {
         Owner::Module => Scope::Module,
@@ -1382,4 +1411,56 @@ fn is_exported_func(marked: bool, key: &str, opts: &PagOpts) -> bool {
 
 fn is_exported_global(marked: bool, key: &str, opts: &PagOpts) -> bool {
     opts.exports.contains(key) || (opts.build_mode == BuildMode::Library && marked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EdgeKind, OmegaSeedKind, Pag, PagOpts, SeedTarget};
+    use pangs_pir::Pir;
+
+    #[test]
+    fn pure_external_search_return_aliases_arg0_without_an_omega_boundary() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"libc-summary",
+                "globals":[],
+                "functions":[
+                    {"key":"main","exported":true,"sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"call_direct","callee":"strchr","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["input","zero"],"dest":"found"},
+                        {"kind":"call_direct","callee":"unmodeled_search","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"args":["input"],"dest":"unknown"}
+                    ]},
+                    {"key":"strchr","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"body":[]},
+                    {"key":"unmodeled_search","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"body":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let strchr = pag
+            .callsites
+            .iter()
+            .find(|callsite| callsite.callee.as_deref() == Some("strchr"))
+            .unwrap();
+        assert!(!strchr.external_boundary);
+        assert!(pag.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Assign
+                && edge.src == strchr.args[0]
+                && Some(edge.dst) == strchr.result
+        }));
+        assert!(!pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::ExternalCallBoundary
+                && seed.target == SeedTarget::Callsite(strchr.id)
+        }));
+
+        let unmodeled = pag
+            .callsites
+            .iter()
+            .find(|callsite| callsite.callee.as_deref() == Some("unmodeled_search"))
+            .unwrap();
+        assert!(unmodeled.external_boundary);
+        assert!(pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::ExternalCallBoundary
+                && seed.target == SeedTarget::Callsite(unmodeled.id)
+        }));
+    }
 }

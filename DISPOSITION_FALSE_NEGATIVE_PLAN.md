@@ -57,6 +57,10 @@ schema-v2 policy to schema-v3 facts.
 
 ## 3. Access completeness structural fix
 
+Narrow external pointer summaries are a complementary analysis-side refinement: they
+can prevent a known pure libc return value from becoming Ω before this fact model is
+applied.  See [the libc pointer-summary plan](PLAN_LIBC_POINTER_SUMMARIES.md).
+
 ### 3.1 Replace the overloaded empty-vector convention
 
 Today `ModRef.pointee_globals.is_empty()` can mean either:

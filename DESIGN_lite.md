@@ -140,6 +140,10 @@ demand queries: golden-file the whole solution on small inputs, diff across chan
 detection → Ω-taint, FSA envelope, KELP safe-fallback discipline, byte-offset field
 sensitivity. Soundness is the hard constraint and is untouched.
 
+External calls remain Ω boundaries by default.  A small exact-name summary may replace
+that boundary only when it encodes a documented, auditable pointer transfer; unlisted
+or shape-mismatched calls remain Ω.
+
 ## 4. The residual risk, named
 
 The cut precision is tier-E context-sensitivity, which CORAL's finding III says

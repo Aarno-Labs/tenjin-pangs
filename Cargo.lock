@@ -968,6 +968,7 @@ version = "0.1.0"
 dependencies = [
  "pangs-pir",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

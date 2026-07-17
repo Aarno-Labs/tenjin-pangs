@@ -8,3 +8,6 @@ version.workspace = true
 pangs-pir = { path = "../pangs-pir" }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
