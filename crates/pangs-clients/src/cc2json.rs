@@ -18,7 +18,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use pangs_api::{Analysis, BuildMode, CallKind, Callee, Caller, FuncId, GlobalTarget, Opts, Stage};
+use pangs_api::{
+    AffectedGlobals, Analysis, BuildMode, CallKind, Callee, Caller, FuncId, Opts, Stage,
+};
 use pangs_pag::{Pag, PagOpts};
 use pangs_pir::{Access, Func, Loc, Pir, Stmt};
 use pangs_solve::{
@@ -105,33 +107,17 @@ fn mutated_globals(pir: &Pir, analysis: &Analysis) -> Vec<String> {
         .iter()
         .filter(|mr| matches!(mr.access, Access::Mod))
     {
-        match &mr.global {
-            GlobalTarget::Name(id) => {
-                mutated.insert(analysis.globals()[*id].key.clone());
+        if mr.detail.as_deref().is_some_and(|detail| {
+            detail.starts_with("high_fanout_pointer_modref:")
+                && detail.contains("pointee_has_string=true")
+        }) {
+            continue;
+        }
+        match analysis.affected_globals(mr) {
+            AffectedGlobals::Finite(globals) => {
+                mutated.extend(globals.iter().map(|&id| analysis.globals()[id].key.clone()))
             }
-            GlobalTarget::Unknown(_)
-                if !high_fanout_modref_has_string_pointee(mr)
-                    && !unknown_modref_has_unrendered_pointees(mr)
-                    && mr
-                        .stationarity_pointee_globals
-                        .as_deref()
-                        .is_some_and(|ids| !ids.is_empty()) =>
-            {
-                mutated.extend(
-                    mr.stationarity_pointee_globals
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .map(|&id| analysis.globals()[id].key.clone()),
-                );
-            }
-            GlobalTarget::Unknown(_)
-                if !mr.pointee_globals.is_empty()
-                    && !unknown_modref_has_unrendered_pointees(mr) =>
-            {
-                mutated.extend(mr.pointee_globals.iter().cloned());
-            }
-            GlobalTarget::Unknown(_) if unknown_modref_may_touch_module_global(mr) => {
+            AffectedGlobals::ModuleWide => {
                 mutated.extend(
                     analysis
                         .globals()
@@ -140,7 +126,6 @@ fn mutated_globals(pir: &Pir, analysis: &Analysis) -> Vec<String> {
                         .map(|g| g.key.clone()),
                 );
             }
-            GlobalTarget::Unknown(_) => {}
         }
     }
 
@@ -159,44 +144,6 @@ fn mutated_globals(pir: &Pir, analysis: &Analysis) -> Vec<String> {
         .filter(|g| mutated.contains(g.key.as_str()) && defined.contains(g.key.as_str()))
         .filter_map(|g| process_global_name(&g.key))
         .collect()
-}
-
-fn unknown_modref_may_touch_module_global(mr: &pangs_api::ModRef) -> bool {
-    if !mr.pointee_globals.is_empty() {
-        return !unknown_modref_has_unrendered_pointees(mr);
-    }
-    let Some(detail) = mr.detail.as_deref() else {
-        return true;
-    };
-    if detail.starts_with("high_fanout_pointer_modref:") {
-        if detail.contains("pointee_has_string=true") {
-            return false;
-        }
-        return true;
-    }
-    if detail.contains("omega:inttoptr") || detail.contains("omega:ptrtoint_escape") {
-        return true;
-    }
-    detail_pointee_count(detail).is_some_and(|count| count > 0)
-}
-
-fn high_fanout_modref_has_string_pointee(mr: &pangs_api::ModRef) -> bool {
-    mr.detail
-        .as_deref()
-        .is_some_and(|detail| detail.contains("pointee_has_string=true"))
-}
-
-fn unknown_modref_has_unrendered_pointees(mr: &pangs_api::ModRef) -> bool {
-    mr.detail.as_deref().is_some_and(|detail| {
-        detail_pointee_count(detail).is_some_and(|count| count > mr.pointee_globals.len())
-    })
-}
-
-fn detail_pointee_count(detail: &str) -> Option<usize> {
-    detail.rsplit('|').find_map(|part| {
-        part.strip_prefix("pointee_count=")
-            .and_then(|value| value.parse::<usize>().ok())
-    })
 }
 
 /// Globals *defined* in this module (those with a constant initializer). pangs' PIR lowering emits

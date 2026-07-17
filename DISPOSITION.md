@@ -148,12 +148,13 @@ one scan, or it does not belong in the vector. Nothing here re-enters the solver
 The concrete JSON/Rust encodings of these types — the evidenced-bool object and its
 per-fact evidenced polarity, witness records, the certificate-slot union, the
 localization verdict, and cascade skip reasons — are fixed in `DISPOSITION_PLAN.md`
-§1.5 and are part of what D1a's golden test freezes as schema v2.
+§1.5 and are part of what D1a's golden test freezes. Schema v3 makes unknown mod/ref
+candidate scope explicit so an abbreviated finite set cannot be mistaken for module-wide Ω.
 
 ## 3. The manifest
 
 One versioned JSON document per analyzed program — **`pangs-manifest.json`,
-`schema_version: 2`** — superseding and subsuming `ONCELOCK.md` §2's standalone schema
+`schema_version: 3`** — superseding and subsuming `ONCELOCK.md` §2's standalone schema
 (which becomes the `facts.phase_stationarity` sub-object; see §8). It is the single
 artifact consumed by *both* toolchain stages and referenced by override files.
 
@@ -209,7 +210,7 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
 
 ```jsonc
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "run": {
     "analysis": {                        // analysis-owned (§3.3): provenance fields
       "entry_spine": { ... },            //   (pangs git, input hash, opts) +

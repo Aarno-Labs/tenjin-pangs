@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use pangs_api::{
-    Analysis, BuildMode, Callee, Caller, CallsiteId, FuncId, GlobalId, GlobalTarget, Opts, Via,
+    AffectedGlobals, Analysis, BuildMode, Callee, Caller, CallsiteId, FuncId, GlobalId, Opts, Via,
 };
 use pangs_manifest::{Certificate, Extra, Site, Witness};
 use pangs_pir::{Access, Pir, StatementCfg, Stmt};
@@ -132,21 +132,10 @@ fn transitive_modified_globals(analysis: &Analysis, function: FuncId) -> Vec<Glo
         .modref(function)
         .filter(|row| row.access == pangs_pir::Access::Mod)
     {
-        match row.global {
-            GlobalTarget::Name(global) => globals.push(global),
-            GlobalTarget::Unknown(_) => {
-                if let Some(pointees) = row.stationarity_pointee_globals {
-                    globals.extend(pointees.iter().copied());
-                } else if row.pointee_globals.is_empty() {
-                    globals
-                        .extend((0..analysis.globals().len()).map(|index| GlobalId(index as u32)));
-                } else {
-                    globals.extend(
-                        row.pointee_globals
-                            .iter()
-                            .filter_map(|name| analysis.lookup_global(name)),
-                    );
-                }
+        match analysis.affected_globals(&row) {
+            AffectedGlobals::Finite(affected) => globals.extend_from_slice(affected),
+            AffectedGlobals::ModuleWide => {
+                globals.extend((0..analysis.globals().len()).map(|index| GlobalId(index as u32)))
             }
         }
     }
@@ -937,22 +926,11 @@ fn transitive_accessed_globals(
 }
 
 fn affected_globals(analysis: &Analysis, row: &pangs_api::ModRef) -> Vec<GlobalId> {
-    match &row.global {
-        GlobalTarget::Name(global) => vec![*global],
-        GlobalTarget::Unknown(_) => {
-            if let Some(pointees) = &row.stationarity_pointee_globals {
-                pointees.iter().copied().collect()
-            } else if row.pointee_globals.is_empty() {
-                (0..analysis.globals().len())
-                    .map(|index| GlobalId(index as u32))
-                    .collect()
-            } else {
-                row.pointee_globals
-                    .iter()
-                    .filter_map(|name| analysis.lookup_global(name))
-                    .collect()
-            }
-        }
+    match analysis.affected_globals(row) {
+        AffectedGlobals::Finite(globals) => globals.to_vec(),
+        AffectedGlobals::ModuleWide => (0..analysis.globals().len())
+            .map(|index| GlobalId(index as u32))
+            .collect(),
     }
 }
 

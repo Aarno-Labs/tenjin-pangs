@@ -212,7 +212,28 @@ pub struct ModRef {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pointee_globals: Vec<String>,
     #[serde(skip)]
-    pub stationarity_pointee_globals: Option<Rc<[GlobalId]>>,
+    pub global_candidates: GlobalCandidateSet,
+}
+
+/// Complete in-process target scope for an unknown mod/ref row. Export abbreviation must never
+/// alter this value: a large but bounded target set remains `Finite`, while `ModuleWide` is
+/// reserved for accesses whose targets cannot be soundly enumerated.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GlobalCandidateSet {
+    Finite(Rc<[GlobalId]>),
+    ModuleWide,
+}
+
+impl Default for GlobalCandidateSet {
+    fn default() -> Self {
+        Self::ModuleWide
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AffectedGlobals<'a> {
+    Finite(&'a [GlobalId]),
+    ModuleWide,
 }
 
 /// Unaggregated local memory-access provenance retained for refactoring clients. Unlike
@@ -675,6 +696,18 @@ pub struct Analysis {
 }
 
 impl Analysis {
+    /// Returns the complete semantic target scope of a mod/ref row. Clients must use this rather
+    /// than interpreting an abbreviated `pointee_globals` export.
+    pub fn affected_globals<'a>(&'a self, row: &'a ModRef) -> AffectedGlobals<'a> {
+        match &row.global {
+            GlobalTarget::Name(global) => AffectedGlobals::Finite(std::slice::from_ref(global)),
+            GlobalTarget::Unknown(_) => match &row.global_candidates {
+                GlobalCandidateSet::Finite(globals) => AffectedGlobals::Finite(globals),
+                GlobalCandidateSet::ModuleWide => AffectedGlobals::ModuleWide,
+            },
+        }
+    }
+
     pub fn run(module: &Pir, opts: &Opts) -> Result<Self, AnalysisError> {
         Self::run_internal(module, opts, false)
     }
@@ -981,7 +1014,7 @@ impl Analysis {
                                 detail: None,
                                 address_node: None,
                                 pointee_globals: Vec::new(),
-                                stationarity_pointee_globals: None,
+                                global_candidates: GlobalCandidateSet::Finite(Rc::from([])),
                             });
                         }
                     }
@@ -2196,7 +2229,7 @@ fn stationarity_verdicts_from_modrefs(
 fn collect_targeted_stationarity_writers(
     modrefs: &[ModRef],
     globals: &[GlobalInfo],
-    global_lookup: &HashMap<String, GlobalId>,
+    _global_lookup: &HashMap<String, GlobalId>,
 ) -> (
     BTreeMap<String, StationarityWriters>,
     BTreeMap<String, StationarityWriters>,
@@ -2215,26 +2248,12 @@ fn collect_targeted_stationarity_writers(
                     .or_default()
                     .push(stationarity_writer_from_modref(mr));
             }
-            GlobalTarget::Unknown(_)
-                if mr
-                    .stationarity_pointee_globals
-                    .as_deref()
-                    .is_some_and(|globals| !globals.is_empty()) =>
+            GlobalTarget::Unknown(_) if matches!(&mr.global_candidates, GlobalCandidateSet::Finite(ids) if !ids.is_empty()) =>
             {
-                let targets = stationarity_target_key_from_ids(
-                    mr.stationarity_pointee_globals.as_deref().unwrap_or(&[]),
-                    globals,
-                );
-                if !targets.is_empty() {
-                    target_unknown_writer_groups
-                        .entry(targets)
-                        .or_default()
-                        .push(stationarity_writer_from_modref(mr));
-                }
-            }
-            GlobalTarget::Unknown(_) if !mr.pointee_globals.is_empty() => {
-                let targets =
-                    stationarity_target_key_from_names(&mr.pointee_globals, global_lookup);
+                let GlobalCandidateSet::Finite(ids) = &mr.global_candidates else {
+                    unreachable!()
+                };
+                let targets = stationarity_target_key_from_ids(ids, globals);
                 if !targets.is_empty() {
                     target_unknown_writer_groups
                         .entry(targets)
@@ -2296,19 +2315,6 @@ fn stationarity_target_key_from_ids(ids: &[GlobalId], globals: &[GlobalInfo]) ->
     targets
 }
 
-fn stationarity_target_key_from_names(
-    names: &[String],
-    global_lookup: &HashMap<String, GlobalId>,
-) -> Vec<GlobalId> {
-    let mut targets = names
-        .iter()
-        .filter_map(|name| global_lookup.get(name).copied())
-        .collect::<Vec<_>>();
-    targets.sort();
-    targets.dedup();
-    targets
-}
-
 fn merge_stationarity_writer_groups(groups: Vec<StationarityWriters>) -> StationarityWriters {
     if groups.len() == 1 {
         return groups.into_iter().next().unwrap();
@@ -2336,25 +2342,14 @@ fn is_module_unknown_stationarity_writer(mr: &ModRef) -> bool {
     if mr.access != Access::Mod || !matches!(mr.global, GlobalTarget::Unknown(_)) {
         return false;
     }
-    if mr
-        .stationarity_pointee_globals
-        .as_deref()
-        .is_some_and(|globals| !globals.is_empty())
-        || !mr.pointee_globals.is_empty()
-    {
-        return false;
-    }
-    unknown_modref_may_touch_module_global(mr)
+    matches!(mr.global_candidates, GlobalCandidateSet::ModuleWide)
+        && unknown_modref_may_touch_module_global(mr)
 }
 
 fn unknown_modref_may_touch_module_global(mr: &ModRef) -> bool {
-    if mr
-        .stationarity_pointee_globals
-        .as_deref()
-        .is_some_and(|globals| !globals.is_empty())
-        || !mr.pointee_globals.is_empty()
-    {
-        return true;
+    match &mr.global_candidates {
+        GlobalCandidateSet::Finite(globals) => return !globals.is_empty(),
+        GlobalCandidateSet::ModuleWide => {}
     }
     let Some(detail) = mr.detail.as_deref() else {
         return true;
@@ -3242,10 +3237,7 @@ impl ModRefBuilder {
                 let existing = &mut self.rows[idx];
                 existing.witness =
                     preferred_modref_witness(existing.witness.take(), row.witness.take());
-                merge_stationarity_pointees(
-                    &mut existing.stationarity_pointee_globals,
-                    row.stationarity_pointee_globals,
-                );
+                merge_global_candidates(&mut existing.global_candidates, row.global_candidates);
                 self.note_modref_result(phase, false);
                 return;
             }
@@ -3260,10 +3252,7 @@ impl ModRefBuilder {
             let existing = &mut self.rows[idx];
             existing.witness =
                 preferred_modref_witness(existing.witness.take(), row.witness.take());
-            merge_stationarity_pointees(
-                &mut existing.stationarity_pointee_globals,
-                row.stationarity_pointee_globals,
-            );
+            merge_global_candidates(&mut existing.global_candidates, row.global_candidates);
             self.note_modref_result(phase, false);
             return;
         }
@@ -3303,7 +3292,7 @@ impl ModRefBuilder {
             detail: None,
             address_node: None,
             pointee_globals: Vec::new(),
-            stationarity_pointee_globals: None,
+            global_candidates: GlobalCandidateSet::Finite(Rc::from([])),
         });
         self.note_modref_result(phase, true);
     }
@@ -4242,7 +4231,7 @@ fn push_high_fanout_pointer_modref_fallback(
     access: Access,
     witness: Option<String>,
     summary: &ModRefNodeSummary<'_>,
-    stationarity_pointee_globals: Rc<[GlobalId]>,
+    global_candidates: Rc<[GlobalId]>,
     fanout: usize,
     occurrences: u64,
     phase: ModRefSourcePhase,
@@ -4271,7 +4260,7 @@ fn push_high_fanout_pointer_modref_fallback(
             detail: Some(detail),
             address_node: Some(summary.label.to_string()),
             pointee_globals: Vec::new(),
-            stationarity_pointee_globals: Some(stationarity_pointee_globals),
+            global_candidates: GlobalCandidateSet::Finite(global_candidates),
         },
         Some(phase),
     );
@@ -4625,7 +4614,7 @@ fn push_pointer_modrefs_from_pag(
                             &summary.pointee_global_ids,
                             &global_key_by_id,
                         ),
-                        stationarity_pointee_globals: Some(Rc::clone(&summary.pointee_global_ids)),
+                        global_candidates: GlobalCandidateSet::ModuleWide,
                     },
                     Some(phase),
                 );
@@ -4802,7 +4791,7 @@ fn push_pointer_memset_modrefs_from_pir(
                         detail: Some(detail),
                         address_node: Some(label),
                         pointee_globals: Vec::new(),
-                        stationarity_pointee_globals: Some(global_ids_for_keys(
+                        global_candidates: GlobalCandidateSet::Finite(global_ids_for_keys(
                             resolution.pointee_globals.iter(),
                             global_lookup,
                         )),
@@ -4838,10 +4827,7 @@ fn push_pointer_memset_modrefs_from_pir(
                         )),
                         address_node: Some(label.clone()),
                         pointee_globals: resolution.pointee_globals.to_vec(),
-                        stationarity_pointee_globals: Some(global_ids_for_keys(
-                            resolution.pointee_globals.iter(),
-                            global_lookup,
-                        )),
+                        global_candidates: GlobalCandidateSet::ModuleWide,
                     },
                     Some(ModRefSourcePhase::MemsetMemcpy),
                 );
@@ -5141,6 +5127,7 @@ struct ModRefPayload {
     detail: Option<String>,
     address_node: Option<String>,
     pointee_globals: Vec<String>,
+    global_candidates: GlobalCandidateSet,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5177,7 +5164,7 @@ impl TransitiveModRefs {
                 detail: payload.detail.clone(),
                 address_node: payload.address_node.clone(),
                 pointee_globals: payload.pointee_globals.clone(),
-                stationarity_pointee_globals: None,
+                global_candidates: payload.global_candidates.clone(),
             }
         })
     }
@@ -5191,6 +5178,7 @@ struct ModRefFactKey {
     detail: Option<String>,
     address_node: Option<String>,
     pointee_globals: Vec<String>,
+    global_candidates: GlobalCandidateSet,
 }
 
 fn modref_payload_key(payload: &ModRefPayload) -> ModRefFactKey {
@@ -5201,6 +5189,7 @@ fn modref_payload_key(payload: &ModRefPayload) -> ModRefFactKey {
         detail: payload.detail.clone(),
         address_node: payload.address_node.clone(),
         pointee_globals: payload.pointee_globals.clone(),
+        global_candidates: payload.global_candidates.clone(),
     }
 }
 
@@ -5254,19 +5243,18 @@ impl Ord for ModRefPayload {
             Ordering::Equal => {}
             order => return order,
         }
-        self.pointee_globals.cmp(&other.pointee_globals)
+        self.pointee_globals
+            .cmp(&other.pointee_globals)
+            .then_with(|| self.global_candidates.cmp(&other.global_candidates))
     }
 }
 
-fn merge_stationarity_pointees(
-    existing: &mut Option<Rc<[GlobalId]>>,
-    incoming: Option<Rc<[GlobalId]>>,
-) {
-    let Some(incoming) = incoming else {
+fn merge_global_candidates(existing: &mut GlobalCandidateSet, incoming: GlobalCandidateSet) {
+    let GlobalCandidateSet::Finite(incoming) = incoming else {
+        *existing = GlobalCandidateSet::ModuleWide;
         return;
     };
-    let Some(current) = existing.as_ref() else {
-        *existing = Some(incoming);
+    let GlobalCandidateSet::Finite(current) = existing else {
         return;
     };
     if current.as_ref() == incoming.as_ref() {
@@ -5276,7 +5264,7 @@ fn merge_stationarity_pointees(
     merged.extend(incoming.iter().copied());
     merged.sort();
     merged.dedup();
-    *existing = Some(Rc::from(merged));
+    *existing = GlobalCandidateSet::Finite(Rc::from(merged));
 }
 
 fn access_rank(access: Access) -> u8 {
@@ -5344,6 +5332,7 @@ fn compute_transitive_modrefs(
             detail: mr.detail.clone(),
             address_node: mr.address_node.clone(),
             pointee_globals: mr.pointee_globals.clone(),
+            global_candidates: mr.global_candidates.clone(),
         };
         let id = intern_modref_payload(&mut payload_ids, &mut payloads, payload);
         local_by_scc[scc_of_func[mr.func.0 as usize]].push(id);
@@ -5563,19 +5552,21 @@ fn compact_transitive_rows(
     let has_mod = rows
         .iter()
         .any(|&payload_id| payloads[payload_id].access == Access::Mod);
+    let ref_candidates = has_ref.then(|| transitive_candidate_union(rows, payloads, Access::Ref));
+    let mod_candidates = has_mod.then(|| transitive_candidate_union(rows, payloads, Access::Mod));
     let mut fallback_rows = Vec::with_capacity(2);
     if has_ref {
         fallback_rows.push(intern_modref_payload(
             payload_ids,
             payloads,
-            high_fanout_transitive_payload(Access::Ref, detail.clone()),
+            high_fanout_transitive_payload(Access::Ref, detail.clone(), ref_candidates.unwrap()),
         ));
     }
     if has_mod {
         fallback_rows.push(intern_modref_payload(
             payload_ids,
             payloads,
-            high_fanout_transitive_payload(Access::Mod, detail),
+            high_fanout_transitive_payload(Access::Mod, detail, mod_candidates.unwrap()),
         ));
     }
     fallback_rows.sort_unstable();
@@ -5583,7 +5574,37 @@ fn compact_transitive_rows(
     *rows = fallback_rows;
 }
 
-fn high_fanout_transitive_payload(access: Access, detail: Option<String>) -> ModRefPayload {
+fn transitive_candidate_union(
+    rows: &[usize],
+    payloads: &[ModRefPayload],
+    access: Access,
+) -> GlobalCandidateSet {
+    let mut globals = Vec::new();
+    for payload in rows
+        .iter()
+        .map(|&id| &payloads[id])
+        .filter(|payload| payload.access == access)
+    {
+        match (&payload.global, &payload.global_candidates) {
+            (GlobalTarget::Name(global), _) => globals.push(*global),
+            (GlobalTarget::Unknown(_), GlobalCandidateSet::Finite(candidates)) => {
+                globals.extend(candidates.iter().copied());
+            }
+            (GlobalTarget::Unknown(_), GlobalCandidateSet::ModuleWide) => {
+                return GlobalCandidateSet::ModuleWide;
+            }
+        }
+    }
+    globals.sort();
+    globals.dedup();
+    GlobalCandidateSet::Finite(Rc::from(globals))
+}
+
+fn high_fanout_transitive_payload(
+    access: Access,
+    detail: Option<String>,
+    global_candidates: GlobalCandidateSet,
+) -> ModRefPayload {
     let reason = match access {
         Access::Ref => "omega_load",
         Access::Mod => "omega_store",
@@ -5596,6 +5617,7 @@ fn high_fanout_transitive_payload(access: Access, detail: Option<String>) -> Mod
         detail,
         address_node: None,
         pointee_globals: Vec::new(),
+        global_candidates,
     }
 }
 

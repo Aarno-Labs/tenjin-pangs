@@ -67,6 +67,37 @@
         "minLength": 1
       },
       "uniqueItems": true
+    },
+    "candidate_scope": {
+      "type": "string",
+      "enum": ["finite", "finite-collapsed", "module-wide"]
+    },
+    "pointee_global_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pointee_global_sample": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "pointee_global_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "global": { "required": ["unknown"] }
+        }
+      },
+      "then": { "required": ["candidate_scope"] }
+    }
+  ]
 }

@@ -12,9 +12,9 @@ mod phase_stationarity;
 pub use cc2json::{run_cc2json, Cc2jsonOpts};
 
 use pangs_api::{
-    Analysis, BuildMode, CallEdge, Callee, Caller, ComponentInfo, FuncId, GlobalId, GlobalTarget,
-    ModRef, Opts, RegistryApi, RegistryEntryOperand, RegistryKind, StationarityVerdict,
-    StationarityWriter,
+    AffectedGlobals, Analysis, BuildMode, CallEdge, Callee, Caller, ComponentInfo, FuncId,
+    GlobalId, GlobalTarget, ModRef, Opts, RegistryApi, RegistryEntryOperand, RegistryKind,
+    StationarityVerdict, StationarityWriter,
 };
 use pangs_manifest::{
     canonicalize_audit, AlwaysFalse, AlwaysTrue, AnalysisRun, AuditRecord, AuditScope, AuditSource,
@@ -442,21 +442,10 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                         analysis
                             .modref(entry)
                             .flat_map(|row| {
-                                let affected = match &row.global {
-                                    GlobalTarget::Name(global) => vec![*global],
-                                    GlobalTarget::Unknown(_) if row.pointee_globals.is_empty() => {
-                                        (0..analysis.globals().len())
-                                            .map(|index| GlobalId(index as u32))
-                                            .collect()
-                                    }
-                                    GlobalTarget::Unknown(_) => analysis
-                                        .globals()
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(_, global)| {
-                                            row.pointee_globals.contains(&global.key)
-                                        })
-                                        .map(|(index, _)| GlobalId(index as u32))
+                                let affected: Vec<_> = match analysis.affected_globals(&row) {
+                                    AffectedGlobals::Finite(globals) => globals.to_vec(),
+                                    AffectedGlobals::ModuleWide => (0..analysis.globals().len())
+                                        .map(|index| GlobalId(index as u32))
                                         .collect(),
                                 };
                                 affected.into_iter().map(move |global| (global, row.access))
@@ -1110,23 +1099,21 @@ impl<'a> DispositionFactRows<'a> {
                         access_failure[index] = Some(row);
                     }
                 }
-                GlobalTarget::Unknown(_) => {
-                    if row.pointee_globals.is_empty() {
-                        for index in 0..global_count {
-                            escape[index].get_or_insert(row);
-                            access_failure[index].get_or_insert(row);
-                        }
-                    } else {
-                        for name in &row.pointee_globals {
-                            let Some(global) = analysis.lookup_global(name) else {
-                                continue;
-                            };
+                GlobalTarget::Unknown(_) => match analysis.affected_globals(row) {
+                    AffectedGlobals::Finite(globals) => {
+                        for global in globals {
                             let index = global.0 as usize;
                             escape[index].get_or_insert(row);
                             access_failure[index].get_or_insert(row);
                         }
                     }
-                }
+                    AffectedGlobals::ModuleWide => {
+                        for index in 0..global_count {
+                            escape[index].get_or_insert(row);
+                            access_failure[index].get_or_insert(row);
+                        }
+                    }
+                },
             }
         }
         let mut violation = vec![None; global_count];
@@ -1954,10 +1941,63 @@ struct ModRefRecord {
     address_node: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pointee_globals: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_scope: Option<CandidateScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pointee_global_count: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pointee_global_sample: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pointee_global_hash: Option<String>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CandidateScope {
+    Finite,
+    FiniteCollapsed,
+    ModuleWide,
 }
 
 impl ModRefRecord {
     fn from_modref(mr: &ModRef, analysis: &Analysis) -> Self {
+        let (candidate_scope, pointee_global_count, pointee_global_sample, pointee_global_hash) =
+            match &mr.global {
+                GlobalTarget::Name(_) => (None, None, Vec::new(), None),
+                GlobalTarget::Unknown(_) => match analysis.affected_globals(mr) {
+                    AffectedGlobals::ModuleWide => {
+                        (Some(CandidateScope::ModuleWide), None, Vec::new(), None)
+                    }
+                    AffectedGlobals::Finite(globals) => {
+                        let mut keys = globals
+                            .iter()
+                            .map(|&global| global_key(analysis, global))
+                            .collect::<Vec<_>>();
+                        keys.sort();
+                        keys.dedup();
+                        let mut exported = mr.pointee_globals.clone();
+                        exported.sort();
+                        exported.dedup();
+                        if keys == exported {
+                            (
+                                Some(CandidateScope::Finite),
+                                Some(keys.len()),
+                                Vec::new(),
+                                None,
+                            )
+                        } else {
+                            let sample = keys.iter().take(8).cloned().collect();
+                            let hash = Some(hash_global_keys(&keys));
+                            (
+                                Some(CandidateScope::FiniteCollapsed),
+                                Some(keys.len()),
+                                sample,
+                                hash,
+                            )
+                        }
+                    }
+                },
+            };
         Self {
             func: func_key(analysis, mr.func),
             global: match &mr.global {
@@ -1974,8 +2014,21 @@ impl ModRefRecord {
             detail: mr.detail.clone(),
             address_node: mr.address_node.clone(),
             pointee_globals: mr.pointee_globals.clone(),
+            candidate_scope,
+            pointee_global_count,
+            pointee_global_sample,
+            pointee_global_hash,
         }
     }
+}
+
+fn hash_global_keys(keys: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for key in keys {
+        hasher.update((key.len() as u64).to_be_bytes());
+        hasher.update(key.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Serialize)]
@@ -2264,6 +2317,57 @@ mod tests {
         assert_eq!(manifest.globals[0].meta.file, None);
         assert!(manifest.unkeyed_globals.is_empty());
         assert!(ledger[0].text.contains("globally unique"));
+    }
+
+    #[test]
+    fn collapsed_finite_modref_does_not_poison_an_outside_global() {
+        let fixture = workspace_root().join("fixtures/synthetic/m1_6/high_fanout_modref.pir.json");
+        let pir = Pir::from_path(&fixture).unwrap();
+        let opts = Opts {
+            stage: pangs_api::Stage::Steens,
+            build_mode: pangs_api::BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let collapsed = analysis
+            .modrefs()
+            .iter()
+            .find(|row| {
+                matches!(&row.global, pangs_api::GlobalTarget::Unknown(reason) if reason == "omega_store")
+                    && row
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.starts_with("high_fanout_pointer_modref:"))
+            })
+            .unwrap();
+        let pangs_api::AffectedGlobals::Finite(candidates) = analysis.affected_globals(collapsed)
+        else {
+            panic!("collapsed finite row widened to module-wide")
+        };
+        let untouched = analysis.lookup_global("@Untouched").unwrap();
+        assert_eq!(candidates.len(), 17);
+        assert!(!candidates.contains(&untouched));
+
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+        let untouched = manifest
+            .globals
+            .iter()
+            .find(|global| global.meta.llvm_name == "@Untouched")
+            .unwrap();
+        assert!(untouched.facts.access_set_complete.value);
     }
 
     #[test]

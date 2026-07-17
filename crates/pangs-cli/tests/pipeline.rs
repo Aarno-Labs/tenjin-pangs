@@ -1769,6 +1769,12 @@ fn analyze_steens_collapses_high_fanout_pointer_modref_to_unknown() {
                 .unwrap()
                 .starts_with("high_fanout_pointer_modref:source=pag_pointer")
             && row.get("pointee_globals").is_none()
+            && row["candidate_scope"] == "finite-collapsed"
+            && row["pointee_global_count"] == 17
+            && row["pointee_global_sample"].as_array().unwrap().len() == 8
+            && row["pointee_global_hash"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
     }));
     assert!(!modref.iter().any(|row| {
         row["access"] == "mod"
@@ -1812,6 +1818,7 @@ fn analyze_andersen_refines_spurious_external_store_address_modref() {
             && row["detail"] == "edge:store|omega:steens_external|pointee_count=1"
             && row["address_node"] == "val:driver:%gp"
             && row["pointee_globals"] == serde_json::json!(["@Table"])
+            && row["candidate_scope"] == "module-wide"
     }));
 
     let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
@@ -2066,7 +2073,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
     );
     let disposition: Value =
         serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
-    assert_eq!(disposition["schema_version"], 2);
+    assert_eq!(disposition["schema_version"], 3);
     let counter = disposition["globals"]
         .as_array()
         .unwrap()
@@ -2134,7 +2141,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "8d21e65afb959b6125d3d2f9242da2f49caed18510fd6d91c44aaf0fda37b881"
+        "fb9ea2999f49fd99ad9e14d1348290c961c3fcc002194521f5a89a9efef28d2f"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(
