@@ -120,11 +120,11 @@ pub(crate) fn evaluate_kill_rules(
 
 fn transitive_modified_globals(analysis: &Analysis, function: FuncId) -> Vec<GlobalId> {
     let mut globals = Vec::new();
-    for row in analysis
-        .modref(function)
-        .filter(|row| row.access == pangs_pir::Access::Mod)
-    {
-        match analysis.affected_globals(&row) {
+    for (access, affected) in analysis.transitive_accesses(function) {
+        if access != pangs_pir::Access::Mod {
+            continue;
+        }
+        match affected {
             AffectedGlobals::Finite(affected) => globals.extend_from_slice(affected),
             AffectedGlobals::ModuleWide => {
                 globals.extend((0..analysis.globals().len()).map(|index| GlobalId(index as u32)))
