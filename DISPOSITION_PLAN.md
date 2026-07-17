@@ -58,9 +58,10 @@ tu-path := repo-relative path, "/" separators, no leading "./",
            as spelled at the *defining* TU
 ```
 
-Example: `src/commands.c::cmd_table`. Function-scope statics need no extra
-qualification: the translation harness uniquifies their names in a pre-pass, so by the
-time PANGS sees the program every static's name is TU-unique. Two prerequisites this
+Examples: `src/commands.c::cmd_table` when source metadata is available, and bare
+`cmd_table.42` when it is not. Statics need no extra qualification: the translation
+harness globally uniquifies their names in a pre-pass, so by the time PANGS sees the
+program every static's name is program-unique. Two prerequisites this
 leans on: (a) the uniquification pre-pass runs **before** analysis, so manifest keys
 match what the C→C tool and translator see — recorded as a run assumption in
 `pangs-audit.json`; (b) fact assembly asserts key uniqueness and hard-errors on
@@ -88,16 +89,13 @@ lexical throughout, with exactly one filesystem-touching step:
    as-given absolute form, to tolerate a root reached via symlink. The remainder is
    `tu-path`.
 5. A path that ends up outside `repo_root`, cannot be absolutized, or contains a
-   literal `::` (which would break key parsing — no escaping scheme: the case does
-   not occur in real C trees, and a loud diagnostic beats a permanent codec) makes
-   the symbol **unkeyable**: the global goes to `unkeyed_globals` with witness kind
-   `unnormalizable-path`; a function in this state is treated like the missing-DI
-   case below (it cannot anchor certificates).
+   literal `::` is omitted from a global key; the globally unique symbol name remains
+   usable. A function in this state still cannot anchor a source-level certificate.
 
 `symbol-name` must match `[A-Za-z0-9_.$]+` — C identifiers plus LLVM/uniquifier
 decorations, colon-free by construction. `tu-path` may contain a single `:` but never
-`::` (step 5), so a key parses unambiguously at its **last** `::`; fact assembly
-validates both components, and nothing unkeyable ever reaches `globals[]`.
+`::` (step 5), so a qualified key parses unambiguously at its **last** `::`; a bare
+key is the symbol alone. Fact assembly validates the available components.
 
 Decisions the grammar previously left open:
 
@@ -127,18 +125,13 @@ Decisions the grammar previously left open:
   Today's lowering emits `file: None` for every global
   (`crates/pangs-pir/src/llvm_sys.rs`, `bump_missing_debug_location("global")`) —
   capturing it is part of the D1b-pre scope, not a new discovery.
-- **A symbol with no DI defining file cannot get a cross-tool identity, and no
-  identity means no cross-tool decision.** No `?::name` fallback keys: a key either
-  follows the grammar or the global is out of scope for this layer. Since `globals[]`
-  records require a key, such a global does not appear there at all — it goes in the
-  analysis-owned **`unkeyed_globals`** diagnostic collection
-  (`{ llvm_name, witness }`, witness kind `missing-debug-metadata`; `DISPOSITION.md`
-  §3), carries no facts or disposition, is unreachable by overrides and markers, and
-  is counted in the `unhandled` remainder for reporting (coverage loss, never
-  corruption — consistent with O1's stance that builds lacking debug metadata
-  certify nothing). A *function* with no DI file is handled analogously where its
-  identity is needed: it cannot be named in certificates, so certificates that would
-  reference it fail with the same witness kind.
+- **A global with no DI defining file uses its globally unique symbol name as its
+  cross-tool identity.** This is not a synthetic placeholder: it is the name produced
+  by the mandatory pre-analysis uniquification pass and consumed by downstream tools.
+  `meta.file` remains optional provenance. `unkeyed_globals` is reserved for a mutable
+  definition whose symbol itself violates the manifest grammar. A *function* with no
+  DI file is still handled conservatively where source identity is needed: it cannot
+  anchor a source-level certificate.
 
 ### 1.2 Marker name mangling
 
@@ -312,7 +305,7 @@ invariant; the schema validator re-checks it.
 `kind` is an open string registry (additive evolution: consumers tolerate unknown
 kinds). Initial entries: `write-site`, `escape-site`, `violation-finding`,
 `spawn-reachability`, `signal-registration`, `omega-access-path`, `external-escape`,
-`missing-debug-metadata`, `unnormalizable-path`.
+`missing-debug-metadata`, `unnormalizable-path`, `invalid-symbol-name`.
 
 **Canonical witness key** — the one ordering/tiebreak rule for witnesses everywhere
 (ground rule 4 sorting, §1.9's "lexicographically smallest witness" selection): the
@@ -722,8 +715,8 @@ Split for independent landing:
   One scan assembling the `DISPOSITION.md` §2 vector per client-relevant global —
   population per `DISPOSITION.md` §3: every defined mutable global (the existing
   `GlobalInfo.mutable` bit, post ignore-list, function-scope statics included;
-  stationary/never-written included), with unkeyable globals diverted to
-  `unkeyed_globals` instead of `globals[]`.
+  stationary/never-written included). Missing source-file metadata produces a bare
+  globally unique key; only invalid symbol spellings are diverted to `unkeyed_globals`.
   New-but-cheap facts built here: `signal_context_access` (reader/writer functions
   whose addresses flow to signal-registration sites — the Ω escape-site scan already
   walks these); `access_set_complete` (factored from the ONCELOCK kill-rule

@@ -33,7 +33,7 @@
   "definitions": {
     "key": {
       "type": "string",
-      "pattern": "^(?!/|\\./)(?!.*::.*::)(?!.*(?:^|/)\\.{1,2}(?:/|$))[^\\\\]+::[A-Za-z0-9_.$]+$"
+      "pattern": "^(?:[A-Za-z0-9_.$]+|(?!/|\\./)(?!.*::.*::)(?!.*(?:^|/)\\.{1,2}(?:/|$))[^\\\\]+::[A-Za-z0-9_.$]+)$"
     },
     "strategy": {
       "enum": ["immutable", "once-lock", "atomic", "mutex", "localize", "unhandled"]

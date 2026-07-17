@@ -38,14 +38,26 @@ pub enum Error {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Key {
-    tu_path: String,
+    tu_path: Option<String>,
     symbol: String,
 }
 
 impl Key {
     pub fn new(tu_path: impl Into<String>, symbol: impl Into<String>) -> Result<Self, Error> {
         let key = Self {
-            tu_path: tu_path.into(),
+            tu_path: Some(tu_path.into()),
+            symbol: symbol.into(),
+        };
+        key.validate()?;
+        Ok(key)
+    }
+
+    /// Construct a key for a globally unique symbol whose defining source file is
+    /// unavailable. The pipeline's static-variable uniquification invariant makes
+    /// this identity safe; manifest validation remains the collision backstop.
+    pub fn unqualified(symbol: impl Into<String>) -> Result<Self, Error> {
+        let key = Self {
+            tu_path: None,
             symbol: symbol.into(),
         };
         key.validate()?;
@@ -53,14 +65,15 @@ impl Key {
     }
 
     pub fn parse(raw: &str) -> Result<Self, Error> {
-        let Some((tu_path, symbol)) = raw.rsplit_once("::") else {
-            return Err(Error::InvalidKey(raw.to_owned()));
-        };
-        Self::new(tu_path, symbol).map_err(|_| Error::InvalidKey(raw.to_owned()))
+        match raw.rsplit_once("::") {
+            Some((tu_path, symbol)) => Self::new(tu_path, symbol),
+            None => Self::unqualified(raw),
+        }
+        .map_err(|_| Error::InvalidKey(raw.to_owned()))
     }
 
-    pub fn tu_path(&self) -> &str {
-        &self.tu_path
+    pub fn tu_path(&self) -> Option<&str> {
+        self.tu_path.as_deref()
     }
 
     pub fn symbol(&self) -> &str {
@@ -68,15 +81,16 @@ impl Key {
     }
 
     fn validate(&self) -> Result<(), Error> {
-        let path_ok = !self.tu_path.is_empty()
-            && !self.tu_path.starts_with('/')
-            && !self.tu_path.starts_with("./")
-            && !self.tu_path.contains("::")
-            && !self.tu_path.contains('\\')
-            && self
-                .tu_path
-                .split('/')
-                .all(|part| !part.is_empty() && part != "." && part != "..");
+        let path_ok = self.tu_path.as_ref().is_none_or(|tu_path| {
+            !tu_path.is_empty()
+                && !tu_path.starts_with('/')
+                && !tu_path.starts_with("./")
+                && !tu_path.contains("::")
+                && !tu_path.contains('\\')
+                && tu_path
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..")
+        });
         let symbol_ok = !self.symbol.is_empty()
             && self
                 .symbol
@@ -92,7 +106,11 @@ impl Key {
 
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}::{}", self.tu_path, self.symbol)
+        if let Some(tu_path) = &self.tu_path {
+            write!(f, "{tu_path}::{}", self.symbol)
+        } else {
+            f.write_str(&self.symbol)
+        }
     }
 }
 
@@ -1167,16 +1185,17 @@ mod tests {
             "src/commands.c::cmd_table",
             "vendor/a:b.c::name.$1",
             "one.c::static.42",
+            "globally_unique_static.42",
         ] {
             let parsed = Key::parse(raw).unwrap();
             assert_eq!(parsed.to_string(), raw);
         }
         for raw in [
-            "name",
             "/src/a.c::g",
             "./src/a.c::g",
             "a/../b.c::g",
             "a.c::bad-name",
+            "bad-name",
         ] {
             assert!(Key::parse(raw).is_err(), "accepted {raw}");
         }

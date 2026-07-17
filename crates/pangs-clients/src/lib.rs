@@ -160,35 +160,22 @@ pub fn assemble_disposition_artifacts(
             continue;
         }
         let llvm_name = info.key.clone();
-        let Some(file) = info.file.as_deref() else {
-            unkeyed_globals.push(UnkeyedGlobal {
-                llvm_name,
-                witness: Witness {
-                    kind: if info.path_error.is_some() {
-                        "unnormalizable-path".into()
-                    } else {
-                        "missing-debug-metadata".into()
-                    },
-                    site: None,
-                    symbol: None,
-                    note: info.path_error.clone(),
-                    extra: Extra::new(),
-                },
-                extra: Extra::new(),
-            });
-            continue;
-        };
         let symbol = info.key.strip_prefix('@').unwrap_or(&info.key);
-        let key = match Key::new(file, symbol) {
+        let key = match info
+            .file
+            .as_deref()
+            .map_or_else(|| Key::unqualified(symbol), |file| Key::new(file, symbol))
+            .or_else(|_| Key::unqualified(symbol))
+        {
             Ok(key) => key,
             Err(_) => {
                 unkeyed_globals.push(UnkeyedGlobal {
                     llvm_name,
                     witness: Witness {
-                        kind: "unnormalizable-path".into(),
+                        kind: "invalid-symbol-name".into(),
                         site: None,
                         symbol: None,
-                        note: Some(file.into()),
+                        note: Some(info.key.clone()),
                         extra: Extra::new(),
                     },
                     extra: Extra::new(),
@@ -272,6 +259,16 @@ pub fn assemble_disposition_artifacts(
         );
     }
 
+    let mut unique_keys = BTreeSet::new();
+    for global in &globals {
+        if !unique_keys.insert(global.key.clone()) {
+            anyhow::bail!(
+                "duplicate disposition global key {}; static-variable uniquification invariant violated",
+                global.key
+            );
+        }
+    }
+
     let coupling_started = Instant::now();
     let coupling_groups = assemble_coupling_groups(analysis, &mut globals);
     if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
@@ -347,7 +344,7 @@ pub fn assemble_disposition_artifacts(
             extra: Extra::new(),
         },
         source: AuditSource::Analysis,
-        text: "function-scope static uniquification runs before PANGS analysis".into(),
+        text: "global static-variable uniquification runs before PANGS analysis; bare manifest keys are globally unique".into(),
         witness: None,
         failures: None,
         extra: Extra::new(),
@@ -2194,8 +2191,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        check_traces, coupling_group_id, export_analysis, once_lock_pair_evidence, report,
-        validate_export_dir, CertifiedGroupEvidence,
+        assemble_disposition_artifacts, check_traces, coupling_group_id, export_analysis,
+        once_lock_pair_evidence, report, validate_export_dir, CertifiedGroupEvidence,
     };
 
     fn group_site(line: u32) -> Site {
@@ -2237,6 +2234,36 @@ mod tests {
             coupling_group_id(&[left.clone(), right.clone()]),
             coupling_group_id(&[right, left])
         );
+    }
+
+    #[test]
+    fn disposition_keys_a_mutable_definition_without_source_metadata() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        pir.globals[0].file = None;
+        pir.globals[0].line = None;
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, ledger) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.globals.len(), 1);
+        assert_eq!(manifest.globals[0].key.to_string(), "g_counter");
+        assert_eq!(manifest.globals[0].meta.file, None);
+        assert!(manifest.unkeyed_globals.is_empty());
+        assert!(ledger[0].text.contains("globally unique"));
     }
 
     #[test]

@@ -165,16 +165,14 @@ after the existing ignore-list filter, function-scope statics included. Excluded
 declarations (no defining TU here; not ours to rewrite). Stationary and never-written
 globals are *included* — they are precisely the `immutable`/`once-lock` candidates.
 
-One carve-out: a defined mutable global whose defining-TU path cannot be recovered
-*or normalized* (`DISPOSITION_PLAN.md` §1.1 — no DI metadata, or a path outside
-`repo_root` / unparseable under the key grammar) has no valid key and therefore
-**cannot appear in `globals[]`**, whose records require one. Such globals go in a
-separate analysis-owned diagnostic collection, **`unkeyed_globals`** — best-effort
-LLVM name + witness (`missing-debug-metadata` or `unnormalizable-path`), no facts,
-no disposition. They are behaviorally
-`unhandled` (no identity ⇒ no override can match them, no marker can name them, no
-tool acts on them ⇒ left as-is) and are counted in the `unhandled` remainder of the
-§10.1 disposition distribution so coverage reporting stays honest.
+The defining-TU path is optional provenance. When it is available and normalizable,
+the key is source-qualified; otherwise the globally unique symbol name is the key.
+This relies on the translation pipeline's pre-analysis static-variable uniquification
+invariant, recorded in the audit ledger, with manifest duplicate-key validation as a
+hard-error backstop. `unkeyed_globals` is retained only for the exceptional case where
+even the symbol spelling cannot satisfy the key grammar (for example a non-C,
+compiler-generated mutable definition); those records carry no facts or disposition
+and count as `unhandled`.
 
 ### 3.1 Identity and keying (load-bearing for overrides)
 
@@ -182,13 +180,13 @@ Overrides and cross-stage references must survive re-runs and source drift, so g
 are keyed by **qualified symbol identity, never coordinates**:
 
 ```
-key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
+key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cmd_table.42"
 ```
 
-- `translation_unit` is the *defining* TU path, repo-relative, required for
-  internal-linkage globals (two `static int verbose;` in different files are distinct
-  keys) and retained for external-linkage globals for uniformity (their `name` is
-  already unique program-wide). The same grammar covers **function identities**
+- `translation_unit`, when present, is the *defining* TU path, repo-relative. A global
+  without recoverable source-file metadata uses its globally unique symbol name alone;
+  the required pre-pass has already renamed same-spelled statics across TUs. The same
+  qualified grammar continues to cover **function identities**
   wherever the manifest references them (certificates, witnesses, once-lock
   rewiring) — static functions collide across TUs exactly like globals
   (`DISPOSITION_PLAN.md` §1.1). Qualified keys are a **manifest-layer identity over
@@ -197,10 +195,10 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
   declarations — which have no defining TU — receive no key, synthetic or otherwise;
   they can be neither disposition subjects nor certificate anchors, and appear in
   witness text by raw name only.
-- Function-scope statics get no extra qualification: the translation harness uniquifies
-  their names in a pre-pass that runs *before* the analysis, so every static's name is
-  TU-unique by the time PANGS sees it. That ordering is a recorded run assumption, and
-  fact assembly asserts key uniqueness (hard error on collision) as the backstop.
+- Statics get no extra qualification beyond that optional file component: the
+  translation harness globally uniquifies their names in a pre-pass that runs *before*
+  analysis. That ordering is a recorded run assumption, and manifest validation
+  asserts key uniqueness (hard error on collision) as the backstop.
 - File/line/col coordinates appear in the manifest only inside certificates and witness
   records, as *evidence from this run* — valid for same-run consumers, never used as
   identity, and never referenced by override files.
@@ -268,8 +266,8 @@ key = <translation_unit>::<name>        e.g.  "src/commands.c::cmd_table"
     }
   ],
   "unkeyed_globals": [                   // analysis-owned diagnostic collection (§3
-    { "llvm_name": "counter.1",          //   population rule): defined mutable globals
-      "witness": { "kind": "missing-debug-metadata" } }   // with no recoverable key
+    { "llvm_name": "non-C-name!",        //   population rule): exceptional mutable
+      "witness": { "kind": "invalid-symbol-name" } }      // definitions with no valid key
   ],
   "coupling_groups": [ { "id": "grp-cmd", "members": [...], "evidence": {...},
                          "strategy_support": {          // analysis-owned, from D2b:
