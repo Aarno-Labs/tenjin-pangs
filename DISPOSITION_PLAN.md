@@ -552,27 +552,20 @@ below is a shared record and is fixed here:
   everything `main` reaches would drown the signal; the object-level side channel a
   violation can open is already covered by Ω, i.e. `omega_escaped_address`). Witness:
   the finding, `kind: "violation-finding"`.
-- **`access_set_complete(g)`**, evaluated in this order with the first failing
-  condition as witness: (a) no *unknown-access* modref row **applies to `g`** —
-  where a row applies to `g` iff its target is `GlobalTarget::Name(g)`, or its
-  target is `GlobalTarget::Unknown(_)` and `g`'s **raw LLVM name**
-  (`meta.llvm_name`) appears in the row's `pointee_globals` candidate set — the
-  candidate lists carry raw LLVM names, so matching is via `meta.llvm_name`, never
-  the qualified manifest key (the current representation puts unknown rows
-  under `Unknown`, never `Name`; attribution is via the candidate list) — **and —
-  the conservative rule — an `Unknown`-target row with an empty/unbounded
-  `pointee_globals` set fails (a) for every global**, with that row as witness (its
-  candidates could not be enumerated, so no access set can claim completeness; such
-  rows should be rare because Ω-derived unknowns already surface via (b), and the
-  §7 counters will show if this over-fires); (b)
+- **`access_set_complete(g)`** is a pure boundedness fact, evaluated in this order
+  with the first failing condition as witness: (a) no `ModuleWide` unknown-access
+  modref row can reach module globals (a retained `Finite` candidate set affects only
+  its members and remains bounded even when abbreviated in exports); (b)
   `¬omega_escaped_address(g)`; (c) `g` is not **exported** — precisely the
   analysis-level exported bit (`is_exported_global`: external linkage ∧ default
   visibility ∧ the run's `exports` config under its build mode), *not* raw external
   linkage alone and *not* escape — an exported global is nameable by client code
   the analysis never sees, so its access set cannot be complete in library mode;
   (b) and (c) deliberately partition the exposure surface: (b) = address escaped
-  (any mode), (c) = reachable by name (library builds); (d) no accessor function of
-  `g` is violation-tainted. When several sites
+  (any mode), (c) = reachable by name (library builds); and (d) lowering did not
+  report an access-bearing construct for which no access site can be represented at
+  all. Bounded indirect accesses and violation findings are routed separately to
+  D3/D4 and do not change this fact. When several sites
   fail one condition, the witness is the lexicographically smallest witness key
   (determinism, ground rule 4).
 - **`word_sized_scalar(g)`** — the name is historical shorthand; the actual

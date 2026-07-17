@@ -204,7 +204,6 @@ pub fn assemble_disposition_artifacts(
             omega_witness.as_ref(),
             opts.build_mode,
             info.exported,
-            violation_witness.as_ref(),
             fact_rows.access_failure[index],
         );
         let localization = fact_rows.localization[index].clone();
@@ -283,6 +282,31 @@ pub fn assemble_disposition_artifacts(
         );
     }
     if let Some(report) = phase_report.as_object_mut() {
+        let bounded_indirect = fact_rows
+            .bounded_indirect
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                row.map(|row| {
+                    serde_json::json!({
+                        "global": analysis.globals()[GlobalId(index as u32)].key,
+                        "witness": function_witness(
+                            analysis,
+                            row.func,
+                            "bounded-indirect-access",
+                            row.witness.clone(),
+                        ),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        report.insert(
+            "bounded_indirect_accesses".into(),
+            serde_json::json!({
+                "globals": bounded_indirect.len(),
+                "witnesses": bounded_indirect,
+            }),
+        );
         let summaries = coupling_groups
             .iter()
             .map(|group| {
@@ -1059,6 +1083,7 @@ struct DispositionFactRows<'a> {
     written: Vec<Option<&'a ModRef>>,
     escape: Vec<Option<&'a ModRef>>,
     access_failure: Vec<Option<&'a ModRef>>,
+    bounded_indirect: Vec<Option<&'a ModRef>>,
     violation: Vec<Option<Witness>>,
     localization: Vec<Option<Localization>>,
 }
@@ -1069,6 +1094,7 @@ impl<'a> DispositionFactRows<'a> {
         let mut written = vec![None; global_count];
         let mut escape = vec![None; global_count];
         let mut access_failure = vec![None; global_count];
+        let mut bounded_indirect = vec![None; global_count];
         let mut violation_finding_by_function = vec![None; analysis.functions().len()];
         for (ordinal, finding) in analysis.audit_findings().iter().enumerate() {
             if let Some(function) = finding.function {
@@ -1095,8 +1121,8 @@ impl<'a> DispositionFactRows<'a> {
                     if row.access == pangs_pir::Access::Mod && written[index].is_none() {
                         written[index] = Some(row);
                     }
-                    if row.via == pangs_api::Via::Unknown && access_failure[index].is_none() {
-                        access_failure[index] = Some(row);
+                    if row.via != pangs_api::Via::Direct {
+                        bounded_indirect[index].get_or_insert(row);
                     }
                 }
                 GlobalTarget::Unknown(_) => match analysis.affected_globals(row) {
@@ -1104,7 +1130,7 @@ impl<'a> DispositionFactRows<'a> {
                         for global in globals {
                             let index = global.0 as usize;
                             escape[index].get_or_insert(row);
-                            access_failure[index].get_or_insert(row);
+                            bounded_indirect[index].get_or_insert(row);
                         }
                     }
                     AffectedGlobals::ModuleWide => {
@@ -1133,6 +1159,7 @@ impl<'a> DispositionFactRows<'a> {
             written,
             escape,
             access_failure,
+            bounded_indirect,
             violation,
             localization,
         }
@@ -1270,14 +1297,13 @@ fn access_set_failure(
     omega: Option<&Witness>,
     mode: BuildMode,
     exported: bool,
-    violation: Option<&Witness>,
     failure_row: Option<&ModRef>,
 ) -> Option<Witness> {
     if let Some(row) = failure_row {
         return Some(function_witness(
             analysis,
             row.func,
-            "omega-access-path",
+            "module-wide-access",
             row.witness.clone(),
         ));
     }
@@ -1293,7 +1319,7 @@ fn access_set_failure(
             extra: Extra::new(),
         });
     }
-    violation.cloned()
+    None
 }
 
 fn localization_index(analysis: &Analysis) -> Vec<Option<Localization>> {
@@ -2368,6 +2394,74 @@ mod tests {
             .find(|global| global.meta.llvm_name == "@Untouched")
             .unwrap();
         assert!(untouched.facts.access_set_complete.value);
+        let touched = manifest
+            .globals
+            .iter()
+            .find(|global| global.meta.llvm_name == "@G00")
+            .unwrap();
+        assert!(touched.facts.access_set_complete.value);
+        assert_eq!(
+            manifest.run.analysis.extra["phase_stationarity_report"]["bounded_indirect_accesses"]
+                ["globals"],
+            17
+        );
+    }
+
+    #[test]
+    fn violation_taint_does_not_change_access_boundedness() {
+        let fixture = workspace_root().join("fixtures/synthetic/m1_5/audit_surface.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        pir.functions
+            .iter_mut()
+            .find(|function| function.key == "driver")
+            .unwrap()
+            .body
+            .retain(|statement| {
+                matches!(statement, pangs_pir::Stmt::CallDirect { callee, .. } if callee == "accept_vararg")
+            });
+        pir.functions
+            .iter_mut()
+            .find(|function| function.key == "driver")
+            .unwrap()
+            .body
+            .insert(
+                0,
+                pangs_pir::Stmt::GlobalRef {
+                    global: "@AuditedGlobal".into(),
+                    access: pangs_pir::Access::Ref,
+                    loc: None,
+                },
+            );
+        pir.globals.push(pangs_pir::Global {
+            key: "@AuditedGlobal".into(),
+            ..pangs_pir::Global::default()
+        });
+        let opts = Opts {
+            build_mode: pangs_api::BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+        let global = manifest
+            .globals
+            .iter()
+            .find(|global| global.meta.llvm_name == "@AuditedGlobal")
+            .unwrap();
+        assert!(global.facts.violation_taint.value);
+        assert!(global.facts.access_set_complete.value);
     }
 
     #[test]

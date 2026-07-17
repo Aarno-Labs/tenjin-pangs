@@ -134,7 +134,7 @@ Per-global facts, with producers:
 | `violation_taint` | evidenced bool (witness when true: the violation finding) — gates every strategy, §1 | A′ detection | exists |
 | `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) — **reporting fact, not a guard**: thread visibility alone defeats no strategy (thread readers are a primary OnceLock use case; the thread-*writer* kill rule lives inside the phase-stationarity certificate) | F scan over spawn sites | specified; exported by D1b |
 | `signal_context_access` | evidenced bool (true iff accessed under a registered signal handler; witness when true: registration site + accessing function) | F scan over Ω escape sites of handlers | new, cheap |
-| `access_set_complete` | evidenced bool (true iff every access site enumerated; **witness when false**: the Ω-tainted path) | F scan | specified (the ONCELOCK kill-rule conjunction, factored out); built by D1b |
+| `access_set_complete` | evidenced bool (true iff analysis bounds every possible accessor; **witness when false**: module-wide Ω, address escape, or library name reachability) | F scan | built by D1b; bounded indirect/rewrite compatibility is diagnosed separately for D3/D4 |
 | `word_sized_scalar` | `{ value, type_spelling?, size_bits?, class?, signed? }` — true iff the type has a matching Rust atomic on the target (`DISPOSITION_PLAN.md` §1.9; the name is historical shorthand, not "pointer-width only") | lowering metadata (O1b) | exists after O1b |
 | `phase_stationarity` | certificate slot (null \| certified \| failed+codes+witnesses) | ONCELOCK pass | specified |
 | `atomic_eligibility` | certificate slot | future pass (§9 D3) | reserved slot |
