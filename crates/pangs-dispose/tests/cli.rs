@@ -76,6 +76,7 @@ fn fixture() -> (Manifest, Vec<AuditRecord>) {
         }],
         unkeyed_globals: Vec::new(),
         coupling_groups: Vec::new(),
+        coupling_candidates: Vec::new(),
         override_report: None,
         materialization: None,
         extra: Extra::new(),

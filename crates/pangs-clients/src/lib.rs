@@ -18,11 +18,11 @@ use pangs_api::{
 };
 use pangs_manifest::{
     canonicalize_audit, AlwaysFalse, AlwaysTrue, AnalysisRun, AuditRecord, AuditScope, AuditSource,
-    Certificate, CommonInterval, CouplingGroup, EvidenceEdge, EvidenceKind, EvidencedBool, Extra,
-    Facts, GlobalRecord as DispositionGlobal, GroupStrategySupport, Key, Linkage, Localization,
-    LocalizationBlocker, LocalizationVerdict, Manifest as DispositionManifest, Meta,
-    OnceLockGroupSupport, RunHeader, ScalarClass, Site, UnkeyedGlobal, Witness, WordSizedScalar,
-    SCHEMA_VERSION,
+    Certificate, CommonInterval, CouplingCandidate, CouplingGroup, EvidenceEdge, EvidenceKind,
+    EvidenceStrength, EvidencedBool, Extra, Facts, GlobalRecord as DispositionGlobal,
+    GroupStrategySupport, Key, Linkage, Localization, LocalizationBlocker, LocalizationVerdict,
+    Manifest as DispositionManifest, Meta, OnceLockGroupSupport, RunHeader, ScalarClass, Site,
+    UnkeyedGlobal, Witness, WordSizedScalar, SCHEMA_VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -273,7 +273,7 @@ pub fn assemble_disposition_artifacts(
     }
 
     let coupling_started = Instant::now();
-    let coupling_groups = assemble_coupling_groups(analysis, &mut globals);
+    let (coupling_groups, coupling_candidates) = assemble_coupling_groups(analysis, &mut globals);
     if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
         eprintln!(
             "pangs disposition timing coupling-groups={}ms groups={} evidence-edges={}",
@@ -352,6 +352,19 @@ pub fn assemble_disposition_artifacts(
                 "groups": summaries
             }),
         );
+        report.insert(
+            "coupling_candidates".into(),
+            serde_json::json!({
+                "count": coupling_candidates.len(),
+                "globals_suspected": coupling_candidates.iter().map(|candidate| candidate.members.len()).sum::<usize>(),
+                "suspected_edges": coupling_candidates.iter().map(|candidate| candidate.evidence.len()).sum::<usize>(),
+                "components": coupling_candidates.iter().map(|candidate| serde_json::json!({
+                    "id": candidate.id,
+                    "members": candidate.members.len(),
+                    "edges": candidate.evidence.len(),
+                })).collect::<Vec<_>>(),
+            }),
+        );
     }
     let mut manifest = DispositionManifest {
         schema_version: SCHEMA_VERSION,
@@ -377,6 +390,7 @@ pub fn assemble_disposition_artifacts(
         globals,
         unkeyed_globals,
         coupling_groups,
+        coupling_candidates,
         override_report: None,
         materialization: None,
         extra: Extra::new(),
@@ -587,7 +601,7 @@ fn registry_witness(
 fn assemble_coupling_groups(
     analysis: &Analysis,
     globals: &mut [DispositionGlobal],
-) -> Vec<CouplingGroup> {
+) -> (Vec<CouplingGroup>, Vec<CouplingCandidate>) {
     let coupling_started = Instant::now();
     let keys = globals
         .iter()
@@ -606,7 +620,7 @@ fn assemble_coupling_groups(
         .enumerate()
         .map(|(index, global)| (global.key.clone(), index))
         .collect::<BTreeMap<_, _>>();
-    let mut components = CouplingComponents::new(keys.len());
+    let mut suspected_components = CouplingComponents::new(keys.len());
     let key_by_global = globals
         .iter()
         .map(|global| (global.meta.llvm_name.clone(), index_by_key[&global.key]))
@@ -616,12 +630,6 @@ fn assemble_coupling_groups(
         .iter()
         .map(|global| key_by_global.get(&global.key).copied())
         .collect::<Vec<_>>();
-    let co_written_count = analysis
-        .directly_written_globals()
-        .iter()
-        .filter_map(|global| key_index_by_global[global.0 as usize])
-        .collect::<BTreeSet<_>>()
-        .len();
     let mut co_write_sites = BTreeMap::<(usize, usize), Vec<Site>>::new();
     for function in (0..analysis.functions().len()).map(|index| FuncId(index as u32)) {
         let mut written = analysis
@@ -636,16 +644,13 @@ fn assemble_coupling_groups(
             continue;
         };
         for &b in rest {
-            if components.union(a, b) {
+            if suspected_components.union(a, b) {
                 if let Some(site) = &site {
                     co_write_sites.entry((a, b)).or_default().push(site.clone());
                 } else {
                     co_write_sites.entry((a, b)).or_default();
                 }
             }
-        }
-        if components.component_size(a) == co_written_count {
-            break;
         }
     }
     if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
@@ -665,7 +670,7 @@ fn assemble_coupling_groups(
         .collect::<BTreeMap<_, _>>();
     let phase_keys = phase_by_key.keys().cloned().collect::<Vec<_>>();
     let mut once_lock_pairs = Vec::<(usize, usize, OnceLockPairEvidence)>::new();
-    let mut once_lock_components = CouplingComponents::new(keys.len());
+    let mut hard_components = CouplingComponents::new(keys.len());
     for left in 0..phase_keys.len() {
         for right in left + 1..phase_keys.len() {
             let a = &phase_keys[left];
@@ -677,8 +682,7 @@ fn assemble_coupling_groups(
             }
             let a = index_by_key[a];
             let b = index_by_key[b];
-            components.union(a, b);
-            if once_lock_components.union(a, b) {
+            if hard_components.union(a, b) {
                 let pair = once_lock_pair_evidence(left_evidence, right_evidence)
                     .expect("compatible once-lock pair must produce evidence");
                 once_lock_pairs.push((a, b, pair));
@@ -696,9 +700,9 @@ fn assemble_coupling_groups(
 
     let mut member_indexes = BTreeMap::<usize, Vec<usize>>::new();
     for index in 0..keys.len() {
-        if components.component_size(index) > 1 {
+        if hard_components.component_size(index) > 1 {
             member_indexes
-                .entry(components.find(index))
+                .entry(hard_components.find(index))
                 .or_default()
                 .push(index);
         }
@@ -714,21 +718,12 @@ fn assemble_coupling_groups(
     let mut evidence_by_group = (0..member_indexes.len())
         .map(|_| Vec::new())
         .collect::<Vec<Vec<EvidenceEdge>>>();
-    for ((a, b), sites) in co_write_sites {
-        let group =
-            group_by_key_index[a].expect("co-write evidence must belong to a coupling group");
-        evidence_by_group[group].push(EvidenceEdge {
-            kind: EvidenceKind::CoWrite,
-            members: vec![keys[a].clone(), keys[b].clone()],
-            sites,
-            extra: Extra::new(),
-        });
-    }
     for (a, b, pair) in once_lock_pairs {
         let group =
             group_by_key_index[a].expect("once-lock evidence must belong to a coupling group");
         evidence_by_group[group].push(EvidenceEdge {
             kind: EvidenceKind::OncelockInterval,
+            strength: EvidenceStrength::Hard,
             members: vec![keys[a].clone(), keys[b].clone()],
             sites: pair.sites,
             extra: pair.extra,
@@ -766,7 +761,54 @@ fn assemble_coupling_groups(
             extra: Extra::new(),
         });
     }
-    groups
+    let mut candidate_member_indexes = BTreeMap::<usize, Vec<usize>>::new();
+    for index in 0..keys.len() {
+        if suspected_components.component_size(index) > 1 {
+            candidate_member_indexes
+                .entry(suspected_components.find(index))
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut candidate_member_indexes = candidate_member_indexes.into_values().collect::<Vec<_>>();
+    candidate_member_indexes.sort_by_key(|members| members[0]);
+    let mut candidate_by_key_index = vec![None; keys.len()];
+    for (candidate, members) in candidate_member_indexes.iter().enumerate() {
+        for member in members {
+            candidate_by_key_index[*member] = Some(candidate);
+        }
+    }
+    let mut candidate_evidence = (0..candidate_member_indexes.len())
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<EvidenceEdge>>>();
+    for ((a, b), sites) in co_write_sites {
+        let candidate = candidate_by_key_index[a]
+            .expect("co-write suspicion must belong to a coupling candidate");
+        candidate_evidence[candidate].push(EvidenceEdge {
+            kind: EvidenceKind::CoWrite,
+            strength: EvidenceStrength::Suspected,
+            members: vec![keys[a].clone(), keys[b].clone()],
+            sites,
+            extra: Extra::new(),
+        });
+    }
+    let candidates = candidate_member_indexes
+        .into_iter()
+        .enumerate()
+        .map(|(candidate, indexes)| {
+            let members = indexes
+                .into_iter()
+                .map(|index| keys[index].clone())
+                .collect::<Vec<_>>();
+            CouplingCandidate {
+                id: coupling_candidate_id(&members),
+                members,
+                evidence: std::mem::take(&mut candidate_evidence[candidate]),
+                extra: Extra::new(),
+            }
+        })
+        .collect();
+    (groups, candidates)
 }
 
 struct CouplingComponents {
@@ -1060,6 +1102,14 @@ fn coupling_group_id(members: &[Key]) -> String {
         .min()
         .expect("coupling group ids require at least one member");
     format!("grp-{:08x}", fnv1a32(smallest.to_string().as_bytes()))
+}
+
+fn coupling_candidate_id(members: &[Key]) -> String {
+    let smallest = members
+        .iter()
+        .min()
+        .expect("coupling candidate ids require at least one member");
+    format!("cand-{:08x}", fnv1a32(smallest.to_string().as_bytes()))
 }
 
 fn evidenced(value: bool, polarity: bool, witness: Option<Witness>) -> EvidencedBool {
@@ -2448,9 +2498,9 @@ mod tests {
 
     use super::{
         assemble_disposition_artifacts, check_traces, classify_violation_relevance,
-        coupling_group_id, export_analysis, once_lock_pair_evidence, report, validate_export_dir,
-        violation_relevance_witness, CertifiedGroupEvidence, DispositionFactRows,
-        ViolationRelevance,
+        coupling_candidate_id, coupling_group_id, export_analysis, once_lock_pair_evidence, report,
+        validate_export_dir, violation_relevance_witness, CertifiedGroupEvidence,
+        DispositionFactRows, ViolationRelevance,
     };
 
     fn group_site(line: u32) -> Site {
@@ -2490,8 +2540,13 @@ mod tests {
         let right = Key::new("group.c", "right").unwrap();
         assert_eq!(
             coupling_group_id(&[left.clone(), right.clone()]),
-            coupling_group_id(&[right, left])
+            coupling_group_id(&[right.clone(), left.clone()])
         );
+
+        let candidate = coupling_candidate_id(&[left.clone(), right.clone()]);
+        assert_eq!(candidate, coupling_candidate_id(&[right, left.clone()]));
+        assert!(candidate.starts_with("cand-"));
+        assert_ne!(candidate, coupling_group_id(&[left]));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Disposition False-Negative Reduction Plan
 
-Status: in progress (F1–F3 implemented 2026-07-17; F4–F5 pending)
+Status: in progress (F1–F4 implemented 2026-07-17; F5 pending)
 
 This plan reduces conservative false negatives in three disposition inputs:
 

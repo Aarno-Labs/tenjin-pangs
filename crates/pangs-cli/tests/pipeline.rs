@@ -2142,7 +2142,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "040274efa1a900e704f830ed55d10f4d345f315aacb3278b0e977ccfd33b736a"
+        "ff8c1a02d04001bba6d0e459916d6dc8c8460a117a6318e7715a6b24474070a9"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(
@@ -2285,26 +2285,20 @@ fn analyze_dispose_reports_registry_reachability_and_coupling() {
         manifest["run"]["analysis"]["opts"]["disposition_registries"][0]["name"],
         "register_worker"
     );
-    assert_eq!(
-        left["facts"]["coupling_group"],
-        right["facts"]["coupling_group"]
-    );
+    assert!(left["facts"]["coupling_group"].is_null());
+    assert!(right["facts"]["coupling_group"].is_null());
     let groups = manifest["coupling_groups"].as_array().unwrap();
-    assert_eq!(groups.len(), 1);
-    assert_eq!(
-        groups[0]["strategy_support"]["once_lock"]["supported"],
-        false
-    );
-    assert_eq!(
-        groups[0]["strategy_support"]["once_lock"]["witness"]["kind"],
-        "phase-stationarity-not-certified"
-    );
-    assert!(groups[0]["evidence"]
+    assert!(groups.is_empty());
+    let candidates = manifest["coupling_candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert!(candidates[0]["evidence"]
         .as_array()
         .unwrap()
         .iter()
         .any(|edge| {
-            edge["kind"] == "co-write" && edge["members"].as_array().unwrap().len() == 2
+            edge["kind"] == "co-write"
+                && edge["strength"] == "suspected"
+                && edge["members"].as_array().unwrap().len() == 2
         }));
 }
 
@@ -2418,6 +2412,7 @@ fn analyze_dispose_derives_common_once_lock_group_support() {
         .unwrap()
         .iter()
         .any(|edge| edge["kind"] == "oncelock-interval"
+            && edge["strength"] == "hard"
             && edge["shared_init_functions"] == serde_json::json!(["initialize"])));
     assert!(!group["evidence"]
         .as_array()

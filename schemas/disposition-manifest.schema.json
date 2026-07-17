@@ -26,6 +26,10 @@
       "type": "array",
       "items": { "$ref": "#/definitions/coupling_group" }
     },
+    "coupling_candidates": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/coupling_candidate" }
+    },
     "override_report": { "type": "object" },
     "materialization": { "$ref": "#/definitions/materialization" }
   },
@@ -254,11 +258,38 @@
       "properties": {
         "id": { "type": "string" },
         "members": { "type": "array", "items": { "$ref": "#/definitions/key" } },
-        "evidence": { "type": "array" },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/evidence_edge" }
+        },
         "strategy_support": { "type": "object" },
         "group_disposition": { "$ref": "#/definitions/strategy" },
         "group_provenance": { "enum": ["cascade", "override", "override-accepted-risk"] },
         "override": { "type": ["object", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "coupling_candidate": {
+      "type": "object",
+      "required": ["id", "members", "evidence"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^cand-[0-9a-f]{8}$" },
+        "members": { "type": "array", "items": { "$ref": "#/definitions/key" } },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/evidence_edge" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "evidence_edge": {
+      "type": "object",
+      "required": ["kind", "strength", "members", "sites"],
+      "properties": {
+        "kind": { "enum": ["co-write", "oncelock-interval"] },
+        "strength": { "enum": ["hard", "suspected"] },
+        "members": { "type": "array", "items": { "$ref": "#/definitions/key" } },
+        "sites": { "type": "array", "items": { "$ref": "#/definitions/site" } }
       },
       "additionalProperties": true
     },

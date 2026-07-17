@@ -480,6 +480,8 @@ pub struct UnkeyedGlobal {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceEdge {
     pub kind: EvidenceKind,
+    #[serde(default)]
+    pub strength: EvidenceStrength,
     pub members: Vec<Key>,
     pub sites: Vec<Site>,
     #[serde(flatten)]
@@ -491,6 +493,19 @@ pub struct EvidenceEdge {
 pub enum EvidenceKind {
     CoWrite,
     OncelockInterval,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidenceStrength {
+    Hard,
+    Suspected,
+}
+
+impl Default for EvidenceStrength {
+    fn default() -> Self {
+        Self::Hard
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -587,6 +602,15 @@ pub struct CouplingGroup {
     pub group_provenance: Option<GroupProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#override: Option<OverrideEcho>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CouplingCandidate {
+    pub id: String,
+    pub members: Vec<Key>,
+    pub evidence: Vec<EvidenceEdge>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -743,6 +767,8 @@ pub struct Manifest {
     pub globals: Vec<GlobalRecord>,
     pub unkeyed_globals: Vec<UnkeyedGlobal>,
     pub coupling_groups: Vec<CouplingGroup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coupling_candidates: Vec<CouplingCandidate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub override_report: Option<OverrideReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -785,6 +811,49 @@ impl Manifest {
                     )));
                 }
             }
+            if group
+                .evidence
+                .iter()
+                .any(|edge| edge.strength != EvidenceStrength::Hard)
+            {
+                return Err(Error::InvalidInvariant(format!(
+                    "hard coupling group {} contains suspected evidence",
+                    group.id
+                )));
+            }
+        }
+        let mut candidate_ids = BTreeSet::new();
+        for candidate in &self.coupling_candidates {
+            if !candidate_ids.insert(&candidate.id) {
+                return Err(Error::InvalidInvariant(format!(
+                    "duplicate coupling candidate id {}",
+                    candidate.id
+                )));
+            }
+            if group_ids.iter().any(|id| *id == &candidate.id) {
+                return Err(Error::InvalidInvariant(format!(
+                    "coupling candidate id collides with hard group {}",
+                    candidate.id
+                )));
+            }
+            for member in &candidate.members {
+                if !global_keys.contains(member) {
+                    return Err(Error::InvalidInvariant(format!(
+                        "coupling candidate {} names absent member {member}",
+                        candidate.id
+                    )));
+                }
+            }
+            if candidate
+                .evidence
+                .iter()
+                .any(|edge| edge.strength != EvidenceStrength::Suspected)
+            {
+                return Err(Error::InvalidInvariant(format!(
+                    "coupling candidate {} contains hard evidence",
+                    candidate.id
+                )));
+            }
         }
         Ok(())
     }
@@ -807,6 +876,19 @@ impl Manifest {
                 edge.sites.sort_by(site_cmp);
             }
             group.evidence.sort_by(|a, b| {
+                let ak = (format!("{:?}", a.kind), &a.members);
+                let bk = (format!("{:?}", b.kind), &b.members);
+                ak.cmp(&bk)
+            });
+        }
+        self.coupling_candidates.sort_by(|a, b| a.id.cmp(&b.id));
+        for candidate in &mut self.coupling_candidates {
+            candidate.members.sort();
+            for edge in &mut candidate.evidence {
+                edge.members.sort();
+                edge.sites.sort_by(site_cmp);
+            }
+            candidate.evidence.sort_by(|a, b| {
                 let ak = (format!("{:?}", a.kind), &a.members);
                 let bk = (format!("{:?}", b.kind), &b.members);
                 ak.cmp(&bk)

@@ -510,8 +510,9 @@ below is a shared record and is fixed here:
 // unkeyed_globals[] — analysis-owned diagnostics (§1.1: no key ⇒ not in globals[])
 { "llvm_name": "<raw LLVM symbol>", "witness": <Witness> }
 
-// coupling_groups[].evidence — a list of typed edges
+// coupling_groups[].evidence and coupling_candidates[].evidence — typed edges
 [ { "kind": "co-write" | "oncelock-interval",
+    "strength": "hard" | "suspected",
     "members": ["<key>", "<key>"],
     "sites": [ <Site>, ... ] } ]
 
@@ -839,28 +840,25 @@ with the same overrides is a byte-level no-op.
 
 ### D2b — shared coupling post-pass (~200 lines, phase F)
 
-v1 evidence, deliberately simple and precision-asymmetric (a spurious group
-over-couples a rewrite; a missed group is dangerous only to D3, which re-derives its
-own evidence):
+Evidence is divided by the strength of the semantic claim:
 
-1. **Co-write evidence:** two globals both directly written by the same function, in
-   the same region when region info is available (v1: same function suffices).
-2. **ONCELOCK evidence** (for certified globals): publication-interval overlap ∧
+1. **Suspected co-write evidence:** two globals directly written by the same function.
+   This is retained for measurement and D3, but is not a policy group.
+2. **Hard ONCELOCK evidence** (for certified globals): publication-interval overlap ∧
    init-subtree intersection — read directly from the O1–O5 per-global certificates.
    Ownership, to be unambiguous: **D2b consumes O1–O5 output; O6 consumes D2b's
    group ids** (for reports and the manifest hand-off). O6 exports nothing that D2b
    needs.
 
-Cluster by union-find over evidence edges; group id = `"grp-" + hash8(smallest member
-key)` (stable across runs, ground rule 4); emit `coupling_groups` with a deterministic
-spanning subset of the evidence edges as witnesses. Co-writes from one function use a
-star rooted at the smallest member; both co-write and ONCELOCK evidence retain only
-successful union edges. This proves identical connectivity without a quadratic
-manifest. **No
-evidence-strength threshold in v1**: clustering is
-unconditional union-find over the two evidence kinds — the documented over-grouping
-below is the accepted cost, and a threshold (with a concrete shape and semantics) is
-a v2 follow-up if group statistics demand one.
+Run separate union-find instances by strength. Emit hard components as
+`coupling_groups` with `grp-` IDs; only these populate `facts.coupling_group` and
+constrain policy. Emit suspected components as `coupling_candidates` with disjoint
+`cand-` IDs. Co-writes from one function use a star rooted at the smallest member;
+both evidence classes retain only successful union edges. Evidence records carry an
+explicit `strength`, and manifest validation rejects suspected evidence in a hard
+group or hard evidence in a candidate component. This preserves identical
+connectivity without a quadratic manifest while preventing weak correlation from
+becoming a hard semantic blocker.
 
 **Group strategy-support derivation (analysis-owned; closes the common-P gap).** D2b
 also computes, per group, the group-specific certificates `DISPOSITION.md` §6 step 1
@@ -919,11 +917,11 @@ Certificate requires **all** of: `word_sized_scalar`; `access_set_complete`; eve
 access site classifiable as load, store, or a recognized RMW shape (`g++`, `g += k`,
 `g = g op k` — classified on IR, emitted per-site so the rewriter knows
 `load(Relaxed)` vs `fetch_add`); no address-taken use incompatible with retyping
-(`&g` never flows beyond directly-lowered access — reuse the pts scan); **conservative
-co-write re-derivation** independent of D2b (`DISPOSITION.md` §6): any other global
-written in the same function within the same statement region ⇒ potential invariant
-⇒ fail with witness (over-strict is correct here; the failure witness feeds the
-threshold discussion). Ships **with** its co-update dynamic audit (instrument
+(`&g` never flows beyond directly-lowered access — reuse the pts scan); no hard
+multi-member coupling group; and a structured resolution for every incident suspected
+coupling edge. Same-function co-write alone is not a veto: D3 must either establish
+independence from the access/dependency structure or fail with an unresolved-coupling
+witness. Ships **with** its co-update dynamic audit (instrument
 suspected-coupled pairs; interleaved-update window ⇒ report) — the audit is part of
 the item, not a follow-up, because atomic coupling is the one silent-corruption cell
 (`DISPOSITION.md` §7).

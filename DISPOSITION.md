@@ -281,6 +281,12 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
                                                          //   "override-accepted-risk"
                          "override": null } ],           // echo of an applied GROUP pin —
                                                          //   the only place it is echoed
+  "coupling_candidates": [ {             // analysis-owned suspected components;
+    "id": "cand-a1b2c3d4",               //   never a policy/override target
+    "members": [...],
+    "evidence": [ { "kind": "co-write", "strength": "suspected",
+                    "members": [...], "sites": [...] } ]
+  } ],
   "override_report": { ... },            // §4.3; dispose-owned
   "materialization": { ... }             // §5: C→C-tool-owned — marker inventory (§5.2)
                                          //   and demotion records (§5.3); absent until
@@ -528,18 +534,21 @@ consumes it differently:
 - `localize`: groups suggest struct-field clustering in the context struct (advisory).
 
 Therefore coupling detection moves out of the ONCELOCK work items into a shared
-F-layer post-pass: cluster globals by co-occurrence in writer functions/regions and
-(where computed) overlapping publication intervals; emit `coupling_groups` with
-deterministic spanning evidence (the co-writing sites). The evidence list is a proof
-forest for group connectivity, not an exhaustive quadratic dump of every implied pair:
-a function that writes `k` globals proposes a stable star, and only successful union
-edges are retained; redundant co-write and ONCELOCK-compatible pairs are omitted once
-their component is connected. Detection is
-heuristic-completeness-asymmetric in the
-usual direction: a *missed* group is dangerous only for `atomic` (hence atomic
-eligibility must itself re-derive co-write evidence conservatively — its certificate,
-not the shared heuristic, is what licenses the rewrite), while a spurious group merely
-over-couples a rewrite.
+F-layer post-pass. Evidence has an explicit strength. Overlapping compatible
+publication intervals are `hard` evidence and are unioned into policy-bearing
+`coupling_groups`. Same-function co-write is only `suspected`: it is emitted in
+`coupling_candidates` for D3 and audit measurement, but does not populate
+`facts.coupling_group` or constrain policy by itself. Both collections use a
+deterministic spanning forest rather than an exhaustive quadratic edge dump: a
+function that writes `k` globals proposes a stable star, and only successful union
+edges are retained. Group IDs use the `grp-` namespace; candidate component IDs use
+the disjoint `cand-` namespace.
+
+This split is fail-closed at the eligibility boundary rather than at correlation
+collection: hard evidence directly forbids independent atomics, while D3 must consume
+suspected edges and either prove that independent treatment is safe or retain a
+structured failure witness. Merely appearing in the same writer function is not, by
+itself, proof of a cross-global invariant.
 
 The policy stage resolves a group after computing each member's independent strategy
 support set and individual cascade result:

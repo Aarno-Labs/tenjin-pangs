@@ -1402,6 +1402,7 @@ mod tests {
             }],
             unkeyed_globals: Vec::<UnkeyedGlobal>::new(),
             coupling_groups: Vec::new(),
+            coupling_candidates: Vec::new(),
             override_report: None,
             materialization: None,
             extra: Extra::new(),
