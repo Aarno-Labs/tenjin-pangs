@@ -1,7 +1,7 @@
 # Disposition False-Negative Reduction Plan
 
 Status: in progress (F1–F4 and F5 static D3 implemented 2026-07-17; sibling
-corpus remeasurement completed for 34 of 35 non-Vim modules; runtime co-update audit
+corpus remeasurement completed for all 35 non-Vim modules; runtime co-update audit
 contract specified in `PLAN_ATOMIC_CO_UPDATE_AUDIT.md`, instrumentation pending)
 
 This plan reduces conservative false negatives in three disposition inputs:
@@ -381,21 +381,21 @@ counts and certified counts are reported separately.
 ### 2026-07-17 sibling-corpus remeasurement
 
 The expanded sibling corpus includes the newly added `exe-pure-O0.bc`.  Excluding the
-two Vim modules and PHP, 34 of 35 modules completed with `--dispose`; the remaining
-`lib-openssl-4.1.0-O1.bc` solver completed but its ordinary raw-analysis export needed
-more than the available 1.9 GiB scratch space before disposition emission.  It must be
-rerun on a larger scratch volume or through a future disposition-only emission path.
+two Vim modules and PHP, all 35 modules completed with `--dispose`.  The OpenSSL
+measurement required a larger scratch volume: it took 310.34 seconds, peaked at
+32.97 GiB RSS, and emitted 3.0 GiB of ordinary raw-analysis artifacts before the
+disposition pair.
 
-Across the 34 completed modules: 1,461 mutable definition globals were considered;
-178 chose `immutable`, 14 chose `atomic`, and 1,269 remained `unhandled`.  The static
+Across the 35 completed modules: 1,687 mutable definition globals were considered;
+202 chose `immutable`, 14 chose `atomic`, and 1,471 remained `unhandled`.  The static
 D3 certificates are the five JPEGoptim globals (`average_count`,
 `compress_err_count`, `decompress_err_count`, `verbose_mode`, `worker_count`) in both
 O0 and O1, and four YAPET O0-g globals (`cat.catcolorspace`, `cats_capacity`,
 `ncats`, `report_error`).  `exe-pure-O0.bc` has no mutable definition globals.
 
 The remaining dominant access-completeness blocker is genuine module-wide access:
-1,352 globals, versus 79 with `external-escape`.  There are 91 suspected coupling
-components with 585 suspected co-write edges and no hard coupling groups.  These
+1,578 globals, versus 79 with `external-escape`.  There are 116 suspected coupling
+components with 646 suspected co-write edges and no hard coupling groups.  These
 counts validate the split between hard groups and D3's per-edge discharge, but they do
 not make a static certificate production-ready: see the co-update audit contract.
 
