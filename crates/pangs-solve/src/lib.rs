@@ -536,7 +536,7 @@ impl<'a> Solver<'a> {
                             global_object_nodes[global_index] = Some(node.id);
                         }
                     }
-                    pangs_pag::ObjectKind::Alloca => {}
+                    pangs_pag::ObjectKind::Alloca | pangs_pag::ObjectKind::ExternalReadonly => {}
                 },
                 NodeKind::Param { func, index } => {
                     if let Some(&func_index) = function_name_to_index.get(func) {

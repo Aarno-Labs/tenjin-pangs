@@ -511,6 +511,7 @@ impl<'a> Refiner<'a> {
                     ObjectKind::Alloca => profile.allocas += 1,
                     ObjectKind::Global => profile.globals.push(key.clone()),
                     ObjectKind::Function => profile.functions.push(key.clone()),
+                    ObjectKind::ExternalReadonly => {}
                 },
             }
         }

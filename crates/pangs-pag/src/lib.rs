@@ -512,6 +512,7 @@ pub enum ObjectKind {
     Alloca,
     Global,
     Function,
+    ExternalReadonly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -677,6 +678,7 @@ enum NodeKey {
     FunctionObject(usize),
     AllocaObject(usize, usize),
     HeapObject(usize, usize),
+    ExternalReadonlyObject(String),
     Param(usize, usize),
     Return(usize),
     SymbolValue(SymbolKind, usize),
@@ -999,8 +1001,13 @@ impl<'a> Builder<'a> {
                             .zip(arg_nodes.get(arg_index).copied())
                             .map(|(result, arg)| (arg, result))
                     });
+                let external_readonly_result = is_external
+                    .then(|| external_readonly_result_model(callee))
+                    .flatten()
+                    .zip(result);
                 let external_boundary = !fresh_allocation
                     && return_alias.is_none()
+                    && external_readonly_result.is_none()
                     && self
                         .functions
                         .get(callee)
@@ -1009,6 +1016,12 @@ impl<'a> Builder<'a> {
                         .unwrap_or(true);
                 if let Some((arg, result)) = return_alias {
                     self.add_edge(EdgeKind::Assign, arg, result, owner.clone(), loc.clone());
+                }
+                if let Some((model, result)) = external_readonly_result {
+                    let slot = self.external_readonly_object(&format!("{model}:slot"));
+                    let table = self.external_readonly_object(&format!("{model}:table"));
+                    self.add_edge(EdgeKind::AddrOf, slot, result, owner.clone(), loc.clone());
+                    self.add_edge(EdgeKind::AddrOf, table, slot, owner.clone(), loc.clone());
                 }
                 if let Some(result) = result.filter(|_| fresh_allocation) {
                     let object = self.add_node(
@@ -1309,13 +1322,27 @@ impl<'a> Builder<'a> {
         let object = match object_kind {
             ObjectKind::Global => self.node_ids[&NodeKey::GlobalObject(object_index)],
             ObjectKind::Function => self.node_ids[&NodeKey::FunctionObject(object_index)],
-            ObjectKind::Alloca => unreachable!("symbols do not name alloca objects"),
+            ObjectKind::Alloca | ObjectKind::ExternalReadonly => {
+                unreachable!("symbols do not name synthetic storage objects")
+            }
         };
         self.add_edge(EdgeKind::AddrOf, object, value, Owner::Module, None);
     }
 
     fn return_node(&self, func_index: usize) -> Option<NodeId> {
         self.node_ids.get(&NodeKey::Return(func_index)).copied()
+    }
+
+    fn external_readonly_object(&mut self, key: &str) -> NodeId {
+        self.add_node(
+            NodeKey::ExternalReadonlyObject(key.into()),
+            format!("obj:external-readonly:{key}"),
+            NodeKind::Object {
+                object: ObjectKind::ExternalReadonly,
+                key: key.into(),
+                owner: None,
+            },
+        )
     }
 }
 
@@ -1335,6 +1362,13 @@ fn external_return_alias_arg(callee: &str) -> Option<usize> {
         "strchr" | "strrchr" | "strstr" | "strpbrk" | "memchr"
     )
     .then_some(0)
+}
+
+/// Exact-name external functions whose pointer result leads only to stable external readonly
+/// storage. The returned slot and its table are represented as non-client objects, so reads of
+/// libc classification data cannot become module-global accesses.
+fn external_readonly_result_model(callee: &str) -> Option<&'static str> {
+    matches!(callee.strip_prefix('@').unwrap_or(callee), "__ctype_b_loc").then_some("glibc-ctype-b")
 }
 
 fn owner_scope(owner: &Owner) -> Scope {
@@ -1415,7 +1449,7 @@ fn is_exported_global(marked: bool, key: &str, opts: &PagOpts) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{EdgeKind, OmegaSeedKind, Pag, PagOpts, SeedTarget};
+    use super::{EdgeKind, NodeKind, ObjectKind, OmegaSeedKind, Pag, PagOpts, SeedTarget};
     use pangs_pir::Pir;
 
     #[test]
@@ -1427,9 +1461,11 @@ mod tests {
                 "functions":[
                     {"key":"main","exported":true,"sig":{"ret":{"class":"void"},"params":[]},"body":[
                         {"kind":"call_direct","callee":"strchr","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["input","zero"],"dest":"found"},
+                        {"kind":"call_direct","callee":"__ctype_b_loc","sig":{"ret":{"class":"integer"},"params":[]},"dest":"ctype"},
                         {"kind":"call_direct","callee":"unmodeled_search","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"args":["input"],"dest":"unknown"}
                     ]},
                     {"key":"strchr","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"body":[]},
+                    {"key":"__ctype_b_loc","external":true,"sig":{"ret":{"class":"integer"},"params":[]},"body":[]},
                     {"key":"unmodeled_search","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"body":[]}
                 ]
             }"#,
@@ -1450,6 +1486,34 @@ mod tests {
         assert!(!pag.omega_seeds.iter().any(|seed| {
             seed.kind == OmegaSeedKind::ExternalCallBoundary
                 && seed.target == SeedTarget::Callsite(strchr.id)
+        }));
+
+        let ctype = pag
+            .callsites
+            .iter()
+            .find(|callsite| callsite.callee.as_deref() == Some("__ctype_b_loc"))
+            .unwrap();
+        assert!(!ctype.external_boundary);
+        assert!(!pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::ExternalCallBoundary
+                && seed.target == SeedTarget::Callsite(ctype.id)
+        }));
+        let slot = pag
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    &node.kind,
+                    NodeKind::Object {
+                        object: ObjectKind::ExternalReadonly,
+                        key,
+                        ..
+                    } if key == "glibc-ctype-b:slot"
+                )
+            })
+            .unwrap();
+        assert!(pag.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::AddrOf && edge.src == slot.id && Some(edge.dst) == ctype.result
         }));
 
         let unmodeled = pag

@@ -42,6 +42,11 @@ The first implementation models these external functions as `return aliases arg0
 | `strpbrk` | reads arg0/arg1 | pointer within arg0 or null |
 | `memchr` | reads arg0 | pointer within arg0 or null |
 
+The initial implementation also models glibc's `__ctype_b_loc` as returning a stable
+pointer to an external readonly ctype-table slot. The slot contains a pointer to an
+external readonly table. Neither synthetic object is a client global, and the model
+has no writable pointer arguments.
+
 The pointer analysis is may-analysis: the null alternative needs no separate object;
 the alias edge safely represents the non-null case.
 
@@ -53,7 +58,8 @@ the alias edge safely represents the non-null case.
 - `strtok`, `basename`, and `dirname` have stateful or mutating behavior.
 - Conversion APIs such as `strtol` need an out-parameter relation for `endptr`.
 - APIs returning external storage (`getenv`, `readdir`, `strerror`) must not be
-  represented as aliases of an input pointer.
+  represented as aliases of an input pointer; each needs a separate ownership and
+  mutability decision like `__ctype_b_loc`'s readonly-table model.
 
 Each deferred family requires its own proposal and fixtures; this plan does not
 create a general libc database.
@@ -69,8 +75,10 @@ create a general libc database.
 
 ## Initial result
 
-Implemented 2026-07-17 for the five pure search functions listed above.  On
+Implemented 2026-07-17 for the five pure search functions listed above and for
+`__ctype_b_loc`. On
 `exe-yapteaparprfotci-O0-g.bc`, the four `catdir` loads through the `strchr` result
 at lines 142 and 144 changed from module-wide `omega_load` rows to finite aliased
-global rows.  `report_error` remains access-incomplete, but its decisive witness now
-correctly identifies a separate unknown access in `check_ps2write` at line 418.
+global rows. The `__ctype_b_loc` summary then removes the ctype-table Ω rows in
+`check_ps2write`; `report_error` has a complete access set and receives an atomic
+certificate for its direct load and store in `gif_fileerror`.
