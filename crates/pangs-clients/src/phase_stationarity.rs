@@ -38,6 +38,7 @@ pub(crate) struct PhaseKill {
 pub(crate) fn evaluate_kill_rules(
     analysis: &Analysis,
     thread_writers: &BTreeMap<GlobalId, Witness>,
+    violation_witnesses: &[Option<Witness>],
 ) -> BTreeMap<GlobalId, Vec<PhaseKill>> {
     let mut failures = BTreeMap::<GlobalId, BTreeMap<&'static str, Witness>>::new();
 
@@ -69,19 +70,10 @@ pub(crate) fn evaluate_kill_rules(
             .or_insert_with(|| witness.clone());
     }
 
-    for finding in analysis.audit_findings() {
-        let Some(function) = finding.function else {
-            continue;
-        };
-        let witness = function_witness(
-            analysis,
-            function,
-            "violation-taint",
-            Some(finding.kind.clone()),
-        );
-        for global in transitive_modified_globals(analysis, function) {
+    for (index, witness) in violation_witnesses.iter().enumerate() {
+        if let Some(witness) = witness {
             failures
-                .entry(global)
+                .entry(GlobalId(index as u32))
                 .or_default()
                 .entry("violation-taint")
                 .or_insert_with(|| witness.clone());
@@ -942,6 +934,7 @@ pub(crate) fn certificate_slots(
     spawn_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
     escape_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
     thread_writers: &BTreeMap<GlobalId, Witness>,
+    violation_witnesses: &[Option<Witness>],
 ) -> (Option<Value>, BTreeMap<GlobalId, Certificate>, Value) {
     let certificate_started = Instant::now();
     let main = (opts.build_mode == BuildMode::Executable
@@ -956,7 +949,7 @@ pub(crate) fn certificate_slots(
         })
     });
     let stage_started = Instant::now();
-    let kills = evaluate_kill_rules(analysis, thread_writers);
+    let kills = evaluate_kill_rules(analysis, thread_writers, violation_witnesses);
     trace_timing("kill-rules", stage_started);
     let stage_started = Instant::now();
     let root = main.and_then(|main| {
@@ -2037,6 +2030,10 @@ mod tests {
         Observation, Quiescence, SelectionFailure,
     };
 
+    fn violation_witnesses(analysis: &Analysis) -> Vec<Option<pangs_manifest::Witness>> {
+        crate::DispositionFactRows::new(analysis).violation
+    }
+
     fn boundary(id: u32, successors: &[u32], predecessors: &[u32]) -> StatementBoundary {
         StatementBoundary {
             id,
@@ -2259,7 +2256,11 @@ mod tests {
             .iter()
             .any(|source| source.starts_with("external-call:main@")));
         let registry = crate::registry_access_facts(&analysis, &pir);
-        let kills = evaluate_kill_rules(&analysis, &registry.thread_writers);
+        let kills = evaluate_kill_rules(
+            &analysis,
+            &registry.thread_writers,
+            &violation_witnesses(&analysis),
+        );
         let codes = |name: &str| {
             let global = analysis.lookup_global(name).unwrap();
             kills[&global]
@@ -2701,6 +2702,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &violation_witnesses(&analysis),
         );
         assert_eq!(entry.unwrap()["root"], "main");
         let Certificate::Certified { certificate, .. } = &slots[&global] else {
@@ -2780,6 +2782,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &violation_witnesses(&analysis),
         );
         let Certificate::Certified { certificate, .. } = &slots[&global] else {
             panic!(
@@ -2881,6 +2884,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &violation_witnesses(&analysis),
         );
         let Certificate::Certified { certificate, .. } = &slots[&global] else {
             panic!("expected certified both-phase slot: {:#?}", slots[&global]);
@@ -2965,6 +2969,7 @@ mod tests {
             &facts.spawn_read_callsites,
             &facts.escape_read_callsites,
             &facts.thread_writers,
+            &violation_witnesses(&analysis),
         );
         let Certificate::Certified { certificate, .. } = &slots[&global] else {
             panic!(

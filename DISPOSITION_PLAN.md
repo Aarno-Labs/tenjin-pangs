@@ -547,11 +547,17 @@ below is a shared record and is fixed here:
   (`kind: "external-escape"`). The `immutable` guard's `¬written ∧
   ¬omega_escaped_address` is therefore partially redundant — accepted; redundancy in
   a soundness guard is free.
-- **`violation_taint(g)`**: true iff some violation finding's containing function `f`
-  has `g` in its *direct or aliased* modref rows (not transitive closure — tainting
-  everything `main` reaches would drown the signal; the object-level side channel a
-  violation can open is already covered by Ω, i.e. `omega_escaped_address`). Witness:
-  the finding, `kind: "violation-finding"`.
+- **`violation_taint(g)`**: direct or bounded-aliased function-local co-occurrence
+  proposes a `(finding, g)` pair; it does not prove relevance. Each pair is classified
+  `address-relevant`, `access-shape-relevant`, `value-only`, `unrelated`, or
+  `unresolved`. Only the first two and fail-closed `unresolved` set this fact.
+  Exact affected-value/address-node identity and exact indirect-access-site identity
+  are positive evidence. Direct named scalar accesses are independent for the modeled
+  function-pointer/boundary finding kinds unless the finding names their object;
+  unknown kinds and indirect paths that require unavailable reachability information
+  are `unresolved`. Every classification remains in `facts.violation_relevance`, with
+  deterministic witnesses; module-wide access rows remain boundedness failures rather
+  than turning same-function co-occurrence into relevance.
 - **`access_set_complete(g)`** is a pure boundedness fact, evaluated in this order
   with the first failing condition as witness: (a) no `ModuleWide` unknown-access
   modref row can reach module globals (a retained `Finite` candidate set affects only

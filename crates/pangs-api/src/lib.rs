@@ -4614,7 +4614,9 @@ fn push_pointer_modrefs_from_pag(
                             &summary.pointee_global_ids,
                             &global_key_by_id,
                         ),
-                        global_candidates: GlobalCandidateSet::ModuleWide,
+                        global_candidates: finite_or_module_wide(Rc::clone(
+                            &summary.pointee_global_ids,
+                        )),
                     },
                     Some(phase),
                 );
@@ -4827,7 +4829,10 @@ fn push_pointer_memset_modrefs_from_pir(
                         )),
                         address_node: Some(label.clone()),
                         pointee_globals: resolution.pointee_globals.to_vec(),
-                        global_candidates: GlobalCandidateSet::ModuleWide,
+                        global_candidates: finite_or_module_wide(global_ids_for_keys(
+                            resolution.pointee_globals.iter(),
+                            global_lookup,
+                        )),
                     },
                     Some(ModRefSourcePhase::MemsetMemcpy),
                 );
@@ -5265,6 +5270,14 @@ fn merge_global_candidates(existing: &mut GlobalCandidateSet, incoming: GlobalCa
     merged.sort();
     merged.dedup();
     *existing = GlobalCandidateSet::Finite(Rc::from(merged));
+}
+
+fn finite_or_module_wide(globals: Rc<[GlobalId]>) -> GlobalCandidateSet {
+    if globals.is_empty() {
+        GlobalCandidateSet::ModuleWide
+    } else {
+        GlobalCandidateSet::Finite(globals)
+    }
 }
 
 fn access_rank(access: Access) -> u8 {

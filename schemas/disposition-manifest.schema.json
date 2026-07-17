@@ -60,6 +60,24 @@
       },
       "additionalProperties": true
     },
+    "violation_relevance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["classification", "finding_kind", "witness"],
+        "properties": {
+          "classification": {
+            "enum": [
+              "address-relevant", "access-shape-relevant", "value-only",
+              "unrelated", "unresolved"
+            ]
+          },
+          "finding_kind": { "type": "string", "minLength": 1 },
+          "witness": { "$ref": "#/definitions/witness" }
+        },
+        "additionalProperties": false
+      }
+    },
     "evidenced_bool_true": {
       "oneOf": [
         {
@@ -186,7 +204,8 @@
         "atomic_eligibility": { "$ref": "#/definitions/certificate_slot" },
         "mutex_eligibility": { "$ref": "#/definitions/certificate_slot" },
         "coupling_group": { "type": ["string", "null"] },
-        "localization": { "$ref": "#/definitions/localization" }
+        "localization": { "$ref": "#/definitions/localization" },
+        "violation_relevance": { "$ref": "#/definitions/violation_relevance" }
       },
       "additionalProperties": true
     },

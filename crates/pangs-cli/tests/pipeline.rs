@@ -1818,7 +1818,8 @@ fn analyze_andersen_refines_spurious_external_store_address_modref() {
             && row["detail"] == "edge:store|omega:steens_external|pointee_count=1"
             && row["address_node"] == "val:driver:%gp"
             && row["pointee_globals"] == serde_json::json!(["@Table"])
-            && row["candidate_scope"] == "module-wide"
+            && row["candidate_scope"] == "finite"
+            && row["pointee_global_count"] == 1
     }));
 
     let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
@@ -2141,7 +2142,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "8b6ab2813e1d3fa910a5628a0ff2c4d9450e05898b9b82e9e480ddc6ec884b9a"
+        "040274efa1a900e704f830ed55d10f4d345f315aacb3278b0e977ccfd33b736a"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(

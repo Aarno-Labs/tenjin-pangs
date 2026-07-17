@@ -131,7 +131,7 @@ Per-global facts, with producers:
 |---|---|---|---|
 | `written` | evidenced bool, *may-written* semantics (witness when true: a write site, or the external escape that prevents ruling writes out — `DISPOSITION_PLAN.md` §1.9) | F `writers(o)` scan | exists (`never_written`) |
 | `omega_escaped_address` | evidenced bool (witness when true: the escape site) | Ω machinery | exists |
-| `violation_taint` | evidenced bool (witness when true: the violation finding) — gates every strategy, §1 | A′ detection | exists |
+| `violation_taint` | evidenced bool (witness when true: an address-relevant, access-shape-relevant, or unresolved violation finding) — gates every strategy, §1; value-only/unrelated findings remain diagnostics | A′ relevance routing | built by F3 |
 | `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) — **reporting fact, not a guard**: thread visibility alone defeats no strategy (thread readers are a primary OnceLock use case; the thread-*writer* kill rule lives inside the phase-stationarity certificate) | F scan over spawn sites | specified; exported by D1b |
 | `signal_context_access` | evidenced bool (true iff accessed under a registered signal handler; witness when true: registration site + accessing function) | F scan over Ω escape sites of handlers | new, cheap |
 | `access_set_complete` | evidenced bool (true iff analysis bounds every possible accessor; **witness when false**: module-wide Ω, address escape, or library name reachability) | F scan | built by D1b; bounded indirect/rewrite compatibility is diagnosed separately for D3/D4 |

@@ -1,6 +1,6 @@
 # Disposition False-Negative Reduction Plan
 
-Status: in progress (F1–F2 implemented 2026-07-17; F3–F5 pending)
+Status: in progress (F1–F3 implemented 2026-07-17; F4–F5 pending)
 
 This plan reduces conservative false negatives in three disposition inputs:
 
@@ -88,7 +88,10 @@ construct the new enum with this precedence:
 
 1. a non-empty retained ID set becomes `Finite(ids)`;
 2. a non-empty legacy `pointee_globals` list is resolved to `Finite(ids)`;
-3. a row classified as external/top/int-to-pointer unbounded becomes `ModuleWide`;
+3. a row whose module-global targets are genuinely unbounded (top, int-to-pointer,
+   or an external result without retained module-global provenance) becomes
+   `ModuleWide`; external/heap memory does not by itself widen a complete finite set
+   of module-global candidates;
 4. any ambiguous legacy empty row becomes `ModuleWide`.
 
 ### 3.2 Centralize affected-global expansion

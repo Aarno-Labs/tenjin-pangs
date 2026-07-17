@@ -676,6 +676,7 @@ enum NodeKey {
     GlobalObject(usize),
     FunctionObject(usize),
     AllocaObject(usize, usize),
+    HeapObject(usize, usize),
     Param(usize, usize),
     Return(usize),
     SymbolValue(SymbolKind, usize),
@@ -983,12 +984,26 @@ impl<'a> Builder<'a> {
                 let result = dest
                     .as_ref()
                     .map(|dest| self.value_node(func_index, owner_scope(&owner), dest));
-                let external_boundary = self
-                    .functions
-                    .get(callee)
-                    .and_then(|index| self.pir.functions.get(*index))
-                    .map(|func| func.external)
-                    .unwrap_or(true);
+                let fresh_allocation = is_fresh_allocator(callee) && result.is_some();
+                let external_boundary = !fresh_allocation
+                    && self
+                        .functions
+                        .get(callee)
+                        .and_then(|index| self.pir.functions.get(*index))
+                        .map(|func| func.external)
+                        .unwrap_or(true);
+                if let Some(result) = result.filter(|_| fresh_allocation) {
+                    let object = self.add_node(
+                        NodeKey::HeapObject(func_index, stmt_index),
+                        format!("obj:heap:{}:{stmt_index}", owner_name(&owner)),
+                        NodeKind::Object {
+                            object: ObjectKind::Alloca,
+                            key: format!("{callee}@{stmt_index}"),
+                            owner: Some(owner_name(&owner).to_string()),
+                        },
+                    );
+                    self.add_edge(EdgeKind::AddrOf, object, result, owner.clone(), loc.clone());
+                }
                 let callsite = self.add_callsite(
                     func_index,
                     CallKind::Direct,
@@ -1284,6 +1299,13 @@ impl<'a> Builder<'a> {
     fn return_node(&self, func_index: usize) -> Option<NodeId> {
         self.node_ids.get(&NodeKey::Return(func_index)).copied()
     }
+}
+
+fn is_fresh_allocator(callee: &str) -> bool {
+    matches!(
+        callee.strip_prefix('@').unwrap_or(callee),
+        "malloc" | "calloc" | "aligned_alloc"
+    )
 }
 
 fn owner_scope(owner: &Owner) -> Scope {

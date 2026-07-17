@@ -129,6 +129,14 @@ pub fn assemble_disposition_artifacts(
             registry_started.elapsed().as_millis()
         );
     }
+    let fact_indexes_started = Instant::now();
+    let fact_rows = DispositionFactRows::new(analysis);
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing fact-row-indexes={}ms",
+            fact_indexes_started.elapsed().as_millis()
+        );
+    }
     let (entry_spine, phase_slots, mut phase_report) = phase_stationarity::certificate_slots(
         analysis,
         module,
@@ -137,19 +145,12 @@ pub fn assemble_disposition_artifacts(
         &registry_facts.spawn_read_callsites,
         &registry_facts.escape_read_callsites,
         &registry_facts.thread_writers,
+        &fact_rows.violation,
     );
     if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
         eprintln!(
             "pangs disposition timing through-phase-certificates={}ms",
             disposition_started.elapsed().as_millis()
-        );
-    }
-    let fact_indexes_started = Instant::now();
-    let fact_rows = DispositionFactRows::new(analysis);
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
-        eprintln!(
-            "pangs disposition timing fact-row-indexes={}ms",
-            fact_indexes_started.elapsed().as_millis()
         );
     }
     let global_facts_started = Instant::now();
@@ -243,7 +244,10 @@ pub fn assemble_disposition_artifacts(
                 mutex_eligibility: None,
                 coupling_group: None,
                 localization,
-                extra: Extra::new(),
+                extra: BTreeMap::from([(
+                    "violation_relevance".into(),
+                    serde_json::to_value(&fact_rows.violation_diagnostics[index])?,
+                )]),
             },
             disposition: None,
             extra: Extra::new(),
@@ -282,6 +286,24 @@ pub fn assemble_disposition_artifacts(
         );
     }
     if let Some(report) = phase_report.as_object_mut() {
+        let mut relevance_by_classification = BTreeMap::<&str, u64>::new();
+        let mut relevance_by_finding_kind = BTreeMap::<&str, u64>::new();
+        for diagnostic in fact_rows.violation_diagnostics.iter().flatten() {
+            *relevance_by_classification
+                .entry(diagnostic.classification.as_str())
+                .or_default() += 1;
+            *relevance_by_finding_kind
+                .entry(diagnostic.finding_kind.as_str())
+                .or_default() += 1;
+        }
+        report.insert(
+            "violation_relevance".into(),
+            serde_json::json!({
+                "by_classification": relevance_by_classification,
+                "by_finding_kind": relevance_by_finding_kind,
+                "hard_globals": fact_rows.violation.iter().filter(|witness| witness.is_some()).count(),
+            }),
+        );
         let bounded_indirect = fact_rows
             .bounded_indirect
             .iter()
@@ -1085,7 +1107,55 @@ struct DispositionFactRows<'a> {
     access_failure: Vec<Option<&'a ModRef>>,
     bounded_indirect: Vec<Option<&'a ModRef>>,
     violation: Vec<Option<Witness>>,
+    violation_diagnostics: Vec<Vec<ViolationRelevanceDiagnostic>>,
     localization: Vec<Option<Localization>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ViolationRelevance {
+    AddressRelevant,
+    AccessShapeRelevant,
+    #[allow(dead_code)] // Reserved until a retained load-value path proves this class.
+    ValueOnly,
+    Unrelated,
+    Unresolved,
+}
+
+impl ViolationRelevance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AddressRelevant => "address-relevant",
+            Self::AccessShapeRelevant => "access-shape-relevant",
+            Self::ValueOnly => "value-only",
+            Self::Unrelated => "unrelated",
+            Self::Unresolved => "unresolved",
+        }
+    }
+
+    fn is_hard(self) -> bool {
+        matches!(
+            self,
+            Self::AddressRelevant | Self::AccessShapeRelevant | Self::Unresolved
+        )
+    }
+
+    fn witness_kind(self) -> &'static str {
+        match self {
+            Self::AddressRelevant => "violation-address-relevant",
+            Self::AccessShapeRelevant => "violation-access-shape-relevant",
+            Self::ValueOnly => "violation-value-only",
+            Self::Unrelated => "violation-unrelated",
+            Self::Unresolved => "violation-relevance-unresolved",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ViolationRelevanceDiagnostic {
+    classification: ViolationRelevance,
+    finding_kind: String,
+    witness: Witness,
 }
 
 impl<'a> DispositionFactRows<'a> {
@@ -1095,29 +1165,10 @@ impl<'a> DispositionFactRows<'a> {
         let mut escape = vec![None; global_count];
         let mut access_failure = vec![None; global_count];
         let mut bounded_indirect = vec![None; global_count];
-        let mut violation_finding_by_function = vec![None; analysis.functions().len()];
-        for (ordinal, finding) in analysis.audit_findings().iter().enumerate() {
-            if let Some(function) = finding.function {
-                violation_finding_by_function[function.0 as usize]
-                    .get_or_insert((ordinal, finding));
-            }
-        }
-        let mut violation_candidates = vec![None; global_count];
         for row in analysis.modrefs() {
             match row.global {
                 GlobalTarget::Name(global) => {
                     let index = global.0 as usize;
-                    if let Some((ordinal, finding)) =
-                        violation_finding_by_function[row.func.0 as usize]
-                    {
-                        let replace = match &violation_candidates[index] {
-                            Some((current, _, _)) => ordinal < *current,
-                            None => true,
-                        };
-                        if replace {
-                            violation_candidates[index] = Some((ordinal, row.func, finding));
-                        }
-                    }
                     if row.access == pangs_pir::Access::Mod && written[index].is_none() {
                         written[index] = Some(row);
                     }
@@ -1143,16 +1194,41 @@ impl<'a> DispositionFactRows<'a> {
             }
         }
         let mut violation = vec![None; global_count];
-        for (index, candidate) in violation_candidates.into_iter().enumerate() {
-            let Some((_, function, finding)) = candidate else {
+        let mut violation_diagnostics = vec![Vec::new(); global_count];
+        for finding in analysis.audit_findings() {
+            let Some(function) = finding.function else {
                 continue;
             };
-            violation[index] = Some(function_witness(
-                analysis,
-                function,
-                "violation-finding",
-                Some(finding.kind.clone()),
-            ));
+            let mut rows_by_global = BTreeMap::<GlobalId, Vec<&ModRef>>::new();
+            for row in analysis.modrefs().iter().filter(|row| row.func == function) {
+                match analysis.affected_globals(row) {
+                    AffectedGlobals::Finite(globals) => {
+                        for &global in globals {
+                            rows_by_global.entry(global).or_default().push(row);
+                        }
+                    }
+                    AffectedGlobals::ModuleWide => {
+                        // Module-wide rows establish boundedness failure, but same-function
+                        // co-occurrence alone is not a relevance proposal. Hard relevance for
+                        // such a row is already fail-closed through access_set_complete.
+                    }
+                }
+            }
+            for (global, rows) in rows_by_global {
+                let relevance =
+                    classify_violation_relevance(analysis, finding, function, global, &rows);
+                let witness =
+                    violation_relevance_witness(analysis, finding, function, global, relevance);
+                let index = global.0 as usize;
+                if relevance.is_hard() && violation[index].is_none() {
+                    violation[index] = Some(witness.clone());
+                }
+                violation_diagnostics[index].push(ViolationRelevanceDiagnostic {
+                    classification: relevance,
+                    finding_kind: finding.kind.clone(),
+                    witness,
+                });
+            }
         }
         let localization = localization_index(analysis);
         Self {
@@ -1161,8 +1237,109 @@ impl<'a> DispositionFactRows<'a> {
             access_failure,
             bounded_indirect,
             violation,
+            violation_diagnostics,
             localization,
         }
+    }
+}
+
+fn classify_violation_relevance(
+    analysis: &Analysis,
+    finding: &pangs_api::Finding,
+    function: FuncId,
+    global: GlobalId,
+    rows: &[&ModRef],
+) -> ViolationRelevance {
+    let global_key = &analysis.globals()[global].key;
+    if finding.affected.iter().any(|affected| {
+        affected
+            .strip_prefix("value:")
+            .or_else(|| affected.strip_prefix("global:"))
+            .is_some_and(|value| value == global_key)
+    }) {
+        return ViolationRelevance::AddressRelevant;
+    }
+
+    let function_key = &analysis.functions()[function].key;
+    let affected_nodes = finding
+        .affected
+        .iter()
+        .filter_map(|affected| affected.strip_prefix("value:"))
+        .flat_map(|value| [value.to_owned(), format!("val:{function_key}:{value}")])
+        .collect::<BTreeSet<_>>();
+    if rows.iter().any(|row| {
+        row.address_node
+            .as_ref()
+            .is_some_and(|node| affected_nodes.contains(node))
+    }) {
+        return ViolationRelevance::AddressRelevant;
+    }
+
+    let has_indirect = rows.iter().any(|row| {
+        row.via != pangs_api::Via::Direct || matches!(row.global, GlobalTarget::Unknown(_))
+    });
+    if has_indirect
+        && analysis.access_sites().iter().any(|site| {
+            site.func == function
+                && site.global == global
+                && site.via != pangs_api::Via::Direct
+                && site.loc.as_ref().is_some_and(|loc| {
+                    finding.file.as_deref() == Some(loc.file.as_str())
+                        && finding.line == Some(loc.line)
+                })
+        })
+    {
+        return ViolationRelevance::AccessShapeRelevant;
+    }
+    if has_indirect {
+        return ViolationRelevance::Unresolved;
+    }
+
+    if modeled_pointer_only_finding(&finding.kind) {
+        ViolationRelevance::Unrelated
+    } else {
+        ViolationRelevance::Unresolved
+    }
+}
+
+fn modeled_pointer_only_finding(kind: &str) -> bool {
+    matches!(
+        kind,
+        "fnptr_ptrtoint"
+            | "fnptr_inttoptr"
+            | "fnptr_varargs_external"
+            | "fnptr_varargs_indirect"
+            | "fnptr_varargs_internal_unmodeled"
+            | "memcpy_fnptr_aggregate"
+            | "memset_fnptr_aggregate"
+            | "dlopen_dlsym"
+            | "setjmp_longjmp"
+    )
+}
+
+fn violation_relevance_witness(
+    analysis: &Analysis,
+    finding: &pangs_api::Finding,
+    function: FuncId,
+    global: GlobalId,
+    relevance: ViolationRelevance,
+) -> Witness {
+    Witness {
+        kind: relevance.witness_kind().into(),
+        site: finding
+            .file
+            .as_ref()
+            .zip(finding.line)
+            .map(|(file, line)| Site {
+                file: file.clone(),
+                line,
+                col: None,
+                function: Some(analysis.functions()[function].key.clone()),
+                extra: Extra::new(),
+            }),
+        symbol: Some(analysis.globals()[global].key.clone()),
+        note: Some(finding.kind.clone()),
+        extra: Extra::new(),
     }
 }
 
@@ -2263,15 +2440,17 @@ mod tests {
 
     use std::time::Instant;
 
-    use pangs_api::{Analysis, Opts};
+    use pangs_api::{Analysis, GlobalId, Opts};
     use pangs_manifest::{Extra, Key, Site};
     use pangs_pir::Pir;
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
-        assemble_disposition_artifacts, check_traces, coupling_group_id, export_analysis,
-        once_lock_pair_evidence, report, validate_export_dir, CertifiedGroupEvidence,
+        assemble_disposition_artifacts, check_traces, classify_violation_relevance,
+        coupling_group_id, export_analysis, once_lock_pair_evidence, report, validate_export_dir,
+        violation_relevance_witness, CertifiedGroupEvidence, DispositionFactRows,
+        ViolationRelevance,
     };
 
     fn group_site(line: u32) -> Site {
@@ -2408,7 +2587,7 @@ mod tests {
     }
 
     #[test]
-    fn violation_taint_does_not_change_access_boundedness() {
+    fn unrelated_varargs_finding_does_not_taint_direct_scalar_access() {
         let fixture = workspace_root().join("fixtures/synthetic/m1_5/audit_surface.pir.json");
         let mut pir = Pir::from_path(&fixture).unwrap();
         pir.functions
@@ -2460,8 +2639,97 @@ mod tests {
             .iter()
             .find(|global| global.meta.llvm_name == "@AuditedGlobal")
             .unwrap();
-        assert!(global.facts.violation_taint.value);
+        assert!(!global.facts.violation_taint.value);
         assert!(global.facts.access_set_complete.value);
+        assert_eq!(
+            global.facts.extra["violation_relevance"][0]["classification"],
+            "unrelated"
+        );
+        assert_eq!(
+            global.facts.extra["violation_relevance"][0]["finding_kind"],
+            "fnptr_varargs_external"
+        );
+    }
+
+    #[test]
+    fn finding_that_names_global_object_remains_hard_relevant() {
+        let fixture = workspace_root().join("fixtures/synthetic/m1_5/audit_surface.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        let driver = pir
+            .functions
+            .iter_mut()
+            .find(|function| function.key == "driver")
+            .unwrap();
+        driver.body.retain(
+            |statement| matches!(statement, pangs_pir::Stmt::Unknown { reason, .. } if reason.starts_with("inline_asm")),
+        );
+        let pangs_pir::Stmt::Unknown { operands, .. } = &mut driver.body[0] else {
+            unreachable!()
+        };
+        operands.push("@AuditedGlobal".into());
+        driver.body.insert(
+            0,
+            pangs_pir::Stmt::GlobalRef {
+                global: "@AuditedGlobal".into(),
+                access: pangs_pir::Access::Ref,
+                loc: None,
+            },
+        );
+        pir.globals.push(pangs_pir::Global {
+            key: "@AuditedGlobal".into(),
+            ..pangs_pir::Global::default()
+        });
+        let opts = Opts {
+            build_mode: pangs_api::BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let facts = DispositionFactRows::new(&analysis);
+        let global = analysis.lookup_global("@AuditedGlobal").unwrap();
+        let witness = facts.violation[global.0 as usize].as_ref().unwrap();
+        assert_eq!(witness.kind, "violation-address-relevant");
+        assert_eq!(
+            facts.violation_diagnostics[global.0 as usize][0].classification,
+            ViolationRelevance::AddressRelevant
+        );
+    }
+
+    #[test]
+    fn unknown_finding_kind_defaults_to_unresolved() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let pir = Pir::from_path(&fixture).unwrap();
+        let analysis = Analysis::run_with_disposition(&pir, &Opts::default()).unwrap();
+        let global = GlobalId(0);
+        let function = analysis.modrefs()[0].func;
+        let rows = analysis
+            .modrefs()
+            .iter()
+            .filter(|row| row.func == function)
+            .collect::<Vec<_>>();
+        let finding = pangs_api::Finding {
+            kind: "future_unknown_violation".into(),
+            file: None,
+            line: None,
+            affected: vec!["value:%opaque".into()],
+            effect: "omega_taint".into(),
+            detail: None,
+            function: Some(function),
+        };
+        assert_eq!(
+            classify_violation_relevance(&analysis, &finding, function, global, &rows),
+            ViolationRelevance::Unresolved
+        );
+        assert_eq!(
+            violation_relevance_witness(
+                &analysis,
+                &finding,
+                function,
+                global,
+                ViolationRelevance::Unresolved,
+            )
+            .kind,
+            "violation-relevance-unresolved"
+        );
     }
 
     #[test]

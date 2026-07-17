@@ -174,6 +174,76 @@ fn builds_core_nodes_edges_callsites_and_seeds() {
 }
 
 #[test]
+fn fresh_allocator_result_is_a_bounded_heap_object() {
+    let alloc_sig = sig(AbiClass::Integer, vec![Param::Integer, Param::Integer]);
+    let pir = Pir {
+        module: "fresh_allocator".into(),
+        source: None,
+        lowering: Default::default(),
+        target: None,
+        functions: vec![
+            Func {
+                key: "calloc".into(),
+                sig: alloc_sig.clone(),
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: true,
+                exported: false,
+                address_taken: false,
+                body: Vec::new(),
+            },
+            Func {
+                key: "main".into(),
+                sig: sig(AbiClass::Void, Vec::new()),
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: true,
+                address_taken: false,
+                body: vec![
+                    Stmt::CallDirect {
+                        callee: "calloc".into(),
+                        sig: alloc_sig,
+                        args: vec!["1".into(), "4".into()],
+                        dest: Some("%heap".into()),
+                        loc: None,
+                    },
+                    Stmt::Load {
+                        dest: "%value".into(),
+                        address: "%heap".into(),
+                        loc: None,
+                    },
+                ],
+            },
+        ],
+        globals: Vec::new(),
+        global_init: Vec::new(),
+    };
+    let pag = Pag::from_pir(
+        &pir,
+        &PagOpts {
+            build_mode: BuildMode::Executable,
+            ..PagOpts::default()
+        },
+    );
+    pag.validate().unwrap();
+
+    let callsite = pag
+        .callsites
+        .iter()
+        .find(|callsite| callsite.callee.as_deref() == Some("calloc"))
+        .unwrap();
+    assert!(!callsite.external_boundary);
+    assert!(pag.nodes.iter().any(|node| node.label == "obj:heap:main:0"));
+    assert!(!pag.omega_seeds.iter().any(|seed| {
+        seed.kind == OmegaSeedKind::ExternalCallBoundary
+            && seed.target == SeedTarget::Callsite(callsite.id)
+    }));
+}
+
+#[test]
 fn direct_internal_vararg_boundary_requires_visible_vararg_consumption() {
     let vararg_sig = Signature {
         ret: AbiClass::Void,
