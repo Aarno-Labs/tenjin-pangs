@@ -307,6 +307,7 @@ fn emit_measurement_report(manifest: &mut Manifest) {
     let mut atomic_word_sized = 0_u64;
     let mut atomic_access_complete = 0_u64;
     let mut atomic_singleton = 0_u64;
+    let mut atomic_certified = 0_u64;
     let mut mutex_candidates = 0_u64;
     let mut mutex_access_complete = 0_u64;
     let mut mutex_signal_safe = 0_u64;
@@ -341,7 +342,10 @@ fn emit_measurement_report(manifest: &mut Manifest) {
             }
         }
 
-        let gate_candidate = matches!(disposition.chosen, Strategy::Localize | Strategy::Unhandled);
+        let gate_candidate = matches!(
+            disposition.chosen,
+            Strategy::Atomic | Strategy::Localize | Strategy::Unhandled
+        );
         if gate_candidate {
             atomic_candidates += 1;
             if global.facts.word_sized_scalar.value {
@@ -352,6 +356,14 @@ fn emit_measurement_report(manifest: &mut Manifest) {
                         atomic_singleton += 1;
                     }
                 }
+            }
+            if global
+                .facts
+                .atomic_eligibility
+                .as_ref()
+                .is_some_and(Certificate::is_certified)
+            {
+                atomic_certified += 1;
             }
 
             mutex_candidates += 1;
@@ -432,7 +444,9 @@ fn emit_measurement_report(manifest: &mut Manifest) {
                 "word_sized_scalar": atomic_word_sized,
                 "access_set_complete": atomic_access_complete,
                 "singleton_coupling_group": atomic_singleton,
-                "eligible": atomic_singleton,
+                "free_gate_eligible": atomic_singleton,
+                "certificate_eligible": atomic_certified,
+                "eligible": atomic_certified,
             },
             "mutex": {
                 "candidate_disposition": mutex_candidates,
@@ -1668,7 +1682,15 @@ mod tests {
             report["cascade_skip_histogram"]["atomic"]["fact_not_computed"]["atomic_eligibility"],
             1
         );
-        assert_eq!(report["would_be_eligibility"]["atomic"]["eligible"], 1);
+        assert_eq!(
+            report["would_be_eligibility"]["atomic"]["free_gate_eligible"],
+            1
+        );
+        assert_eq!(
+            report["would_be_eligibility"]["atomic"]["certificate_eligible"],
+            0
+        );
+        assert_eq!(report["would_be_eligibility"]["atomic"]["eligible"], 0);
         assert_eq!(report["would_be_eligibility"]["mutex"]["eligible"], 1);
         assert_eq!(report["context_struct_pressure"]["known_size_bits"], 32);
         assert_eq!(

@@ -274,6 +274,22 @@ pub fn assemble_disposition_artifacts(
 
     let coupling_started = Instant::now();
     let (coupling_groups, coupling_candidates) = assemble_coupling_groups(analysis, &mut globals);
+    let atomic_started = Instant::now();
+    assemble_atomic_eligibility(analysis, target, &coupling_candidates, &mut globals);
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing atomic-eligibility={}ms certified={}",
+            atomic_started.elapsed().as_millis(),
+            globals
+                .iter()
+                .filter(|global| global
+                    .facts
+                    .atomic_eligibility
+                    .as_ref()
+                    .is_some_and(Certificate::is_certified))
+                .count()
+        );
+    }
     if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
         eprintln!(
             "pangs disposition timing coupling-groups={}ms groups={} evidence-edges={}",
@@ -363,6 +379,17 @@ pub fn assemble_disposition_artifacts(
                     "members": candidate.members.len(),
                     "edges": candidate.evidence.len(),
                 })).collect::<Vec<_>>(),
+            }),
+        );
+        report.insert(
+            "atomic_eligibility".into(),
+            serde_json::json!({
+                "certified": globals.iter().filter(|global| global.facts.atomic_eligibility.as_ref().is_some_and(Certificate::is_certified)).count(),
+                "failed": globals.iter().filter(|global| matches!(global.facts.atomic_eligibility, Some(Certificate::Failed { .. }))).count(),
+                "not_word_sized": globals.iter().filter(|global| !global.facts.word_sized_scalar.value).count(),
+                "access_incomplete": globals.iter().filter(|global| !global.facts.access_set_complete.value).count(),
+                "hard_coupled": globals.iter().filter(|global| global.facts.coupling_group.is_some()).count(),
+                "violation_tainted": globals.iter().filter(|global| global.facts.violation_taint.value).count(),
             }),
         );
     }
@@ -809,6 +836,428 @@ fn assemble_coupling_groups(
         })
         .collect();
     (groups, candidates)
+}
+
+fn assemble_atomic_eligibility(
+    analysis: &Analysis,
+    target: &pangs_pir::TargetInfo,
+    candidates: &[CouplingCandidate],
+    globals: &mut [DispositionGlobal],
+) {
+    let mut access_by_global = vec![Vec::new(); analysis.globals().len()];
+    for site in analysis.access_sites() {
+        access_by_global[site.global.0 as usize].push(site);
+    }
+    let mut indirect_rows_by_global = vec![BTreeSet::new(); analysis.globals().len()];
+    for (row_index, row) in analysis.modrefs().iter().enumerate() {
+        if row.via == pangs_api::Via::Direct {
+            continue;
+        }
+        if let AffectedGlobals::Finite(affected) = analysis.affected_globals(row) {
+            for gid in affected {
+                indirect_rows_by_global[gid.0 as usize].insert(row_index);
+            }
+        }
+    }
+    let gids_by_key = globals
+        .iter()
+        .filter_map(|global| {
+            analysis
+                .lookup_global(&global.meta.llvm_name)
+                .map(|gid| (global.key.clone(), gid))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for global in globals {
+        let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) else {
+            global.facts.atomic_eligibility = Some(Certificate::Failed {
+                codes: vec!["global-not-in-analysis".into()],
+                witnesses: vec![atomic_witness(
+                    "global-not-in-analysis",
+                    Some(global.key.to_string()),
+                    None,
+                    None,
+                )],
+                recipe: None,
+                diagnostics: None,
+                extra: Extra::new(),
+            });
+            continue;
+        };
+
+        let sites = &access_by_global[gid.0 as usize];
+        let (access_recipe, access_failures) = atomic_access_recipe(analysis, sites);
+        let mut codes = Vec::new();
+        let mut witnesses = Vec::new();
+        let mut fail = |code: &str, witness: Witness| {
+            codes.push(code.to_owned());
+            witnesses.push(witness);
+        };
+
+        if !global.facts.word_sized_scalar.value {
+            fail(
+                "word-sized-scalar",
+                atomic_witness(
+                    "atomic-word-sized-scalar-failed",
+                    Some(global.key.to_string()),
+                    None,
+                    global.meta.type_spelling.clone(),
+                ),
+            );
+        }
+        if !global.facts.access_set_complete.value {
+            fail(
+                "access-set-complete",
+                global
+                    .facts
+                    .access_set_complete
+                    .witness
+                    .clone()
+                    .unwrap_or_else(|| {
+                        atomic_witness(
+                            "atomic-access-set-incomplete",
+                            Some(global.key.to_string()),
+                            None,
+                            None,
+                        )
+                    }),
+            );
+        }
+        if global.facts.violation_taint.value {
+            fail(
+                "violation-taint",
+                global
+                    .facts
+                    .violation_taint
+                    .witness
+                    .clone()
+                    .unwrap_or_else(|| {
+                        atomic_witness(
+                            "atomic-violation-taint",
+                            Some(global.key.to_string()),
+                            None,
+                            None,
+                        )
+                    }),
+            );
+        }
+        if let Some(group) = &global.facts.coupling_group {
+            fail(
+                "hard-coupling-group",
+                atomic_witness(
+                    "atomic-hard-coupling-group",
+                    Some(global.key.to_string()),
+                    None,
+                    Some(group.clone()),
+                ),
+            );
+        }
+        for (code, witness) in access_failures {
+            fail(&code, witness);
+        }
+
+        let (suspected, coupling_failures) = atomic_suspected_coupling(
+            analysis,
+            &global.key,
+            &gids_by_key,
+            candidates,
+            &access_by_global,
+            &indirect_rows_by_global,
+        );
+        for (code, witness) in coupling_failures {
+            fail(&code, witness);
+        }
+
+        let width = global.facts.word_sized_scalar.size_bits;
+        let signal_lock_free = !global.facts.signal_context_access.value
+            || width.is_some_and(|width| target.supported_atomic_widths.contains(&width));
+        if !signal_lock_free {
+            fail(
+                "signal-atomic-not-lock-free",
+                atomic_witness(
+                    "signal-atomic-not-lock-free",
+                    Some(global.key.to_string()),
+                    None,
+                    width.map(|width| format!("{width}-bit atomic is not target-guaranteed")),
+                ),
+            );
+        }
+
+        let recipe_ready = global.facts.word_sized_scalar.value
+            && global.facts.access_set_complete.value
+            && access_recipe.is_some()
+            && signal_lock_free;
+        let recipe = recipe_ready.then(|| {
+            serde_json::json!({
+                "declaration": {
+                    "key": global.key,
+                    "llvm_name": global.meta.llvm_name,
+                    "file": global.meta.file,
+                    "line": global.meta.line,
+                    "type_spelling": global.meta.type_spelling,
+                    "size_bits": global.facts.word_sized_scalar.size_bits,
+                    "linkage": global.meta.linkage,
+                },
+                "accesses": access_recipe.unwrap_or_default(),
+                "cross_tu": {
+                    "required": global.meta.linkage == Linkage::External,
+                    "scope": "linked-module",
+                },
+                "ordering": "relaxed",
+            })
+        });
+
+        global.facts.atomic_eligibility = Some(if codes.is_empty() {
+            Certificate::Certified {
+                certificate: serde_json::json!({
+                    "recipe": recipe.expect("a certified atomic must have a complete recipe"),
+                    "suspected_coupling": suspected,
+                    "signal_lock_free": {
+                        "required": global.facts.signal_context_access.value,
+                        "width": width,
+                        "target_guaranteed": signal_lock_free,
+                    },
+                }),
+                extra: Extra::new(),
+            }
+        } else {
+            Certificate::Failed {
+                codes,
+                witnesses,
+                recipe,
+                diagnostics: Some(serde_json::json!({
+                    "suspected_coupling": suspected,
+                    "access_sites_observed": sites.len(),
+                })),
+                extra: Extra::new(),
+            }
+        });
+    }
+}
+
+fn atomic_suspected_coupling(
+    analysis: &Analysis,
+    key: &Key,
+    gids_by_key: &BTreeMap<Key, GlobalId>,
+    candidates: &[CouplingCandidate],
+    access_by_global: &[Vec<&pangs_api::AccessSite>],
+    indirect_rows_by_global: &[BTreeSet<usize>],
+) -> (Vec<Value>, Vec<(String, Witness)>) {
+    let mut resolutions = Vec::new();
+    let mut failures = Vec::new();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.members.contains(key))
+    {
+        for edge in candidate
+            .evidence
+            .iter()
+            .filter(|edge| edge.members.contains(key))
+        {
+            let endpoint_ids = edge
+                .members
+                .iter()
+                .filter_map(|member| gids_by_key.get(member).copied())
+                .collect::<Vec<_>>();
+            if endpoint_ids.len() != edge.members.len() {
+                failures.push((
+                    "suspected-coupling-unresolved".into(),
+                    atomic_witness(
+                        "atomic-suspected-coupling-unresolved",
+                        Some(candidate.id.clone()),
+                        None,
+                        Some("candidate endpoint is absent from the analysis global table".into()),
+                    ),
+                ));
+                continue;
+            }
+            let shared_pointer_row = endpoint_ids
+                .split_first()
+                .and_then(|(first, rest)| {
+                    indirect_rows_by_global[first.0 as usize]
+                        .iter()
+                        .copied()
+                        .find(|row_index| {
+                            rest.iter().all(|gid| {
+                                indirect_rows_by_global[gid.0 as usize].contains(row_index)
+                            })
+                        })
+                })
+                .map(|row_index| &analysis.modrefs()[row_index]);
+            if let Some(row) = shared_pointer_row {
+                failures.push((
+                    "suspected-coupling-shared-address".into(),
+                    function_witness(
+                        analysis,
+                        row.func,
+                        "atomic-suspected-coupling-shared-address",
+                        row.witness.clone(),
+                    ),
+                ));
+                continue;
+            }
+
+            let mut reads_by_location =
+                BTreeMap::<(FuncId, Option<pangs_api::LocInfo>), usize>::new();
+            for gid in &endpoint_ids {
+                let locations = access_by_global[gid.0 as usize]
+                    .iter()
+                    .filter(|site| site.access == pangs_pir::Access::Ref && site.loc.is_some())
+                    .map(|site| (site.func, site.loc.clone()))
+                    .collect::<BTreeSet<_>>();
+                for location in locations {
+                    *reads_by_location.entry(location).or_default() += 1;
+                }
+            }
+            if let Some(((function, loc), _)) = reads_by_location
+                .into_iter()
+                .find(|(_, endpoint_count)| *endpoint_count == endpoint_ids.len())
+            {
+                let site = loc.map(|loc| Site {
+                    file: loc.file,
+                    line: loc.line,
+                    col: Some(loc.col),
+                    function: Some(analysis.functions()[function].key.clone()),
+                    extra: Extra::new(),
+                });
+                failures.push((
+                    "suspected-coupling-joint-reader".into(),
+                    atomic_witness(
+                        "atomic-suspected-coupling-joint-reader",
+                        Some(candidate.id.clone()),
+                        site,
+                        Some(
+                            edge.members
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
+                    ),
+                ));
+                continue;
+            }
+
+            resolutions.push(serde_json::json!({
+                "candidate": candidate.id,
+                "members": edge.members,
+                "evidence": edge.kind,
+                "resolution": "co-write-only-direct-endpoints-no-joint-reader",
+            }));
+        }
+    }
+    (resolutions, failures)
+}
+
+fn atomic_access_recipe(
+    analysis: &Analysis,
+    sites: &[&pangs_api::AccessSite],
+) -> (Option<Vec<Value>>, Vec<(String, Witness)>) {
+    let mut ordered = sites.to_vec();
+    ordered.sort_by_key(|site| (site.func, site.statement_index, site.access, site.via));
+    let mut failures = Vec::new();
+    let mut entries = Vec::new();
+    let mut consumed = vec![false; ordered.len()];
+
+    for index in 0..ordered.len() {
+        if consumed[index] {
+            continue;
+        }
+        let site = ordered[index];
+        let function = &analysis.functions()[site.func];
+        let manifest_site = atomic_access_site(analysis, site);
+        if site.via != pangs_api::Via::Direct {
+            failures.push((
+                "address-access-not-lowerable".into(),
+                atomic_witness(
+                    "atomic-address-access-not-lowerable",
+                    Some(function.key.clone()),
+                    manifest_site,
+                    Some(format!("{:?} access", site.via)),
+                ),
+            ));
+            continue;
+        }
+        if site.loc.is_none() || site.statement_index.is_none() {
+            failures.push((
+                "access-site-unmapped".into(),
+                atomic_witness(
+                    "atomic-access-site-unmapped",
+                    Some(function.key.clone()),
+                    manifest_site,
+                    site.statement_index
+                        .map(|value| format!("statement {value}")),
+                ),
+            ));
+            continue;
+        }
+
+        if site.access == pangs_pir::Access::Ref {
+            let pair = ((index + 1)..ordered.len()).find(|&other| {
+                let candidate = ordered[other];
+                !consumed[other]
+                    && candidate.func == site.func
+                    && candidate.access == pangs_pir::Access::Mod
+                    && candidate.via == pangs_api::Via::Direct
+                    && candidate.loc == site.loc
+                    && candidate
+                        .statement_index
+                        .zip(site.statement_index)
+                        .is_some_and(|(candidate_index, site_index)| {
+                            candidate_index > site_index && candidate_index - site_index <= 2
+                        })
+            });
+            if let Some(other) = pair {
+                consumed[other] = true;
+                entries.push(serde_json::json!({
+                    "operation": "rmw-source-expression",
+                    "function": function.key,
+                    "site": manifest_site,
+                    "statement_indices": [site.statement_index, ordered[other].statement_index],
+                }));
+                continue;
+            }
+        }
+
+        entries.push(serde_json::json!({
+            "operation": if site.access == pangs_pir::Access::Ref { "load" } else { "store" },
+            "function": function.key,
+            "site": manifest_site,
+            "statement_index": site.statement_index,
+        }));
+    }
+
+    if failures.is_empty() {
+        (Some(entries), failures)
+    } else {
+        (None, failures)
+    }
+}
+
+fn atomic_access_site(analysis: &Analysis, access: &pangs_api::AccessSite) -> Option<Site> {
+    let loc = access.loc.as_ref()?;
+    let function = &analysis.functions()[access.func];
+    Some(Site {
+        file: loc.file.clone(),
+        line: loc.line,
+        col: Some(loc.col),
+        function: Some(function.key.clone()),
+        extra: Extra::new(),
+    })
+}
+
+fn atomic_witness(
+    kind: &str,
+    symbol: Option<String>,
+    site: Option<Site>,
+    note: Option<String>,
+) -> Witness {
+    Witness {
+        kind: kind.into(),
+        site,
+        symbol,
+        note,
+        extra: Extra::new(),
+    }
 }
 
 struct CouplingComponents {
@@ -2491,7 +2940,7 @@ mod tests {
     use std::time::Instant;
 
     use pangs_api::{Analysis, GlobalId, Opts};
-    use pangs_manifest::{Extra, Key, Site};
+    use pangs_manifest::{Certificate, Extra, Key, Site};
     use pangs_pir::Pir;
     use serde_json::json;
     use tempfile::TempDir;
@@ -2555,6 +3004,25 @@ mod tests {
         let mut pir = Pir::from_path(&fixture).unwrap();
         pir.globals[0].file = None;
         pir.globals[0].line = None;
+        pir.globals[0].type_spelling = Some("int".into());
+        pir.globals[0].size_bits = Some(32);
+        pir.globals[0].align_bits = Some(32);
+        pir.globals[0].scalar_class = Some(pangs_pir::ScalarTypeClass::Integer);
+        pir.globals[0].signed = Some(true);
+        pir.functions[0].body.insert(
+            0,
+            pangs_pir::Stmt::GlobalRef {
+                global: "g_counter".into(),
+                access: pangs_pir::Access::Ref,
+                loc: Some(pangs_pir::Loc {
+                    file: "fixtures/synthetic/trivial/trivial.c".into(),
+                    line: 4,
+                    col: 3,
+                    dir: None,
+                    filename: None,
+                }),
+            },
+        );
         let opts = Opts::default();
         let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
         let target = pangs_pir::TargetInfo {
@@ -2577,6 +3045,16 @@ mod tests {
         assert_eq!(manifest.globals[0].meta.file, None);
         assert!(manifest.unkeyed_globals.is_empty());
         assert!(ledger[0].text.contains("globally unique"));
+        let Some(Certificate::Certified { certificate, .. }) =
+            &manifest.globals[0].facts.atomic_eligibility
+        else {
+            panic!("direct source-mapped scalar accesses should certify atomic eligibility")
+        };
+        assert_eq!(
+            certificate["recipe"]["accesses"][0]["operation"],
+            "rmw-source-expression"
+        );
+        assert!(certificate["recipe"]["declaration"]["file"].is_null());
     }
 
     #[test]
@@ -2634,6 +3112,12 @@ mod tests {
             .find(|global| global.meta.llvm_name == "@G00")
             .unwrap();
         assert!(touched.facts.access_set_complete.value);
+        let Some(Certificate::Failed { codes, .. }) = &touched.facts.atomic_eligibility else {
+            panic!("bounded indirect accesses must still be classified by D3")
+        };
+        assert!(codes
+            .iter()
+            .any(|code| code == "address-access-not-lowerable"));
         assert_eq!(
             manifest.run.analysis.extra["phase_stationarity_report"]["bounded_indirect_accesses"]
                 ["globals"],

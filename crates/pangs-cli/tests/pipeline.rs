@@ -2142,7 +2142,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "ff8c1a02d04001bba6d0e459916d6dc8c8460a117a6318e7715a6b24474070a9"
+        "6057dc6d931ede65aeb7b780ad0616cb4a5fe50a7ac24a7fb265eec7d23ca467"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(
@@ -2424,6 +2424,15 @@ fn analyze_dispose_derives_common_once_lock_group_support() {
         .unwrap()
         .iter()
         .all(|global| global["disposition"]["chosen"] == "once-lock"));
+    assert!(manifest["globals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|global| global["facts"]["atomic_eligibility"]["codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|code| code == "hard-coupling-group")));
     let report = &manifest["run"]["analysis"]["phase_stationarity_report"]["coupling_groups"];
     assert_eq!(report["count"], 1);
     assert_eq!(report["once_lock_supported"], 1);

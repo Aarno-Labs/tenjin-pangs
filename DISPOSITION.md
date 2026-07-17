@@ -656,10 +656,13 @@ Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
 - **D2b — shared coupling post-pass (~200 lines).** Extracted from O6's clustering,
   generalized to co-write regions; group evidence records; group disposition
   resolution.
-- **D3 — atomic eligibility pass (future, size TBD).** Word-sized scalar check, RMW
-  site classification (`g++` → `fetch_add` shapes), address-taken compatibility,
-  conservative co-write re-derivation (§6), certificate + failure codes into the
-  reserved slot. Ships with its co-update dynamic audit (§7).
+- **D3 — atomic eligibility pass (implemented; runtime audit pending).** Produces a
+  certificate only after scalar-width, bounded-access, relevant-violation, hard-group,
+  source-mapped load/store/RMW recipe, and signal lock-free checks pass. It consumes
+  suspected co-write edges individually: shared indirect-address candidates and
+  same-expression joint readers fail closed; otherwise the direct-endpoint discharge is
+  recorded in the certificate. The co-update dynamic audit (§7) remains required before
+  a materializer enables atomic rewrites in production.
 - **D4 — mutex eligibility pass (future, size TBD).** Access-set completeness reuse,
   reentrancy check (call-graph reachability between access sites), signal-context
   gate, lock-granularity advice from groups.
@@ -669,10 +672,10 @@ Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
   here so all three agree.
 
 Order: D1 → D2 → D2b (v1, alongside O-items; D1 is a prerequisite for consuming
-ONCELOCK output at all under the new interface), then D5 when the C→C tool is ready to
-consume dispositions, then D3/D4 gated on §10 measurements. v1 cascade with only the
-existing passes degenerates gracefully: `immutable` / `once-lock` / `localize` /
-`unhandled`, with `atomic`/`mutex` slots present-but-null in every record.
+ONCELOCK output at all under the new interface), then D3's static certificate and D5
+when the C→C tool is ready to consume dispositions; D4 remains gated on §10
+measurements. Until D4 lands, the cascade has `mutex` present-but-null; atomic is
+available only through its D3 certificate.
 
 ### Testing
 
