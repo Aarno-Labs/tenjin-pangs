@@ -61,6 +61,9 @@ schema-v2 policy to schema-v3 facts.
 Narrow external pointer summaries are a complementary analysis-side refinement: they
 can prevent a known pure libc return value from becoming Ω before this fact model is
 applied.  See [the libc pointer-summary plan](PLAN_LIBC_POINTER_SUMMARIES.md).
+The [ExposedGlobals domain prototype](PLAN_EXPOSED_GLOBALS_DOMAIN.md) separately
+preserves whether a remaining Ω pointer can reach no module globals, only globals in
+the run's exported-or-address-escaped exposure surface, or every module global.
 
 ### 3.1 Replace the overloaded empty-vector convention
 
