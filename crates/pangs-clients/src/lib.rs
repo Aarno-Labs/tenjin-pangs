@@ -883,18 +883,43 @@ fn assemble_atomic_eligibility(
     candidates: &[CouplingCandidate],
     globals: &mut [DispositionGlobal],
 ) {
-    let mut access_by_global = vec![Vec::new(); analysis.globals().len()];
+    let mut access_site_counts = vec![0_usize; analysis.globals().len()];
     for site in analysis.access_sites() {
-        access_by_global[site.global.0 as usize].push(site);
+        access_site_counts[site.global.0 as usize] += 1;
+    }
+    // Do not build detailed access/coupling indexes unless at least one global has passed every
+    // coarse gate.  Incomplete access sets, taint, type shape, hard coupling, and non-lock-free
+    // signal use each independently make an atomic certificate impossible.
+    let mut needs_detailed_check = false;
+    for global in globals.iter() {
+        let Some(_) = analysis.lookup_global(&global.meta.llvm_name) else {
+            continue;
+        };
+        let width = global.facts.word_sized_scalar.size_bits;
+        let signal_lock_free = !global.facts.signal_context_access.value
+            || width.is_some_and(|width| target.supported_atomic_widths.contains(&width));
+        needs_detailed_check |= global.facts.word_sized_scalar.value
+            && global.facts.access_set_complete.value
+            && !global.facts.violation_taint.value
+            && global.facts.coupling_group.is_none()
+            && signal_lock_free;
+    }
+    let mut access_by_global = vec![Vec::new(); analysis.globals().len()];
+    if needs_detailed_check {
+        for site in analysis.access_sites() {
+            access_by_global[site.global.0 as usize].push(site);
+        }
     }
     let mut indirect_rows_by_global = vec![BTreeSet::new(); analysis.globals().len()];
-    for (row_index, row) in analysis.modrefs().iter().enumerate() {
-        if row.via == pangs_api::Via::Direct {
-            continue;
-        }
-        if let AffectedGlobals::Finite(affected) = analysis.affected_globals(row) {
-            for gid in affected {
-                indirect_rows_by_global[gid.0 as usize].insert(row_index);
+    if needs_detailed_check {
+        for (row_index, row) in analysis.modrefs().iter().enumerate() {
+            if row.via == pangs_api::Via::Direct {
+                continue;
+            }
+            if let AffectedGlobals::Finite(affected) = analysis.affected_globals(row) {
+                for gid in affected {
+                    indirect_rows_by_global[gid.0 as usize].insert(row_index);
+                }
             }
         }
     }
@@ -923,8 +948,6 @@ fn assemble_atomic_eligibility(
             continue;
         };
 
-        let sites = &access_by_global[gid.0 as usize];
-        let (access_recipe, access_failures) = atomic_access_recipe(analysis, sites);
         let mut codes = Vec::new();
         let mut witnesses = Vec::new();
         let mut fail = |code: &str, witness: Witness| {
@@ -990,21 +1013,6 @@ fn assemble_atomic_eligibility(
                 ),
             );
         }
-        for (code, witness) in access_failures {
-            fail(&code, witness);
-        }
-
-        let (suspected, coupling_failures) = atomic_suspected_coupling(
-            analysis,
-            &global.key,
-            &gids_by_key,
-            candidates,
-            &access_by_global,
-            &indirect_rows_by_global,
-        );
-        for (code, witness) in coupling_failures {
-            fail(&code, witness);
-        }
 
         let width = global.facts.word_sized_scalar.size_bits;
         let signal_lock_free = !global.facts.signal_context_access.value
@@ -1021,10 +1029,46 @@ fn assemble_atomic_eligibility(
             );
         }
 
-        let recipe_ready = global.facts.word_sized_scalar.value
-            && global.facts.access_set_complete.value
-            && access_recipe.is_some()
-            && signal_lock_free;
+        drop(fail);
+        if !codes.is_empty() {
+            global.facts.atomic_eligibility = Some(Certificate::Failed {
+                codes,
+                witnesses,
+                recipe: None,
+                diagnostics: Some(serde_json::json!({
+                    "access_lowering": {
+                        "status": "skipped",
+                        "reason": "coarse-eligibility-failed",
+                    },
+                    "access_sites_observed": access_site_counts[gid.0 as usize],
+                })),
+                extra: Extra::new(),
+            });
+            continue;
+        }
+
+        let sites = &access_by_global[gid.0 as usize];
+        let (access_recipe, access_failures) = atomic_access_recipe(analysis, sites);
+        let mut fail = |code: &str, witness: Witness| {
+            codes.push(code.to_owned());
+            witnesses.push(witness);
+        };
+        for (code, witness) in access_failures {
+            fail(&code, witness);
+        }
+        let (suspected, coupling_failures) = atomic_suspected_coupling(
+            analysis,
+            &global.key,
+            &gids_by_key,
+            candidates,
+            &access_by_global,
+            &indirect_rows_by_global,
+        );
+        for (code, witness) in coupling_failures {
+            fail(&code, witness);
+        }
+
+        let recipe_ready = access_recipe.is_some();
         let recipe = recipe_ready.then(|| {
             serde_json::json!({
                 "declaration": {
@@ -3204,12 +3248,18 @@ mod tests {
             .find(|global| global.meta.llvm_name == "@G00")
             .unwrap();
         assert!(touched.facts.access_set_complete.value);
-        let Some(Certificate::Failed { codes, .. }) = &touched.facts.atomic_eligibility else {
-            panic!("bounded indirect accesses must still be classified by D3")
+        let Some(Certificate::Failed {
+            codes, diagnostics, ..
+        }) = &touched.facts.atomic_eligibility
+        else {
+            panic!("coarse atomic gates must produce a failed D3 certificate")
         };
-        assert!(codes
-            .iter()
-            .any(|code| code == "address-access-not-lowerable"));
+        assert!(codes.iter().any(|code| code == "word-sized-scalar"));
+        let diagnostics = diagnostics.as_ref().unwrap();
+        assert_eq!(
+            diagnostics["access_lowering"]["status"], "skipped",
+            "a decisive coarse gate must bound access-lowering diagnostics"
+        );
         assert_eq!(
             manifest.run.analysis.extra["phase_stationarity_report"]["bounded_indirect_accesses"]
                 ["globals"],

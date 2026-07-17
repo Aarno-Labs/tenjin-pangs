@@ -662,7 +662,9 @@ Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
   suspected co-write edges individually: shared indirect-address candidates and
   same-expression joint readers fail closed; otherwise the direct-endpoint discharge is
   recorded in the certificate. The co-update dynamic audit (§7) remains required before
-  a materializer enables atomic rewrites in production.
+  a materializer enables atomic rewrites in production. A failed coarse gate emits its
+  decisive witness and a bounded `access_lowering: skipped` diagnostic; D3 does not
+  enumerate redundant per-access rewrite failures once certification is impossible.
 - **D4 — mutex eligibility pass (future, size TBD).** Access-set completeness reuse,
   reentrancy check (call-graph reachability between access sites), signal-context
   gate, lock-granularity advice from groups.
