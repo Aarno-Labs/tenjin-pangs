@@ -1883,6 +1883,25 @@ impl Analysis {
         self.transitive_modrefs.iter(func)
     }
 
+    /// Borrowed transitive access summaries for clients that only need target scope and access
+    /// kind.  This avoids cloning full mod/ref provenance (including strings and candidate sets)
+    /// merely to inspect a registry callback's global effects.
+    pub fn transitive_accesses(
+        &self,
+        func: FuncId,
+    ) -> impl Iterator<Item = (Access, AffectedGlobals<'_>)> + '_ {
+        self.transitive_modrefs.iter_payloads(func).map(|payload| {
+            let affected = match &payload.global {
+                GlobalTarget::Name(global) => AffectedGlobals::Finite(std::slice::from_ref(global)),
+                GlobalTarget::Unknown(_) => match &payload.global_candidates {
+                    GlobalCandidateSet::Finite(globals) => AffectedGlobals::Finite(globals),
+                    GlobalCandidateSet::ModuleWide => AffectedGlobals::ModuleWide,
+                },
+            };
+            (payload.access, affected)
+        })
+    }
+
     pub fn modref_count(&self, func: FuncId) -> usize {
         self.transitive_modrefs.row_count(func)
     }
@@ -5172,6 +5191,13 @@ impl TransitiveModRefs {
                 global_candidates: payload.global_candidates.clone(),
             }
         })
+    }
+
+    fn iter_payloads(&self, func: FuncId) -> impl Iterator<Item = &ModRefPayload> + '_ {
+        let row_set = self.row_set_by_func[func.0 as usize];
+        self.row_sets[row_set]
+            .iter()
+            .map(|&payload_id| &self.payloads[payload_id])
     }
 }
 

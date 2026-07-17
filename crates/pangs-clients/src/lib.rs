@@ -453,7 +453,31 @@ struct RegistryAccessFacts {
 
 fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> RegistryAccessFacts {
     let mut result = RegistryAccessFacts::default();
-    let mut entry_access_cache = BTreeMap::<FuncId, Vec<(GlobalId, pangs_pir::Access)>>::new();
+    // A registry fact is existential: for each callback/global pair we only need to know
+    // whether any transitive row reads it and whether any row writes it.  Keeping every row
+    // here made unresolved registrations retain tens of millions of duplicate pairs.
+    let mut entry_access_cache = BTreeMap::<FuncId, Vec<(GlobalId, u8)>>::new();
+    let mut registry_calls = 0_u64;
+    let mut registry_specs = 0_u64;
+    let mut unresolved_specs = 0_u64;
+    let function_ids_by_llvm_name = module
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(index, function)| {
+            (
+                function.key.strip_prefix('@').unwrap_or(&function.key),
+                FuncId(index as u32),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let address_taken_entries = analysis
+        .functions()
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.address_taken && !candidate.external)
+        .map(|(index, _)| FuncId(index as u32))
+        .collect::<Vec<_>>();
     let mut callsite_index = 0_u32;
     for (caller_index, function) in module.functions.iter().enumerate() {
         let caller = FuncId(caller_index as u32);
@@ -491,16 +515,11 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                 }
             }
             for (kind, arg_index, pointee) in specs {
+                registry_calls += 1;
                 let operand = args.get(arg_index);
                 let direct_entry = operand.and_then(|operand| {
                     let operand = operand.strip_prefix('@').unwrap_or(operand);
-                    module
-                        .functions
-                        .iter()
-                        .position(|candidate| {
-                            candidate.key.strip_prefix('@').unwrap_or(&candidate.key) == operand
-                        })
-                        .map(|index| FuncId(index as u32))
+                    function_ids_by_llvm_name.get(operand).copied()
                 });
                 let solved_entry = analysis
                     .registry_entry(callsite)
@@ -508,17 +527,13 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                 let unresolved = solved_entry
                     .map(|entry| entry.unresolved)
                     .unwrap_or(pointee || direct_entry.is_none());
+                registry_specs += 1;
+                unresolved_specs += u64::from(unresolved);
                 let precise_entries = solved_entry
                     .map(|entry| entry.targets.clone())
                     .unwrap_or_else(|| direct_entry.into_iter().collect());
                 let widened_entries = if unresolved {
-                    analysis
-                        .functions()
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, candidate)| candidate.address_taken && !candidate.external)
-                        .map(|(index, _)| FuncId(index as u32))
-                        .collect::<Vec<_>>()
+                    address_taken_entries.iter().copied().collect::<Vec<_>>()
                 } else {
                     Vec::new()
                 };
@@ -526,20 +541,34 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                 let witness = registry_witness(analysis, caller, loc, kind, unresolved);
                 for entry in entries {
                     let accesses = entry_access_cache.entry(entry).or_insert_with(|| {
-                        analysis
-                            .modref(entry)
-                            .flat_map(|row| {
-                                let affected: Vec<_> = match analysis.affected_globals(&row) {
-                                    AffectedGlobals::Finite(globals) => globals.to_vec(),
-                                    AffectedGlobals::ModuleWide => (0..analysis.globals().len())
-                                        .map(|index| GlobalId(index as u32))
-                                        .collect(),
-                                };
-                                affected.into_iter().map(move |global| (global, row.access))
+                        let mut masks = vec![0_u8; analysis.globals().len()];
+                        for (access, affected) in analysis.transitive_accesses(entry) {
+                            let mask = match access {
+                                pangs_pir::Access::Ref => 0b01,
+                                pangs_pir::Access::Mod => 0b10,
+                            };
+                            match affected {
+                                AffectedGlobals::Finite(globals) => {
+                                    for global in globals {
+                                        masks[global.0 as usize] |= mask;
+                                    }
+                                }
+                                AffectedGlobals::ModuleWide => {
+                                    for entry_mask in &mut masks {
+                                        *entry_mask |= mask;
+                                    }
+                                }
+                            }
+                        }
+                        masks
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(index, mask)| {
+                                (mask != 0).then_some((GlobalId(index as u32), mask))
                             })
                             .collect()
                     });
-                    for &(global, access) in accesses.iter() {
+                    for &(global, mask) in accesses.iter() {
                         match kind {
                             RegistryKind::Spawn => {
                                 result
@@ -554,7 +583,7 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                                     .or_insert_with(|| witness.clone());
                             }
                         }
-                        if access == pangs_pir::Access::Ref {
+                        if mask & 0b01 != 0 {
                             result
                                 .pseudo_read_callsites
                                 .entry(global)
@@ -566,7 +595,7 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                             };
                             classified.entry(global).or_default().insert(callsite);
                         }
-                        if kind == RegistryKind::Spawn && access == pangs_pir::Access::Mod {
+                        if kind == RegistryKind::Spawn && mask & 0b10 != 0 {
                             result
                                 .thread_writers
                                 .entry(global)
@@ -576,6 +605,16 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                 }
             }
         }
+    }
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition registry detail calls={} specs={} unresolved={} distinct-entries={} cached-accesses={}",
+            registry_calls,
+            registry_specs,
+            unresolved_specs,
+            entry_access_cache.len(),
+            entry_access_cache.values().map(Vec::len).sum::<usize>(),
+        );
     }
     result
 }
@@ -1692,6 +1731,27 @@ impl<'a> DispositionFactRows<'a> {
                 },
             }
         }
+        // Findings are function-scoped.  Building these two indexes once avoids scanning every
+        // mod/ref (and every access site) again for each finding.  On large linked programs the
+        // old O(findings * modrefs) walk dominated disposition assembly.
+        let mut modrefs_by_function = vec![Vec::new(); analysis.functions().len()];
+        for row in analysis.modrefs() {
+            modrefs_by_function[row.func.0 as usize].push(row);
+        }
+        let mut indirect_access_locations =
+            BTreeMap::<(FuncId, GlobalId), BTreeSet<(String, u32)>>::new();
+        for site in analysis.access_sites() {
+            if site.via == pangs_api::Via::Direct {
+                continue;
+            }
+            if let Some(loc) = &site.loc {
+                indirect_access_locations
+                    .entry((site.func, site.global))
+                    .or_default()
+                    .insert((loc.file.clone(), loc.line));
+            }
+        }
+
         let mut violation = vec![None; global_count];
         let mut violation_diagnostics = vec![Vec::new(); global_count];
         for finding in analysis.audit_findings() {
@@ -1699,7 +1759,7 @@ impl<'a> DispositionFactRows<'a> {
                 continue;
             };
             let mut rows_by_global = BTreeMap::<GlobalId, Vec<&ModRef>>::new();
-            for row in analysis.modrefs().iter().filter(|row| row.func == function) {
+            for row in &modrefs_by_function[function.0 as usize] {
                 match analysis.affected_globals(row) {
                     AffectedGlobals::Finite(globals) => {
                         for &global in globals {
@@ -1714,8 +1774,14 @@ impl<'a> DispositionFactRows<'a> {
                 }
             }
             for (global, rows) in rows_by_global {
-                let relevance =
-                    classify_violation_relevance(analysis, finding, function, global, &rows);
+                let relevance = classify_violation_relevance_indexed(
+                    analysis,
+                    finding,
+                    function,
+                    global,
+                    &rows,
+                    indirect_access_locations.get(&(function, global)),
+                );
                 let witness =
                     violation_relevance_witness(analysis, finding, function, global, relevance);
                 let index = global.0 as usize;
@@ -1742,12 +1808,39 @@ impl<'a> DispositionFactRows<'a> {
     }
 }
 
+#[cfg(test)]
 fn classify_violation_relevance(
     analysis: &Analysis,
     finding: &pangs_api::Finding,
     function: FuncId,
     global: GlobalId,
     rows: &[&ModRef],
+) -> ViolationRelevance {
+    let indirect_locations = analysis
+        .access_sites()
+        .iter()
+        .filter(|site| {
+            site.func == function && site.global == global && site.via != pangs_api::Via::Direct
+        })
+        .filter_map(|site| site.loc.as_ref().map(|loc| (loc.file.clone(), loc.line)))
+        .collect::<BTreeSet<_>>();
+    classify_violation_relevance_indexed(
+        analysis,
+        finding,
+        function,
+        global,
+        rows,
+        Some(&indirect_locations),
+    )
+}
+
+fn classify_violation_relevance_indexed(
+    analysis: &Analysis,
+    finding: &pangs_api::Finding,
+    function: FuncId,
+    global: GlobalId,
+    rows: &[&ModRef],
+    indirect_locations: Option<&BTreeSet<(String, u32)>>,
 ) -> ViolationRelevance {
     let global_key = &analysis.globals()[global].key;
     if finding.affected.iter().any(|affected| {
@@ -1778,15 +1871,14 @@ fn classify_violation_relevance(
         row.via != pangs_api::Via::Direct || matches!(row.global, GlobalTarget::Unknown(_))
     });
     if has_indirect
-        && analysis.access_sites().iter().any(|site| {
-            site.func == function
-                && site.global == global
-                && site.via != pangs_api::Via::Direct
-                && site.loc.as_ref().is_some_and(|loc| {
-                    finding.file.as_deref() == Some(loc.file.as_str())
-                        && finding.line == Some(loc.line)
-                })
-        })
+        && finding
+            .file
+            .as_ref()
+            .zip(finding.line)
+            .is_some_and(|(file, line)| {
+                indirect_locations
+                    .is_some_and(|locations| locations.contains(&(file.clone(), line)))
+            })
     {
         return ViolationRelevance::AccessShapeRelevant;
     }
