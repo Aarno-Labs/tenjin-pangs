@@ -1,7 +1,8 @@
 # Disposition False-Negative Reduction Plan
 
-Status: in progress (F1–F4 implemented 2026-07-17; F5 static D3 implemented,
-corpus remeasurement and runtime co-update audit pending)
+Status: in progress (F1–F4 and F5 static D3 implemented 2026-07-17; sibling
+corpus remeasurement completed for 34 of 35 non-Vim modules; runtime co-update audit
+contract specified in `PLAN_ATOMIC_CO_UPDATE_AUDIT.md`, instrumentation pending)
 
 This plan reduces conservative false negatives in three disposition inputs:
 
@@ -376,6 +377,27 @@ Acceptance: every newly eligible global has a complete D3 certificate; free-gate
 counts and certified counts are reported separately.
 
 ## 7. Required measurements
+
+### 2026-07-17 sibling-corpus remeasurement
+
+The expanded sibling corpus includes the newly added `exe-pure-O0.bc`.  Excluding the
+two Vim modules and PHP, 34 of 35 modules completed with `--dispose`; the remaining
+`lib-openssl-4.1.0-O1.bc` solver completed but its ordinary raw-analysis export needed
+more than the available 1.9 GiB scratch space before disposition emission.  It must be
+rerun on a larger scratch volume or through a future disposition-only emission path.
+
+Across the 34 completed modules: 1,461 mutable definition globals were considered;
+178 chose `immutable`, 14 chose `atomic`, and 1,269 remained `unhandled`.  The static
+D3 certificates are the five JPEGoptim globals (`average_count`,
+`compress_err_count`, `decompress_err_count`, `verbose_mode`, `worker_count`) in both
+O0 and O1, and four YAPET O0-g globals (`cat.catcolorspace`, `cats_capacity`,
+`ncats`, `report_error`).  `exe-pure-O0.bc` has no mutable definition globals.
+
+The remaining dominant access-completeness blocker is genuine module-wide access:
+1,352 globals, versus 79 with `external-escape`.  There are 91 suspected coupling
+components with 585 suspected co-write edges and no hard coupling groups.  These
+counts validate the split between hard groups and D3's per-edge discharge, but they do
+not make a static certificate production-ready: see the co-update audit contract.
 
 Each corpus run records:
 
