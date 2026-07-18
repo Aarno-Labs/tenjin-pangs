@@ -59,8 +59,8 @@ The policy stage assigns each client-relevant global the **first applicable** en
 ```
 1. immutable   iff  never-written ∧ ¬omega-escaped-address
 2. once-lock   iff  phase-stationarity certificate present
-3. atomic      iff  atomic-eligibility certificate present            (future pass)
-4. mutex       iff  mutex-eligibility certificate present             (future pass)
+3. atomic      iff  atomic-eligibility certificate present
+4. mutex       iff  mutex-eligibility certificate present
 5. localize    iff  build mode = application ∧ localization verdict OK
 6. unhandled   otherwise (with the accumulated failure witnesses)
 ```
@@ -137,8 +137,8 @@ Per-global facts, with producers:
 | `access_set_complete` | evidenced bool (true iff analysis bounds every possible accessor; **witness when false**: module-wide Ω, address escape, or library name reachability) | F scan | built by D1b; bounded indirect/rewrite compatibility is diagnosed separately for D3/D4 |
 | `word_sized_scalar` | `{ value, type_spelling?, size_bits?, class?, signed? }` — true iff the type has a matching Rust atomic on the target (`DISPOSITION_PLAN.md` §1.9; the name is historical shorthand, not "pointer-width only") | lowering metadata (O1b) | exists after O1b |
 | `phase_stationarity` | certificate slot (null \| certified \| failed+codes+witnesses) | ONCELOCK pass | specified |
-| `atomic_eligibility` | certificate slot | future pass (§9 D3) | reserved slot |
-| `mutex_eligibility` | certificate slot | future pass (§9 D4) | reserved slot |
+| `atomic_eligibility` | certificate slot | D3 access-lowering pass (§9) | implemented |
+| `mutex_eligibility` | certificate slot | D4 final-call-graph reentrancy pass (§9) | implemented |
 | `coupling_group` | group id | shared coupling analysis (§6) | generalizes ONCELOCK §2.3 |
 | `localization` | localization verdict (null \| ok \| blocked+blockers) | existing client (`DESIGN.md` §7) | exists |
 
@@ -243,8 +243,10 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
                                 "certificate": { /* ONCELOCK.md §2.1 payload:
                                      publication, writers, init_subtree,
                                      readers, observations */ } },
-        "atomic_eligibility": null,      // pass not yet built; null ≠ failed
-        "mutex_eligibility": null,
+        "atomic_eligibility": { "status": "failed",
+                                "codes": ["word-sized-scalar"], "witnesses": [...] },
+        "mutex_eligibility": { "status": "certified",
+                               "certificate": { /* accessor set + lock recipe */ } },
         "coupling_group": "grp-cmd",
         "localization": { "component": "comp-17", "verdict": "ok", "blockers": [] }
       },
@@ -274,7 +276,7 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
                          "strategy_support": {          // analysis-owned, from D2b:
                            "once_lock": { /* common-P certificate or absent-with-
                                              witness; DISPOSITION_PLAN.md D2b */ },
-                           "mutex": null                // reserved for D4
+                           "mutex": { /* shared-lock reentrancy certificate */ }
                          },
                          "group_disposition": "once-lock",
                          "group_provenance": "cascade",  // "cascade" | "override" |
@@ -647,9 +649,10 @@ Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
   load/store/RMW recipe, and signal lock-free checks pass. A failed coarse gate emits its
   decisive witness and a bounded `access_lowering: skipped` diagnostic; D3 does not
   enumerate redundant per-access rewrite failures once certification is impossible.
-- **D4 — mutex eligibility pass (future, size TBD).** Access-set completeness reuse,
-  reentrancy check (call-graph reachability between access sites), signal-context
-  gate, lock-granularity advice from groups.
+- **D4 — mutex eligibility pass (implemented).** Reuses access-set completeness and
+  violation relevance, rejects signal-context access, and checks final-call-graph
+  reachability between accessor functions. It emits deterministic call-path witnesses,
+  per-global lock recipes, and shared-lock support certificates for coupling groups.
 - **D5 — marker contract (~150 lines analysis-side).** Marker name mangling +
   collision check + inventory schema; the insertion itself is C→C-tool work, and the
   consumption is Rust-rewriter work, but the name scheme and inventory format are owned
@@ -657,9 +660,8 @@ Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
 
 Order: D1 → D2 → D2b (v1, alongside O-items; D1 is a prerequisite for consuming
 ONCELOCK output at all under the new interface), then D3's static certificate and D5
-when the C→C tool is ready to consume dispositions; D4 remains gated on §10
-measurements. Until D4 lands, the cascade has `mutex` present-but-null; atomic is
-available only through its D3 certificate.
+when the C→C tool is ready to consume dispositions. D3 and D4 now populate their
+certificate slots; their C/Rust materializers remain future boundary work.
 
 ### Testing
 

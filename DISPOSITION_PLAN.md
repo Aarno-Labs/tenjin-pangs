@@ -12,9 +12,10 @@ agents picking up a single work item cold.*
 ## 0. Scope and ground rules
 
 **In scope (v1):** D1 (manifest + fact assembly + cascade), D2 (overrides), D2b (shared
-coupling post-pass), D5 (marker contract), the contract test harnesses, and a
-de-risking spike (D0) on marker survival. **Specified but gated (build only when the §7
-counters say so):** D3 (atomic eligibility), D4 (mutex eligibility).
+coupling post-pass), D3 (atomic eligibility), D4 (mutex eligibility), D5 (marker
+contract), the contract test harnesses, and a de-risking spike (D0) on marker survival.
+D3 and D4 are implemented; their production materializers remain outside this
+repository.
 
 Ground rules, restated as implementation invariants — every PR touching this layer is
 reviewable against them:
@@ -863,8 +864,8 @@ consumes, stored as `coupling_groups[].strategy_support`:
   intersection of the members' publication intervals ∧ at least one insertable
   boundary inside the intersection. Present as the intersected interval + chosen
   common P; absent with a witness naming the first failing condition otherwise.
-- `strategy_support.mutex` — reserved slot, `null` until D4 emits the group
-  reentrancy certificate.
+- `strategy_support.mutex` — D4's typed group reentrancy certificate, computed over
+  the union of member accessor functions; a certified recipe selects one shared lock.
 
 No new analysis: interval intersection over per-member certificates is a scan, per
 `DISPOSITION.md` §2's rule of construction. This fixes the pipeline **run order** as
@@ -918,7 +919,7 @@ per-global: existing synchronization remains in place, while unsynchronized conc
 plain-global access was undefined source behavior. No co-write analysis or runtime
 co-update audit is required.
 
-### D4 — mutex eligibility (gated)
+### D4 — mutex eligibility (implemented)
 
 Certificate: `access_set_complete`; ¬`signal_context_access`; reentrancy check — build
 the "may access g" function set, fail if any member can reach another member through
@@ -926,6 +927,16 @@ the final call graph while holding the would-be lock (v1 approximation: any call
 between two access-containing functions ⇒ fail with the path as witness; refine to
 lock-scope granularity only if the counter says it matters). Granularity advice from
 D2b groups. Dynamic audit: lock-cycle detection under the program's test suite.
+
+The implementation treats the path as non-empty: two distinct accessors connected by a
+path fail, as does recursion back to the same accessor, while the zero-length identity
+path does not. Coarse failures are `access-set-complete`, `signal-context-access`, and
+`violation-taint`; the reentrancy failure is `reentrant-access-path`. Certified globals
+carry the accessor set, the `final-call-graph-v1` model name, a per-global lock recipe,
+and the required dynamic lock-cycle audit. D2b groups repeat the check over the union of
+their member accessor sets and emit a typed `strategy_support.mutex` certificate. A
+certified group recipe prescribes one shared `Mutex<Struct>`; a group is blocked by an
+ineligible member or a `group-reentrant-access-path`.
 
 ## 4. Sequencing
 
