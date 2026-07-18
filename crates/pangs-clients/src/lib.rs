@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -290,6 +290,23 @@ pub fn assemble_disposition_artifacts(
                 .count()
         );
     }
+    let mutex_started = Instant::now();
+    let mutex_reachability = MutexReachability::new(analysis);
+    assemble_mutex_eligibility(analysis, &mutex_reachability, &mut globals);
+    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+        eprintln!(
+            "pangs disposition timing mutex-eligibility={}ms certified={}",
+            mutex_started.elapsed().as_millis(),
+            globals
+                .iter()
+                .filter(|global| global
+                    .facts
+                    .mutex_eligibility
+                    .as_ref()
+                    .is_some_and(Certificate::is_certified))
+                .count()
+        );
+    }
     if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
         eprintln!(
             "pangs disposition timing coupling-groups={}ms groups={} evidence-edges={}",
@@ -375,6 +392,16 @@ pub fn assemble_disposition_artifacts(
                 "failed": globals.iter().filter(|global| matches!(global.facts.atomic_eligibility, Some(Certificate::Failed { .. }))).count(),
                 "not_word_sized": globals.iter().filter(|global| !global.facts.word_sized_scalar.value).count(),
                 "access_incomplete": globals.iter().filter(|global| !global.facts.access_set_complete.value).count(),
+                "violation_tainted": globals.iter().filter(|global| global.facts.violation_taint.value).count(),
+            }),
+        );
+        report.insert(
+            "mutex_eligibility".into(),
+            serde_json::json!({
+                "certified": globals.iter().filter(|global| global.facts.mutex_eligibility.as_ref().is_some_and(Certificate::is_certified)).count(),
+                "failed": globals.iter().filter(|global| matches!(global.facts.mutex_eligibility, Some(Certificate::Failed { .. }))).count(),
+                "access_incomplete": globals.iter().filter(|global| !global.facts.access_set_complete.value).count(),
+                "signal_context_access": globals.iter().filter(|global| global.facts.signal_context_access.value).count(),
                 "violation_tainted": globals.iter().filter(|global| global.facts.violation_taint.value).count(),
             }),
         );
@@ -980,6 +1007,258 @@ fn atomic_source_materialization(global: &DispositionGlobal) -> serde_json::Valu
             "code": "declaration-source-unmapped",
             "detail": "static eligibility is certified, but the C declaration requires symbol-based source recovery",
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MutexCallStep {
+    callee: FuncId,
+    callsite: Option<pangs_api::CallsiteId>,
+}
+
+struct MutexReachability {
+    outgoing: Vec<Vec<MutexCallStep>>,
+}
+
+impl MutexReachability {
+    fn new(analysis: &Analysis) -> Self {
+        let mut outgoing = vec![Vec::new(); analysis.functions().len()];
+        for edge in analysis.call_edges() {
+            let (Caller::Func(caller), Callee::Func(callee)) = (&edge.caller, &edge.callee) else {
+                continue;
+            };
+            outgoing[caller.0 as usize].push(MutexCallStep {
+                callee: *callee,
+                callsite: edge.callsite,
+            });
+        }
+        for edges in &mut outgoing {
+            edges.sort_by_key(|edge| (edge.callee, edge.callsite));
+            edges.dedup_by_key(|edge| (edge.callee, edge.callsite));
+        }
+        Self { outgoing }
+    }
+
+    /// Find a non-empty final-call-graph path from an accessor to an accessor. A direct or
+    /// indirect recursive edge therefore fails, while the zero-length identity path does not.
+    fn accessor_path(&self, accessors: &BTreeSet<FuncId>) -> Option<Vec<(FuncId, MutexCallStep)>> {
+        for &source in accessors {
+            let mut seen = vec![false; self.outgoing.len()];
+            let mut parent = vec![None::<(FuncId, MutexCallStep)>; self.outgoing.len()];
+            let mut queue = VecDeque::new();
+            seen[source.0 as usize] = true;
+            queue.push_back(source);
+            while let Some(caller) = queue.pop_front() {
+                for &step in &self.outgoing[caller.0 as usize] {
+                    if accessors.contains(&step.callee) {
+                        let mut path = vec![(caller, step)];
+                        let mut cursor = caller;
+                        while cursor != source {
+                            let (previous, previous_step) = parent[cursor.0 as usize]
+                                .expect("BFS-discovered function must have a parent");
+                            path.push((previous, previous_step));
+                            cursor = previous;
+                        }
+                        path.reverse();
+                        return Some(path);
+                    }
+                    if !seen[step.callee.0 as usize] {
+                        seen[step.callee.0 as usize] = true;
+                        parent[step.callee.0 as usize] = Some((caller, step));
+                        queue.push_back(step.callee);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+fn assemble_mutex_eligibility(
+    analysis: &Analysis,
+    reachability: &MutexReachability,
+    globals: &mut [DispositionGlobal],
+) {
+    let mut accessors_by_global = vec![BTreeSet::new(); analysis.globals().len()];
+    let mut access_site_counts = vec![0_usize; analysis.globals().len()];
+    for site in analysis.access_sites() {
+        accessors_by_global[site.global.0 as usize].insert(site.func);
+        access_site_counts[site.global.0 as usize] += 1;
+    }
+
+    for global in globals {
+        let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) else {
+            global.facts.mutex_eligibility = Some(Certificate::Failed {
+                codes: vec!["global-not-in-analysis".into()],
+                witnesses: vec![mutex_witness(
+                    "mutex-global-not-in-analysis",
+                    Some(global.key.to_string()),
+                    None,
+                    None,
+                )],
+                recipe: None,
+                diagnostics: None,
+                extra: Extra::new(),
+            });
+            continue;
+        };
+
+        let mut codes = Vec::new();
+        let mut witnesses = Vec::new();
+        if !global.facts.access_set_complete.value {
+            codes.push("access-set-complete".into());
+            witnesses.push(
+                global
+                    .facts
+                    .access_set_complete
+                    .witness
+                    .clone()
+                    .unwrap_or_else(|| {
+                        mutex_witness(
+                            "mutex-access-set-incomplete",
+                            Some(global.key.to_string()),
+                            None,
+                            None,
+                        )
+                    }),
+            );
+        }
+        if global.facts.signal_context_access.value {
+            codes.push("signal-context-access".into());
+            witnesses.push(
+                global
+                    .facts
+                    .signal_context_access
+                    .witness
+                    .clone()
+                    .unwrap_or_else(|| {
+                        mutex_witness(
+                            "mutex-signal-context-access",
+                            Some(global.key.to_string()),
+                            None,
+                            None,
+                        )
+                    }),
+            );
+        }
+        if global.facts.violation_taint.value {
+            codes.push("violation-taint".into());
+            witnesses.push(
+                global
+                    .facts
+                    .violation_taint
+                    .witness
+                    .clone()
+                    .unwrap_or_else(|| {
+                        mutex_witness(
+                            "mutex-violation-taint",
+                            Some(global.key.to_string()),
+                            None,
+                            None,
+                        )
+                    }),
+            );
+        }
+
+        let accessors = &accessors_by_global[gid.0 as usize];
+        if codes.is_empty() {
+            if let Some(path) = reachability.accessor_path(accessors) {
+                codes.push("reentrant-access-path".into());
+                witnesses.push(mutex_path_witness(analysis, &global.key.to_string(), &path));
+            }
+        }
+
+        let accessor_functions = accessors
+            .iter()
+            .map(|func| analysis.functions()[*func].key.clone())
+            .collect::<Vec<_>>();
+        global.facts.mutex_eligibility = Some(if codes.is_empty() {
+            Certificate::Certified {
+                certificate: serde_json::json!({
+                    "accessor_functions": accessor_functions,
+                    "reentrancy": {
+                        "model": "final-call-graph-v1",
+                        "status": "no-accessor-reachable-from-accessor",
+                    },
+                    "lock_recipe": {
+                        "granularity": "per-global",
+                        "dynamic_audit": "lock-cycle-detection-required",
+                    },
+                }),
+                extra: Extra::new(),
+            }
+        } else {
+            Certificate::Failed {
+                codes,
+                witnesses,
+                recipe: None,
+                diagnostics: Some(serde_json::json!({
+                    "access_sites_observed": access_site_counts[gid.0 as usize],
+                    "accessor_functions": accessor_functions,
+                    "reentrancy_check": if global.facts.access_set_complete.value
+                        && !global.facts.signal_context_access.value
+                        && !global.facts.violation_taint.value
+                    { "performed" } else { "skipped-coarse-eligibility-failed" },
+                })),
+                extra: Extra::new(),
+            }
+        });
+    }
+}
+
+fn mutex_witness(
+    kind: &str,
+    symbol: Option<String>,
+    site: Option<Site>,
+    note: Option<String>,
+) -> Witness {
+    Witness {
+        kind: kind.into(),
+        site,
+        symbol,
+        note,
+        extra: Extra::new(),
+    }
+}
+
+fn mutex_path_witness(
+    analysis: &Analysis,
+    global: &str,
+    path: &[(FuncId, MutexCallStep)],
+) -> Witness {
+    let call_path = path
+        .iter()
+        .map(|(caller, step)| {
+            let callsite = step.callsite.map(|id| &analysis.callsites()[id]);
+            serde_json::json!({
+                "caller": analysis.functions()[*caller].key,
+                "callee": analysis.functions()[step.callee].key,
+                "callsite": callsite.map(|site| &site.key),
+                "site": callsite.and_then(|site| site.loc.as_ref()).map(|loc| serde_json::json!({
+                    "file": loc.file,
+                    "line": loc.line,
+                    "col": loc.col,
+                })),
+            })
+        })
+        .collect::<Vec<_>>();
+    let first_site = path
+        .iter()
+        .find_map(|(_, step)| step.callsite)
+        .and_then(|id| analysis.callsites()[id].loc.as_ref())
+        .map(|loc| Site {
+            file: loc.file.clone(),
+            line: loc.line,
+            col: Some(loc.col),
+            function: Some(analysis.functions()[path[0].0].key.clone()),
+            extra: Extra::new(),
+        });
+    Witness {
+        kind: "mutex-reentrant-access-path".into(),
+        site: first_site,
+        symbol: Some(global.into()),
+        note: Some("an accessor can call an accessor while holding the would-be mutex".into()),
+        extra: BTreeMap::from([("call_path".into(), serde_json::json!(call_path))]),
     }
 }
 
@@ -3074,6 +3353,103 @@ mod tests {
         assert!(witnesses
             .iter()
             .any(|witness| witness.kind == "atomic-volatile-access"));
+    }
+
+    #[test]
+    fn mutex_eligibility_rejects_call_paths_between_accessors() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        let main = pir
+            .functions
+            .iter_mut()
+            .find(|function| function.key == "main")
+            .unwrap();
+        main.body
+            .retain(|statement| matches!(statement, pangs_pir::Stmt::CallDirect { .. }));
+        main.body.insert(
+            0,
+            pangs_pir::Stmt::GlobalRef {
+                global: "g_counter".into(),
+                access: pangs_pir::Access::Ref,
+                volatile: false,
+                loc: None,
+            },
+        );
+        let driver = pir
+            .functions
+            .iter_mut()
+            .find(|function| function.key == "driver")
+            .unwrap();
+        driver.body = vec![pangs_pir::Stmt::GlobalRef {
+            global: "g_counter".into(),
+            access: pangs_pir::Access::Mod,
+            volatile: false,
+            loc: None,
+        }];
+        let target = pir
+            .functions
+            .iter_mut()
+            .find(|function| function.key == "target")
+            .unwrap();
+        target.body = vec![pangs_pir::Stmt::GlobalRef {
+            global: "isolated".into(),
+            access: pangs_pir::Access::Mod,
+            volatile: false,
+            loc: None,
+        }];
+        pir.globals.push(pangs_pir::Global {
+            key: "isolated".into(),
+            mutable: true,
+            ..pangs_pir::Global::default()
+        });
+
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+
+        let reentrant = manifest
+            .globals
+            .iter()
+            .find(|global| global.meta.llvm_name == "g_counter")
+            .unwrap();
+        let Some(Certificate::Failed {
+            codes, witnesses, ..
+        }) = &reentrant.facts.mutex_eligibility
+        else {
+            panic!("an accessor-to-accessor call path must fail mutex eligibility")
+        };
+        assert!(codes.iter().any(|code| code == "reentrant-access-path"));
+        let path = witnesses
+            .iter()
+            .find(|witness| witness.kind == "mutex-reentrant-access-path")
+            .unwrap();
+        assert_eq!(path.extra["call_path"][0]["caller"], "main");
+        assert_eq!(path.extra["call_path"][0]["callee"], "driver");
+
+        let isolated = manifest
+            .globals
+            .iter()
+            .find(|global| global.meta.llvm_name == "isolated")
+            .unwrap();
+        let Some(Certificate::Certified { certificate, .. }) = &isolated.facts.mutex_eligibility
+        else {
+            panic!("an isolated accessor should certify mutex eligibility")
+        };
+        assert_eq!(certificate["reentrancy"]["model"], "final-call-graph-v1");
+        assert_eq!(certificate["accessor_functions"], json!(["target"]));
     }
 
     #[test]
