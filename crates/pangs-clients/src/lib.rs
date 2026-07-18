@@ -273,7 +273,7 @@ pub fn assemble_disposition_artifacts(
     }
 
     let coupling_started = Instant::now();
-    let coupling_groups = assemble_coupling_groups(analysis, &mut globals);
+    let mut coupling_groups = assemble_coupling_groups(analysis, &mut globals);
     let atomic_started = Instant::now();
     assemble_atomic_eligibility(analysis, target, &mut globals);
     if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
@@ -293,6 +293,12 @@ pub fn assemble_disposition_artifacts(
     let mutex_started = Instant::now();
     let mutex_reachability = MutexReachability::new(analysis);
     assemble_mutex_eligibility(analysis, &mutex_reachability, &mut globals);
+    assemble_group_mutex_support(
+        analysis,
+        &mutex_reachability,
+        &globals,
+        &mut coupling_groups,
+    );
     if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
         eprintln!(
             "pangs disposition timing mutex-eligibility={}ms certified={}",
@@ -1202,6 +1208,101 @@ fn assemble_mutex_eligibility(
                 })),
                 extra: Extra::new(),
             }
+        });
+    }
+}
+
+fn assemble_group_mutex_support(
+    analysis: &Analysis,
+    reachability: &MutexReachability,
+    globals: &[DispositionGlobal],
+    groups: &mut [CouplingGroup],
+) {
+    let global_by_key = globals
+        .iter()
+        .map(|global| (global.key.clone(), global))
+        .collect::<BTreeMap<_, _>>();
+    let mut accessors_by_global = vec![BTreeSet::new(); analysis.globals().len()];
+    for site in analysis.access_sites() {
+        accessors_by_global[site.global.0 as usize].insert(site.func);
+    }
+
+    for group in groups {
+        let mut accessors = BTreeSet::new();
+        let mut member_failures = Vec::new();
+        for member in &group.members {
+            let Some(global) = global_by_key.get(member) else {
+                member_failures.push(mutex_witness(
+                    "mutex-group-member-missing",
+                    Some(member.to_string()),
+                    None,
+                    Some(group.id.clone()),
+                ));
+                continue;
+            };
+            if !global
+                .facts
+                .mutex_eligibility
+                .as_ref()
+                .is_some_and(Certificate::is_certified)
+            {
+                member_failures.push(mutex_witness(
+                    "mutex-group-member-ineligible",
+                    Some(member.to_string()),
+                    None,
+                    Some(group.id.clone()),
+                ));
+            }
+            if let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) {
+                accessors.extend(&accessors_by_global[gid.0 as usize]);
+            }
+        }
+
+        if !member_failures.is_empty() {
+            group.strategy_support.mutex = Some(Certificate::Failed {
+                codes: vec!["group-member-ineligible".into()],
+                witnesses: member_failures,
+                recipe: None,
+                diagnostics: Some(serde_json::json!({
+                    "lock_granularity": "shared-group",
+                    "group": group.id,
+                    "members": group.members,
+                    "reentrancy_check": "skipped-member-eligibility-failed",
+                })),
+                extra: Extra::new(),
+            });
+            continue;
+        }
+
+        group.strategy_support.mutex = Some(match reachability.accessor_path(&accessors) {
+            Some(path) => Certificate::Failed {
+                codes: vec!["group-reentrant-access-path".into()],
+                witnesses: vec![mutex_path_witness(analysis, &group.id, &path)],
+                recipe: None,
+                diagnostics: Some(serde_json::json!({
+                    "lock_granularity": "shared-group",
+                    "group": group.id,
+                    "members": group.members,
+                    "accessor_functions": accessors.iter().map(|func| analysis.functions()[*func].key.clone()).collect::<Vec<_>>(),
+                })),
+                extra: Extra::new(),
+            },
+            None => Certificate::Certified {
+                certificate: serde_json::json!({
+                    "reentrancy": {
+                        "model": "final-call-graph-v1",
+                        "status": "no-group-accessor-reachable-from-group-accessor",
+                    },
+                    "lock_recipe": {
+                        "granularity": "shared-group",
+                        "group": group.id,
+                        "members": group.members,
+                        "dynamic_audit": "lock-cycle-detection-required",
+                    },
+                    "accessor_functions": accessors.iter().map(|func| analysis.functions()[*func].key.clone()).collect::<Vec<_>>(),
+                }),
+                extra: Extra::new(),
+            },
         });
     }
 }

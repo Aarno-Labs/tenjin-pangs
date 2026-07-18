@@ -840,9 +840,11 @@ fn group_availability(
             }
             Some(_) => None,
         },
-        Strategy::Mutex if group.strategy_support.mutex.is_none() => {
-            Some(OverrideOutcome::RejectedStrategyUnavailable)
-        }
+        Strategy::Mutex => match &group.strategy_support.mutex {
+            Some(certificate) if certificate.is_certified() => None,
+            Some(_) => Some(OverrideOutcome::RejectedNoRecipe),
+            None => Some(OverrideOutcome::RejectedStrategyUnavailable),
+        },
         _ => None,
     }
 }
@@ -896,20 +898,24 @@ fn group_failures(
             }
             Some(_) => {}
         },
-        Strategy::Mutex => {
-            let certified = group
-                .strategy_support
-                .mutex
-                .as_ref()
-                .and_then(|value| value.get("status"))
-                .and_then(serde_json::Value::as_str)
-                == Some("certified");
-            if !certified {
+        Strategy::Mutex => match &group.strategy_support.mutex {
+            Some(Certificate::Certified { .. }) => {}
+            Some(Certificate::Failed { witnesses, .. }) => {
+                if let Some(member) = group.members.first() {
+                    failures.extend(witnesses.iter().cloned().map(|witness| GuardFailure {
+                        member: member.clone(),
+                        guard: "group_mutex_reentrancy".into(),
+                        witness,
+                        extra: Extra::new(),
+                    }));
+                }
+            }
+            None => {
                 if let Some(member) = group.members.first() {
                     failures.push(missing_group_failure(member, "group_mutex_reentrancy"));
                 }
             }
-        }
+        },
         _ => {}
     }
     failures.sort_by(|a, b| (a.member.clone(), &a.guard).cmp(&(b.member.clone(), &b.guard)));
@@ -1578,6 +1584,38 @@ mod tests {
             r#override: None,
             extra: Extra::new(),
         });
+    }
+
+    #[test]
+    fn failed_group_mutex_certificate_is_not_available() {
+        let mut facts = base_facts();
+        facts.written.value = true;
+        facts.mutex_eligibility = Some(certified());
+        let mut manifest = manifest_with(facts);
+        add_two_member_group(&mut manifest);
+        manifest.coupling_groups[0].strategy_support.mutex = Some(Certificate::Failed {
+            codes: vec!["group-reentrant-access-path".into()],
+            witnesses: vec![Witness {
+                kind: "mutex-reentrant-access-path".into(),
+                site: None,
+                symbol: Some("grp-test".into()),
+                note: None,
+                extra: Extra::new(),
+            }],
+            recipe: None,
+            diagnostics: None,
+            extra: Extra::new(),
+        });
+
+        assert_eq!(
+            group_availability(&manifest, 0, Strategy::Mutex),
+            Some(OverrideOutcome::RejectedNoRecipe)
+        );
+        let failures = group_failures(&manifest, 0, Strategy::Mutex);
+        assert!(failures.iter().any(|failure| {
+            failure.guard == "group_mutex_reentrancy"
+                && failure.witness.kind == "mutex-reentrant-access-path"
+        }));
     }
 
     #[test]

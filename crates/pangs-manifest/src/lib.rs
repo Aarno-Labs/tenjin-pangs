@@ -577,7 +577,7 @@ pub struct CommonInterval {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroupStrategySupport {
     pub once_lock: Option<OnceLockGroupSupport>,
-    pub mutex: Option<Value>,
+    pub mutex: Option<Certificate>,
     #[serde(flatten)]
     pub extra: Extra,
 }

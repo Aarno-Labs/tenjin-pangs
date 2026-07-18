@@ -2142,7 +2142,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "6b75e72eefc77018d1e3a9aedc4fd41c457852b0b1a30ac5f2e5c7979bc7bf09"
+        "1c2b1b670ede2904fd08024de631806c03151617a4e71d8bf30f4485d8ce73d6"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(
@@ -2392,6 +2392,15 @@ fn analyze_dispose_derives_common_once_lock_group_support() {
     let group = &groups[0];
     assert_eq!(group["members"].as_array().unwrap().len(), 2);
     assert_eq!(group["strategy_support"]["once_lock"]["supported"], true);
+    assert_eq!(group["strategy_support"]["mutex"]["status"], "failed");
+    assert_eq!(
+        group["strategy_support"]["mutex"]["codes"][0],
+        "group-member-ineligible"
+    );
+    assert_eq!(
+        group["strategy_support"]["mutex"]["diagnostics"]["lock_granularity"],
+        "shared-group"
+    );
     assert!(
         group["strategy_support"]["once_lock"]["publication_function"]
             .as_str()
