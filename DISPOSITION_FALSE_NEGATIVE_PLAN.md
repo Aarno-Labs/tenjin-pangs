@@ -336,6 +336,11 @@ counts and certified counts are reported separately.
 
 ### 2026-07-17 sibling-corpus remeasurement
 
+A later 41-module rerun after making atomic eligibility strictly per-global is recorded
+in `notes/disposition_atomic_perglobal_remeasurement_2026-07-17.md`. It retains exactly
+the same 14 atomic certificates; the larger inventory totals 2,040 globals, 204
+immutable, 14 atomic, and 1,822 unhandled.
+
 The expanded sibling corpus includes the newly added `exe-pure-O0.bc`.  Excluding the
 two Vim modules and PHP, all 35 modules completed with `--dispose`.  The OpenSSL
 measurement required a larger scratch volume: it took 310.34 seconds, peaked at
