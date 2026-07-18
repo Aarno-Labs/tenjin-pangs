@@ -212,7 +212,14 @@ impl FunctionCtx {
             return self.local_key(value);
         }
         if !LLVMIsAConstantInt(value).is_null() {
-            return LLVMConstIntGetSExtValue(value).to_string();
+            let width = LLVMGetIntTypeWidth(LLVMTypeOf(value));
+            if width <= 64 {
+                return LLVMConstIntGetSExtValue(value).to_string();
+            }
+            // LLVMConstIntGetSExtValue aborts for values whose significant bits do not
+            // fit in i64. Wide integers cannot be D3 atomics on current targets, but
+            // scalar lowering must still retain them without crashing.
+            return value_string(value);
         }
         if !LLVMIsAConstantPointerNull(value).is_null() {
             return "null".to_string();
@@ -2665,14 +2672,14 @@ unsafe fn bytes_to_string(ptr: *const c_char, len: usize) -> String {
 }
 
 unsafe fn constant_i64(value: LLVMValueRef) -> Option<i64> {
-    if LLVMIsAConstantInt(value).is_null() {
+    if LLVMIsAConstantInt(value).is_null() || LLVMGetIntTypeWidth(LLVMTypeOf(value)) > 64 {
         return None;
     }
     Some(LLVMConstIntGetSExtValue(value))
 }
 
 unsafe fn constant_u64(value: LLVMValueRef) -> Option<u64> {
-    if LLVMIsAConstantInt(value).is_null() {
+    if LLVMIsAConstantInt(value).is_null() || LLVMGetIntTypeWidth(LLVMTypeOf(value)) > 64 {
         return None;
     }
     Some(LLVMConstIntGetZExtValue(value))

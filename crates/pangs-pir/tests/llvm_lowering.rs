@@ -791,6 +791,7 @@ entry:
   %sum = add i32 %a, %b
   %diff = sub i32 %a, %b
   %mask = and i32 %sum, %diff
+  %wide = add i128 170141183460469231731687303715884105727, 1
   %cmp = icmp eq i32 %sum, %diff
   %fsum = fadd float %x, %y
   %neg = fneg float %x
@@ -801,13 +802,13 @@ entry:
     .unwrap();
 
     let pir = pir_from_llvm_sys(&ll_path);
-    assert_eq!(pir.lowering.instruction_counts["add"], 1);
+    assert_eq!(pir.lowering.instruction_counts["add"], 2);
     assert_eq!(pir.lowering.instruction_counts["sub"], 1);
     assert_eq!(pir.lowering.instruction_counts["and"], 1);
     assert_eq!(pir.lowering.instruction_counts["icmp"], 1);
     assert_eq!(pir.lowering.instruction_counts["fadd"], 1);
     assert_eq!(pir.lowering.instruction_counts["fneg"], 1);
-    assert_eq!(pir.lowering.modeled_counts["scalar_add"], 1);
+    assert_eq!(pir.lowering.modeled_counts["scalar_add"], 2);
     assert_eq!(pir.lowering.modeled_counts["scalar_sub"], 1);
     assert_eq!(pir.lowering.modeled_counts["scalar_and"], 1);
     assert_eq!(
@@ -816,8 +817,12 @@ entry:
             .iter()
             .filter(|stmt| matches!(stmt, Stmt::ScalarOp { .. }))
             .count(),
-        3
+        4
     );
+    assert!(pir.functions[0].body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::ScalarOp { lhs, .. } if lhs == "i128 170141183460469231731687303715884105727"
+    )));
     assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:icmp"], 1);
     assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:fadd"], 1);
     assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:fneg"], 1);
