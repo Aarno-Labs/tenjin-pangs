@@ -148,6 +148,10 @@ pub struct Global {
     pub scalar_class: Option<ScalarTypeClass>,
     #[serde(default)]
     pub signed: Option<bool>,
+    /// The definition's typed LLVM constant initializer (for example, `i32 0`).
+    /// Declarations have no initializer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initializer_ir: Option<String>,
     /// Names of other global values (functions and global variables) referenced by this
     /// global's constant initializer, walked recursively through struct/array/expr
     /// constants. Mirrors cclyzer's `global_initializer_references` (constant-init.dl) and
@@ -173,6 +177,7 @@ impl Default for Global {
             path_error: None,
             scalar_class: None,
             signed: None,
+            initializer_ir: None,
             init_refs: Vec::new(),
         }
     }

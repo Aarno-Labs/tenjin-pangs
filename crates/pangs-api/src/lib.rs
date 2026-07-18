@@ -132,6 +132,9 @@ pub struct GlobalInfo {
     pub path_error: Option<String>,
     pub scalar_class: Option<ScalarTypeClass>,
     pub signed: Option<bool>,
+    /// Retained for in-process disposition recipes; not part of ordinary analysis JSON.
+    #[serde(skip)]
+    pub initializer_ir: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -803,6 +806,7 @@ impl Analysis {
                 path_error: global.path_error.clone(),
                 scalar_class: global.scalar_class,
                 signed: global.signed,
+                initializer_ir: global.initializer_ir.clone(),
             });
         }
 

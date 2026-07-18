@@ -173,6 +173,7 @@ fn lowers_llvm14_bitcode_function_pointer_smoke() {
     assert_eq!(counter.type_spelling.as_deref(), Some("int"));
     assert_eq!(counter.scalar_class, Some(ScalarTypeClass::Integer));
     assert_eq!(counter.signed, Some(true));
+    assert_eq!(counter.initializer_ir.as_deref(), Some("i32 0"));
     assert!(counter
         .file
         .as_deref()

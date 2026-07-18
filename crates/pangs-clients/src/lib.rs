@@ -927,6 +927,10 @@ fn assemble_atomic_eligibility(
                     "line": global.meta.line,
                     "type_spelling": global.meta.type_spelling,
                     "size_bits": global.facts.word_sized_scalar.size_bits,
+                    "align_bits": global.meta.align_bits,
+                    "scalar_class": global.facts.word_sized_scalar.class,
+                    "signed": global.facts.word_sized_scalar.signed,
+                    "initializer_ir": analysis.globals()[gid].initializer_ir,
                     "linkage": global.meta.linkage,
                 },
                 "accesses": access_recipe.unwrap_or_default(),
@@ -2911,6 +2915,7 @@ mod tests {
         pir.globals[0].align_bits = Some(32);
         pir.globals[0].scalar_class = Some(pangs_pir::ScalarTypeClass::Integer);
         pir.globals[0].signed = Some(true);
+        pir.globals[0].initializer_ir = Some("i32 0".into());
         let loc = Some(pangs_pir::Loc {
             file: "fixtures/synthetic/trivial/trivial.c".into(),
             line: 4,
@@ -2985,6 +2990,16 @@ mod tests {
         );
         assert_eq!(certificate["recipe"]["accesses"][0]["operand"], "1");
         assert!(certificate["recipe"]["declaration"]["file"].is_null());
+        assert_eq!(
+            certificate["recipe"]["declaration"]["initializer_ir"],
+            "i32 0"
+        );
+        assert_eq!(certificate["recipe"]["declaration"]["align_bits"], 32);
+        assert_eq!(
+            certificate["recipe"]["declaration"]["scalar_class"],
+            "integer"
+        );
+        assert_eq!(certificate["recipe"]["declaration"]["signed"], true);
     }
 
     #[test]
@@ -2996,6 +3011,7 @@ mod tests {
         pir.globals[0].align_bits = Some(32);
         pir.globals[0].scalar_class = Some(pangs_pir::ScalarTypeClass::Integer);
         pir.globals[0].signed = Some(true);
+        pir.globals[0].initializer_ir = Some("i32 0".into());
         pir.functions[0].body.insert(
             0,
             pangs_pir::Stmt::GlobalRef {
@@ -3049,6 +3065,7 @@ mod tests {
         pir.globals[0].align_bits = Some(32);
         pir.globals[0].scalar_class = Some(pangs_pir::ScalarTypeClass::Integer);
         pir.globals[0].signed = Some(true);
+        pir.globals[0].initializer_ir = Some("i32 0".into());
         pir.functions[0].body.insert(
             0,
             pangs_pir::Stmt::GlobalRef {

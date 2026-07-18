@@ -329,6 +329,10 @@ unsafe fn lower_module(module: LLVMModuleRef, repo_roots: Option<&RepoRoots>) ->
                 path_error: debug.as_ref().and_then(|debug| debug.path_error.clone()),
                 scalar_class: debug.as_ref().and_then(|debug| debug.scalar_class),
                 signed: debug.as_ref().and_then(|debug| debug.signed),
+                initializer_ir: {
+                    let initializer = LLVMGetInitializer(*global);
+                    (!initializer.is_null()).then(|| value_string(initializer))
+                },
                 init_refs: collect_global_init_refs(*global),
             }
         })
