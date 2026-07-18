@@ -946,6 +946,7 @@ fn assemble_atomic_eligibility(
             Certificate::Certified {
                 certificate: serde_json::json!({
                     "recipe": recipe.expect("a certified atomic must have a complete recipe"),
+                    "source_materialization": atomic_source_materialization(global),
                     "signal_lock_free": {
                         "required": global.facts.signal_context_access.value,
                         "width": width,
@@ -965,6 +966,20 @@ fn assemble_atomic_eligibility(
                 extra: Extra::new(),
             }
         });
+    }
+}
+
+fn atomic_source_materialization(global: &DispositionGlobal) -> serde_json::Value {
+    if global.meta.file.is_some() && global.meta.line.is_some() {
+        serde_json::json!({
+            "status": "source-mapped",
+        })
+    } else {
+        serde_json::json!({
+            "status": "blocked",
+            "code": "declaration-source-unmapped",
+            "detail": "static eligibility is certified, but the C declaration requires symbol-based source recovery",
+        })
     }
 }
 
@@ -3000,6 +3015,11 @@ mod tests {
             "integer"
         );
         assert_eq!(certificate["recipe"]["declaration"]["signed"], true);
+        assert_eq!(certificate["source_materialization"]["status"], "blocked");
+        assert_eq!(
+            certificate["source_materialization"]["code"],
+            "declaration-source-unmapped"
+        );
     }
 
     #[test]
