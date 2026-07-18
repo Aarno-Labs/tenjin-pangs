@@ -1026,24 +1026,64 @@ fn atomic_access_recipe(
                     && candidate.func == site.func
                     && candidate.access == pangs_pir::Access::Mod
                     && candidate.via == pangs_api::Via::Direct
-                    && candidate.loc == site.loc
-                    && candidate
-                        .statement_index
-                        .zip(site.statement_index)
-                        .is_some_and(|(candidate_index, site_index)| {
-                            candidate_index > site_index && candidate_index - site_index <= 2
-                        })
+                    && candidate.atomic_rmw.as_ref().is_some_and(|rmw| {
+                        Some(rmw.reference_statement_index) == site.statement_index
+                    })
             });
             if let Some(other) = pair {
                 consumed[other] = true;
+                let rmw = ordered[other]
+                    .atomic_rmw
+                    .as_ref()
+                    .expect("an exact RMW pair carries operation evidence");
                 entries.push(serde_json::json!({
-                    "operation": "rmw-source-expression",
+                    "operation": atomic_rmw_operation(rmw.op),
+                    "operand": rmw.operand,
                     "function": function.key,
                     "site": manifest_site,
-                    "statement_indices": [site.statement_index, ordered[other].statement_index],
+                    "statement_indices": [
+                        site.statement_index,
+                        rmw.operation_statement_index,
+                        ordered[other].statement_index
+                    ],
                 }));
                 continue;
             }
+        }
+
+        if site.atomic_rmw.is_some() {
+            failures.push((
+                "rmw-shape-unresolved".into(),
+                atomic_witness(
+                    "atomic-rmw-shape-unresolved",
+                    Some(function.key.clone()),
+                    manifest_site,
+                    Some("recognized scalar update has no matching direct global load".into()),
+                ),
+            ));
+            continue;
+        }
+
+        let shares_source_expression_with_opposite_access = ordered.iter().any(|candidate| {
+            candidate.func == site.func
+                && candidate.loc == site.loc
+                && candidate.access != site.access
+                && candidate.atomic_rmw.is_none()
+        });
+        if shares_source_expression_with_opposite_access {
+            failures.push((
+                "rmw-shape-unclassified".into(),
+                atomic_witness(
+                    "atomic-rmw-shape-unclassified",
+                    Some(function.key.clone()),
+                    manifest_site,
+                    Some(
+                        "same-expression load/store lacks a proven supported scalar operation"
+                            .into(),
+                    ),
+                ),
+            ));
+            continue;
         }
 
         entries.push(serde_json::json!({
@@ -1058,6 +1098,16 @@ fn atomic_access_recipe(
         (Some(entries), failures)
     } else {
         (None, failures)
+    }
+}
+
+fn atomic_rmw_operation(op: pangs_pir::ScalarOp) -> &'static str {
+    match op {
+        pangs_pir::ScalarOp::Add => "fetch_add",
+        pangs_pir::ScalarOp::Sub => "fetch_sub",
+        pangs_pir::ScalarOp::And => "fetch_and",
+        pangs_pir::ScalarOp::Or => "fetch_or",
+        pangs_pir::ScalarOp::Xor => "fetch_xor",
     }
 }
 
@@ -2861,20 +2911,46 @@ mod tests {
         pir.globals[0].align_bits = Some(32);
         pir.globals[0].scalar_class = Some(pangs_pir::ScalarTypeClass::Integer);
         pir.globals[0].signed = Some(true);
-        pir.functions[0].body.insert(
-            0,
-            pangs_pir::Stmt::GlobalRef {
-                global: "g_counter".into(),
-                access: pangs_pir::Access::Ref,
-                volatile: false,
-                loc: Some(pangs_pir::Loc {
-                    file: "fixtures/synthetic/trivial/trivial.c".into(),
-                    line: 4,
-                    col: 3,
-                    dir: None,
-                    filename: None,
-                }),
-            },
+        let loc = Some(pangs_pir::Loc {
+            file: "fixtures/synthetic/trivial/trivial.c".into(),
+            line: 4,
+            col: 3,
+            dir: None,
+            filename: None,
+        });
+        pir.functions[0].body.splice(
+            0..1,
+            [
+                pangs_pir::Stmt::Load {
+                    dest: "%old".into(),
+                    address: "@g_counter".into(),
+                    loc: loc.clone(),
+                },
+                pangs_pir::Stmt::GlobalRef {
+                    global: "g_counter".into(),
+                    access: pangs_pir::Access::Ref,
+                    volatile: false,
+                    loc: loc.clone(),
+                },
+                pangs_pir::Stmt::ScalarOp {
+                    dest: "%new".into(),
+                    op: pangs_pir::ScalarOp::Add,
+                    lhs: "%old".into(),
+                    rhs: "1".into(),
+                    loc: loc.clone(),
+                },
+                pangs_pir::Stmt::Store {
+                    address: "@g_counter".into(),
+                    value: "%new".into(),
+                    loc: loc.clone(),
+                },
+                pangs_pir::Stmt::GlobalRef {
+                    global: "g_counter".into(),
+                    access: pangs_pir::Access::Mod,
+                    volatile: false,
+                    loc,
+                },
+            ],
         );
         let opts = Opts::default();
         let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
@@ -2905,8 +2981,9 @@ mod tests {
         };
         assert_eq!(
             certificate["recipe"]["accesses"][0]["operation"],
-            "rmw-source-expression"
+            "fetch_add"
         );
+        assert_eq!(certificate["recipe"]["accesses"][0]["operand"], "1");
         assert!(certificate["recipe"]["declaration"]["file"].is_null());
     }
 
@@ -2961,6 +3038,54 @@ mod tests {
         assert!(witnesses
             .iter()
             .any(|witness| witness.kind == "atomic-volatile-access"));
+    }
+
+    #[test]
+    fn nearby_load_store_without_scalar_dataflow_is_not_an_rmw() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        pir.globals[0].type_spelling = Some("int".into());
+        pir.globals[0].size_bits = Some(32);
+        pir.globals[0].align_bits = Some(32);
+        pir.globals[0].scalar_class = Some(pangs_pir::ScalarTypeClass::Integer);
+        pir.globals[0].signed = Some(true);
+        pir.functions[0].body.insert(
+            0,
+            pangs_pir::Stmt::GlobalRef {
+                global: "g_counter".into(),
+                access: pangs_pir::Access::Ref,
+                volatile: false,
+                loc: Some(pangs_pir::Loc {
+                    file: "fixtures/synthetic/trivial/trivial.c".into(),
+                    line: 4,
+                    col: 3,
+                    dir: None,
+                    filename: None,
+                }),
+            },
+        );
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+
+        let Some(Certificate::Failed { codes, .. }) = &manifest.globals[0].facts.atomic_eligibility
+        else {
+            panic!("proximity alone must not certify an RMW")
+        };
+        assert!(codes.iter().any(|code| code == "rmw-shape-unclassified"));
     }
 
     #[test]

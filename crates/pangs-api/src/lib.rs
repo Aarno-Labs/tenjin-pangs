@@ -5,7 +5,9 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use pangs_pag::{BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts};
-use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, ScalarTypeClass, Stmt, SymbolLinkage};
+use pangs_pir::{
+    fsa_compatible, Access, LoweringStats, Pir, ScalarOp, ScalarTypeClass, Stmt, SymbolLinkage,
+};
 use pangs_solve::{
     debug_assert_narrows, solve_andersen_with_overrides,
     solve_andersen_with_overrides_and_target_points_to, solve_steensgaard,
@@ -246,8 +248,17 @@ pub struct AccessSite {
     pub access: Access,
     pub via: Via,
     pub volatile: bool,
+    pub atomic_rmw: Option<AtomicRmwAccess>,
     pub loc: Option<LocInfo>,
     pub statement_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AtomicRmwAccess {
+    pub op: ScalarOp,
+    pub operand: String,
+    pub reference_statement_index: u32,
+    pub operation_statement_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1002,6 +1013,9 @@ impl Analysis {
                                 access: *access,
                                 via: Via::Direct,
                                 volatile: *volatile,
+                                atomic_rmw: (*access == Access::Mod)
+                                    .then(|| direct_atomic_rmw(&func.body, stmt_idx, global))
+                                    .flatten(),
                                 loc: loc.as_ref().map(loc_info),
                                 statement_index: Some(stmt_idx as u32),
                             });
@@ -2506,6 +2520,96 @@ fn is_ignored_client_global(key: &str) -> bool {
 
 fn signature_text(sig: &pangs_pir::Signature) -> String {
     format!("{:?}({:?})", sig.ret, sig.params)
+}
+
+fn direct_atomic_rmw(body: &[Stmt], mod_ref_index: usize, global: &str) -> Option<AtomicRmwAccess> {
+    let store_index = mod_ref_index.checked_sub(1)?;
+    let Stmt::Store {
+        address,
+        value,
+        loc: store_loc,
+    } = &body[store_index]
+    else {
+        return None;
+    };
+    if !same_global_address(address, global) {
+        return None;
+    }
+    let operation_index = store_index.checked_sub(1)?;
+    let Stmt::ScalarOp {
+        dest,
+        op,
+        lhs,
+        rhs,
+        loc: operation_loc,
+    } = &body[operation_index]
+    else {
+        return None;
+    };
+    if dest != value || operation_loc != store_loc {
+        return None;
+    }
+
+    let (loaded, operand) = match op {
+        ScalarOp::Sub => (lhs, rhs),
+        ScalarOp::Add | ScalarOp::And | ScalarOp::Or | ScalarOp::Xor => {
+            if scalar_value_is_direct_global_load(body, operation_index, lhs, global, store_loc) {
+                (lhs, rhs)
+            } else {
+                (rhs, lhs)
+            }
+        }
+    };
+    let reference_index =
+        direct_global_load_reference(body, operation_index, loaded, global, store_loc)?;
+    Some(AtomicRmwAccess {
+        op: *op,
+        operand: operand.clone(),
+        reference_statement_index: reference_index as u32,
+        operation_statement_index: operation_index as u32,
+    })
+}
+
+fn scalar_value_is_direct_global_load(
+    body: &[Stmt],
+    before: usize,
+    value: &str,
+    global: &str,
+    loc: &Option<pangs_pir::Loc>,
+) -> bool {
+    direct_global_load_reference(body, before, value, global, loc).is_some()
+}
+
+fn direct_global_load_reference(
+    body: &[Stmt],
+    before: usize,
+    value: &str,
+    global: &str,
+    loc: &Option<pangs_pir::Loc>,
+) -> Option<usize> {
+    let load_index = (0..before).rev().find(|&index| {
+        matches!(
+            &body[index],
+            Stmt::Load { dest, address, loc: load_loc }
+                if dest == value && same_global_address(address, global) && load_loc == loc
+        )
+    })?;
+    let reference_index = (load_index + 1..before).find(|&index| {
+        matches!(
+            &body[index],
+            Stmt::GlobalRef {
+                global: reference_global,
+                access: Access::Ref,
+                loc: reference_loc,
+                ..
+            } if reference_global == global && reference_loc == loc
+        )
+    })?;
+    Some(reference_index)
+}
+
+fn same_global_address(address: &str, global: &str) -> bool {
+    address.strip_prefix('@').unwrap_or(address) == global.strip_prefix('@').unwrap_or(global)
 }
 
 fn loc_info(loc: &pangs_pir::Loc) -> LocInfo {
@@ -4515,6 +4619,7 @@ fn push_pointer_modrefs_from_pag(
                         access: pointer_access.access,
                         via: Via::Aliased,
                         volatile: false,
+                        atomic_rmw: None,
                         loc: site_loc.clone(),
                         statement_index: None,
                     });
@@ -4564,6 +4669,7 @@ fn push_pointer_modrefs_from_pag(
                         Via::Aliased
                     },
                     volatile: false,
+                    atomic_rmw: None,
                     loc: site_loc.clone(),
                     statement_index: None,
                 });
@@ -4690,6 +4796,7 @@ fn push_pointer_memcpy_constexpr_modrefs_from_pir(
                     access,
                     via: Via::Aliased,
                     volatile: false,
+                    atomic_rmw: None,
                     loc: loc.as_ref().map(loc_info),
                     statement_index: Some(statement_index as u32),
                 });
@@ -4732,6 +4839,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     access: Access::Mod,
                     via: Via::Aliased,
                     volatile: false,
+                    atomic_rmw: None,
                     loc: loc.as_ref().map(loc_info),
                     statement_index: Some(statement_index as u32),
                 });
@@ -4753,6 +4861,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     access: Access::Mod,
                     via: Via::Aliased,
                     volatile: false,
+                    atomic_rmw: None,
                     loc: loc.as_ref().map(loc_info),
                     statement_index: Some(statement_index as u32),
                 });
@@ -4790,6 +4899,7 @@ fn push_pointer_memset_modrefs_from_pir(
                         Via::Aliased
                     },
                     volatile: false,
+                    atomic_rmw: None,
                     loc: loc.as_ref().map(loc_info),
                     statement_index: Some(statement_index as u32),
                 });

@@ -999,8 +999,8 @@ eligibility counters (§7) are emitted from D1b's fact vector from day one.
 
 From the fact vector alone, before either pass exists:
 
-- **atomic would-be count:** `word_sized_scalar ∧ access_set_complete ∧
-  singleton coupling group ∧ disposed localize/unhandled` — an overcount of what D3
+- **atomic would-be count:** `word_sized_scalar ∧ access_set_complete ∧ disposed
+  localize/unhandled` — an overcount of what D3
   could certify (no RMW-shape or address-compat check yet), which is the correct
   direction for a build/no-build gate.
 - **mutex would-be count:** `access_set_complete ∧ ¬signal_context_access ∧ disposed

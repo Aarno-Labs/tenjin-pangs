@@ -930,6 +930,29 @@ unsafe fn lower_instruction(
                 inst,
             );
         }
+        LLVMOpcode::LLVMAdd
+        | LLVMOpcode::LLVMSub
+        | LLVMOpcode::LLVMAnd
+        | LLVMOpcode::LLVMOr
+        | LLVMOpcode::LLVMXor => {
+            let op = match opcode {
+                LLVMOpcode::LLVMAdd => crate::ScalarOp::Add,
+                LLVMOpcode::LLVMSub => crate::ScalarOp::Sub,
+                LLVMOpcode::LLVMAnd => crate::ScalarOp::And,
+                LLVMOpcode::LLVMOr => crate::ScalarOp::Or,
+                LLVMOpcode::LLVMXor => crate::ScalarOp::Xor,
+                _ => unreachable!(),
+            };
+            body.push(Stmt::ScalarOp {
+                dest: fctx.local_key(inst),
+                op,
+                lhs: fctx.operand_key(LLVMGetOperand(inst, 0)),
+                rhs: fctx.operand_key(LLVMGetOperand(inst, 1)),
+                loc: loc(inst),
+            });
+            lowering.bump_modeled(format!("scalar_{}", opcode_key(opcode)));
+            bump_missing_loc(lowering, opcode_key(opcode), inst);
+        }
         LLVMOpcode::LLVMPtrToInt => {
             let source = LLVMGetOperand(inst, 0);
             body.push(Stmt::PtrToInt {

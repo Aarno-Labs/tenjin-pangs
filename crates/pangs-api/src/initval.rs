@@ -389,6 +389,7 @@ fn stmt_dest(stmt: &Stmt) -> Option<&str> {
     match stmt {
         Stmt::Alloca { dest, .. }
         | Stmt::Assign { dest, .. }
+        | Stmt::ScalarOp { dest, .. }
         | Stmt::Load { dest, .. }
         | Stmt::Gep { dest, .. }
         | Stmt::PtrToInt { dest, .. }
@@ -402,6 +403,7 @@ fn stmt_operands(stmt: &Stmt) -> Vec<&str> {
     match stmt {
         Stmt::Alloca { .. } => Vec::new(),
         Stmt::Assign { sources, .. } => sources.iter().map(String::as_str).collect(),
+        Stmt::ScalarOp { lhs, rhs, .. } => vec![lhs.as_str(), rhs.as_str()],
         Stmt::Load { address, .. } => vec![address.as_str()],
         Stmt::Store { address, value, .. } => vec![address.as_str(), value.as_str()],
         Stmt::Gep { base, .. } => vec![base.as_str()],

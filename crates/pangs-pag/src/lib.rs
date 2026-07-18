@@ -1136,7 +1136,7 @@ impl<'a> Builder<'a> {
                     );
                 }
             }
-            Stmt::GlobalRef { .. } => {}
+            Stmt::GlobalRef { .. } | Stmt::ScalarOp { .. } => {}
         }
     }
 

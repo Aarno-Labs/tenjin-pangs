@@ -195,6 +195,16 @@ pub enum ScalarTypeClass {
     Pointer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScalarOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -216,6 +226,14 @@ pub enum Stmt {
         dest: String,
         #[serde(default)]
         sources: Vec<String>,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    ScalarOp {
+        dest: String,
+        op: ScalarOp,
+        lhs: String,
+        rhs: String,
         #[serde(default)]
         loc: Option<Loc>,
     },

@@ -226,6 +226,7 @@ impl<'a> SimpleResolver<'a> {
             Stmt::Assign { sources, .. } => {
                 self.resolve_all_sources(func_index, stmt_index, sources, depth, visiting, out)
             }
+            Stmt::ScalarOp { .. } => WalkResult::Complex,
             Stmt::Gep { base, .. } => {
                 self.resolve_value(func_index, stmt_index, base, depth, visiting, out)
             }
@@ -563,6 +564,9 @@ impl<'a> SimpleResolver<'a> {
             Stmt::Assign { dest, sources, .. } if sources.iter().any(|source| source == target) => {
                 self.local_value_escapes(func_index, dest, depth, visiting)
             }
+            Stmt::ScalarOp { dest, lhs, rhs, .. } if lhs == target || rhs == target => {
+                self.local_value_escapes(func_index, dest, depth, visiting)
+            }
             Stmt::Store { address, value, .. } if value == target => !self
                 .function_place(func_index, stmt_index, address)
                 .map(|place| self.global_place_is_simple(&place))
@@ -593,6 +597,7 @@ impl<'a> SimpleResolver<'a> {
             }
             Stmt::Alloca { .. }
             | Stmt::Assign { .. }
+            | Stmt::ScalarOp { .. }
             | Stmt::Store { .. }
             | Stmt::Return { .. }
             | Stmt::GlobalRef { .. } => false,
@@ -636,6 +641,9 @@ impl<'a> SimpleResolver<'a> {
             Stmt::Assign { dest, sources, .. } if sources.iter().any(|source| source == value) => {
                 self.local_value_escapes(func_index, dest, depth, visiting)
             }
+            Stmt::ScalarOp { dest, lhs, rhs, .. } if lhs == value || rhs == value => {
+                self.local_value_escapes(func_index, dest, depth, visiting)
+            }
             Stmt::Gep { dest, base, .. } if base == value => {
                 self.local_value_escapes(func_index, dest, depth, visiting)
             }
@@ -675,6 +683,7 @@ impl<'a> SimpleResolver<'a> {
             }
             Stmt::Alloca { .. }
             | Stmt::Assign { .. }
+            | Stmt::ScalarOp { .. }
             | Stmt::Gep { .. }
             | Stmt::Return { .. }
             | Stmt::GlobalRef { .. } => false,
@@ -931,6 +940,7 @@ fn stmt_dest(stmt: &Stmt) -> Option<&str> {
     match stmt {
         Stmt::Alloca { dest, .. }
         | Stmt::Assign { dest, .. }
+        | Stmt::ScalarOp { dest, .. }
         | Stmt::Load { dest, .. }
         | Stmt::Gep { dest, .. }
         | Stmt::PtrToInt { dest, .. }
@@ -949,6 +959,7 @@ fn stmt_operands(stmt: &Stmt) -> Vec<&str> {
     match stmt {
         Stmt::Alloca { .. } | Stmt::GlobalRef { .. } => Vec::new(),
         Stmt::Assign { sources, .. } => sources.iter().map(String::as_str).collect(),
+        Stmt::ScalarOp { lhs, rhs, .. } => vec![lhs.as_str(), rhs.as_str()],
         Stmt::Load { address, .. } => vec![address.as_str()],
         Stmt::Store { address, value, .. } => vec![address.as_str(), value.as_str()],
         Stmt::Gep { base, .. } => vec![base.as_str()],
@@ -978,6 +989,7 @@ fn function_symbol_value_operands(stmt: &Stmt) -> Vec<&str> {
     match stmt {
         Stmt::Alloca { .. } | Stmt::GlobalRef { .. } => Vec::new(),
         Stmt::Assign { sources, .. } => sources.iter().map(String::as_str).collect(),
+        Stmt::ScalarOp { lhs, rhs, .. } => vec![lhs.as_str(), rhs.as_str()],
         Stmt::Load { address, .. } => vec![address.as_str()],
         Stmt::Store { address, value, .. } => vec![address.as_str(), value.as_str()],
         Stmt::Gep { base, .. } => vec![base.as_str()],
@@ -1011,6 +1023,7 @@ where
 {
     match stmt {
         Stmt::Assign { .. } => false,
+        Stmt::ScalarOp { dest, lhs, rhs, .. } => dest == target || lhs == target || rhs == target,
         Stmt::Store { address, value, .. } if value == target => {
             !global_is_safe_slot(address.as_str())
         }

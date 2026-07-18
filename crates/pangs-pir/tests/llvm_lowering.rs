@@ -779,7 +779,7 @@ entry:
 }
 
 #[test]
-fn llvm_sys_names_unmodeled_arithmetic_opcodes() {
+fn llvm_sys_models_supported_scalar_ops_and_names_the_rest() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("arith.ll");
     fs::write(
@@ -806,9 +806,17 @@ entry:
     assert_eq!(pir.lowering.instruction_counts["icmp"], 1);
     assert_eq!(pir.lowering.instruction_counts["fadd"], 1);
     assert_eq!(pir.lowering.instruction_counts["fneg"], 1);
-    assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:add"], 1);
-    assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:sub"], 1);
-    assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:and"], 1);
+    assert_eq!(pir.lowering.modeled_counts["scalar_add"], 1);
+    assert_eq!(pir.lowering.modeled_counts["scalar_sub"], 1);
+    assert_eq!(pir.lowering.modeled_counts["scalar_and"], 1);
+    assert_eq!(
+        pir.functions[0]
+            .body
+            .iter()
+            .filter(|stmt| matches!(stmt, Stmt::ScalarOp { .. }))
+            .count(),
+        3
+    );
     assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:icmp"], 1);
     assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:fadd"], 1);
     assert_eq!(pir.lowering.skipped_counts["unmodeled_instruction:fneg"], 1);

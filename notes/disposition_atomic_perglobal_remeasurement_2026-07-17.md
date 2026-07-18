@@ -106,3 +106,13 @@ not yet sufficient as a self-contained production materialization recipe:
 The next highest-value atomic work is to close items 1, 2, and 4 in the certificate
 contract, then decide whether source-less declarations are intentionally materialized
 through symbol recovery or remain analysis-only certificates.
+
+### Roadmap follow-up
+
+The subsequent D3 hardening carries volatile provenance through `AccessSite` and
+rejects it, closing item 4. It also replaces proximity-based `rmw-source-expression`
+pairing with proven scalar data flow. Current recipes name `fetch_add`, `fetch_sub`,
+`fetch_and`, `fetch_or`, or `fetch_xor`, include the exact IR operand, and identify the
+load, operation, and store statement indices. The same 14 corpus certificates survive;
+their 20 updates classify exactly, including JPEGoptim's `worker_count--` as
+`fetch_add` with operand `-1` in the optimized IR. Items 2, 3, and 5 remain.
