@@ -981,6 +981,18 @@ fn atomic_access_recipe(
         let site = ordered[index];
         let function = &analysis.functions()[site.func];
         let manifest_site = atomic_access_site(analysis, site);
+        if site.volatile {
+            failures.push((
+                "volatile-access".into(),
+                atomic_witness(
+                    "atomic-volatile-access",
+                    Some(function.key.clone()),
+                    manifest_site,
+                    Some("volatile C access cannot be replaced by an ordinary Rust atomic".into()),
+                ),
+            ));
+            continue;
+        }
         if site.via != pangs_api::Via::Direct {
             failures.push((
                 "address-access-not-lowerable".into(),
@@ -2854,6 +2866,7 @@ mod tests {
             pangs_pir::Stmt::GlobalRef {
                 global: "g_counter".into(),
                 access: pangs_pir::Access::Ref,
+                volatile: false,
                 loc: Some(pangs_pir::Loc {
                     file: "fixtures/synthetic/trivial/trivial.c".into(),
                     line: 4,
@@ -2895,6 +2908,59 @@ mod tests {
             "rmw-source-expression"
         );
         assert!(certificate["recipe"]["declaration"]["file"].is_null());
+    }
+
+    #[test]
+    fn volatile_global_access_blocks_atomic_eligibility() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        pir.globals[0].type_spelling = Some("int".into());
+        pir.globals[0].size_bits = Some(32);
+        pir.globals[0].align_bits = Some(32);
+        pir.globals[0].scalar_class = Some(pangs_pir::ScalarTypeClass::Integer);
+        pir.globals[0].signed = Some(true);
+        pir.functions[0].body.insert(
+            0,
+            pangs_pir::Stmt::GlobalRef {
+                global: "g_counter".into(),
+                access: pangs_pir::Access::Ref,
+                volatile: true,
+                loc: Some(pangs_pir::Loc {
+                    file: "fixtures/synthetic/trivial/trivial.c".into(),
+                    line: 4,
+                    col: 3,
+                    dir: None,
+                    filename: None,
+                }),
+            },
+        );
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+
+        let Some(Certificate::Failed {
+            codes, witnesses, ..
+        }) = &manifest.globals[0].facts.atomic_eligibility
+        else {
+            panic!("volatile access must fail atomic eligibility")
+        };
+        assert!(codes.iter().any(|code| code == "volatile-access"));
+        assert!(witnesses
+            .iter()
+            .any(|witness| witness.kind == "atomic-volatile-access"));
     }
 
     #[test]
@@ -2993,6 +3059,7 @@ mod tests {
                 pangs_pir::Stmt::GlobalRef {
                     global: "@AuditedGlobal".into(),
                     access: pangs_pir::Access::Ref,
+                    volatile: false,
                     loc: None,
                 },
             );
@@ -3057,6 +3124,7 @@ mod tests {
             pangs_pir::Stmt::GlobalRef {
                 global: "@AuditedGlobal".into(),
                 access: pangs_pir::Access::Ref,
+                volatile: false,
                 loc: None,
             },
         );

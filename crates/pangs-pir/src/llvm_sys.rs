@@ -863,6 +863,7 @@ unsafe fn lower_instruction(
                 body.push(Stmt::GlobalRef {
                     global,
                     access: Access::Ref,
+                    volatile: LLVMGetVolatile(inst) != 0,
                     loc: loc(inst),
                 });
                 lowering.bump_modeled("global_ref");
@@ -888,6 +889,7 @@ unsafe fn lower_instruction(
                 body.push(Stmt::GlobalRef {
                     global,
                     access: Access::Mod,
+                    volatile: LLVMGetVolatile(inst) != 0,
                     loc: loc(inst),
                 });
                 lowering.bump_modeled("global_mod");
@@ -1537,6 +1539,7 @@ unsafe fn lower_global_initializers(
         body.push(Stmt::GlobalRef {
             global: key.clone(),
             access: Access::Mod,
+            volatile: false,
             loc: None,
         });
         lowering.bump_modeled("global_init_mod");
@@ -1628,6 +1631,7 @@ unsafe fn lower_global_initializer_value(
             body.push(Stmt::GlobalRef {
                 global,
                 access: Access::Ref,
+                volatile: false,
                 loc: None,
             });
             lowering.bump_modeled("global_init_ref");

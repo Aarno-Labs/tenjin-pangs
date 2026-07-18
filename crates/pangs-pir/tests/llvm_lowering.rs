@@ -423,6 +423,28 @@ fn lowers_volatile_and_atomic_global_accesses_from_ll() {
     assert_eq!(pir.lowering.modeled_counts["atomic_load"], 1);
     assert_eq!(pir.lowering.modeled_counts["global_mod"], 2);
     assert_eq!(pir.lowering.modeled_counts["global_ref"], 2);
+    assert_eq!(
+        touch
+            .body
+            .iter()
+            .filter(|stmt| matches!(stmt, Stmt::GlobalRef { volatile: true, .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        touch
+            .body
+            .iter()
+            .filter(|stmt| matches!(
+                stmt,
+                Stmt::GlobalRef {
+                    volatile: false,
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
 }
 
 #[test]

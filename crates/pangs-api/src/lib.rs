@@ -245,6 +245,7 @@ pub struct AccessSite {
     pub global: GlobalId,
     pub access: Access,
     pub via: Via,
+    pub volatile: bool,
     pub loc: Option<LocInfo>,
     pub statement_index: Option<u32>,
 }
@@ -991,6 +992,7 @@ impl Analysis {
                     Stmt::GlobalRef {
                         global,
                         access,
+                        volatile,
                         loc,
                     } => {
                         if let Some(&gid) = global_lookup.get(global) {
@@ -999,6 +1001,7 @@ impl Analysis {
                                 global: gid,
                                 access: *access,
                                 via: Via::Direct,
+                                volatile: *volatile,
                                 loc: loc.as_ref().map(loc_info),
                                 statement_index: Some(stmt_idx as u32),
                             });
@@ -4511,6 +4514,7 @@ fn push_pointer_modrefs_from_pag(
                         global: gid,
                         access: pointer_access.access,
                         via: Via::Aliased,
+                        volatile: false,
                         loc: site_loc.clone(),
                         statement_index: None,
                     });
@@ -4559,6 +4563,7 @@ fn push_pointer_modrefs_from_pag(
                     } else {
                         Via::Aliased
                     },
+                    volatile: false,
                     loc: site_loc.clone(),
                     statement_index: None,
                 });
@@ -4684,6 +4689,7 @@ fn push_pointer_memcpy_constexpr_modrefs_from_pir(
                     global: gid,
                     access,
                     via: Via::Aliased,
+                    volatile: false,
                     loc: loc.as_ref().map(loc_info),
                     statement_index: Some(statement_index as u32),
                 });
@@ -4725,6 +4731,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     global: gid,
                     access: Access::Mod,
                     via: Via::Aliased,
+                    volatile: false,
                     loc: loc.as_ref().map(loc_info),
                     statement_index: Some(statement_index as u32),
                 });
@@ -4745,6 +4752,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     global: gid,
                     access: Access::Mod,
                     via: Via::Aliased,
+                    volatile: false,
                     loc: loc.as_ref().map(loc_info),
                     statement_index: Some(statement_index as u32),
                 });
@@ -4781,6 +4789,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     } else {
                         Via::Aliased
                     },
+                    volatile: false,
                     loc: loc.as_ref().map(loc_info),
                     statement_index: Some(statement_index as u32),
                 });

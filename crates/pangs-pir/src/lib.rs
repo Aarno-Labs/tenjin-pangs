@@ -199,6 +199,10 @@ fn default_true() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Stmt {
@@ -302,6 +306,8 @@ pub enum Stmt {
     GlobalRef {
         global: String,
         access: Access,
+        #[serde(default, skip_serializing_if = "is_false")]
+        volatile: bool,
         #[serde(default)]
         loc: Option<Loc>,
     },

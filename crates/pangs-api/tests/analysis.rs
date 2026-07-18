@@ -723,6 +723,7 @@ fn absence_only_initval_is_stationary_without_runtime_writers() {
             body: vec![Stmt::GlobalRef {
                 global: "@G".to_string(),
                 access: Access::Ref,
+                volatile: false,
                 loc: None,
             }],
         }],
@@ -792,21 +793,25 @@ fn string_constant_like_globals_are_not_tracked_by_client_analysis() {
                 Stmt::GlobalRef {
                     global: ".str.1".to_string(),
                     access: Access::Ref,
+                    volatile: false,
                     loc: None,
                 },
                 Stmt::GlobalRef {
                     global: "__PRETTY_FUNCTION__.reader".to_string(),
                     access: Access::Ref,
+                    volatile: false,
                     loc: None,
                 },
                 Stmt::GlobalRef {
                     global: "__const.reader.table".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
                 Stmt::GlobalRef {
                     global: "@Tracked".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
             ],
@@ -1028,16 +1033,19 @@ fn direct_global_modref_marks_never_written_and_preserves_direct_witness() {
                 Stmt::GlobalRef {
                     global: "@G".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
                 Stmt::GlobalRef {
                     global: "@G".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
                 Stmt::GlobalRef {
                     global: "@G".to_string(),
                     access: Access::Ref,
+                    volatile: false,
                     loc: None,
                 },
             ],
@@ -1124,6 +1132,7 @@ fn modref_api_closes_over_direct_calls_but_export_rows_stay_local() {
                 body: vec![Stmt::GlobalRef {
                     global: "@G".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 }],
             },
@@ -1198,11 +1207,13 @@ fn transitive_modref_api_collapses_duplicate_witnesses() {
                     Stmt::GlobalRef {
                         global: "@G".to_string(),
                         access: Access::Mod,
+                        volatile: false,
                         loc: None,
                     },
                     Stmt::GlobalRef {
                         global: "@G".to_string(),
                         access: Access::Mod,
+                        volatile: false,
                         loc: None,
                     },
                 ],
@@ -1268,6 +1279,7 @@ fn modref_api_closes_over_fsa_indirect_targets() {
                 body: vec![Stmt::GlobalRef {
                     global: "@G".to_string(),
                     access: Access::Ref,
+                    volatile: false,
                     loc: None,
                 }],
             },
@@ -1337,6 +1349,7 @@ fn typed_modref_closure_preserves_split_between_local_and_transitive_rows() {
                 body: vec![Stmt::GlobalRef {
                     global: "@G".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 }],
             },
@@ -1414,6 +1427,7 @@ fn direct_external_call_taints_only_the_connected_component() {
                     Stmt::GlobalRef {
                         global: "@Gext".to_string(),
                         access: Access::Mod,
+                        volatile: false,
                         loc: None,
                     },
                     Stmt::CallDirect {
@@ -1437,6 +1451,7 @@ fn direct_external_call_taints_only_the_connected_component() {
                 body: vec![Stmt::GlobalRef {
                     global: "@Glocal".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 }],
             },
@@ -3143,6 +3158,7 @@ fn transitive_modrefs_preserve_recursive_call_closure() {
                     Stmt::GlobalRef {
                         global: "@G".to_string(),
                         access: Access::Ref,
+                        volatile: false,
                         loc: None,
                     },
                 ],

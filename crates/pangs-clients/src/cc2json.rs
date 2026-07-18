@@ -1526,6 +1526,7 @@ mod tests {
             global_init: vec![Stmt::GlobalRef {
                 global: "ReturnedBuf".to_string(),
                 access: Access::Mod,
+                volatile: false,
                 loc: None,
             }],
         };
@@ -1613,6 +1614,7 @@ mod tests {
             global_init: vec![Stmt::GlobalRef {
                 global: "ReturnedBuf".to_string(),
                 access: Access::Mod,
+                volatile: false,
                 loc: None,
             }],
         };
@@ -1715,11 +1717,13 @@ mod tests {
                 Stmt::GlobalRef {
                     global: "ReturnedBuf".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
                 Stmt::GlobalRef {
                     global: "Fmt".to_string(),
                     access: Access::Ref,
+                    volatile: false,
                     loc: None,
                 },
             ],
@@ -1765,6 +1769,7 @@ mod tests {
             global_init: vec![Stmt::GlobalRef {
                 global: "ReturnedBuf".to_string(),
                 access: Access::Mod,
+                volatile: false,
                 loc: None,
             }],
         };
@@ -1840,21 +1845,25 @@ mod tests {
                 Stmt::GlobalRef {
                     global: "ReadonlyA".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
                 Stmt::GlobalRef {
                     global: "ReadonlyB".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
                 Stmt::GlobalRef {
                     global: "Mutated".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
                 Stmt::GlobalRef {
                     global: "SubstringMutated".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
             ],
@@ -1909,11 +1918,13 @@ mod tests {
                 Stmt::GlobalRef {
                     global: "IndirectMutated".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
                 Stmt::GlobalRef {
                     global: "IndirectExprMutated".to_string(),
                     access: Access::Mod,
+                    volatile: false,
                     loc: None,
                 },
             ],
@@ -1997,6 +2008,7 @@ mod tests {
             .map(|idx| Stmt::GlobalRef {
                 global: format!("@G{idx:02}"),
                 access: Access::Mod,
+                volatile: false,
                 loc: None,
             })
             .collect();
@@ -2078,6 +2090,7 @@ mod tests {
             global_init: vec![Stmt::GlobalRef {
                 global: "Dispatch".to_string(),
                 access: Access::Mod,
+                volatile: false,
                 loc: None,
             }],
         };
