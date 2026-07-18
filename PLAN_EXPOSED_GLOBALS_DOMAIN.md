@@ -146,3 +146,6 @@ it in its current form.  A two-global net access-completeness gain, no new polic
 decision, and four lost static atomic certificates are not compelling.  The prototype
 commit was discarded; this design remains a record for a future implementation with
 a more precise fallback than whole-class Steensgaard domain joins.
+
+The bounded follow-up is specified in
+[the domain-only fallback plan](PLAN_DOMAIN_ONLY_FALLBACK.md).
