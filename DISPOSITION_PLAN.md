@@ -510,9 +510,9 @@ below is a shared record and is fixed here:
 // unkeyed_globals[] — analysis-owned diagnostics (§1.1: no key ⇒ not in globals[])
 { "llvm_name": "<raw LLVM symbol>", "witness": <Witness> }
 
-// coupling_groups[].evidence and coupling_candidates[].evidence — typed edges
-[ { "kind": "co-write" | "oncelock-interval",
-    "strength": "hard" | "suspected",
+// coupling_groups[].evidence — typed hard edges
+[ { "kind": "oncelock-interval",
+    "strength": "hard",
     "members": ["<key>", "<key>"],
     "sites": [ <Site>, ... ] } ]
 
@@ -840,25 +840,18 @@ with the same overrides is a byte-level no-op.
 
 ### D2b — shared coupling post-pass (~200 lines, phase F)
 
-Evidence is divided by the strength of the semantic claim:
-
-1. **Suspected co-write evidence:** two globals directly written by the same function.
-   This is retained for measurement and D3, but is not a policy group.
-2. **Hard ONCELOCK evidence** (for certified globals): publication-interval overlap ∧
+The component consumes **hard ONCELOCK evidence** (for certified globals):
+publication-interval overlap ∧
    init-subtree intersection — read directly from the O1–O5 per-global certificates.
    Ownership, to be unambiguous: **D2b consumes O1–O5 output; O6 consumes D2b's
    group ids** (for reports and the manifest hand-off). O6 exports nothing that D2b
    needs.
 
-Run separate union-find instances by strength. Emit hard components as
-`coupling_groups` with `grp-` IDs; only these populate `facts.coupling_group` and
-constrain policy. Emit suspected components as `coupling_candidates` with disjoint
-`cand-` IDs. Co-writes from one function use a star rooted at the smallest member;
-both evidence classes retain only successful union edges. Evidence records carry an
-explicit `strength`, and manifest validation rejects suspected evidence in a hard
-group or hard evidence in a candidate component. This preserves identical
-connectivity without a quadratic manifest while preventing weak correlation from
-becoming a hard semantic blocker.
+Emit hard components as `coupling_groups` with `grp-` IDs; these populate
+`facts.coupling_group` and constrain joint strategies. Evidence records carry an
+explicit hard strength. Same-function co-writes are not collected because they do not
+constrain per-global atomic rewriting under defined-behavior preservation. The
+`coupling_candidates` manifest field remains empty for schema compatibility.
 
 **Group strategy-support derivation (analysis-owned; closes the common-P gap).** D2b
 also computes, per group, the group-specific certificates `DISPOSITION.md` §6 step 1
@@ -882,7 +875,9 @@ assembly (attaches `coupling_group` ids and emits `coupling_groups`) →
 Policy resolution is separate from clustering: compute each member's independent
 support set, intersect those sets, apply the group-specific guards from
 `DISPOSITION.md` §6, then select the first supported configured strategy (or validate
-the group override). Never compare enum ordinals or infer support from an earlier
+the group override). If atomic is independently selected for only a subset, retain
+those per-member results and leave the group disposition unset; coupling cannot demote
+an eligible atomic. Never compare enum ordinals or infer support from an earlier
 certificate. Joint `once-lock`/`mutex` materialization failure demotes the whole group;
 `immutable`/`localize` materialization failure may demote only the affected member.
 
@@ -890,7 +885,7 @@ certificate. Joint `once-lock`/`mutex` materialization failure demotes the whole
 written by one utility function — expected to over-group in v1, test
 documents this as intended); determinism of ids under member reordering; a
 group-resolution matrix covering empty/non-empty support intersections, reordered
-cascades, missing common OnceLock publication, multi-member atomic rejection, group
+cascades, missing common OnceLock publication, multi-member per-global atomic support, group
 pins with and without `accept_risk`, and conflicting member pins. The mock materializer
 also verifies whole-group demotion for a failed joint `once-lock`/`mutex` rewrite and
 member-only demotion for `immutable`/`localize`.
@@ -917,14 +912,11 @@ Certificate requires **all** of: `word_sized_scalar`; `access_set_complete`; eve
 access site classifiable as load, store, or a recognized RMW shape (`g++`, `g += k`,
 `g = g op k` — classified on IR, emitted per-site so the rewriter knows
 `load(Relaxed)` vs `fetch_add`); no address-taken use incompatible with retyping
-(`&g` never flows beyond directly-lowered access — reuse the pts scan); no hard
-multi-member coupling group; and a structured resolution for every incident suspected
-coupling edge. Same-function co-write alone is not a veto: D3 must either establish
-independence from the access/dependency structure or fail with an unresolved-coupling
-witness. Ships **with** its co-update dynamic audit (instrument
-suspected-coupled pairs; interleaved-update window ⇒ report) — the audit is part of
-the item, not a follow-up, because atomic coupling is the one silent-corruption cell
-(`DISPOSITION.md` §7).
+(`&g` never flows beyond directly-lowered access — reuse the pts scan); and target-
+lock-free atomic support for signal-context access. Eligibility is deliberately
+per-global: existing synchronization remains in place, while unsynchronized concurrent
+plain-global access was undefined source behavior. No co-write analysis or runtime
+co-update audit is required.
 
 ### D4 — mutex eligibility (gated)
 
@@ -1027,7 +1019,7 @@ on 2026-07-16. The run produced 3,204 keyed mutable globals and no unkeyed globa
 
 | gate | candidate disposition | shape/safety input | access complete | eligible |
 |---|---:|---:|---:|---:|
-| atomic | 1,864 | 1,035 word-sized scalars; 0 singleton-group survivors | 0 | 0 |
+| atomic | 1,864 | 1,035 word-sized scalars | 0 access-complete | 0 |
 | mutex | 1,864 | 0 signal-context-safe survivors | 0 | 0 |
 
 All 3,204 access sets failed on `omega-access-path`, so Vim alone provides no case

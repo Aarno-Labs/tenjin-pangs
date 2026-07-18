@@ -320,8 +320,8 @@ diagnosis is mechanical, matching the provenance-tag philosophy of `DESIGN_lite.
 ### 2.3 Co-quiescence groups (detection moved to the shared coupling component)
 
 Coupled globals (e.g., `cmd_table` + `cmd_count`, whose readers assume mutual
-consistency) matter beyond this pass: the same co-write evidence gates atomic
-eligibility and sets mutex granularity. Detection therefore lives in the shared coupling
+consistency) matter to strategies that create a joint runtime object, particularly
+OnceLock and mutex handling. Detection therefore lives in the shared coupling
 post-pass (`DISPOSITION.md` §6, work item D2b), which uses this pass's publication
 intervals (overlap) and init subtrees (intersection) as part of its clustering evidence.
 This pass stays strictly per-global: certified members of one group should publish as

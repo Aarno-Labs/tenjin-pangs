@@ -1,14 +1,14 @@
 # Disposition False-Negative Reduction Plan
 
-Status: in progress (F1–F4 and F5 static D3 implemented 2026-07-17; sibling
-corpus remeasurement completed for all 35 non-Vim modules; runtime co-update audit
-contract specified in `PLAN_ATOMIC_CO_UPDATE_AUDIT.md`, instrumentation pending)
+Status: completed 2026-07-17 (F1–F4 and per-global F5 D3 implemented; sibling corpus
+remeasurement completed for all 35 non-Vim modules; the proposed co-update audit was
+subsequently retired under the defined-behavior preservation contract).
 
 This plan reduces conservative false negatives in three disposition inputs:
 
 1. access completeness and `omega_load` attribution;
 2. violation taint;
-3. coupling groups used by atomic eligibility.
+3. over-broad coupling groups that formerly blocked atomic eligibility.
 
 The motivating case is jpegoptim's `verbose_mode`. It is a naturally aligned 32-bit
 integer with direct loads/stores and one increment, but the current free atomic gate
@@ -31,9 +31,9 @@ from becoming hard semantic blockers.
   full.
 - An audit finding blocks a global only when it can affect that global's address,
   hide an access, or prevent classification of an access that must be rewritten.
-- Function-level co-write is suspicion, not proof of a multi-global invariant.
-- Hard coupling must have evidence strong enough to justify blocking independent
-  atomic handling.
+- Function-level co-write does not constrain per-global atomic handling.
+- Coupling constrains only strategies that create a joint runtime object or joint
+  publication.
 - Any unresolved relevance query fails closed and records why.
 - Existing source-qualified and bare global keys are unaffected.
 
@@ -46,7 +46,7 @@ The three questions must be represented separately:
 | Can analysis bound every possible accessor of this global? | fact assembly | `access_set_complete` |
 | Can every bounded access be rewritten with the requested strategy? | D3/D4 eligibility pass | strategy certificate |
 | Can a known analysis violation invalidate either conclusion? | violation relevance routing, then D3/D4 | relevant violation witness |
-| Is independent treatment unsafe because of a multi-global invariant? | coupling pass, then D3/D4 | hard group or independence certificate |
+| Does a joint strategy need a multi-global runtime object? | coupling pass, then OnceLock/D4 | hard group and joint-strategy certificate |
 
 `access_set_complete` therefore answers a boundedness question. It does not promise
 that every bounded indirect access already has an atomic rewrite recipe.
@@ -249,9 +249,9 @@ continues to veto twice and the fact remains semantically misleading.
 - `my_output_message` no longer hard-taints `verbose_mode` solely because of its
   `fprintf` finding.
 
-## 5. Coupling: distinguish hard invariants from weak suspicion
+## 5. Coupling: keep it out of per-global atomic eligibility
 
-### 5.1 Current problem
+### 5.1 Original problem
 
 The coupling pass joins every global directly written by the same function. A large
 option parser therefore creates a star, and union-find transitively turns weak
@@ -262,67 +262,22 @@ For jpegoptim, `parse_arguments` couples `verbose_mode` to `csv`, while `main`
 couples it to `average_count`; transitive union produces a 39-member group without
 evidence of a 39-variable consistency invariant.
 
-### 5.2 Split evidence strength
+### 5.2 Final rule
 
-Represent coupling evidence as:
+Same-function co-writes are not collected. They neither prove a joint invariant nor
+constrain conversion of an eligible scalar global to an atomic. D3 is strictly
+per-global and has no hard-group gate, suspected-edge discharge, or dynamic co-update
+audit.
 
-```text
-hard
-suspected
-```
+Hard `coupling_groups` remain only for strategies that create joint publication or a
+joint runtime object. The current producer derives them from compatible OnceLock
+publication intervals and shared initialization subtrees. The deprecated
+`coupling_candidates` field remains empty for manifest schema compatibility.
 
-Function-level co-write is always `suspected`. It is emitted for measurement and
-review but does not participate in hard-group union.
-
-Initial hard evidence is limited to:
-
-- writes in the same statement/basic-block region under the same control predicate,
-  with a data or publication dependency between the values;
-- a flag/payload publication pattern where readers use one member to validate or
-  select another;
-- repeated paired co-read and co-write evidence across distinct functions/regions;
-- an existing once-lock common-publication certificate;
-- an explicit reviewed coupling declaration.
-
-Do not promote an edge to hard based only on function membership, source proximity,
-or one co-write occurrence.
-
-### 5.3 Preserve both inventories
-
-Schema v3 records:
-
-- `coupling_groups`: hard groups that constrain policy;
-- `coupling_candidates`: suspected edges/components that remain visible in reports.
-
-Only hard groups feed `facts.coupling_group` and atomic's group constraint. Group IDs
-continue to derive from sorted member keys. Candidate IDs use a distinct prefix so an
-override cannot confuse suspicion with a policy group.
-
-### 5.4 Let D3 discharge weak evidence
-
-D3 consumes suspected edges as audit inputs. For a singleton hard group, it may
-certify atomic independence when:
-
-- all accesses to the candidate global are classified;
-- no suspected neighbor has a hard data/publication dependency with it;
-- no reader requires a joint snapshot; and
-- changing the candidate's access representation does not leave a pointer or layout
-  dependency shared with a neighbor.
-
-If D3 cannot discharge a suspected edge, it fails with a specific witness rather than
-silently promoting the entire transitive candidate component to a hard group.
-
-### 5.5 Coupling acceptance tests
-
-- A command-line parser writing independent flags produces suspected edges but no
-  hard mega-group.
-- A flag/payload publication fixture remains a hard two-member group.
-- A paired counter/value update with paired readers remains hard.
-- Two independent writes in one function do not become hard solely through
-  transitive union.
-- Hard-group construction remains deterministic under function and row reordering.
-- `verbose_mode` is not hard-coupled to `csv` or `average_count` without additional
-  invariant evidence.
+Acceptance requires an option parser writing several globals to create no co-write
+inventory, while a real common-publication fixture still receives deterministic hard
+group evidence for joint OnceLock/Mutex decisions. Members of such a hard group remain
+individually eligible for atomic handling.
 
 ## 6. Implementation sequence
 
@@ -357,20 +312,18 @@ Acceptance: jpegoptim's unrelated high-fanout `optarg` row no longer poisons
 Acceptance: the jpegoptim `fprintf` finding remains audited but does not veto the
 direct atomic access proof for `verbose_mode`; address-relevant fixtures still veto.
 
-### F4 — Coupling strength
+### F4 — Coupling scope
 
-- Emit suspected function-co-write evidence separately.
-- Implement the initial hard-evidence rules.
-- Union only hard edges into policy groups.
-- Update group schema, overrides, canonicalization, and measurement reports.
+- Remove function-co-write candidate construction.
+- Retain only hard common-publication edges for joint strategies.
+- Keep atomic eligibility independent of hard groups.
 
-Acceptance: option-parser fixtures avoid mega-groups while true publication and
-joint-state fixtures remain grouped.
+Acceptance: option-parser fixtures emit no candidates, true publication fixtures
+remain grouped, and their members can still receive per-global atomic certificates.
 
 ### F5 — D3 integration and remeasurement
 
-- Implement or update D3 to consume bounded access sites, hard groups, suspected
-  edges, and relevant violations.
+- Implement or update D3 to consume bounded access sites and relevant violations.
 - Require a rewrite recipe for every load, store, RMW, address-taking use, declaration,
   and cross-TU access.
 - Require target-guaranteed lock-free atomics for signal-context accesses.
@@ -397,10 +350,9 @@ O0 and O1, and four YAPET O0-g globals (`cat.catcolorspace`, `cats_capacity`,
 `ncats`, `report_error`).  `exe-pure-O0.bc` has no mutable definition globals.
 
 The remaining dominant access-completeness blocker is genuine module-wide access:
-1,578 globals, versus 79 with `external-escape`.  There are 116 suspected coupling
-components with 646 suspected co-write edges and no hard coupling groups.  These
-counts validate the split between hard groups and D3's per-edge discharge, but they do
-not make a static certificate production-ready: see the co-update audit contract.
+1,578 globals, versus 79 with `external-escape`. The historical run also measured 116
+suspected components with 646 co-write edges; that inventory is now retired because it
+does not bear on defined-behavior-preserving atomic conversion.
 
 Each corpus run records:
 
@@ -408,7 +360,7 @@ Each corpus run records:
 - globals failed by each category;
 - candidate-set fanout p50/p95/max;
 - violation relevance counts by classification and finding kind;
-- hard versus suspected coupling edges, group counts, and group-size percentiles;
+- hard joint-strategy group counts and group-size percentiles;
 - atomic funnel counts after each condition;
 - newly eligible globals and the witness removed relative to the baseline;
 - runtime, peak RSS, and artifact-size deltas.
@@ -427,10 +379,8 @@ Before enabling the new facts in production policy:
    a sample.
 3. Review every violation kind newly classified `value-only` or `unrelated`; unknown
    kinds default to `unresolved`.
-4. Review all hard-to-suspected coupling changes on the synthetic invariant fixtures.
-5. Require dynamic stress or sanitizer coverage for newly certified atomics where a
-   runnable corpus target exists.
-6. Keep an environment-controlled diagnostic mode that emits the full finite
+4. Review hard common-publication groups on the synthetic invariant fixtures.
+5. Keep an environment-controlled diagnostic mode that emits the full finite
    candidate list and relevance paths for audit runs without expanding default
    artifacts.
 
@@ -441,9 +391,9 @@ After F1–F4, `verbose_mode` should have:
 - a complete access set because the high-fanout `optarg` load has a finite candidate
   set that excludes it;
 - no hard violation taint from the unrelated `fprintf` varargs finding;
-- no hard 39-member coupling group from option-parser co-write alone;
+- no coupling group or candidate inventory from option-parser co-write alone;
 - retained `signal_context_access=true`, which continues to reject mutex;
-- retained `word_sized_scalar=true` and a suspected-coupling audit trail.
+- retained `word_sized_scalar=true`.
 
 That makes it a D3 candidate, not automatically certified. D3 must still prove all
 direct and indirect accesses, rewrite `verbose_mode++` as an atomic RMW, update every

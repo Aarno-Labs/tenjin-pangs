@@ -18,9 +18,9 @@ use pangs_api::{
 };
 use pangs_manifest::{
     canonicalize_audit, AlwaysFalse, AlwaysTrue, AnalysisRun, AuditRecord, AuditScope, AuditSource,
-    Certificate, CommonInterval, CouplingCandidate, CouplingGroup, EvidenceEdge, EvidenceKind,
-    EvidenceStrength, EvidencedBool, Extra, Facts, GlobalRecord as DispositionGlobal,
-    GroupStrategySupport, Key, Linkage, Localization, LocalizationBlocker, LocalizationVerdict,
+    Certificate, CommonInterval, CouplingGroup, EvidenceEdge, EvidenceKind, EvidenceStrength,
+    EvidencedBool, Extra, Facts, GlobalRecord as DispositionGlobal, GroupStrategySupport, Key,
+    Linkage, Localization, LocalizationBlocker, LocalizationVerdict,
     Manifest as DispositionManifest, Meta, OnceLockGroupSupport, RunHeader, ScalarClass, Site,
     UnkeyedGlobal, Witness, WordSizedScalar, SCHEMA_VERSION,
 };
@@ -273,9 +273,9 @@ pub fn assemble_disposition_artifacts(
     }
 
     let coupling_started = Instant::now();
-    let (coupling_groups, coupling_candidates) = assemble_coupling_groups(analysis, &mut globals);
+    let coupling_groups = assemble_coupling_groups(analysis, &mut globals);
     let atomic_started = Instant::now();
-    assemble_atomic_eligibility(analysis, target, &coupling_candidates, &mut globals);
+    assemble_atomic_eligibility(analysis, target, &mut globals);
     if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
         eprintln!(
             "pangs disposition timing atomic-eligibility={}ms certified={}",
@@ -369,26 +369,12 @@ pub fn assemble_disposition_artifacts(
             }),
         );
         report.insert(
-            "coupling_candidates".into(),
-            serde_json::json!({
-                "count": coupling_candidates.len(),
-                "globals_suspected": coupling_candidates.iter().map(|candidate| candidate.members.len()).sum::<usize>(),
-                "suspected_edges": coupling_candidates.iter().map(|candidate| candidate.evidence.len()).sum::<usize>(),
-                "components": coupling_candidates.iter().map(|candidate| serde_json::json!({
-                    "id": candidate.id,
-                    "members": candidate.members.len(),
-                    "edges": candidate.evidence.len(),
-                })).collect::<Vec<_>>(),
-            }),
-        );
-        report.insert(
             "atomic_eligibility".into(),
             serde_json::json!({
                 "certified": globals.iter().filter(|global| global.facts.atomic_eligibility.as_ref().is_some_and(Certificate::is_certified)).count(),
                 "failed": globals.iter().filter(|global| matches!(global.facts.atomic_eligibility, Some(Certificate::Failed { .. }))).count(),
                 "not_word_sized": globals.iter().filter(|global| !global.facts.word_sized_scalar.value).count(),
                 "access_incomplete": globals.iter().filter(|global| !global.facts.access_set_complete.value).count(),
-                "hard_coupled": globals.iter().filter(|global| global.facts.coupling_group.is_some()).count(),
                 "violation_tainted": globals.iter().filter(|global| global.facts.violation_taint.value).count(),
             }),
         );
@@ -417,7 +403,7 @@ pub fn assemble_disposition_artifacts(
         globals,
         unkeyed_globals,
         coupling_groups,
-        coupling_candidates,
+        coupling_candidates: Vec::new(),
         override_report: None,
         materialization: None,
         extra: Extra::new(),
@@ -667,8 +653,7 @@ fn registry_witness(
 fn assemble_coupling_groups(
     analysis: &Analysis,
     globals: &mut [DispositionGlobal],
-) -> (Vec<CouplingGroup>, Vec<CouplingCandidate>) {
-    let coupling_started = Instant::now();
+) -> Vec<CouplingGroup> {
     let keys = globals
         .iter()
         .map(|global| global.key.clone())
@@ -686,47 +671,6 @@ fn assemble_coupling_groups(
         .enumerate()
         .map(|(index, global)| (global.key.clone(), index))
         .collect::<BTreeMap<_, _>>();
-    let mut suspected_components = CouplingComponents::new(keys.len());
-    let key_by_global = globals
-        .iter()
-        .map(|global| (global.meta.llvm_name.clone(), index_by_key[&global.key]))
-        .collect::<BTreeMap<_, _>>();
-    let key_index_by_global = analysis
-        .globals()
-        .iter()
-        .map(|global| key_by_global.get(&global.key).copied())
-        .collect::<Vec<_>>();
-    let mut co_write_sites = BTreeMap::<(usize, usize), Vec<Site>>::new();
-    for function in (0..analysis.functions().len()).map(|index| FuncId(index as u32)) {
-        let mut written = analysis
-            .direct_writes(function)
-            .iter()
-            .filter_map(|global| key_index_by_global[global.0 as usize])
-            .collect::<Vec<_>>();
-        written.sort_unstable();
-        written.dedup();
-        let site = function_site(analysis, function);
-        let Some((&a, rest)) = written.split_first() else {
-            continue;
-        };
-        for &b in rest {
-            if suspected_components.union(a, b) {
-                if let Some(site) = &site {
-                    co_write_sites.entry((a, b)).or_default().push(site.clone());
-                } else {
-                    co_write_sites.entry((a, b)).or_default();
-                }
-            }
-        }
-    }
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
-        eprintln!(
-            "pangs disposition timing coupling-co-write={}ms evidence-edges={}",
-            coupling_started.elapsed().as_millis(),
-            co_write_sites.len()
-        );
-    }
-
     let once_lock_started = Instant::now();
     let phase_by_key = globals
         .iter()
@@ -827,69 +771,20 @@ fn assemble_coupling_groups(
             extra: Extra::new(),
         });
     }
-    let mut candidate_member_indexes = BTreeMap::<usize, Vec<usize>>::new();
-    for index in 0..keys.len() {
-        if suspected_components.component_size(index) > 1 {
-            candidate_member_indexes
-                .entry(suspected_components.find(index))
-                .or_default()
-                .push(index);
-        }
-    }
-    let mut candidate_member_indexes = candidate_member_indexes.into_values().collect::<Vec<_>>();
-    candidate_member_indexes.sort_by_key(|members| members[0]);
-    let mut candidate_by_key_index = vec![None; keys.len()];
-    for (candidate, members) in candidate_member_indexes.iter().enumerate() {
-        for member in members {
-            candidate_by_key_index[*member] = Some(candidate);
-        }
-    }
-    let mut candidate_evidence = (0..candidate_member_indexes.len())
-        .map(|_| Vec::new())
-        .collect::<Vec<Vec<EvidenceEdge>>>();
-    for ((a, b), sites) in co_write_sites {
-        let candidate = candidate_by_key_index[a]
-            .expect("co-write suspicion must belong to a coupling candidate");
-        candidate_evidence[candidate].push(EvidenceEdge {
-            kind: EvidenceKind::CoWrite,
-            strength: EvidenceStrength::Suspected,
-            members: vec![keys[a].clone(), keys[b].clone()],
-            sites,
-            extra: Extra::new(),
-        });
-    }
-    let candidates = candidate_member_indexes
-        .into_iter()
-        .enumerate()
-        .map(|(candidate, indexes)| {
-            let members = indexes
-                .into_iter()
-                .map(|index| keys[index].clone())
-                .collect::<Vec<_>>();
-            CouplingCandidate {
-                id: coupling_candidate_id(&members),
-                members,
-                evidence: std::mem::take(&mut candidate_evidence[candidate]),
-                extra: Extra::new(),
-            }
-        })
-        .collect();
-    (groups, candidates)
+    groups
 }
 
 fn assemble_atomic_eligibility(
     analysis: &Analysis,
     target: &pangs_pir::TargetInfo,
-    candidates: &[CouplingCandidate],
     globals: &mut [DispositionGlobal],
 ) {
     let mut access_site_counts = vec![0_usize; analysis.globals().len()];
     for site in analysis.access_sites() {
         access_site_counts[site.global.0 as usize] += 1;
     }
-    // Do not build detailed access/coupling indexes unless at least one global has passed every
-    // coarse gate.  Incomplete access sets, taint, type shape, hard coupling, and non-lock-free
-    // signal use each independently make an atomic certificate impossible.
+    // Do not build the detailed access index unless at least one global has passed every coarse
+    // per-global gate.
     let mut needs_detailed_check = false;
     for global in globals.iter() {
         let Some(_) = analysis.lookup_global(&global.meta.llvm_name) else {
@@ -901,7 +796,6 @@ fn assemble_atomic_eligibility(
         needs_detailed_check |= global.facts.word_sized_scalar.value
             && global.facts.access_set_complete.value
             && !global.facts.violation_taint.value
-            && global.facts.coupling_group.is_none()
             && signal_lock_free;
     }
     let mut access_by_global = vec![Vec::new(); analysis.globals().len()];
@@ -910,27 +804,6 @@ fn assemble_atomic_eligibility(
             access_by_global[site.global.0 as usize].push(site);
         }
     }
-    let mut indirect_rows_by_global = vec![BTreeSet::new(); analysis.globals().len()];
-    if needs_detailed_check {
-        for (row_index, row) in analysis.modrefs().iter().enumerate() {
-            if row.via == pangs_api::Via::Direct {
-                continue;
-            }
-            if let AffectedGlobals::Finite(affected) = analysis.affected_globals(row) {
-                for gid in affected {
-                    indirect_rows_by_global[gid.0 as usize].insert(row_index);
-                }
-            }
-        }
-    }
-    let gids_by_key = globals
-        .iter()
-        .filter_map(|global| {
-            analysis
-                .lookup_global(&global.meta.llvm_name)
-                .map(|gid| (global.key.clone(), gid))
-        })
-        .collect::<BTreeMap<_, _>>();
     for global in globals {
         let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) else {
             global.facts.atomic_eligibility = Some(Certificate::Failed {
@@ -1002,18 +875,6 @@ fn assemble_atomic_eligibility(
                     }),
             );
         }
-        if let Some(group) = &global.facts.coupling_group {
-            fail(
-                "hard-coupling-group",
-                atomic_witness(
-                    "atomic-hard-coupling-group",
-                    Some(global.key.to_string()),
-                    None,
-                    Some(group.clone()),
-                ),
-            );
-        }
-
         let width = global.facts.word_sized_scalar.size_bits;
         let signal_lock_free = !global.facts.signal_context_access.value
             || width.is_some_and(|width| target.supported_atomic_widths.contains(&width));
@@ -1056,18 +917,6 @@ fn assemble_atomic_eligibility(
         for (code, witness) in access_failures {
             fail(&code, witness);
         }
-        let (suspected, coupling_failures) = atomic_suspected_coupling(
-            analysis,
-            &global.key,
-            &gids_by_key,
-            candidates,
-            &access_by_global,
-            &indirect_rows_by_global,
-        );
-        for (code, witness) in coupling_failures {
-            fail(&code, witness);
-        }
-
         let recipe_ready = access_recipe.is_some();
         let recipe = recipe_ready.then(|| {
             serde_json::json!({
@@ -1093,7 +942,6 @@ fn assemble_atomic_eligibility(
             Certificate::Certified {
                 certificate: serde_json::json!({
                     "recipe": recipe.expect("a certified atomic must have a complete recipe"),
-                    "suspected_coupling": suspected,
                     "signal_lock_free": {
                         "required": global.facts.signal_context_access.value,
                         "width": width,
@@ -1108,127 +956,12 @@ fn assemble_atomic_eligibility(
                 witnesses,
                 recipe,
                 diagnostics: Some(serde_json::json!({
-                    "suspected_coupling": suspected,
                     "access_sites_observed": sites.len(),
                 })),
                 extra: Extra::new(),
             }
         });
     }
-}
-
-fn atomic_suspected_coupling(
-    analysis: &Analysis,
-    key: &Key,
-    gids_by_key: &BTreeMap<Key, GlobalId>,
-    candidates: &[CouplingCandidate],
-    access_by_global: &[Vec<&pangs_api::AccessSite>],
-    indirect_rows_by_global: &[BTreeSet<usize>],
-) -> (Vec<Value>, Vec<(String, Witness)>) {
-    let mut resolutions = Vec::new();
-    let mut failures = Vec::new();
-    for candidate in candidates
-        .iter()
-        .filter(|candidate| candidate.members.contains(key))
-    {
-        for edge in candidate
-            .evidence
-            .iter()
-            .filter(|edge| edge.members.contains(key))
-        {
-            let endpoint_ids = edge
-                .members
-                .iter()
-                .filter_map(|member| gids_by_key.get(member).copied())
-                .collect::<Vec<_>>();
-            if endpoint_ids.len() != edge.members.len() {
-                failures.push((
-                    "suspected-coupling-unresolved".into(),
-                    atomic_witness(
-                        "atomic-suspected-coupling-unresolved",
-                        Some(candidate.id.clone()),
-                        None,
-                        Some("candidate endpoint is absent from the analysis global table".into()),
-                    ),
-                ));
-                continue;
-            }
-            let shared_pointer_row = endpoint_ids
-                .split_first()
-                .and_then(|(first, rest)| {
-                    indirect_rows_by_global[first.0 as usize]
-                        .iter()
-                        .copied()
-                        .find(|row_index| {
-                            rest.iter().all(|gid| {
-                                indirect_rows_by_global[gid.0 as usize].contains(row_index)
-                            })
-                        })
-                })
-                .map(|row_index| &analysis.modrefs()[row_index]);
-            if let Some(row) = shared_pointer_row {
-                failures.push((
-                    "suspected-coupling-shared-address".into(),
-                    function_witness(
-                        analysis,
-                        row.func,
-                        "atomic-suspected-coupling-shared-address",
-                        row.witness.clone(),
-                    ),
-                ));
-                continue;
-            }
-
-            let mut reads_by_location =
-                BTreeMap::<(FuncId, Option<pangs_api::LocInfo>), usize>::new();
-            for gid in &endpoint_ids {
-                let locations = access_by_global[gid.0 as usize]
-                    .iter()
-                    .filter(|site| site.access == pangs_pir::Access::Ref && site.loc.is_some())
-                    .map(|site| (site.func, site.loc.clone()))
-                    .collect::<BTreeSet<_>>();
-                for location in locations {
-                    *reads_by_location.entry(location).or_default() += 1;
-                }
-            }
-            if let Some(((function, loc), _)) = reads_by_location
-                .into_iter()
-                .find(|(_, endpoint_count)| *endpoint_count == endpoint_ids.len())
-            {
-                let site = loc.map(|loc| Site {
-                    file: loc.file,
-                    line: loc.line,
-                    col: Some(loc.col),
-                    function: Some(analysis.functions()[function].key.clone()),
-                    extra: Extra::new(),
-                });
-                failures.push((
-                    "suspected-coupling-joint-reader".into(),
-                    atomic_witness(
-                        "atomic-suspected-coupling-joint-reader",
-                        Some(candidate.id.clone()),
-                        site,
-                        Some(
-                            edge.members
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        ),
-                    ),
-                ));
-                continue;
-            }
-
-            resolutions.push(serde_json::json!({
-                "candidate": candidate.id,
-                "members": edge.members,
-                "evidence": edge.kind,
-                "resolution": "co-write-only-direct-endpoints-no-joint-reader",
-            }));
-        }
-    }
-    (resolutions, failures)
 }
 
 fn atomic_access_recipe(
@@ -1606,22 +1339,6 @@ fn site_cmp(left: &Site, right: &Site) -> std::cmp::Ordering {
     ))
 }
 
-fn function_site(analysis: &Analysis, function: FuncId) -> Option<Site> {
-    let info = &analysis.functions()[function];
-    let file = info.file.clone()?;
-    let line = info.line?;
-    let function = Key::new(&file, info.key.strip_prefix('@').unwrap_or(&info.key))
-        .ok()
-        .map(|key| key.to_string());
-    Some(Site {
-        file,
-        line,
-        col: None,
-        function,
-        extra: Extra::new(),
-    })
-}
-
 fn fnv1a32(bytes: &[u8]) -> u32 {
     bytes.iter().fold(0x811c9dc5, |hash, byte| {
         (hash ^ u32::from(*byte)).wrapping_mul(0x01000193)
@@ -1634,14 +1351,6 @@ fn coupling_group_id(members: &[Key]) -> String {
         .min()
         .expect("coupling group ids require at least one member");
     format!("grp-{:08x}", fnv1a32(smallest.to_string().as_bytes()))
-}
-
-fn coupling_candidate_id(members: &[Key]) -> String {
-    let smallest = members
-        .iter()
-        .min()
-        .expect("coupling candidate ids require at least one member");
-    format!("cand-{:08x}", fnv1a32(smallest.to_string().as_bytes()))
 }
 
 fn evidenced(value: bool, polarity: bool, witness: Option<Witness>) -> EvidencedBool {
@@ -3083,9 +2792,9 @@ mod tests {
 
     use super::{
         assemble_disposition_artifacts, check_traces, classify_violation_relevance,
-        coupling_candidate_id, coupling_group_id, export_analysis, once_lock_pair_evidence, report,
-        validate_export_dir, violation_relevance_witness, CertifiedGroupEvidence,
-        DispositionFactRows, ViolationRelevance,
+        coupling_group_id, export_analysis, once_lock_pair_evidence, report, validate_export_dir,
+        violation_relevance_witness, CertifiedGroupEvidence, DispositionFactRows,
+        ViolationRelevance,
     };
 
     fn group_site(line: u32) -> Site {
@@ -3127,11 +2836,6 @@ mod tests {
             coupling_group_id(&[left.clone(), right.clone()]),
             coupling_group_id(&[right.clone(), left.clone()])
         );
-
-        let candidate = coupling_candidate_id(&[left.clone(), right.clone()]);
-        assert_eq!(candidate, coupling_candidate_id(&[right, left.clone()]));
-        assert!(candidate.starts_with("cand-"));
-        assert_ne!(candidate, coupling_group_id(&[left]));
     }
 
     #[test]

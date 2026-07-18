@@ -281,12 +281,7 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
                                                          //   "override-accepted-risk"
                          "override": null } ],           // echo of an applied GROUP pin —
                                                          //   the only place it is echoed
-  "coupling_candidates": [ {             // analysis-owned suspected components;
-    "id": "cand-a1b2c3d4",               //   never a policy/override target
-    "members": [...],
-    "evidence": [ { "kind": "co-write", "strength": "suspected",
-                    "members": [...], "sites": [...] } ]
-  } ],
+  "coupling_candidates": [],             // deprecated compatibility field
   "override_report": { ... },            // §4.3; dispose-owned
   "materialization": { ... }             // §5: C→C-tool-owned — marker inventory (§5.2)
                                          //   and demotion records (§5.3); absent until
@@ -525,30 +520,19 @@ only the affected member.
 consumes it differently:
 
 - `once-lock`: publish the group as one `OnceLock<Struct>` at one P (existing design).
-- `atomic`: a group with >1 member **fails atomic eligibility for all members** —
-  independent atomics would introduce torn states that the original single-threaded C
-  could never exhibit. This is the one place where the new strategies can *silently
-  corrupt semantics* (not memory safety), so the group fact is a hard gate, not advice.
+- `atomic`: groups do not constrain this per-global representation rewrite. Defined
+  concurrent access to a plain C global already has synchronization, which the atomic
+  rewrite retains; unsynchronized read/write concurrency was undefined.
 - `mutex`: the group shares one `Mutex<Struct>` — both for consistency and to erase
   lock-ordering hazards between members.
 - `localize`: groups suggest struct-field clustering in the context struct (advisory).
 
-Therefore coupling detection moves out of the ONCELOCK work items into a shared
-F-layer post-pass. Evidence has an explicit strength. Overlapping compatible
-publication intervals are `hard` evidence and are unioned into policy-bearing
-`coupling_groups`. Same-function co-write is only `suspected`: it is emitted in
-`coupling_candidates` for D3 and audit measurement, but does not populate
-`facts.coupling_group` or constrain policy by itself. Both collections use a
-deterministic spanning forest rather than an exhaustive quadratic edge dump: a
-function that writes `k` globals proposes a stable star, and only successful union
-edges are retained. Group IDs use the `grp-` namespace; candidate component IDs use
-the disjoint `cand-` namespace.
-
-This split is fail-closed at the eligibility boundary rather than at correlation
-collection: hard evidence directly forbids independent atomics, while D3 must consume
-suspected edges and either prove that independent treatment is safe or retain a
-structured failure witness. Merely appearing in the same writer function is not, by
-itself, proof of a cross-global invariant.
+Coupling detection lives in a shared F-layer post-pass. Overlapping compatible
+publication intervals are hard evidence and are unioned into policy-bearing
+`coupling_groups`. Same-function co-writes are not collected: correlation alone does
+not justify a joint representation or constrain atomic eligibility. Group IDs use the
+`grp-` namespace. The manifest's `coupling_candidates` field is retained empty for
+schema compatibility.
 
 The policy stage resolves a group after computing each member's independent strategy
 support set and individual cascade result:
@@ -559,12 +543,15 @@ support set and individual cascade result:
    `coupling_groups[].strategy_support.once_lock` — analysis-owned, derived by D2b
    from the members' phase-stationarity certificates (nonempty publication-interval
    intersection in one common publication function; `DISPOSITION_PLAN.md` D2b);
-   `atomic` is unsupported for a group with more than one member; and `mutex`
+   `atomic` adds no group-specific guard; and `mutex`
    requires the group-level reentrancy certificate at `strategy_support.mutex`
    (reserved, emitted by D4). `unhandled` is always supported. `immutable` and
    `localize` add no group-specific guard beyond every member's ordinary guard.
 2. Without a group override, choose the first group-supported strategy in the
-   configured cascade. Thus cascade reordering changes preference, never proof.
+   configured cascade. Thus cascade reordering changes preference, never proof. One
+   exception preserves atomic's per-global semantics: if only a subset independently
+   chose `atomic`, leave the group disposition unset and retain every member's
+   independent result rather than demoting the eligible subset.
 3. A group override is honored normally only when that strategy is group-supported.
    If it is not, it follows the ordinary contradictory-facts rule: reject it unless
    `accept_risk = true`, in which case record one accepted-risk audit entry whose
@@ -604,15 +591,14 @@ in the Rust output — the silent failure classes are all *relational*, not site
 |---|---|---|---|---|
 | `immutable` | compile error | missed Ω-escaped write path → UB write to immutable | **silent** — which is why `¬omega_escaped_address` is in the cascade guard | none beyond existing Ω discipline |
 | `once-lock` | compile error | post-P write missed → `set` panics; read-before-set → `get` panics | loud | post-P store logging (`ONCELOCK.md` §3.4.3), stop-ship on any hit |
-| `atomic` | compile error | missed coupling → torn multi-global invariant | **silent** | co-update logging: instrument test builds to detect interleaved-update windows between suspected-coupled globals (design with D3, §9) |
+| `atomic` | compile error | incompatible or missed access lowering | no additional relational failure for defined source behavior | none |
 | `mutex` | compile error | reentrant access path → deadlock; signal-context access → deadlock/UB | loud-ish (liveness, not corruption) | lock-cycle detection under the program's test suite |
 | `localize` | n/a | FN call edge → wrong routing → silent corruption | **silent** | unchanged from `DESIGN.md` §9 |
 
-The three silent cells get the investment: `immutable`'s is already guarded by an
-existing fact; `localize`'s is the original problem the whole soundness posture exists
-for; `atomic`'s coupling audit is a new obligation that ships **with** the atomics pass,
-not after it. Accepted-risk overrides (§4.2) add per-global rows to this matrix in the
-soundness inventory.
+The silent cells for `immutable` and `localize` get the investment described above.
+Atomic eligibility is per-global and requires no co-update audit under the
+defined-behavior preservation contract. Accepted-risk overrides (§4.2) add per-global
+rows to this matrix in the soundness inventory.
 
 ## 8. Amendments required to the other documents
 
@@ -653,16 +639,12 @@ Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
   fields. No new analysis.
 - **D2 — override machinery (~250 lines).** TOML parsing, §4.2 validation, override
   report, soundness-inventory append for accepted risks, CI exit-code discipline.
-- **D2b — shared coupling post-pass (~200 lines).** Extracted from O6's clustering,
-  generalized to co-write regions; group evidence records; group disposition
-  resolution.
-- **D3 — atomic eligibility pass (implemented; runtime audit pending).** Produces a
-  certificate only after scalar-width, bounded-access, relevant-violation, hard-group,
-  source-mapped load/store/RMW recipe, and signal lock-free checks pass. It consumes
-  suspected co-write edges individually: shared indirect-address candidates and
-  same-expression joint readers fail closed; otherwise the direct-endpoint discharge is
-  recorded in the certificate. The co-update dynamic audit (§7) remains required before
-  a materializer enables atomic rewrites in production. A failed coarse gate emits its
+- **D2b — shared coupling post-pass (~200 lines).** Extracted from O6's clustering;
+  derives hard common-publication groups, group evidence records, and group disposition
+  resolution for joint strategies.
+- **D3 — atomic eligibility pass (implemented).** Produces a per-global certificate
+  only after scalar-width, bounded-access, relevant-violation, source-mapped
+  load/store/RMW recipe, and signal lock-free checks pass. A failed coarse gate emits its
   decisive witness and a bounded `access_lowering: skipped` diagnostic; D3 does not
   enumerate redundant per-access rewrite failures once certification is impossible.
 - **D4 — mutex eligibility pass (future, size TBD).** Access-set completeness reuse,
@@ -697,8 +679,8 @@ available only through its D3 certificate.
    per-strategy counts and the `unhandled` remainder, on Vim + PHP.
 2. **Cascade-skip histogram** — which guard kills how many globals at each level;
    `atomic`/`mutex` slots' *would-be* eligibility (measurable cheaply from the fact
-   vector even before D3/D4 exist: word-sized ∧ access-complete ∧ singleton-group
-   counts) gates whether D3/D4 are worth building — the same free-counter pattern as
+   vector even before D3/D4 exist: word-sized ∧ access-complete counts) gates whether
+   D3/D4 are worth building — the same free-counter pattern as
    ONCELOCK's `no-single-P`.
 3. **Context-struct pressure with escape valves** — re-evaluate the `DESIGN.md` §11.4
    mega-component risk with `mutex` available: if the globals that bloat the context

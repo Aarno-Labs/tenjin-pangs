@@ -2142,7 +2142,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "538e9357c9ed76133cb10c91a0473f0ca795b9fd0ad87708973b755da25ee9d3"
+        "32e2f597910ec81ca61213da4f95bcae6a4c630eaab4933a58a6b0fe35e27c4d"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(
@@ -2289,17 +2289,9 @@ fn analyze_dispose_reports_registry_reachability_and_coupling() {
     assert!(right["facts"]["coupling_group"].is_null());
     let groups = manifest["coupling_groups"].as_array().unwrap();
     assert!(groups.is_empty());
-    let candidates = manifest["coupling_candidates"].as_array().unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert!(candidates[0]["evidence"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|edge| {
-            edge["kind"] == "co-write"
-                && edge["strength"] == "suspected"
-                && edge["members"].as_array().unwrap().len() == 2
-        }));
+    assert!(manifest
+        .get("coupling_candidates")
+        .is_none_or(Value::is_null));
 }
 
 #[test]
@@ -2428,11 +2420,7 @@ fn analyze_dispose_derives_common_once_lock_group_support() {
         .as_array()
         .unwrap()
         .iter()
-        .all(|global| global["facts"]["atomic_eligibility"]["codes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|code| code == "hard-coupling-group")));
+        .all(|global| global["facts"]["atomic_eligibility"]["status"] == "certified"));
     let report = &manifest["run"]["analysis"]["phase_stationarity_report"]["coupling_groups"];
     assert_eq!(report["count"], 1);
     assert_eq!(report["once_lock_supported"], 1);

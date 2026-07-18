@@ -306,7 +306,7 @@ fn emit_measurement_report(manifest: &mut Manifest) {
     let mut atomic_candidates = 0_u64;
     let mut atomic_word_sized = 0_u64;
     let mut atomic_access_complete = 0_u64;
-    let mut atomic_singleton = 0_u64;
+    let mut atomic_free_gate_eligible = 0_u64;
     let mut atomic_certified = 0_u64;
     let mut mutex_candidates = 0_u64;
     let mut mutex_access_complete = 0_u64;
@@ -352,9 +352,7 @@ fn emit_measurement_report(manifest: &mut Manifest) {
                 atomic_word_sized += 1;
                 if global.facts.access_set_complete.value {
                     atomic_access_complete += 1;
-                    if global.facts.coupling_group.is_none() {
-                        atomic_singleton += 1;
-                    }
+                    atomic_free_gate_eligible += 1;
                 }
             }
             if global
@@ -443,8 +441,7 @@ fn emit_measurement_report(manifest: &mut Manifest) {
                 "candidate_disposition": atomic_candidates,
                 "word_sized_scalar": atomic_word_sized,
                 "access_set_complete": atomic_access_complete,
-                "singleton_coupling_group": atomic_singleton,
-                "free_gate_eligible": atomic_singleton,
+                "free_gate_eligible": atomic_free_gate_eligible,
                 "certificate_eligible": atomic_certified,
                 "eligible": atomic_certified,
             },
@@ -625,6 +622,26 @@ fn resolve_groups(
         let override_spec = overrides.groups.get(&group_id);
         if override_spec.is_some() {
             matched.insert(group_id.clone());
+        }
+
+        // Atomic is a per-global representation rewrite. If only some members chose it in their
+        // independent cascades, a hard group for a joint strategy must not demote those members
+        // merely because the other members lack atomic certificates.
+        let independently_atomic = member_keys.iter().any(|key| {
+            manifest
+                .globals
+                .iter()
+                .find(|global| &global.key == key)
+                .and_then(|global| global.disposition.as_ref())
+                .is_some_and(|disposition| disposition.cascade_chosen == Strategy::Atomic)
+        });
+        if override_spec.is_none()
+            && independently_atomic
+            && !group_failures(manifest, group_index, Strategy::Atomic).is_empty()
+        {
+            manifest.coupling_groups[group_index].group_disposition = None;
+            manifest.coupling_groups[group_index].group_provenance = None;
+            continue;
         }
 
         let chosen = if let Some(spec) = override_spec {
@@ -879,22 +896,6 @@ fn group_failures(
             }
             Some(_) => {}
         },
-        Strategy::Atomic if group.members.len() > 1 => {
-            for member in &group.members {
-                failures.push(GuardFailure {
-                    member: member.clone(),
-                    guard: "multi_member_atomic".into(),
-                    witness: Witness {
-                        kind: "coupling-group".into(),
-                        site: None,
-                        symbol: None,
-                        note: Some(group.id.clone()),
-                        extra: Extra::new(),
-                    },
-                    extra: Extra::new(),
-                });
-            }
-        }
         Strategy::Mutex => {
             let certified = group
                 .strategy_support
@@ -1633,6 +1634,58 @@ mod tests {
             .iter()
             .any(|entry| entry.scope == OverrideScope::Global
                 && entry.outcome == OverrideOutcome::Rejected));
+    }
+
+    #[test]
+    fn multi_member_group_does_not_veto_atomic() {
+        let mut facts = base_facts();
+        facts.written.value = true;
+        facts.atomic_eligibility = Some(certified());
+        let mut manifest = manifest_with(facts);
+        add_two_member_group(&mut manifest);
+        let mut ledger = Vec::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Atomic],
+        };
+
+        apply_policy(&mut manifest, &mut ledger, &config, None, None, None).unwrap();
+
+        assert_eq!(
+            manifest.coupling_groups[0].group_disposition,
+            Some(Strategy::Atomic)
+        );
+        assert!(manifest
+            .globals
+            .iter()
+            .all(|global| { global.disposition.as_ref().unwrap().chosen == Strategy::Atomic }));
+    }
+
+    #[test]
+    fn group_does_not_demote_an_individually_eligible_atomic() {
+        let mut facts = base_facts();
+        facts.written.value = true;
+        facts.atomic_eligibility = Some(certified());
+        let mut manifest = manifest_with(facts);
+        add_two_member_group(&mut manifest);
+        manifest.globals[1].facts.atomic_eligibility = None;
+        let mut ledger = Vec::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Atomic],
+        };
+
+        apply_policy(&mut manifest, &mut ledger, &config, None, None, None).unwrap();
+
+        assert_eq!(manifest.coupling_groups[0].group_disposition, None);
+        assert_eq!(
+            manifest.globals[0].disposition.as_ref().unwrap().chosen,
+            Strategy::Atomic
+        );
+        assert_eq!(
+            manifest.globals[1].disposition.as_ref().unwrap().chosen,
+            Strategy::Unhandled
+        );
     }
 
     #[test]
