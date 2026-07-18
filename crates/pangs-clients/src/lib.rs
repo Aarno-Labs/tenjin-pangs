@@ -1188,6 +1188,7 @@ fn assemble_mutex_eligibility(
                     },
                     "lock_recipe": {
                         "granularity": "per-global",
+                        "scope": "whole-accessor-function-v1",
                         "dynamic_audit": "lock-cycle-detection-required",
                     },
                 }),
@@ -1297,6 +1298,7 @@ fn assemble_group_mutex_support(
                         "granularity": "shared-group",
                         "group": group.id,
                         "members": group.members,
+                        "scope": "whole-accessor-function-v1",
                         "dynamic_audit": "lock-cycle-detection-required",
                     },
                     "accessor_functions": accessors.iter().map(|func| analysis.functions()[*func].key.clone()).collect::<Vec<_>>(),
@@ -3550,6 +3552,10 @@ mod tests {
             panic!("an isolated accessor should certify mutex eligibility")
         };
         assert_eq!(certificate["reentrancy"]["model"], "final-call-graph-v1");
+        assert_eq!(
+            certificate["lock_recipe"]["scope"],
+            "whole-accessor-function-v1"
+        );
         assert_eq!(certificate["accessor_functions"], json!(["target"]));
     }
 
