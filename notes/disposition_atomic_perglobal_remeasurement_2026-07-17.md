@@ -115,4 +115,60 @@ pairing with proven scalar data flow. Current recipes name `fetch_add`, `fetch_s
 `fetch_and`, `fetch_or`, or `fetch_xor`, include the exact IR operand, and identify the
 load, operation, and store statement indices. The same 14 corpus certificates survive;
 their 20 updates classify exactly, including JPEGoptim's `worker_count--` as
-`fetch_add` with operand `-1` in the optimized IR. Items 2, 3, and 5 remain.
+`fetch_add` with operand `-1` in the optimized IR.
+
+Declaration recipes now also retain the typed LLVM initializer, alignment, scalar
+class, and signedness. All 14 certificates have complete representation data: their
+initializers are `i32 0` or `i64 0`. This closes item 2 without changing ordinary
+analysis JSON. A separate `source_materialization` result preserves the distinction
+between static eligibility and immediate source rewriteability: five certificates are
+`source-mapped`, while nine remain `blocked` with
+`declaration-source-unmapped`. Thus item 3 is explicit rather than silently delegated
+to the materializer. Item 5 remains a production pipeline invariant.
+
+## Hardened-certificate remeasurement (2026-07-18)
+
+The non-Vim/non-PHP directory grew during the rerun from 41 to 42 modules with the
+addition of `lib-ksba-O0-g.bc`. Forty-one current runs completed and validated.
+OpenSSL was again the resource outlier and was killed at 219.61 seconds after reaching
+37,901,612 KiB RSS. Its prior validated manifest has no atomic certificates (24
+immutable and 202 unhandled globals), so it is unaffected by these D3-only recipe and
+guard changes and can be used to close the coverage inventory.
+
+Across the resulting 42-module inventory there are 2,049 mutable definition globals:
+
+- 204 `immutable`;
+- 14 `atomic`;
+- 1,831 `unhandled`.
+
+The added KSBA O0 module contributes nine unhandled globals. Removing it gives the
+same 41-module totals as the previous measurement: 2,040 globals, 204 immutable, 14
+atomic, and 1,822 unhandled. The atomic set is unchanged. All 14 have a non-null
+initializer and complete representation data; five are source-mapped and nine are
+explicitly blocked on declaration source recovery.
+
+The run also found and fixed a robustness regression introduced by scalar-op
+lowering: curl O0 contains an integer constant wider than 64 bits. Asking LLVM for its
+signed 64-bit value aborts. Pang now prints wide constants without narrowing and only
+uses LLVM's 64-bit integer accessors for constants of at most 64 bits. A dedicated
+`i128` regression test and the successful curl O0 rerun cover the fix.
+
+### JPEGoptim O1 source mapping audit
+
+The two otherwise eligible integers `quality` and `target_size` still each have two
+unmapped O1 access sites. These are not ordinary missing-location cases suitable for
+nearest-neighbor recovery:
+
+- the three C assignments involved in clamping `quality` are folded into one LLVM
+  store whose debug location has line zero;
+- the two branch-specific `target_size` assignments are folded through a phi into one
+  line-zero store;
+- one `quality` load and one `target_size` load have no instruction location after
+  condition folding, although their downstream combined predicates retain a location.
+
+The O0 PIR confirms the lost multiplicity: it contains five separate `quality`
+accesses for the clamp and two separate `target_size` writes. Assigning a nearby O1
+location to either fused store would therefore emit an incomplete, falsely one-to-one
+source recipe. No heuristic recovery was added. Safely certifying these globals needs
+multi-site source provenance retained through optimization or an AST-level
+identifier-rewrite contract.
