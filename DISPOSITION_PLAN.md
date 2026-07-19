@@ -937,7 +937,11 @@ path from an accessor to an unresolved direct or indirect callee fails closed wi
 whole-function lock is held. External declarations represented by ordinary function
 nodes do not fail this check. Certified globals carry the accessor set, the
 `final-call-graph-v1` model name, a per-global lock recipe, the v1
-whole-accessor-function lock scope, and the required dynamic lock-cycle audit.
+whole-accessor-function lock scope, declaration/initializer metadata, a
+`source_materialization` status, and the required dynamic lock-cycle audit. Source
+materialization is blocked by `declaration-source-unmapped` when the declaration lacks
+a source file/line, or by `no-runtime-accessor-sites` when the v1 recipe has nowhere to
+insert a lock; these do not erase the independently useful static certificate.
 D2b groups repeat the check over the union of their member accessor sets and emit a
 typed `strategy_support.mutex` certificate. A certified group recipe prescribes one
 shared `Mutex<Struct>` with the same lock scope; a group is blocked by an ineligible

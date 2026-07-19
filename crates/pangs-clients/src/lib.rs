@@ -1256,6 +1256,7 @@ fn assemble_mutex_eligibility(
             Certificate::Certified {
                 certificate: serde_json::json!({
                     "accessor_functions": accessor_functions,
+                    "declaration": mutex_declaration(analysis, global, gid),
                     "reentrancy": {
                         "model": "final-call-graph-v1",
                         "status": "no-accessor-reachable-from-accessor",
@@ -1265,6 +1266,10 @@ fn assemble_mutex_eligibility(
                         "scope": "whole-accessor-function-v1",
                         "dynamic_audit": "lock-cycle-detection-required",
                     },
+                    "source_materialization": mutex_source_materialization(
+                        global,
+                        accessors.len(),
+                    ),
                 }),
                 extra: Extra::new(),
             }
@@ -1284,6 +1289,47 @@ fn assemble_mutex_eligibility(
                 extra: Extra::new(),
             }
         });
+    }
+}
+
+fn mutex_declaration(
+    analysis: &Analysis,
+    global: &DispositionGlobal,
+    gid: GlobalId,
+) -> serde_json::Value {
+    serde_json::json!({
+        "key": global.key,
+        "llvm_name": global.meta.llvm_name,
+        "file": global.meta.file,
+        "line": global.meta.line,
+        "type_spelling": global.meta.type_spelling,
+        "size_bits": global.meta.size_bits,
+        "align_bits": global.meta.align_bits,
+        "initializer_ir": analysis.globals()[gid].initializer_ir,
+        "linkage": global.meta.linkage,
+    })
+}
+
+fn mutex_source_materialization(
+    global: &DispositionGlobal,
+    accessor_count: usize,
+) -> serde_json::Value {
+    if global.meta.file.is_none() || global.meta.line.is_none() {
+        serde_json::json!({
+            "status": "blocked",
+            "code": "declaration-source-unmapped",
+            "detail": "static eligibility is certified, but the C declaration requires symbol-based source recovery",
+        })
+    } else if accessor_count == 0 {
+        serde_json::json!({
+            "status": "blocked",
+            "code": "no-runtime-accessor-sites",
+            "detail": "static eligibility is certified, but the whole-accessor-function lock recipe has no runtime insertion site",
+        })
+    } else {
+        serde_json::json!({
+            "status": "source-mapped",
+        })
     }
 }
 
@@ -3764,6 +3810,67 @@ mod tests {
         assert_eq!(
             witness.extra["call_path"][0]["callee"]["unknown"],
             "external_callee"
+        );
+    }
+
+    #[test]
+    fn mutex_certificate_carries_declaration_and_blocks_an_empty_accessor_recipe() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        pir.globals.push(pangs_pir::Global {
+            key: "table".into(),
+            file: Some("fixtures/synthetic/trivial/trivial.c".into()),
+            line: Some(20),
+            type_spelling: Some("struct entry[4]".into()),
+            size_bits: Some(256),
+            align_bits: Some(64),
+            initializer_ir: Some("[4 x %struct.entry] zeroinitializer".into()),
+            mutable: true,
+            ..pangs_pir::Global::default()
+        });
+        pir.global_init.push(pangs_pir::Stmt::GlobalRef {
+            global: "table".into(),
+            access: pangs_pir::Access::Mod,
+            volatile: false,
+            loc: None,
+        });
+
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+
+        let table = manifest
+            .globals
+            .iter()
+            .find(|global| global.meta.llvm_name == "table")
+            .unwrap();
+        let Some(Certificate::Certified { certificate, .. }) = &table.facts.mutex_eligibility
+        else {
+            panic!("a complete empty runtime access set is statically mutex-eligible")
+        };
+        assert_eq!(certificate["declaration"]["llvm_name"], "table");
+        assert_eq!(certificate["declaration"]["size_bits"], 256);
+        assert_eq!(certificate["declaration"]["align_bits"], 64);
+        assert_eq!(
+            certificate["declaration"]["initializer_ir"],
+            "[4 x %struct.entry] zeroinitializer"
+        );
+        assert_eq!(
+            certificate["source_materialization"]["code"],
+            "no-runtime-accessor-sites"
         );
     }
 
