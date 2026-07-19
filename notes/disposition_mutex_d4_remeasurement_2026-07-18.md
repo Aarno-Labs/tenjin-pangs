@@ -2,6 +2,10 @@
 
 Date: 2026-07-18
 
+> This records the initial D4 result. The subsequent fail-closed callback hardening
+> supersedes its certificate and coverage totals; see
+> `disposition_mutex_d4_hardening_remeasurement_2026-07-18.md`.
+
 ## Scope and method
 
 D4 was measured on every non-Vim, non-PHP sibling in
