@@ -1022,27 +1022,54 @@ struct MutexCallStep {
     callsite: Option<pangs_api::CallsiteId>,
 }
 
+#[derive(Clone)]
+struct MutexUnknownStep {
+    reason: String,
+    callsite: Option<pangs_api::CallsiteId>,
+}
+
 struct MutexReachability {
     outgoing: Vec<Vec<MutexCallStep>>,
+    unknown_outgoing: Vec<Vec<MutexUnknownStep>>,
 }
 
 impl MutexReachability {
     fn new(analysis: &Analysis) -> Self {
         let mut outgoing = vec![Vec::new(); analysis.functions().len()];
+        let mut unknown_outgoing = vec![Vec::new(); analysis.functions().len()];
         for edge in analysis.call_edges() {
-            let (Caller::Func(caller), Callee::Func(callee)) = (&edge.caller, &edge.callee) else {
+            let Caller::Func(caller) = &edge.caller else {
                 continue;
             };
-            outgoing[caller.0 as usize].push(MutexCallStep {
-                callee: *callee,
-                callsite: edge.callsite,
-            });
+            match &edge.callee {
+                Callee::Func(callee) => outgoing[caller.0 as usize].push(MutexCallStep {
+                    callee: *callee,
+                    callsite: edge.callsite,
+                }),
+                Callee::Unknown(reason) => {
+                    unknown_outgoing[caller.0 as usize].push(MutexUnknownStep {
+                        reason: reason.clone(),
+                        callsite: edge.callsite,
+                    });
+                }
+            }
         }
         for edges in &mut outgoing {
             edges.sort_by_key(|edge| (edge.callee, edge.callsite));
             edges.dedup_by_key(|edge| (edge.callee, edge.callsite));
         }
-        Self { outgoing }
+        for edges in &mut unknown_outgoing {
+            edges.sort_by(|left, right| {
+                (&left.reason, left.callsite).cmp(&(&right.reason, right.callsite))
+            });
+            edges.dedup_by(|left, right| {
+                left.reason == right.reason && left.callsite == right.callsite
+            });
+        }
+        Self {
+            outgoing,
+            unknown_outgoing,
+        }
     }
 
     /// Find a non-empty final-call-graph path from an accessor to an accessor. A direct or
@@ -1068,6 +1095,43 @@ impl MutexReachability {
                         path.reverse();
                         return Some(path);
                     }
+                    if !seen[step.callee.0 as usize] {
+                        seen[step.callee.0 as usize] = true;
+                        parent[step.callee.0 as usize] = Some((caller, step));
+                        queue.push_back(step.callee);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a known path from an accessor to a call with an unresolved target. Under the v1
+    /// whole-function lock scope, the unknown target may call back into any accessor.
+    fn unknown_callee_path(
+        &self,
+        accessors: &BTreeSet<FuncId>,
+    ) -> Option<(Vec<(FuncId, MutexCallStep)>, FuncId, MutexUnknownStep)> {
+        for &source in accessors {
+            let mut seen = vec![false; self.outgoing.len()];
+            let mut parent = vec![None::<(FuncId, MutexCallStep)>; self.outgoing.len()];
+            let mut queue = VecDeque::new();
+            seen[source.0 as usize] = true;
+            queue.push_back(source);
+            while let Some(caller) = queue.pop_front() {
+                if let Some(unknown) = self.unknown_outgoing[caller.0 as usize].first() {
+                    let mut path = Vec::new();
+                    let mut cursor = caller;
+                    while cursor != source {
+                        let (previous, previous_step) = parent[cursor.0 as usize]
+                            .expect("BFS-discovered function must have a parent");
+                        path.push((previous, previous_step));
+                        cursor = previous;
+                    }
+                    path.reverse();
+                    return Some((path, caller, unknown.clone()));
+                }
+                for &step in &self.outgoing[caller.0 as usize] {
                     if !seen[step.callee.0 as usize] {
                         seen[step.callee.0 as usize] = true;
                         parent[step.callee.0 as usize] = Some((caller, step));
@@ -1171,6 +1235,16 @@ fn assemble_mutex_eligibility(
             if let Some(path) = reachability.accessor_path(accessors) {
                 codes.push("reentrant-access-path".into());
                 witnesses.push(mutex_path_witness(analysis, &global.key.to_string(), &path));
+            }
+            if let Some((path, caller, unknown)) = reachability.unknown_callee_path(accessors) {
+                codes.push("unknown-callee-reentrancy".into());
+                witnesses.push(mutex_unknown_callee_witness(
+                    analysis,
+                    &global.key.to_string(),
+                    &path,
+                    caller,
+                    &unknown,
+                ));
             }
         }
 
@@ -1361,6 +1435,49 @@ fn mutex_path_witness(
         site: first_site,
         symbol: Some(global.into()),
         note: Some("an accessor can call an accessor while holding the would-be mutex".into()),
+        extra: BTreeMap::from([("call_path".into(), serde_json::json!(call_path))]),
+    }
+}
+
+fn mutex_unknown_callee_witness(
+    analysis: &Analysis,
+    global: &str,
+    path: &[(FuncId, MutexCallStep)],
+    caller: FuncId,
+    unknown: &MutexUnknownStep,
+) -> Witness {
+    let mut call_path = path
+        .iter()
+        .map(|(caller, step)| {
+            let callsite = step.callsite.map(|id| &analysis.callsites()[id]);
+            serde_json::json!({
+                "caller": analysis.functions()[*caller].key,
+                "callee": analysis.functions()[step.callee].key,
+                "callsite": callsite.map(|site| &site.key),
+            })
+        })
+        .collect::<Vec<_>>();
+    let callsite = unknown.callsite.map(|id| &analysis.callsites()[id]);
+    call_path.push(serde_json::json!({
+        "caller": analysis.functions()[caller].key,
+        "callee": { "unknown": unknown.reason },
+        "callsite": callsite.map(|site| &site.key),
+    }));
+    let site = callsite.and_then(|site| site.loc.as_ref()).map(|loc| Site {
+        file: loc.file.clone(),
+        line: loc.line,
+        col: Some(loc.col),
+        function: Some(analysis.functions()[caller].key.clone()),
+        extra: Extra::new(),
+    });
+    Witness {
+        kind: "mutex-unknown-callee-reentrancy".into(),
+        site,
+        symbol: Some(global.into()),
+        note: Some(
+            "an unresolved callee reachable while holding the would-be mutex may call an accessor"
+                .into(),
+        ),
         extra: BTreeMap::from([("call_path".into(), serde_json::json!(call_path))]),
     }
 }
@@ -3557,6 +3674,97 @@ mod tests {
             "whole-accessor-function-v1"
         );
         assert_eq!(certificate["accessor_functions"], json!(["target"]));
+    }
+
+    #[test]
+    fn mutex_eligibility_rejects_unknown_callees_reachable_from_an_accessor() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        let unknown_call = pir
+            .functions
+            .iter()
+            .find(|function| function.key == "main")
+            .and_then(|function| {
+                function.body.iter().find_map(|statement| match statement {
+                    pangs_pir::Stmt::CallDirect { .. } => Some(statement.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap();
+        let unknown_call = match unknown_call {
+            pangs_pir::Stmt::CallDirect {
+                sig,
+                args,
+                dest,
+                loc,
+                ..
+            } => pangs_pir::Stmt::CallDirect {
+                callee: "missing_external".into(),
+                sig,
+                args,
+                dest,
+                loc,
+            },
+            _ => unreachable!(),
+        };
+        let target = pir
+            .functions
+            .iter_mut()
+            .find(|function| function.key == "target")
+            .unwrap();
+        target.body = vec![
+            pangs_pir::Stmt::GlobalRef {
+                global: "isolated".into(),
+                access: pangs_pir::Access::Mod,
+                volatile: false,
+                loc: None,
+            },
+            unknown_call,
+        ];
+        pir.globals.push(pangs_pir::Global {
+            key: "isolated".into(),
+            mutable: true,
+            ..pangs_pir::Global::default()
+        });
+
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let target_info = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target_info,
+        )
+        .unwrap();
+
+        let isolated = manifest
+            .globals
+            .iter()
+            .find(|global| global.meta.llvm_name == "isolated")
+            .unwrap();
+        let Some(Certificate::Failed {
+            codes, witnesses, ..
+        }) = &isolated.facts.mutex_eligibility
+        else {
+            panic!("an unresolved callee reachable from an accessor must fail closed")
+        };
+        assert!(codes.iter().any(|code| code == "unknown-callee-reentrancy"));
+        let witness = witnesses
+            .iter()
+            .find(|witness| witness.kind == "mutex-unknown-callee-reentrancy")
+            .unwrap();
+        assert_eq!(witness.extra["call_path"][0]["caller"], "target");
+        assert_eq!(
+            witness.extra["call_path"][0]["callee"]["unknown"],
+            "external_callee"
+        );
     }
 
     #[test]

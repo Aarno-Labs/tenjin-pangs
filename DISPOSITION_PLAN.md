@@ -931,9 +931,13 @@ D2b groups. Dynamic audit: lock-cycle detection under the program's test suite.
 The implementation treats the path as non-empty: two distinct accessors connected by a
 path fail, as does recursion back to the same accessor, while the zero-length identity
 path does not. Coarse failures are `access-set-complete`, `signal-context-access`, and
-`violation-taint`; the reentrancy failure is `reentrant-access-path`. Certified globals
-carry the accessor set, the `final-call-graph-v1` model name, a per-global lock recipe,
-the v1 whole-accessor-function lock scope, and the required dynamic lock-cycle audit.
+`violation-taint`; the known-path reentrancy failure is `reentrant-access-path`. A known
+path from an accessor to an unresolved direct or indirect callee fails closed with
+`unknown-callee-reentrancy`, because the unknown target may call an accessor while the
+whole-function lock is held. External declarations represented by ordinary function
+nodes do not fail this check. Certified globals carry the accessor set, the
+`final-call-graph-v1` model name, a per-global lock recipe, the v1
+whole-accessor-function lock scope, and the required dynamic lock-cycle audit.
 D2b groups repeat the check over the union of their member accessor sets and emit a
 typed `strategy_support.mutex` certificate. A certified group recipe prescribes one
 shared `Mutex<Struct>` with the same lock scope; a group is blocked by an ineligible

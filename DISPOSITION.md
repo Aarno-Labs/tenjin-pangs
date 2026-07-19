@@ -651,8 +651,11 @@ Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
   enumerate redundant per-access rewrite failures once certification is impossible.
 - **D4 — mutex eligibility pass (implemented).** Reuses access-set completeness and
   violation relevance, rejects signal-context access, and checks final-call-graph
-  reachability between accessor functions. It emits deterministic call-path witnesses,
-  per-global lock recipes, and shared-lock support certificates for coupling groups.
+  reachability between accessor functions. Under the whole-accessor-function recipe it
+  also fails closed when an accessor can reach an unresolved callee, since that callee
+  may call back into an accessor while the lock is held. It emits deterministic
+  call-path witnesses, per-global lock recipes, and shared-lock support certificates
+  for coupling groups.
 - **D5 — marker contract (~150 lines analysis-side).** Marker name mangling +
   collision check + inventory schema; the insertion itself is C→C-tool work, and the
   consumption is Rust-rewriter work, but the name scheme and inventory format are owned
