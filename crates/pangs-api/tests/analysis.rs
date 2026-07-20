@@ -5,7 +5,7 @@ use pangs_api::{
     run_m2_ablation, Analysis, BuildMode, Caller, EscapeStatus, M2AblationMode, Opts, Stage,
     StationarityReason,
 };
-use pangs_pir::{AbiClass, Access, Func, Global, Param, Pir, Signature, Stmt};
+use pangs_pir::{AbiClass, Access, Func, Global, Param, Pir, Signature, Stmt, VarArgPosition};
 
 fn sig(ret: AbiClass, params: Vec<Param>) -> Signature {
     Signature {
@@ -2307,6 +2307,114 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
             .count(),
         1
     );
+}
+
+#[test]
+fn positional_varargs_suppress_only_proven_internal_boundaries() {
+    let vararg_sig = Signature {
+        ret: AbiClass::Void,
+        params: vec![Param::Integer],
+        vararg: true,
+        cc: "ccc".to_string(),
+    };
+    let positional_body = vec![Stmt::VarArg {
+        dest: "%slot".to_string(),
+        position: VarArgPosition::Exact { index: 0 },
+        loc: None,
+    }];
+    let callback = |key: &str| Func {
+        key: key.to_string(),
+        sig: sig(AbiClass::Void, vec![]),
+        param_names: vec![],
+        file: None,
+        line: None,
+        external: false,
+        exported: false,
+        address_taken: true,
+        body: vec![],
+    };
+    let pir = Pir {
+        module: "positional_vararg_audit".to_string(),
+        source: None,
+        lowering: Default::default(),
+        target: None,
+        functions: vec![
+            Func {
+                key: "modeled_sink".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec!["%tag".to_string()],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: positional_body.clone(),
+            },
+            Func {
+                key: "opaque_sink".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec!["%tag".to_string()],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: true,
+                body: positional_body,
+            },
+            callback("cb_safe"),
+            callback("cb_opaque"),
+            Func {
+                key: "driver".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![
+                    Stmt::CallDirect {
+                        callee: "modeled_sink".to_string(),
+                        sig: vararg_sig.clone(),
+                        args: vec!["%tag".to_string(), "cb_safe".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                    Stmt::CallDirect {
+                        callee: "opaque_sink".to_string(),
+                        sig: vararg_sig,
+                        args: vec!["%tag".to_string(), "cb_opaque".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                ],
+            },
+        ],
+        globals: vec![],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let affected = analysis
+        .audit_findings()
+        .iter()
+        .filter(|finding| finding.kind == "fnptr_varargs_internal_unmodeled")
+        .flat_map(|finding| finding.affected.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    assert!(affected.contains("function:cb_opaque"));
+    assert!(affected.iter().all(|value| !value.contains("cb_safe")));
+    let safe = analysis.lookup_func("cb_safe").unwrap();
+    let opaque = analysis.lookup_func("cb_opaque").unwrap();
+    assert!(!analysis.functions()[safe].address_escaped);
+    assert!(analysis.functions()[opaque].address_escaped);
 }
 
 #[test]

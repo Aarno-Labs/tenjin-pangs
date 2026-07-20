@@ -243,6 +243,7 @@ impl<'a> SimpleResolver<'a> {
             Stmt::Alloca { .. }
             | Stmt::PtrToInt { .. }
             | Stmt::IntToPtr { .. }
+            | Stmt::VarArg { .. }
             | Stmt::Memcpy { .. }
             | Stmt::Memset { .. }
             | Stmt::Unknown { .. }
@@ -600,6 +601,7 @@ impl<'a> SimpleResolver<'a> {
             | Stmt::ScalarOp { .. }
             | Stmt::Store { .. }
             | Stmt::Return { .. }
+            | Stmt::VarArg { .. }
             | Stmt::GlobalRef { .. } => false,
         }
     }
@@ -685,6 +687,7 @@ impl<'a> SimpleResolver<'a> {
             | Stmt::Assign { .. }
             | Stmt::ScalarOp { .. }
             | Stmt::Gep { .. }
+            | Stmt::VarArg { .. }
             | Stmt::Return { .. }
             | Stmt::GlobalRef { .. } => false,
         }
@@ -944,7 +947,8 @@ fn stmt_dest(stmt: &Stmt) -> Option<&str> {
         | Stmt::Load { dest, .. }
         | Stmt::Gep { dest, .. }
         | Stmt::PtrToInt { dest, .. }
-        | Stmt::IntToPtr { dest, .. } => Some(dest),
+        | Stmt::IntToPtr { dest, .. }
+        | Stmt::VarArg { dest, .. } => Some(dest),
         Stmt::CallDirect { dest, .. } | Stmt::CallIndirect { dest, .. } => dest.as_deref(),
         Stmt::Unknown { results, .. } => results.first().map(String::as_str),
         Stmt::Store { .. }
@@ -957,7 +961,7 @@ fn stmt_dest(stmt: &Stmt) -> Option<&str> {
 
 fn stmt_operands(stmt: &Stmt) -> Vec<&str> {
     match stmt {
-        Stmt::Alloca { .. } | Stmt::GlobalRef { .. } => Vec::new(),
+        Stmt::Alloca { .. } | Stmt::VarArg { .. } | Stmt::GlobalRef { .. } => Vec::new(),
         Stmt::Assign { sources, .. } => sources.iter().map(String::as_str).collect(),
         Stmt::ScalarOp { lhs, rhs, .. } => vec![lhs.as_str(), rhs.as_str()],
         Stmt::Load { address, .. } => vec![address.as_str()],
@@ -987,7 +991,7 @@ fn stmt_operands(stmt: &Stmt) -> Vec<&str> {
 
 fn function_symbol_value_operands(stmt: &Stmt) -> Vec<&str> {
     match stmt {
-        Stmt::Alloca { .. } | Stmt::GlobalRef { .. } => Vec::new(),
+        Stmt::Alloca { .. } | Stmt::VarArg { .. } | Stmt::GlobalRef { .. } => Vec::new(),
         Stmt::Assign { sources, .. } => sources.iter().map(String::as_str).collect(),
         Stmt::ScalarOp { lhs, rhs, .. } => vec![lhs.as_str(), rhs.as_str()],
         Stmt::Load { address, .. } => vec![address.as_str()],
@@ -1058,6 +1062,7 @@ where
                 || args.iter().any(|arg| arg == target)
         }
         Stmt::Alloca { dest, .. } => dest == target,
+        Stmt::VarArg { dest, .. } => dest == target,
         Stmt::GlobalRef { .. } => false,
     }
 }

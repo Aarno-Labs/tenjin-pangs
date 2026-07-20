@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use pangs_pir::{Loc, Pir, Signature, Stmt};
+use pangs_pir::{Loc, Pir, Signature, Stmt, VarArgPosition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -703,6 +703,7 @@ struct Builder<'a> {
     symbol_addr_edges: BTreeSet<(ObjectKind, usize, SymbolKind, usize)>,
     globals: BTreeMap<String, usize>,
     functions: BTreeMap<String, usize>,
+    positional_vararg_functions: BTreeSet<String>,
     callsite_ordinals: BTreeMap<usize, u32>,
 }
 
@@ -720,6 +721,7 @@ impl<'a> Builder<'a> {
             .enumerate()
             .map(|(index, func)| (func.key.clone(), index))
             .collect();
+        let positional_vararg_functions = positionally_modeled_vararg_functions(pir, opts);
         Self {
             pir,
             opts,
@@ -731,6 +733,7 @@ impl<'a> Builder<'a> {
             symbol_addr_edges: BTreeSet::new(),
             globals,
             functions,
+            positional_vararg_functions,
             callsite_ordinals: BTreeMap::new(),
         }
     }
@@ -926,6 +929,11 @@ impl<'a> Builder<'a> {
                     Some(dest.clone()),
                 );
             }
+            Stmt::VarArg { dest, .. } => {
+                // Direct callsites add the proven actual-to-result edges. Keeping node creation
+                // here also makes a malformed/unbound model fail closed as an empty value.
+                self.value_node(func_index, owner_scope(&owner), dest);
+            }
             Stmt::Memcpy {
                 dst,
                 src,
@@ -1076,6 +1084,39 @@ impl<'a> Builder<'a> {
                                     );
                                 }
                             }
+                            if self.positional_vararg_functions.contains(callee) {
+                                for access in callee_func.body.iter().filter_map(|stmt| {
+                                    let Stmt::VarArg { dest, position, .. } = stmt else {
+                                        return None;
+                                    };
+                                    Some((dest, *position))
+                                }) {
+                                    let destination = self.value_node(
+                                        callee_index,
+                                        Scope::Function(callee.clone()),
+                                        access.0,
+                                    );
+                                    let fixed = callee_func.sig.params.len();
+                                    let actuals: &[NodeId] = match access.1 {
+                                        VarArgPosition::Exact { index } => arg_nodes
+                                            .get(fixed + index as usize)
+                                            .map(std::slice::from_ref)
+                                            .unwrap_or(&[]),
+                                        VarArgPosition::From { index } => {
+                                            arg_nodes.get(fixed + index as usize..).unwrap_or(&[])
+                                        }
+                                    };
+                                    for &actual in actuals {
+                                        self.add_edge(
+                                            EdgeKind::Assign,
+                                            actual,
+                                            destination,
+                                            owner.clone(),
+                                            loc.clone(),
+                                        );
+                                    }
+                                }
+                            }
                             if let Some(result) = result {
                                 if let Some(ret) = self.return_node(callee_index) {
                                     self.add_edge(
@@ -1170,7 +1211,9 @@ impl<'a> Builder<'a> {
         else {
             return true;
         };
-        func.external || func.body.iter().any(stmt_consumes_varargs)
+        func.external
+            || (!self.positional_vararg_functions.contains(callee)
+                && func.body.iter().any(stmt_consumes_varargs))
     }
 
     fn indirect_vararg_call_requires_boundary(&self, callsite: CallsiteId) -> bool {
@@ -1423,11 +1466,73 @@ fn loc_key(loc: Option<&Loc>) -> String {
 
 fn stmt_consumes_varargs(stmt: &Stmt) -> bool {
     match stmt {
+        Stmt::VarArg { .. } => true,
         Stmt::Unknown { op, reason, .. } => {
             reason == "va_arg" || reason == "varargs_intrinsic" || op.starts_with("llvm.va_")
         }
         _ => false,
     }
+}
+
+/// Functions whose visible `va_arg` operations can be bound to direct callsite actuals without
+/// an opaque ABI boundary. The proof is deliberately whole-function and build-mode-sensitive:
+/// address-taken functions and library-visible definitions may have callers absent from the PIR.
+pub fn positionally_modeled_vararg_functions(pir: &Pir, opts: &PagOpts) -> BTreeSet<String> {
+    pir.functions
+        .iter()
+        .filter(|func| {
+            if func.external
+                || !func.sig.vararg
+                || func.address_taken
+                || is_exported_func(func.exported, &func.key, opts)
+            {
+                return false;
+            }
+            let accesses = func
+                .body
+                .iter()
+                .filter_map(|stmt| match stmt {
+                    Stmt::VarArg { position, .. } => Some(*position),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if accesses.is_empty()
+                || func.body.iter().any(|stmt| {
+                    matches!(stmt, Stmt::Unknown { op, reason, .. }
+                        if reason == "va_arg"
+                            || reason == "varargs_intrinsic"
+                            || op.starts_with("llvm.va_"))
+                })
+            {
+                return false;
+            }
+            let fixed = func.sig.params.len();
+            let calls = pir
+                .functions
+                .iter()
+                .flat_map(|caller| caller.body.iter())
+                .filter_map(|stmt| match stmt {
+                    Stmt::CallDirect { callee, args, .. } if callee == &func.key => {
+                        Some(args.len())
+                    }
+                    _ => None,
+                });
+            let mut saw_call = false;
+            for actual_count in calls {
+                saw_call = true;
+                if accesses.iter().any(|position| {
+                    let index = match position {
+                        VarArgPosition::Exact { index } | VarArgPosition::From { index } => *index,
+                    } as usize;
+                    actual_count <= fixed + index
+                }) {
+                    return false;
+                }
+            }
+            saw_call
+        })
+        .map(|func| func.key.clone())
+        .collect()
 }
 
 fn is_known_benign_vararg_callee(callee: &str) -> bool {

@@ -393,7 +393,8 @@ fn stmt_dest(stmt: &Stmt) -> Option<&str> {
         | Stmt::Load { dest, .. }
         | Stmt::Gep { dest, .. }
         | Stmt::PtrToInt { dest, .. }
-        | Stmt::IntToPtr { dest, .. } => Some(dest),
+        | Stmt::IntToPtr { dest, .. }
+        | Stmt::VarArg { dest, .. } => Some(dest),
         Stmt::CallDirect { dest, .. } | Stmt::CallIndirect { dest, .. } => dest.as_deref(),
         _ => None,
     }
@@ -408,6 +409,7 @@ fn stmt_operands(stmt: &Stmt) -> Vec<&str> {
         Stmt::Store { address, value, .. } => vec![address.as_str(), value.as_str()],
         Stmt::Gep { base, .. } => vec![base.as_str()],
         Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => vec![source.as_str()],
+        Stmt::VarArg { .. } => Vec::new(),
         Stmt::Memcpy { dst, src, .. } => vec![dst.as_str(), src.as_str()],
         Stmt::Memset { dst, value, .. } => vec![dst.as_str(), value.as_str()],
         Stmt::Unknown {

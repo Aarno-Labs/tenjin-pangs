@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use pangs_pir::{Param, Pir, ScalarTypeClass, Stmt};
+use pangs_pir::{Param, Pir, ScalarTypeClass, Stmt, VarArgPosition};
 use tempfile::TempDir;
 
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
@@ -369,6 +369,66 @@ fn lowers_vararg_and_x87_signatures_from_ll() {
                 && args.len() == 1
                 && sig.params.as_slice() == [Param::X87]
                 && sig.ret == pangs_pir::AbiClass::X87
+    )));
+}
+
+#[test]
+fn recognizes_closed_sysv_pointer_varargs_and_rejects_va_copy() {
+    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
+    let tmp = TempDir::new().unwrap();
+    let bc_path = tmp.path().join("positional-varargs.bc");
+    assert!(Command::new(CLANG_14)
+        .args(["-O0", "-g", "-emit-llvm", "-c"])
+        .arg(m1_1_fixture("positional_varargs.c"))
+        .arg("-o")
+        .arg(&bc_path)
+        .status()
+        .unwrap()
+        .success());
+
+    let pir = Pir::from_path(&bc_path).unwrap();
+    let first = pir
+        .functions
+        .iter()
+        .find(|function| function.key == "first_pointer")
+        .unwrap();
+    assert!(first.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::VarArg {
+            position: VarArgPosition::Exact { index: 0 },
+            ..
+        }
+    )));
+    assert!(!first.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { reason, .. } if reason == "varargs_intrinsic"
+    )));
+
+    let tail = pir
+        .functions
+        .iter()
+        .find(|function| function.key == "pointer_tail")
+        .unwrap();
+    assert!(tail.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::VarArg {
+            position: VarArgPosition::From { index: 0 },
+            ..
+        }
+    )));
+
+    let copied = pir
+        .functions
+        .iter()
+        .find(|function| function.key == "copied_list")
+        .unwrap();
+    assert!(!copied
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::VarArg { .. })));
+    assert!(copied.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { op, .. } if op.starts_with("llvm.va_")
     )));
 }
 

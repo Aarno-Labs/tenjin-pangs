@@ -210,6 +210,15 @@ pub enum ScalarOp {
     Xor,
 }
 
+/// The vararg slots that may be read by one statically recognized `va_arg` operation.
+/// `From` is used when the operation is in a loop and can consume every remaining slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VarArgPosition {
+    Exact { index: u32 },
+    From { index: u32 },
+}
+
 fn default_true() -> bool {
     true
 }
@@ -275,6 +284,14 @@ pub enum Stmt {
     IntToPtr {
         dest: String,
         source: String,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    /// A proven ABI lowering of `va_arg`. The ordinary LLVM instructions remain in the PIR, but
+    /// this statement supplies the precise callsite-to-result relation used by the PAG.
+    VarArg {
+        dest: String,
+        position: VarArgPosition,
         #[serde(default)]
         loc: Option<Loc>,
     },

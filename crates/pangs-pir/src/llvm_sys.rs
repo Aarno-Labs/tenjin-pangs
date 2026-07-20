@@ -20,7 +20,7 @@ use llvm_sys::{
 
 use crate::{
     AbiClass, Access, Func, Global, Loc, LoweringStats, Param, Pir, PirError, ScalarTypeClass,
-    Signature, StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo,
+    Signature, StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo, VarArgPosition,
 };
 
 type AliasMap = BTreeMap<String, AliasTarget>;
@@ -164,6 +164,7 @@ impl Drop for ParsedModule {
 
 struct ModuleCtx {
     data_layout: LLVMTargetDataRef,
+    target_triple: String,
     func_names: BTreeSet<String>,
     global_names: BTreeSet<String>,
     aliases: AliasMap,
@@ -174,14 +175,16 @@ struct FunctionCtx {
     func_name: String,
     unnamed: BTreeMap<usize, String>,
     next_unnamed: u64,
+    positional_varargs: BTreeMap<usize, VarArgPosition>,
 }
 
 impl FunctionCtx {
-    fn new(func_name: String) -> Self {
+    fn new(func_name: String, positional_varargs: BTreeMap<usize, VarArgPosition>) -> Self {
         Self {
             func_name,
             unnamed: BTreeMap::new(),
             next_unnamed: 0,
+            positional_varargs,
         }
     }
 
@@ -280,6 +283,7 @@ unsafe fn lower_module(module: LLVMModuleRef, repo_roots: Option<&RepoRoots>) ->
 
     let ctx = ModuleCtx {
         data_layout: LLVMGetModuleDataLayout(module),
+        target_triple: c_string_or_empty(LLVMGetTarget(module)),
         func_names,
         global_names,
         aliases: alias_map,
@@ -582,7 +586,8 @@ unsafe fn lower_function(
     }
     let key = value_name(function);
     let mut body = Vec::new();
-    let mut fctx = FunctionCtx::new(key.clone());
+    let positional_varargs = recognize_positional_varargs(ctx, function);
+    let mut fctx = FunctionCtx::new(key.clone(), positional_varargs);
     let param_names = function_param_names(function, &mut fctx);
     lower_personality_function(ctx, function, lowering);
 
@@ -837,6 +842,310 @@ unsafe fn function_param_names(function: LLVMValueRef, fctx: &mut FunctionCtx) -
     out
 }
 
+/// Recognize Clang's x86-64 SysV lowering of a pointer-valued `va_arg`. This deliberately accepts
+/// only the complete, canonical gp-register/overflow-area diamond. Any unfamiliar target, list
+/// manipulation, additional static access, or malformed update returns no model and preserves the
+/// ordinary opaque varargs boundary.
+unsafe fn recognize_positional_varargs(
+    ctx: &ModuleCtx,
+    function: LLVMValueRef,
+) -> BTreeMap<usize, VarArgPosition> {
+    if !ctx.target_triple.starts_with("x86_64-") {
+        return BTreeMap::new();
+    }
+
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    let mut candidate_loads = Vec::new();
+    let mut block = LLVMGetFirstBasicBlock(function);
+    while !block.is_null() {
+        let mut inst = LLVMGetFirstInstruction(block);
+        while !inst.is_null() {
+            if LLVMGetInstructionOpcode(inst) == LLVMOpcode::LLVMCall {
+                if let Some(callee) = direct_symbol_name(LLVMGetCalledValue(inst)) {
+                    if matches!(callee.as_str(), "llvm.va_start" | "llvm.va_end")
+                        && LLVMGetNumArgOperands(inst) == 1
+                    {
+                        let root = va_list_root(LLVMGetOperand(inst, 0));
+                        if callee == "llvm.va_start" {
+                            starts.push(root);
+                        } else {
+                            ends.push(root);
+                        }
+                    } else if callee.starts_with("llvm.va_") {
+                        return BTreeMap::new();
+                    }
+                }
+            }
+            if LLVMGetInstructionOpcode(inst) == LLVMOpcode::LLVMLoad
+                && is_pointer_like_type(LLVMTypeOf(inst))
+                && pointer_va_arg_root(inst).is_some()
+            {
+                candidate_loads.push(inst);
+            }
+            inst = LLVMGetNextInstruction(inst);
+        }
+        block = LLVMGetNextBasicBlock(block);
+    }
+
+    if starts.len() != 1
+        || ends.is_empty()
+        || candidate_loads.len() != 1
+        || ends.iter().any(|root| *root != starts[0])
+    {
+        return BTreeMap::new();
+    }
+    let root = starts[0];
+    let load = candidate_loads[0];
+    if pointer_va_arg_root(load) != Some(root) || !va_list_uses_are_supported(root) {
+        return BTreeMap::new();
+    }
+
+    let position = if instruction_block_is_cyclic(load) {
+        VarArgPosition::From { index: 0 }
+    } else {
+        VarArgPosition::Exact { index: 0 }
+    };
+    BTreeMap::from([(load as usize, position)])
+}
+
+unsafe fn pointer_va_arg_root(load: LLVMValueRef) -> Option<LLVMValueRef> {
+    let address = LLVMGetOperand(load, 0);
+    if LLVMIsAPHINode(address).is_null() || LLVMCountIncoming(address) != 2 {
+        return None;
+    }
+    let left = LLVMGetIncomingValue(address, 0);
+    let right = LLVMGetIncomingValue(address, 1);
+    recognize_va_arg_arms(left, right).or_else(|| recognize_va_arg_arms(right, left))
+}
+
+unsafe fn recognize_va_arg_arms(
+    register_arm: LLVMValueRef,
+    memory_arm: LLVMValueRef,
+) -> Option<LLVMValueRef> {
+    let register_slot = strip_pointer_cast(register_arm)?;
+    if LLVMGetInstructionOpcode(register_slot) != LLVMOpcode::LLVMGetElementPtr
+        || LLVMGetNumOperands(register_slot) != 2
+    {
+        return None;
+    }
+    let register_area = LLVMGetOperand(register_slot, 0);
+    let gp_offset = LLVMGetOperand(register_slot, 1);
+    if LLVMGetInstructionOpcode(register_area) != LLVMOpcode::LLVMLoad
+        || LLVMGetInstructionOpcode(gp_offset) != LLVMOpcode::LLVMLoad
+    {
+        return None;
+    }
+    let register_field = LLVMGetOperand(register_area, 0);
+    let gp_field = LLVMGetOperand(gp_offset, 0);
+    let root = va_list_field_root(register_field, 3)?;
+    if va_list_field_root(gp_field, 0) != Some(root)
+        || !field_has_integer_increment_store(gp_field, gp_offset, 8)
+    {
+        return None;
+    }
+
+    let memory_load = strip_pointer_cast(memory_arm)?;
+    if LLVMGetInstructionOpcode(memory_load) != LLVMOpcode::LLVMLoad {
+        return None;
+    }
+    let overflow_field = LLVMGetOperand(memory_load, 0);
+    if va_list_field_root(overflow_field, 2) != Some(root)
+        || !field_has_pointer_increment_store(overflow_field, memory_load, 8)
+    {
+        return None;
+    }
+    Some(root)
+}
+
+unsafe fn strip_pointer_cast(value: LLVMValueRef) -> Option<LLVMValueRef> {
+    if LLVMIsAInstruction(value).is_null() {
+        return None;
+    }
+    match LLVMGetInstructionOpcode(value) {
+        LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast => Some(LLVMGetOperand(value, 0)),
+        _ => Some(value),
+    }
+}
+
+unsafe fn va_list_field_root(field: LLVMValueRef, expected: i64) -> Option<LLVMValueRef> {
+    if LLVMIsAInstruction(field).is_null()
+        || LLVMGetInstructionOpcode(field) != LLVMOpcode::LLVMGetElementPtr
+        || LLVMGetNumOperands(field) != 3
+        || constant_i64(LLVMGetOperand(field, 1)) != Some(0)
+        || constant_i64(LLVMGetOperand(field, 2)) != Some(expected)
+    {
+        return None;
+    }
+    Some(va_list_root(LLVMGetOperand(field, 0)))
+}
+
+unsafe fn va_list_root(mut value: LLVMValueRef) -> LLVMValueRef {
+    loop {
+        if LLVMIsAInstruction(value).is_null() {
+            return value;
+        }
+        match LLVMGetInstructionOpcode(value) {
+            LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast => {
+                value = LLVMGetOperand(value, 0);
+            }
+            LLVMOpcode::LLVMGetElementPtr
+                if (1..LLVMGetNumOperands(value) as u32)
+                    .all(|index| constant_i64(LLVMGetOperand(value, index)) == Some(0)) =>
+            {
+                value = LLVMGetOperand(value, 0);
+            }
+            _ => return value,
+        }
+    }
+}
+
+unsafe fn field_has_integer_increment_store(
+    field: LLVMValueRef,
+    old: LLVMValueRef,
+    increment: i64,
+) -> bool {
+    field_has_store(field, |stored| {
+        !LLVMIsAInstruction(stored).is_null()
+            && LLVMGetInstructionOpcode(stored) == LLVMOpcode::LLVMAdd
+            && ((LLVMGetOperand(stored, 0) == old
+                && constant_i64(LLVMGetOperand(stored, 1)) == Some(increment))
+                || (LLVMGetOperand(stored, 1) == old
+                    && constant_i64(LLVMGetOperand(stored, 0)) == Some(increment)))
+    })
+}
+
+unsafe fn field_has_pointer_increment_store(
+    field: LLVMValueRef,
+    old: LLVMValueRef,
+    increment: i64,
+) -> bool {
+    field_has_store(field, |stored| {
+        !LLVMIsAInstruction(stored).is_null()
+            && LLVMGetInstructionOpcode(stored) == LLVMOpcode::LLVMGetElementPtr
+            && LLVMGetNumOperands(stored) == 2
+            && LLVMGetOperand(stored, 0) == old
+            && constant_i64(LLVMGetOperand(stored, 1)) == Some(increment)
+    })
+}
+
+unsafe fn field_has_store(field: LLVMValueRef, predicate: impl Fn(LLVMValueRef) -> bool) -> bool {
+    let mut current_use = LLVMGetFirstUse(field);
+    while !current_use.is_null() {
+        let user = LLVMGetUser(current_use);
+        if !LLVMIsAInstruction(user).is_null()
+            && LLVMGetInstructionOpcode(user) == LLVMOpcode::LLVMStore
+            && LLVMGetOperand(user, 1) == field
+            && predicate(LLVMGetOperand(user, 0))
+        {
+            return true;
+        }
+        current_use = LLVMGetNextUse(current_use);
+    }
+    false
+}
+
+unsafe fn va_list_uses_are_supported(root: LLVMValueRef) -> bool {
+    let mut work = vec![root];
+    let mut seen = BTreeSet::new();
+    let mut overflow_fields = 0_u32;
+    let mut register_fields = 0_u32;
+    while let Some(value) = work.pop() {
+        if !seen.insert(value as usize) {
+            continue;
+        }
+        let mut current_use = LLVMGetFirstUse(value);
+        while !current_use.is_null() {
+            let user = LLVMGetUser(current_use);
+            if LLVMIsAInstruction(user).is_null() {
+                return false;
+            }
+            match LLVMGetInstructionOpcode(user) {
+                LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast => work.push(user),
+                LLVMOpcode::LLVMGetElementPtr => {
+                    let all_zero = (1..LLVMGetNumOperands(user) as u32)
+                        .all(|index| constant_i64(LLVMGetOperand(user, index)) == Some(0));
+                    let supported_field = LLVMGetNumOperands(user) == 3
+                        && constant_i64(LLVMGetOperand(user, 1)) == Some(0)
+                        && matches!(constant_i64(LLVMGetOperand(user, 2)), Some(0 | 2 | 3));
+                    if !all_zero && !supported_field {
+                        return false;
+                    }
+                    match va_list_field_index(user) {
+                        Some(2) => overflow_fields += 1,
+                        Some(3) => register_fields += 1,
+                        _ => {}
+                    }
+                    work.push(user);
+                }
+                LLVMOpcode::LLVMLoad => {
+                    if !matches!(va_list_field_index(value), Some(0 | 2 | 3)) {
+                        return false;
+                    }
+                }
+                LLVMOpcode::LLVMStore => {
+                    if LLVMGetOperand(user, 1) != value
+                        || !matches!(va_list_field_index(value), Some(0 | 2))
+                    {
+                        return false;
+                    }
+                }
+                LLVMOpcode::LLVMCall => {
+                    let Some(callee) = direct_symbol_name(LLVMGetCalledValue(user)) else {
+                        return false;
+                    };
+                    if !matches!(callee.as_str(), "llvm.va_start" | "llvm.va_end") {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            current_use = LLVMGetNextUse(current_use);
+        }
+    }
+    overflow_fields == 1 && register_fields == 1
+}
+
+unsafe fn va_list_field_index(value: LLVMValueRef) -> Option<i64> {
+    if LLVMIsAInstruction(value).is_null()
+        || LLVMGetInstructionOpcode(value) != LLVMOpcode::LLVMGetElementPtr
+        || LLVMGetNumOperands(value) != 3
+        || constant_i64(LLVMGetOperand(value, 1)) != Some(0)
+    {
+        return None;
+    }
+    constant_i64(LLVMGetOperand(value, 2))
+}
+
+unsafe fn instruction_block_is_cyclic(instruction: LLVMValueRef) -> bool {
+    let start = LLVMGetInstructionParent(instruction);
+    let Some(terminator) =
+        (!LLVMGetBasicBlockTerminator(start).is_null()).then(|| LLVMGetBasicBlockTerminator(start))
+    else {
+        return false;
+    };
+    let mut work = (0..LLVMGetNumSuccessors(terminator))
+        .map(|index| LLVMGetSuccessor(terminator, index))
+        .collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    while let Some(block) = work.pop() {
+        if block == start {
+            return true;
+        }
+        if !seen.insert(block as usize) {
+            continue;
+        }
+        let terminator = LLVMGetBasicBlockTerminator(block);
+        if !terminator.is_null() {
+            work.extend(
+                (0..LLVMGetNumSuccessors(terminator))
+                    .map(|index| LLVMGetSuccessor(terminator, index)),
+            );
+        }
+    }
+    false
+}
+
 /// Proves that a `ptrtoint` result remains inside the small integer domain whose only terminal
 /// operation is `icmp`. Unknown users fail closed. Cyclic phi graphs are accepted only when every
 /// edge leaving the cycle eventually reaches a supported comparison/arithmetic node.
@@ -907,8 +1216,9 @@ unsafe fn lower_instruction(
         }
         LLVMOpcode::LLVMLoad => {
             let address = LLVMGetOperand(inst, 0);
+            let dest = fctx.local_key(inst);
             body.push(Stmt::Load {
-                dest: fctx.local_key(inst),
+                dest: dest.clone(),
                 address: fctx.operand_key(address),
                 loc: loc(inst),
             });
@@ -928,6 +1238,14 @@ unsafe fn lower_instruction(
                     loc: loc(inst),
                 });
                 lowering.bump_modeled("global_ref");
+            }
+            if let Some(position) = fctx.positional_varargs.get(&(inst as usize)).copied() {
+                body.push(Stmt::VarArg {
+                    dest,
+                    position,
+                    loc: loc(inst),
+                });
+                lowering.bump_modeled("positional_va_arg");
             }
         }
         LLVMOpcode::LLVMStore => {
@@ -1573,6 +1891,11 @@ unsafe fn lower_intrinsic_call(
     }
 
     if callee.starts_with("llvm.va_") {
+        if !fctx.positional_varargs.is_empty() && matches!(callee, "llvm.va_start" | "llvm.va_end")
+        {
+            lowering.bump_modeled(format!("positional_{callee}"));
+            return true;
+        }
         lowering.bump_tainted(format!("intrinsic:{callee}"));
         push_unknown(
             body,

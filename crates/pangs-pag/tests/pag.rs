@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use pangs_pag::{BuildMode, OmegaSeedKind, Pag, PagOpts, SeedTarget, ValidationIssue};
-use pangs_pir::{AbiClass, Func, Param, Pir, Signature, Stmt};
+use pangs_pir::{AbiClass, Func, Param, Pir, Signature, Stmt, VarArgPosition};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -380,6 +380,125 @@ fn direct_internal_vararg_boundary_requires_visible_vararg_consumption() {
         seed.kind == OmegaSeedKind::VarargCallBoundary
             && seed.target == SeedTarget::Callsite(summarized.id)
     }));
+}
+
+#[test]
+fn positional_varargs_bind_only_the_callees_tail_actuals() {
+    let vararg_sig = Signature {
+        ret: AbiClass::Void,
+        params: vec![Param::Integer],
+        vararg: true,
+        cc: "ccc".to_string(),
+    };
+    let positional_body = vec![Stmt::VarArg {
+        dest: "%slot".to_string(),
+        position: VarArgPosition::From { index: 0 },
+        loc: None,
+    }];
+    let pir = Pir {
+        module: "positional_varargs".to_string(),
+        source: None,
+        lowering: Default::default(),
+        target: None,
+        functions: vec![
+            Func {
+                key: "modeled_sink".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec!["%tag".to_string()],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: positional_body.clone(),
+            },
+            Func {
+                key: "address_taken_sink".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec!["%tag".to_string()],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: true,
+                body: positional_body,
+            },
+            Func {
+                key: "cb".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: true,
+                body: vec![],
+            },
+            Func {
+                key: "driver".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![
+                    Stmt::CallDirect {
+                        callee: "modeled_sink".to_string(),
+                        sig: vararg_sig.clone(),
+                        args: vec!["%tag".to_string(), "cb".to_string(), "%data".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                    Stmt::CallDirect {
+                        callee: "address_taken_sink".to_string(),
+                        sig: vararg_sig,
+                        args: vec!["%tag".to_string(), "cb".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
+                ],
+            },
+        ],
+        globals: vec![],
+        global_init: vec![],
+    };
+
+    let pag = Pag::from_pir(&pir, &PagOpts::default());
+    let modeled = pag
+        .callsites
+        .iter()
+        .find(|site| site.callee.as_deref() == Some("modeled_sink"))
+        .unwrap();
+    let fallback = pag
+        .callsites
+        .iter()
+        .find(|site| site.callee.as_deref() == Some("address_taken_sink"))
+        .unwrap();
+    assert!(!pag.omega_seeds.iter().any(|seed| {
+        seed.kind == OmegaSeedKind::VarargCallBoundary
+            && seed.target == SeedTarget::Callsite(modeled.id)
+    }));
+    assert!(pag.omega_seeds.iter().any(|seed| {
+        seed.kind == OmegaSeedKind::VarargCallBoundary
+            && seed.target == SeedTarget::Callsite(fallback.id)
+    }));
+
+    let destination = pag
+        .nodes
+        .iter()
+        .find(|node| node.label == "val:modeled_sink:%slot")
+        .unwrap()
+        .id;
+    let mut sources = pag
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == pangs_pag::EdgeKind::Assign && edge.dst == destination)
+        .map(|edge| pag.nodes[edge.src.0 as usize].label.as_str())
+        .collect::<Vec<_>>();
+    sources.sort_unstable();
+    assert_eq!(sources, ["sym:function:cb", "val:driver:%data"]);
 }
 
 #[test]

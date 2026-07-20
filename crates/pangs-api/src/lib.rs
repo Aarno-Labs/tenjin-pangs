@@ -4,7 +4,10 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::time::Instant;
 
-use pangs_pag::{BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts};
+use pangs_pag::{
+    positionally_modeled_vararg_functions, BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag,
+    PagOpts,
+};
 use pangs_pir::{
     fsa_compatible, Access, LoweringStats, Pir, ScalarOp, ScalarTypeClass, Stmt, SymbolLinkage,
 };
@@ -794,6 +797,14 @@ impl Analysis {
             Vec::new()
         };
         let setup_scan_started = Instant::now();
+        let positional_vararg_functions = positionally_modeled_vararg_functions(
+            module,
+            &PagOpts {
+                build_mode: opts.build_mode.into(),
+                exports: opts.exports.clone(),
+                ..PagOpts::default()
+            },
+        );
         let mut func_lookup = HashMap::new();
         let mut functions = Vec::new();
         for (idx, func) in module.functions.iter().enumerate() {
@@ -911,9 +922,14 @@ impl Analysis {
                             stmt,
                             loc,
                             &callsite_key,
+                            &positional_vararg_functions,
                         );
                         if let Stmt::CallDirect { sig, .. } = stmt {
-                            if let Some(kind) = direct_vararg_audit_kind(module, callee) {
+                            if let Some(kind) = direct_vararg_audit_kind(
+                                module,
+                                callee,
+                                &positional_vararg_functions,
+                            ) {
                                 record_vararg_deferred_audit(
                                     &mut deferred_audits,
                                     caller,
@@ -1237,8 +1253,12 @@ impl Analysis {
                     _ => solve_steensgaard(module, &pag, opts.build_mode.into()),
                 };
                 solve_us = solve_started.elapsed().as_micros() as u64;
-                let safe_indirect_varargs =
-                    safe_indirect_vararg_callsites(module, &indirect_vararg_keys, &solved);
+                let safe_indirect_varargs = safe_indirect_vararg_callsites(
+                    module,
+                    &indirect_vararg_keys,
+                    &solved,
+                    &positional_vararg_functions,
+                );
                 if !safe_indirect_varargs.is_empty() {
                     let pag_started = Instant::now();
                     pag = Pag::from_pir(
@@ -1318,8 +1338,12 @@ impl Analysis {
                         solve_us += solve_started.elapsed().as_micros() as u64;
                     }
                 }
-                let safe_indirect_varargs =
-                    safe_indirect_vararg_callsites(module, &indirect_vararg_keys, &solved);
+                let safe_indirect_varargs = safe_indirect_vararg_callsites(
+                    module,
+                    &indirect_vararg_keys,
+                    &solved,
+                    &positional_vararg_functions,
+                );
                 if disposition_facts {
                     registry_entries = resolve_registry_entries(
                         &pag,
@@ -3048,6 +3072,7 @@ fn detect_direct_call_audits(
     stmt: &Stmt,
     loc: &Option<pangs_pir::Loc>,
     callsite_key: &str,
+    positional_vararg_functions: &BTreeSet<String>,
 ) {
     if let Some(kind) = direct_boundary_kind(callee) {
         push_audit_finding(
@@ -3066,7 +3091,7 @@ fn detect_direct_call_audits(
             audit_taints,
             module,
             caller,
-            direct_vararg_audit_kind(module, callee),
+            direct_vararg_audit_kind(module, callee, positional_vararg_functions),
             Some(format!("callee:{callee}")),
             sig,
             args,
@@ -3204,11 +3229,16 @@ fn record_vararg_deferred_audit(
     });
 }
 
-fn direct_vararg_audit_kind(module: &Pir, callee: &str) -> Option<&'static str> {
+fn direct_vararg_audit_kind(
+    module: &Pir,
+    callee: &str,
+    positional_vararg_functions: &BTreeSet<String>,
+) -> Option<&'static str> {
     if is_known_benign_vararg_callee(callee) {
         return None;
     }
     match module.functions.iter().find(|func| func.key == callee) {
+        Some(func) if positional_vararg_functions.contains(&func.key) => None,
         Some(func) if !func.external && !func.body.iter().any(stmt_consumes_varargs) => None,
         Some(func) if !func.external => Some("fnptr_varargs_internal_unmodeled"),
         _ => Some("fnptr_varargs_external"),
@@ -3219,11 +3249,19 @@ fn safe_indirect_vararg_callsites(
     module: &Pir,
     indirect_vararg_keys: &BTreeSet<String>,
     solved: &pangs_solve::SolveResult,
+    positional_vararg_functions: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     solved
         .indirect_calls
         .iter()
-        .filter(|site| indirect_vararg_site_is_safe(module, indirect_vararg_keys, site))
+        .filter(|site| {
+            indirect_vararg_site_is_safe(
+                module,
+                indirect_vararg_keys,
+                site,
+                positional_vararg_functions,
+            )
+        })
         .map(|site| site.callsite_key.clone())
         .collect()
 }
@@ -3232,6 +3270,7 @@ fn indirect_vararg_site_is_safe(
     module: &Pir,
     indirect_vararg_keys: &BTreeSet<String>,
     site: &IndirectCallResolution,
+    positional_vararg_functions: &BTreeSet<String>,
 ) -> bool {
     if !indirect_vararg_keys.contains(&site.callsite_key)
         || site.unknown_callee
@@ -3247,7 +3286,8 @@ fn indirect_vararg_site_is_safe(
             .map(|func| {
                 func.sig.vararg
                     && !func.external
-                    && direct_vararg_audit_kind(module, target).is_none()
+                    && direct_vararg_audit_kind(module, target, positional_vararg_functions)
+                        .is_none()
             })
             .unwrap_or(false)
     })
@@ -3281,6 +3321,7 @@ fn is_known_benign_vararg_callee(callee: &str) -> bool {
 
 fn stmt_consumes_varargs(stmt: &Stmt) -> bool {
     match stmt {
+        Stmt::VarArg { .. } => true,
         Stmt::Unknown { op, reason, .. } => {
             reason == "va_arg" || reason == "varargs_intrinsic" || op.starts_with("llvm.va_")
         }
