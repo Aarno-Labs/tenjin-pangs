@@ -4,9 +4,9 @@
 //! It runs *on top of* Steensgaard: `solve_steensgaard_with_classes` provides the union-find
 //! classes (Kahlon partitions) and the authoritative global escape facts. Andersen then
 //! refines the **points-to sets** within interesting, within-budget partitions, which
-//! sharpens three outputs — indirect-call concrete targets and per-node `external` /
-//! `pointee_globals` (mod/ref) — while global escape and unknown-caller verdicts stay
-//! exactly as Steensgaard computed them.
+//! sharpens per-node points-to-derived outputs — indirect-call concrete targets,
+//! `reaches_function_pointer`, `external`, and `pointee_globals` (mod/ref) — while global
+//! escape and unknown-caller verdicts stay exactly as Steensgaard computed them.
 //!
 //! Soundness rests on three facts:
 //! * Steensgaard unification is a sound over-approximation of Andersen, so refined targets
@@ -166,8 +166,15 @@ fn finish_andersen(
     // Override only the refined facts; keep global escape/unknown-caller facts from
     // Steensgaard. Unrefined/oversize node partitions retain their Steensgaard node rows.
     base.indirect_calls = refined.indirect_calls;
-    for (label, external, pointee_globals, external_sources) in refined.nodes {
+    for (label, reaches_function_pointer, external, pointee_globals, external_sources) in
+        refined.nodes
+    {
         if let Some(node) = base.nodes.get_mut(&label) {
+            // Andersen runs inside a self-contained Steensgaard partition, so its points-to
+            // set is a sound subset of the union-based answer. In particular, a data pointer
+            // need not retain `reaches_function_pointer` merely because field-insensitive
+            // Steensgaard merged a sibling callback field into the same pointee class.
+            node.reaches_function_pointer = reaches_function_pointer;
             node.external = external;
             node.pointee_globals = pointee_globals.into();
             node.external_sources = external_sources;
@@ -186,7 +193,7 @@ fn finish_andersen(
 
 struct RefinerOutput {
     indirect_calls: Vec<IndirectCallResolution>,
-    nodes: Vec<(String, bool, Vec<String>, Vec<String>)>,
+    nodes: Vec<(String, bool, bool, Vec<String>, Vec<String>)>,
     /// Refined global-object points-to (`obj:global:<name>` label → named allocations), only
     /// populated when `Refiner::materialize_global_points_to` is set.
     global_points_to: Vec<(String, BTreeSet<String>)>,
@@ -1046,17 +1053,33 @@ impl<'a> Refiner<'a> {
     }
 
     fn apply_external_call_effects(&self, solve: &mut Solve, callsite: &pangs_pag::Callsite) {
+        let detailed = std::env::var_os("PANGS_ANDERSEN_EXPLAIN_NODE").is_some();
+        let arg_source = if detailed {
+            format!("omega:external_call_arg:{}", callsite.key)
+        } else {
+            "omega:external_call_arg".to_string()
+        };
         for &arg in &callsite.args {
-            self.seed_unknown_store_through(solve, arg, "omega:external_call_arg");
+            self.seed_unknown_store_through(solve, arg, &arg_source);
         }
         if let Some(result) = callsite.result {
-            self.seed_points_to_omega(solve, result, "omega:external_call_result");
+            let result_source = if detailed {
+                format!("omega:external_call_result:{}", callsite.key)
+            } else {
+                "omega:external_call_result".to_string()
+            };
+            self.seed_points_to_omega(solve, result, &result_source);
         }
     }
 
     fn apply_vararg_call_effects(&self, solve: &mut Solve, callsite: &pangs_pag::Callsite) {
+        let source = if std::env::var_os("PANGS_ANDERSEN_EXPLAIN_NODE").is_some() {
+            format!("omega:vararg_call_arg:{}", callsite.key)
+        } else {
+            "omega:vararg_call_arg".to_string()
+        };
         for &arg in callsite.args.iter().skip(callsite.sig.params.len()) {
-            self.seed_unknown_store_through(solve, arg, "omega:vararg_call_arg");
+            self.seed_unknown_store_through(solve, arg, &source);
         }
     }
 
@@ -1245,7 +1268,11 @@ impl<'a> Refiner<'a> {
         out
     }
 
-    fn emit_node_resolutions(&self, pts: &Solve) -> Vec<(String, bool, Vec<String>, Vec<String>)> {
+    fn emit_node_resolutions(
+        &self,
+        pts: &Solve,
+    ) -> Vec<(String, bool, bool, Vec<String>, Vec<String>)> {
+        let explain_label = std::env::var("PANGS_ANDERSEN_EXPLAIN_NODE").ok();
         let mut out = Vec::new();
         for node in &self.pag.nodes {
             if !node.kind.is_value_like_public() || !self.in_scope[node.id.0 as usize] {
@@ -1254,6 +1281,16 @@ impl<'a> Refiner<'a> {
             let set = pts.pts.get(&node.id.0);
             let external = set
                 .map(|set| set.iter().any(|cell| *cell == self.omega))
+                .unwrap_or(false);
+            let reaches_function_pointer = set
+                .map(|set| {
+                    set.iter().any(|cell| {
+                        *cell == self.omega
+                            || self
+                                .fn_cell_to_index
+                                .contains_key(pts.field_base.get(cell).unwrap_or(cell))
+                    })
+                })
                 .unwrap_or(false);
             let mut globals: Vec<String> = set
                 .into_iter()
@@ -1274,7 +1311,54 @@ impl<'a> Refiner<'a> {
             } else {
                 Vec::new()
             };
-            out.push((node.label.clone(), external, globals, external_sources));
+            if explain_label.as_deref() == Some(node.label.as_str()) {
+                let mut allocations = set
+                    .into_iter()
+                    .flat_map(|set| set.iter().copied())
+                    .map(|cell| {
+                        if cell == self.omega {
+                            return "omega".to_string();
+                        }
+                        let root = *pts.field_base.get(&cell).unwrap_or(&cell);
+                        if let Some(index) = self.fn_cell_to_index.get(&root) {
+                            return format!("function:{}", self.pir.functions[*index].key);
+                        }
+                        if let Some(index) = self.global_of_cell.get(&root) {
+                            return format!("global:{}", self.pir.globals[*index].key);
+                        }
+                        self.pag
+                            .nodes
+                            .get(root as usize)
+                            .map(|node| node.label.clone())
+                            .unwrap_or_else(|| format!("cell:{cell}"))
+                    })
+                    .collect::<Vec<_>>();
+                allocations.sort();
+                allocations.dedup();
+                const SOURCE_LIMIT: usize = 32;
+                let source_count = external_sources.len();
+                let source_sample = external_sources
+                    .iter()
+                    .take(SOURCE_LIMIT)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "pangs andersen explain node={} reaches_function_pointer={} external={} allocations={:?} omega_source_count={} omega_source_sample={:?}",
+                    node.label,
+                    reaches_function_pointer,
+                    external,
+                    allocations,
+                    source_count,
+                    source_sample
+                );
+            }
+            out.push((
+                node.label.clone(),
+                reaches_function_pointer,
+                external,
+                globals,
+                external_sources,
+            ));
         }
         out
     }
@@ -1957,6 +2041,30 @@ mod tests {
             .iter()
             .all(|t| steens.indirect_calls[0].targets.contains(t)));
         assert!(andersen.metrics.rounds >= 1);
+    }
+
+    #[test]
+    fn andersen_refines_function_pointer_reachability_for_data_fields() {
+        let (pir, pag) = load("field_sensitive_data_vs_fnptr.pir.json");
+
+        // Steensgaard merges the aggregate's callback and data fields, so the loaded data
+        // pointer inherits the callback function object.
+        let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        let data = "val:setup:%data";
+        assert!(steens.nodes[data].reaches_function_pointer);
+        assert_eq!(
+            steens.nodes[data].pointee_globals,
+            vec!["@Data".to_string()]
+        );
+
+        // Andersen keeps the constant-offset fields separate. Its allocation set contains
+        // only @Data, so the refined function-pointer bit must narrow with it.
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
+        assert!(!andersen.nodes[data].reaches_function_pointer);
+        assert_eq!(
+            andersen.nodes[data].pointee_globals,
+            vec!["@Data".to_string()]
+        );
     }
 
     #[test]

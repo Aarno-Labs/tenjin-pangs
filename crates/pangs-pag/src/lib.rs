@@ -1433,6 +1433,22 @@ fn external_constant_result_model(callee: &str) -> bool {
         .starts_with("__ctype_get_")
 }
 
+fn is_standard_printf_family(callee: &str) -> bool {
+    matches!(
+        callee.strip_prefix('@').unwrap_or(callee),
+        "printf"
+            | "fprintf"
+            | "sprintf"
+            | "snprintf"
+            | "dprintf"
+            | "vprintf"
+            | "vfprintf"
+            | "vsprintf"
+            | "vsnprintf"
+            | "vdprintf"
+    )
+}
+
 fn owner_scope(owner: &Owner) -> Scope {
     match owner {
         Owner::Module => Scope::Module,
@@ -1535,7 +1551,10 @@ pub fn positionally_modeled_vararg_functions(pir: &Pir, opts: &PagOpts) -> BTree
         .collect()
 }
 
-fn is_known_benign_vararg_callee(callee: &str) -> bool {
+pub fn is_known_benign_vararg_callee(callee: &str) -> bool {
+    if is_standard_printf_family(callee) {
+        return true;
+    }
     matches!(
         callee,
         // tmux formatting/logging wrappers inspected for M4.3.
@@ -1587,11 +1606,15 @@ mod tests {
                         {"kind":"call_direct","callee":"strchr","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["input","zero"],"dest":"found"},
                         {"kind":"call_direct","callee":"__ctype_b_loc","sig":{"ret":{"class":"integer"},"params":[]},"dest":"ctype"},
                         {"kind":"call_direct","callee":"__ctype_get_mb_cur_max","sig":{"ret":{"class":"integer"},"params":[]},"dest":"mb_cur_max"},
+                        {"kind":"call_direct","callee":"fprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"args":["stream","format","input"],"dest":"printed"},
+                        {"kind":"call_direct","callee":"sprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"args":["output","format","input"],"dest":"formatted"},
                         {"kind":"call_direct","callee":"unmodeled_search","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"args":["input"],"dest":"unknown"}
                     ]},
                     {"key":"strchr","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"body":[]},
                     {"key":"__ctype_b_loc","external":true,"sig":{"ret":{"class":"integer"},"params":[]},"body":[]},
                     {"key":"__ctype_get_mb_cur_max","external":true,"sig":{"ret":{"class":"integer"},"params":[]},"body":[]},
+                    {"key":"fprintf","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"body":[]},
+                    {"key":"sprintf","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"body":[]},
                     {"key":"unmodeled_search","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"body":[]}
                 ]
             }"#,
@@ -1651,6 +1674,38 @@ mod tests {
         assert!(!pag.omega_seeds.iter().any(|seed| {
             seed.kind == OmegaSeedKind::ExternalCallBoundary
                 && seed.target == SeedTarget::Callsite(ctype_get.id)
+        }));
+
+        let fprintf = pag
+            .callsites
+            .iter()
+            .find(|callsite| callsite.callee.as_deref() == Some("fprintf"))
+            .unwrap();
+        // `%n` and custom streams can write/escape through external behavior, so retain the
+        // ordinary external boundary. Only the opaque variadic-ABI boundary is discharged.
+        assert!(fprintf.external_boundary);
+        assert!(pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::ExternalCallBoundary
+                && seed.target == SeedTarget::Callsite(fprintf.id)
+        }));
+        assert!(!pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::VarargCallBoundary
+                && seed.target == SeedTarget::Callsite(fprintf.id)
+        }));
+
+        let sprintf = pag
+            .callsites
+            .iter()
+            .find(|callsite| callsite.callee.as_deref() == Some("sprintf"))
+            .unwrap();
+        assert!(sprintf.external_boundary);
+        assert!(pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::ExternalCallBoundary
+                && seed.target == SeedTarget::Callsite(sprintf.id)
+        }));
+        assert!(!pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::VarargCallBoundary
+                && seed.target == SeedTarget::Callsite(sprintf.id)
         }));
 
         let unmodeled = pag

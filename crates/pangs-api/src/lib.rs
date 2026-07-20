@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use pangs_pag::{
-    positionally_modeled_vararg_functions, BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag,
-    PagOpts,
+    is_known_benign_vararg_callee, positionally_modeled_vararg_functions,
+    BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts,
 };
 use pangs_pir::{
     fsa_compatible, Access, LoweringStats, Pir, ScalarOp, ScalarTypeClass, Stmt, SymbolLinkage,
@@ -3291,32 +3291,6 @@ fn indirect_vararg_site_is_safe(
             })
             .unwrap_or(false)
     })
-}
-
-fn is_known_benign_vararg_callee(callee: &str) -> bool {
-    matches!(
-        callee,
-        // tmux formatting/logging wrappers inspected for M4.3.
-        "log_debug"
-            | "cmdq_error"
-            | "cmdq_print"
-            | "fatalx"
-            | "xasprintf"
-            | "xsnprintf"
-            | "format_add"
-            | "cfg_add_cause"
-            // curl formatting/message wrappers inspected for M4.3.
-            | "warnf"
-            | "errorf"
-            | "notef"
-            | "helpf"
-            | "easysrc_addf"
-            | "curl_mprintf"
-            | "curl_mfprintf"
-            | "curl_msnprintf"
-            | "curl_maprintf"
-            | "curlx_dyn_addf"
-    )
 }
 
 fn stmt_consumes_varargs(stmt: &Stmt) -> bool {

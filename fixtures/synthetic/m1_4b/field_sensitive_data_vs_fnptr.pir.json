@@ -1,0 +1,27 @@
+{
+  "module": "m1_4b.field_sensitive_data_vs_fnptr",
+  "functions": [
+    {
+      "key": "setup",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%s", "ty": "struct.S" },
+        { "kind": "gep", "dest": "%callback_slot", "base": "%s", "byte_off": 0 },
+        { "kind": "store", "address": "%callback_slot", "value": "callback" },
+        { "kind": "gep", "dest": "%data_slot", "base": "%s", "byte_off": 8 },
+        { "kind": "store", "address": "%data_slot", "value": "@Data" },
+        { "kind": "load", "dest": "%data", "address": "%data_slot" }
+      ]
+    },
+    {
+      "key": "callback",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": [
+    { "key": "@Data", "mutable": true }
+  ],
+  "global_init": []
+}

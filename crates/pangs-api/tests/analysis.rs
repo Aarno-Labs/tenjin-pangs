@@ -2217,6 +2217,17 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                 }],
             },
             Func {
+                key: "fprintf".to_string(),
+                sig: vararg_sig.clone(),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: true,
+                exported: false,
+                address_taken: false,
+                body: vec![],
+            },
+            Func {
                 key: "cb".to_string(),
                 sig: sig(AbiClass::Void, vec![]),
                 param_names: vec![],
@@ -2265,6 +2276,13 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                         dest: None,
                         loc: None,
                     },
+                    Stmt::CallDirect {
+                        callee: "fprintf".to_string(),
+                        sig: vararg_sig.clone(),
+                        args: vec!["%tag".to_string(), "cb".to_string()],
+                        dest: None,
+                        loc: None,
+                    },
                     Stmt::CallIndirect {
                         operand: "%callee".to_string(),
                         sig: vararg_sig,
@@ -2289,6 +2307,10 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
     assert!(kinds.contains("fnptr_varargs_internal_unmodeled"));
     assert!(kinds.contains("fnptr_varargs_indirect"));
     assert_eq!(analysis.metrics().audit_findings, 3);
+    assert!(!analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.detail.as_deref() == Some("callee:fprintf")));
     let driver = analysis.lookup_func("driver").unwrap();
     let component = analysis.component(analysis.component_of(driver));
     assert!(component.frozen);
