@@ -337,6 +337,22 @@ pub struct Finding {
     pub detail: Option<String>,
     #[serde(skip)]
     pub function: Option<FuncId>,
+    /// Solver-backed address flow from the finding's affected value operands.  This is retained
+    /// only in-process for clients deciding whether a function-scoped audit is relevant to a
+    /// particular global; it is not part of the stable audit JSON surface.
+    #[serde(skip)]
+    pub global_flow: AuditGlobalFlow,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AuditGlobalFlow {
+    /// This finding has no value-operand flow certificate (for example, inline assembly).
+    #[default]
+    NotComputed,
+    /// Every affected value was resolved within the modeled program, to this complete set.
+    Finite(Vec<GlobalId>),
+    /// At least one affected value has external/unknown flow or could not be resolved.
+    ModuleWide,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1315,6 +1331,7 @@ impl Analysis {
                     &mut audit_taints,
                     module,
                     &solved.nodes,
+                    &global_lookup,
                     deferred_audits,
                     &safe_indirect_varargs,
                 );
@@ -2040,6 +2057,7 @@ fn emit_deferred_steens_audits(
     audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
     module: &Pir,
     node_summaries: &BTreeMap<String, NodeResolution>,
+    global_lookup: &HashMap<String, GlobalId>,
     deferred: Vec<DeferredAudit>,
     safe_indirect_varargs: &BTreeSet<String>,
 ) {
@@ -2057,6 +2075,13 @@ fn emit_deferred_steens_audits(
                     .map(|node| node.reaches_function_pointer)
                     .unwrap_or(false)
                 {
+                    let global_flow = audit_global_flow(
+                        module,
+                        &owner,
+                        std::slice::from_ref(&operand),
+                        node_summaries,
+                        global_lookup,
+                    );
                     push_audit_finding(
                         findings,
                         audit_taints,
@@ -2066,6 +2091,7 @@ fn emit_deferred_steens_audits(
                         vec![format!("value:{operand}")],
                         Some(audit_witness(&owner, &loc)),
                     );
+                    findings.last_mut().unwrap().global_flow = global_flow;
                 }
             }
             DeferredAudit::IntToPtr {
@@ -2080,6 +2106,13 @@ fn emit_deferred_steens_audits(
                     .map(|node| node.reaches_function_pointer)
                     .unwrap_or(false)
                 {
+                    let global_flow = audit_global_flow(
+                        module,
+                        &owner,
+                        std::slice::from_ref(&result),
+                        node_summaries,
+                        global_lookup,
+                    );
                     push_audit_finding(
                         findings,
                         audit_taints,
@@ -2089,6 +2122,7 @@ fn emit_deferred_steens_audits(
                         vec![format!("value:{result}")],
                         Some(audit_witness(&owner, &loc)),
                     );
+                    findings.last_mut().unwrap().global_flow = global_flow;
                 }
             }
             DeferredAudit::VarargFnPtr {
@@ -2103,7 +2137,7 @@ fn emit_deferred_steens_audits(
                 if kind == "fnptr_varargs_indirect" && safe_indirect_varargs.contains(&witness) {
                     continue;
                 }
-                let affected = values
+                let affected_values = values
                     .into_iter()
                     .filter(|value| {
                         let label = pag_value_label(module, &owner, value);
@@ -2112,9 +2146,19 @@ fn emit_deferred_steens_audits(
                             .map(|node| node.reaches_function_pointer)
                             .unwrap_or(false)
                     })
+                    .collect::<Vec<_>>();
+                let affected = affected_values
+                    .iter()
                     .map(|value| format!("value:{value}"))
                     .collect::<Vec<_>>();
                 if !affected.is_empty() {
+                    let global_flow = audit_global_flow(
+                        module,
+                        &owner,
+                        &affected_values,
+                        node_summaries,
+                        global_lookup,
+                    );
                     push_audit_finding_with_detail(
                         findings,
                         audit_taints,
@@ -2125,10 +2169,37 @@ fn emit_deferred_steens_audits(
                         Some(witness),
                         detail,
                     );
+                    findings.last_mut().unwrap().global_flow = global_flow;
                 }
             }
         }
     }
+}
+
+fn audit_global_flow(
+    module: &Pir,
+    owner: &str,
+    values: &[String],
+    node_summaries: &BTreeMap<String, NodeResolution>,
+    global_lookup: &HashMap<String, GlobalId>,
+) -> AuditGlobalFlow {
+    let mut globals = BTreeSet::new();
+    for value in values {
+        let label = pag_value_label(module, owner, value);
+        let Some(summary) = node_summaries.get(&label) else {
+            return AuditGlobalFlow::ModuleWide;
+        };
+        if summary.external {
+            return AuditGlobalFlow::ModuleWide;
+        }
+        globals.extend(
+            summary
+                .pointee_globals
+                .iter()
+                .filter_map(|key| global_lookup.get(key).copied()),
+        );
+    }
+    AuditGlobalFlow::Finite(globals.into_iter().collect())
 }
 
 fn pag_value_label(module: &Pir, owner: &str, value: &str) -> String {
@@ -3278,6 +3349,7 @@ fn push_audit_finding_with_detail(
         effect: "omega_taint".to_string(),
         detail,
         function: Some(caller),
+        global_flow: AuditGlobalFlow::NotComputed,
     });
     audit_taints.entry(caller).or_default().push(Taint {
         kind: kind.to_string(),

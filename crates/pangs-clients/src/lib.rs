@@ -2249,6 +2249,14 @@ fn classify_violation_relevance_indexed(
         return ViolationRelevance::AddressRelevant;
     }
 
+    let flow_is_disjoint = match &finding.global_flow {
+        pangs_api::AuditGlobalFlow::Finite(globals) if globals.contains(&global) => {
+            return ViolationRelevance::AddressRelevant;
+        }
+        pangs_api::AuditGlobalFlow::Finite(_) => true,
+        pangs_api::AuditGlobalFlow::ModuleWide | pangs_api::AuditGlobalFlow::NotComputed => false,
+    };
+
     let has_indirect = rows.iter().any(|row| {
         row.via != pangs_api::Via::Direct || matches!(row.global, GlobalTarget::Unknown(_))
     });
@@ -2264,7 +2272,7 @@ fn classify_violation_relevance_indexed(
     {
         return ViolationRelevance::AccessShapeRelevant;
     }
-    if has_indirect {
+    if has_indirect && !(flow_is_disjoint && modeled_pointer_only_finding(&finding.kind)) {
         return ViolationRelevance::Unresolved;
     }
 
@@ -3453,6 +3461,54 @@ mod tests {
         }
     }
 
+    fn add_disconnected_and_connected_audits(pir: &mut Pir) {
+        let sig = pir
+            .functions
+            .iter()
+            .find(|function| function.key == "main")
+            .unwrap()
+            .sig
+            .clone();
+        pir.functions.push(pangs_pir::Func {
+            key: "cb".into(),
+            sig,
+            param_names: vec![],
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: true,
+            body: vec![],
+        });
+        let main = pir
+            .functions
+            .iter_mut()
+            .find(|function| function.key == "main")
+            .unwrap();
+        main.body.extend([
+            pangs_pir::Stmt::Assign {
+                dest: "%fp".into(),
+                sources: vec!["cb".into()],
+                loc: None,
+            },
+            pangs_pir::Stmt::PtrToInt {
+                dest: "%fp_bits".into(),
+                source: "%fp".into(),
+                loc: None,
+            },
+            pangs_pir::Stmt::Assign {
+                dest: "%mixed".into(),
+                sources: vec!["cb".into(), "@G00".into()],
+                loc: None,
+            },
+            pangs_pir::Stmt::PtrToInt {
+                dest: "%mixed_bits".into(),
+                source: "%mixed".into(),
+                loc: None,
+            },
+        ]);
+    }
+
     #[test]
     fn once_lock_pair_evidence_requires_overlap_path_and_shared_init() {
         let evidence = |earliest, latest, path: u64, init: &[&str]| CertifiedGroupEvidence {
@@ -4022,6 +4078,32 @@ mod tests {
     }
 
     #[test]
+    fn finite_audit_flow_only_taints_connected_high_fanout_candidate() {
+        let fixture = workspace_root().join("fixtures/synthetic/m1_6/high_fanout_modref.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        add_disconnected_and_connected_audits(&mut pir);
+        let opts = Opts {
+            stage: pangs_api::Stage::Andersen,
+            build_mode: pangs_api::BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let facts = DispositionFactRows::new(&analysis);
+        let g00 = analysis.lookup_global("@G00").unwrap();
+        let g01 = analysis.lookup_global("@G01").unwrap();
+
+        assert_eq!(
+            facts.violation[g00.0 as usize].as_ref().unwrap().kind,
+            "violation-address-relevant"
+        );
+        assert!(facts.violation[g01.0 as usize].is_none());
+        assert!(facts.violation_diagnostics[g01.0 as usize]
+            .iter()
+            .filter(|diagnostic| diagnostic.finding_kind == "fnptr_ptrtoint")
+            .all(|diagnostic| diagnostic.classification == ViolationRelevance::Unrelated));
+    }
+
+    #[test]
     fn unrelated_varargs_finding_does_not_taint_direct_scalar_access() {
         let fixture = workspace_root().join("fixtures/synthetic/m1_5/audit_surface.pir.json");
         let mut pir = Pir::from_path(&fixture).unwrap();
@@ -4151,6 +4233,7 @@ mod tests {
             effect: "omega_taint".into(),
             detail: None,
             function: Some(function),
+            global_flow: pangs_api::AuditGlobalFlow::NotComputed,
         };
         assert_eq!(
             classify_violation_relevance(&analysis, &finding, function, global, &rows),

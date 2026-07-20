@@ -54,6 +54,47 @@ fn m2_2_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn add_disconnected_and_connected_audits(pir: &mut Pir) {
+    pir.functions.push(Func {
+        key: "cb".into(),
+        sig: sig(AbiClass::Void, vec![]),
+        param_names: vec![],
+        file: None,
+        line: None,
+        external: false,
+        exported: false,
+        address_taken: true,
+        body: vec![],
+    });
+    let main = pir
+        .functions
+        .iter_mut()
+        .find(|function| function.key == "main")
+        .unwrap();
+    main.body.extend([
+        Stmt::Assign {
+            dest: "%fp".into(),
+            sources: vec!["cb".into()],
+            loc: None,
+        },
+        Stmt::PtrToInt {
+            dest: "%fp_bits".into(),
+            source: "%fp".into(),
+            loc: None,
+        },
+        Stmt::Assign {
+            dest: "%mixed".into(),
+            sources: vec!["cb".into(), "@G00".into()],
+            loc: None,
+        },
+        Stmt::PtrToInt {
+            dest: "%mixed_bits".into(),
+            source: "%mixed".into(),
+            loc: None,
+        },
+    ]);
+}
+
 fn m2_3_fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/synthetic/m2_3")
@@ -2456,6 +2497,39 @@ fn steens_only_audits_int_punning_when_it_reaches_function_pointers() {
         .iter()
         .any(|taint| taint.kind == "fnptr_inttoptr"
             && taint.witness.as_deref() == Some("driver@!noloc#0")));
+}
+
+#[test]
+fn audit_findings_retain_finite_global_flow_for_relevance_clients() {
+    let mut pir = Pir::from_path(m1_6_fixture("high_fanout_modref.pir.json")).unwrap();
+    add_disconnected_and_connected_audits(&mut pir);
+    let analysis = Analysis::run_with_disposition(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let g00 = analysis.lookup_global("@G00").unwrap();
+
+    let fp = analysis
+        .audit_findings()
+        .iter()
+        .find(|finding| finding.affected == ["value:%fp"])
+        .unwrap();
+    assert_eq!(fp.global_flow, pangs_api::AuditGlobalFlow::Finite(vec![]));
+
+    let mixed = analysis
+        .audit_findings()
+        .iter()
+        .find(|finding| finding.affected == ["value:%mixed"])
+        .unwrap();
+    assert_eq!(
+        mixed.global_flow,
+        pangs_api::AuditGlobalFlow::Finite(vec![g00])
+    );
 }
 
 #[test]
