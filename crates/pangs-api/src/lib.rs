@@ -5183,7 +5183,16 @@ fn compute_components(
     let mut parent: Vec<usize> = (0..funcs.len()).collect();
     for edge in edges {
         if let (Caller::Func(a), Callee::Func(b)) = (&edge.caller, &edge.callee) {
-            union(&mut parent, a.0 as usize, b.0 as usize);
+            // Components describe connectivity within the client program.  An external
+            // declaration can be shared by many otherwise unrelated callers (for example,
+            // `strcmp`), but it supplies no client-code path between them.  Treating that
+            // declaration as a graph vertex would merge their globals and let one caller's
+            // uncertainty unnecessarily freeze another caller's localization candidate.
+            // Direct and resolved callback edges between two internal functions remain
+            // connectivity edges.
+            if !funcs[a.0 as usize].external && !funcs[b.0 as usize].external {
+                union(&mut parent, a.0 as usize, b.0 as usize);
+            }
         }
     }
 
@@ -5979,5 +5988,76 @@ mod registry_tests {
             .unwrap()
             .insert("external-call:earlier@file.c:9:3#0".into());
         assert!(pointee_operand_external(&solved, label, site));
+    }
+}
+
+#[cfg(test)]
+mod component_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn func(key: &str, external: bool) -> FuncInfo {
+        FuncInfo {
+            key: key.to_string(),
+            file: None,
+            line: None,
+            external,
+            exported: false,
+            address_taken: false,
+            address_escaped: false,
+            escape_witness: None,
+            escape_sources: Vec::new(),
+            vararg: false,
+            sig: "void()".to_string(),
+        }
+    }
+
+    fn edge(caller: u32, callee: u32) -> CallEdge {
+        CallEdge {
+            caller: Caller::Func(FuncId(caller)),
+            callsite: None,
+            callee: Callee::Func(FuncId(callee)),
+            kind: CallKind::Direct,
+            tier: Tier::Direct,
+        }
+    }
+
+    #[test]
+    fn components_do_not_connect_internal_callers_through_external_declarations() {
+        let funcs = vec![
+            func("main", false),
+            func("cmd", false),
+            func("strcmp", true),
+        ];
+        let components = compute_components(
+            &funcs,
+            &[],
+            &[],
+            &[edge(0, 2), edge(1, 2)],
+            &[],
+            &BTreeMap::new(),
+        );
+
+        let member_keys: Vec<Vec<&str>> = components
+            .iter()
+            .map(|component| {
+                component
+                    .members
+                    .iter()
+                    .map(|id| funcs[id.0 as usize].key.as_str())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(member_keys, vec![vec!["cmd"], vec!["main"], vec!["strcmp"]]);
+    }
+
+    #[test]
+    fn components_keep_internal_direct_edges_connected() {
+        let funcs = vec![func("caller", false), func("callback", false)];
+        let components = compute_components(&funcs, &[], &[], &[edge(0, 1)], &[], &BTreeMap::new());
+
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].members, vec![FuncId(1), FuncId(0)]);
     }
 }
