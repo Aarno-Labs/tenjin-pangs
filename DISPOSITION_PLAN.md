@@ -544,14 +544,15 @@ below is a shared record and is fixed here:
 
 ### 1.9 Fact-production rules (D1b normative — not to be inferred)
 
-- **`written`** is *may-written*: `value = !never_written` from the solved solution,
-  which today is also false when the object's storage escapes externally
-  (`crates/pangs-solve/src/lib.rs`, `never_written = !escape_external ∧ no store
-  reaches the class`). The witness is a concrete write site when one exists
-  (`kind: "write-site"`), otherwise the escape that prevents ruling writes out
-  (`kind: "external-escape"`). The `immutable` guard's `¬written ∧
-  ¬omega_escaped_address` is therefore partially redundant — accepted; redundancy in
-  a soundness guard is free.
+- **`written`** is *may-runtime-written*: static-initializer stores establish the
+  initial value and do not set the fact. The solver preserves its legacy
+  `never_written = !escape_external ∧ no store reaches the class` output unchanged and
+  additively reports whether a store edge owned by runtime function code reaches the
+  class. Fact assembly sets `written = runtime_written ∨ escape_external`. The witness
+  is a concrete runtime write site when one exists (`kind: "write-site"`), otherwise
+  the escape that prevents ruling writes out (`kind: "external-escape"`). The
+  `immutable` guard's `¬written ∧ ¬omega_escaped_address` is therefore partially
+  redundant — accepted; redundancy in a soundness guard is free.
 - **`violation_taint(g)`**: direct or bounded-aliased function-local co-occurrence
   proposes a `(finding, g)` pair; it does not prove relevance. Each pair is classified
   `address-relevant`, `access-shape-relevant`, `value-only`, `unrelated`, or

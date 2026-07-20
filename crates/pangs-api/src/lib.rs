@@ -120,6 +120,10 @@ pub struct GlobalInfo {
     pub mutable: bool,
     pub stationary: bool,
     pub never_written: bool,
+    /// Runtime store reachability, excluding static-initializer stores. Retained for
+    /// in-process disposition fact assembly; ordinary analysis JSON remains unchanged.
+    #[serde(skip)]
+    pub runtime_written: bool,
     pub escape: EscapeStatus,
     pub address_escaped: bool,
     pub escape_witness: Option<String>,
@@ -790,6 +794,7 @@ impl Analysis {
                 mutable: global.mutable && !global.is_const,
                 stationary: false,
                 never_written: true,
+                runtime_written: false,
                 escape: if exported {
                     EscapeStatus::External
                 } else {
@@ -1025,6 +1030,7 @@ impl Analysis {
                             });
                             if matches!(access, Access::Mod) {
                                 globals[gid.0 as usize].never_written = false;
+                                globals[gid.0 as usize].runtime_written = true;
                             }
                             modrefs.push(ModRef {
                                 func: caller,
@@ -1423,6 +1429,7 @@ impl Analysis {
                             .find(|source| *source != &own_export)
                             .cloned();
                         global.never_written = state.never_written;
+                        global.runtime_written = state.runtime_written;
                     }
                 }
                 mark_external_storage_globals(

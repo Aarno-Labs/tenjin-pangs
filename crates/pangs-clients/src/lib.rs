@@ -188,7 +188,10 @@ pub fn assemble_disposition_artifacts(
         let omega_escaped = info.address_escaped;
         let omega_witness = omega_escaped
             .then(|| omega_escape_witness(analysis, &key, info, fact_rows.escape[index]));
-        let written = !info.never_written;
+        // `never_written` intentionally includes static-initializer stores for the legacy
+        // analysis surface. Disposition immutability cares about writes after initialization;
+        // external storage remains may-written even without an observed runtime store.
+        let written = info.runtime_written || info.escape == pangs_api::EscapeStatus::External;
         let write_witness = written.then(|| {
             written_witness(
                 analysis,
@@ -3857,6 +3860,10 @@ mod tests {
             .iter()
             .find(|global| global.meta.llvm_name == "table")
             .unwrap();
+        assert!(
+            !table.facts.written.value,
+            "a static initializer is not a runtime write"
+        );
         let Some(Certificate::Certified { certificate, .. }) = &table.facts.mutex_eligibility
         else {
             panic!("a complete empty runtime access set is statically mutex-eligible")

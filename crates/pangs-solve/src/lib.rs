@@ -168,6 +168,10 @@ pub struct GlobalResolution {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub escape_sources: Vec<String>,
     pub never_written: bool,
+    /// Whether a store edge owned by runtime function code may reach this object.
+    /// Static-initializer stores are deliberately excluded.
+    #[serde(default)]
+    pub runtime_written: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -813,13 +817,18 @@ impl<'a> Solver<'a> {
         }
 
         let mut stored_classes = BTreeSet::new();
+        let mut runtime_stored_classes = BTreeSet::new();
         for edge in &self.pag.edges {
             if !matches!(edge.kind, pangs_pag::EdgeKind::Store) {
                 continue;
             }
             let dst = self.class_of(edge.dst);
             let pointee = self.pointee_of(dst);
-            stored_classes.insert(self.find(pointee));
+            let root = self.find(pointee);
+            stored_classes.insert(root);
+            if matches!(edge.owner, pangs_pag::Owner::Function(_)) {
+                runtime_stored_classes.insert(root);
+            }
         }
 
         let mut globals = BTreeMap::new();
@@ -837,6 +846,7 @@ impl<'a> Solver<'a> {
             let own_export = format!("exported-symbol:obj:global:{}", global.key);
             let address_escape = escape_sources.iter().any(|source| source != &own_export);
             let never_written = !escape_external && !stored_classes.contains(&root);
+            let runtime_written = runtime_stored_classes.contains(&root);
             globals.insert(
                 global.key.clone(),
                 GlobalResolution {
@@ -844,6 +854,7 @@ impl<'a> Solver<'a> {
                     address_escape,
                     escape_sources,
                     never_written,
+                    runtime_written,
                 },
             );
         }
