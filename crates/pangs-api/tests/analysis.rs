@@ -2154,6 +2154,12 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
         vararg: true,
         cc: "ccc".to_string(),
     };
+    let fprintf_sig = Signature {
+        ret: AbiClass::Integer,
+        params: vec![Param::Integer, Param::Integer],
+        vararg: true,
+        cc: "ccc".to_string(),
+    };
     let pir = Pir {
         module: "m4_vararg_taxonomy".to_string(),
         source: None,
@@ -2218,7 +2224,7 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
             },
             Func {
                 key: "fprintf".to_string(),
-                sig: vararg_sig.clone(),
+                sig: fprintf_sig.clone(),
                 param_names: vec![],
                 file: None,
                 line: None,
@@ -2278,8 +2284,12 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                     },
                     Stmt::CallDirect {
                         callee: "fprintf".to_string(),
-                        sig: vararg_sig.clone(),
-                        args: vec!["%tag".to_string(), "cb".to_string()],
+                        sig: fprintf_sig,
+                        args: vec![
+                            "%stream".to_string(),
+                            "@fmt_safe".to_string(),
+                            "cb".to_string(),
+                        ],
                         dest: None,
                         loc: None,
                     },
@@ -2293,7 +2303,13 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                 ],
             },
         ],
-        globals: vec![],
+        globals: vec![Global {
+            key: "@fmt_safe".to_string(),
+            is_const: true,
+            mutable: false,
+            initializer_ir: Some("[3 x i8] c\"%s\\00\"".to_string()),
+            ..Global::default()
+        }],
         global_init: vec![],
     };
     let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
@@ -2329,6 +2345,103 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
             .count(),
         1
     );
+}
+
+#[test]
+fn printf_vararg_audits_require_a_constant_percent_n_free_format() {
+    let fprintf_sig = Signature {
+        ret: AbiClass::Integer,
+        params: vec![Param::Integer, Param::Integer],
+        vararg: true,
+        cc: "ccc".to_string(),
+    };
+    let call = |format: &str| Stmt::CallDirect {
+        callee: "fprintf".to_string(),
+        sig: fprintf_sig.clone(),
+        args: vec!["%stream".to_string(), format.to_string(), "cb".to_string()],
+        dest: None,
+        loc: None,
+    };
+    let pir = Pir {
+        module: "printf-format-audits".to_string(),
+        source: None,
+        lowering: Default::default(),
+        target: None,
+        functions: vec![
+            Func {
+                key: "fprintf".to_string(),
+                sig: fprintf_sig.clone(),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: true,
+                exported: false,
+                address_taken: false,
+                body: vec![],
+            },
+            Func {
+                key: "cb".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: true,
+                body: vec![],
+            },
+            Func {
+                key: "driver".to_string(),
+                sig: sig(AbiClass::Void, vec![]),
+                param_names: vec![],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![call("@fmt_safe"), call("@fmt_percent_n"), call("%dynamic")],
+            },
+        ],
+        globals: vec![
+            Global {
+                key: "@fmt_safe".to_string(),
+                is_const: true,
+                mutable: false,
+                initializer_ir: Some("[3 x i8] c\"%s\\00\"".to_string()),
+                ..Global::default()
+            },
+            Global {
+                key: "@fmt_percent_n".to_string(),
+                is_const: true,
+                mutable: false,
+                initializer_ir: Some("[3 x i8] c\"%n\\00\"".to_string()),
+                ..Global::default()
+            },
+        ],
+        global_init: vec![],
+    };
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let printf_findings = analysis
+        .audit_findings()
+        .iter()
+        .filter(|finding| {
+            finding.kind == "fnptr_varargs_external"
+                && finding.detail.as_deref() == Some("callee:fprintf")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(printf_findings.len(), 2);
+    assert!(printf_findings
+        .iter()
+        .all(|finding| finding.affected == ["function:cb"] || finding.affected == ["value:cb"]));
 }
 
 #[test]

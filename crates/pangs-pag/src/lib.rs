@@ -683,7 +683,14 @@ enum NodeKey {
     Return(usize),
     SymbolValue(SymbolKind, usize),
     FunctionValue(usize, String),
+    ExternalNonPointerWrite(usize, usize),
     GlobalInitValue(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenPrintfEffect {
+    NoClientWrite,
+    WritesArg { index: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1021,10 +1028,14 @@ impl<'a> Builder<'a> {
                     .flatten()
                     .zip(result);
                 let pure_constant_external = is_external && external_constant_result_model(callee);
+                let printf_effect = is_external
+                    .then(|| proven_printf_effect(self.pir, callee, args))
+                    .flatten();
                 let external_boundary = !fresh_allocation
                     && return_alias.is_none()
                     && external_readonly_result.is_none()
                     && !pure_constant_external
+                    && printf_effect.is_none()
                     && self
                         .functions
                         .get(callee)
@@ -1063,6 +1074,27 @@ impl<'a> Builder<'a> {
                     external_boundary,
                     loc.clone(),
                 );
+                if let Some(ProvenPrintfEffect::WritesArg { index }) = printf_effect {
+                    if let Some(&destination) = arg_nodes.get(index) {
+                        let source = self.add_node(
+                            NodeKey::ExternalNonPointerWrite(func_index, stmt_index),
+                            format!(
+                                "val:{}:@external-nonpointer-write:{stmt_index}",
+                                owner_name(&owner)
+                            ),
+                            NodeKind::Value {
+                                scope: owner_scope(&owner),
+                            },
+                        );
+                        self.add_edge(
+                            EdgeKind::Store,
+                            source,
+                            destination,
+                            owner.clone(),
+                            loc.clone(),
+                        );
+                    }
+                }
                 if let Some(callee_index) = self.functions.get(callee).copied() {
                     if let Some(callee_func) = self.pir.functions.get(callee_index) {
                         if !callee_func.external {
@@ -1140,7 +1172,7 @@ impl<'a> Builder<'a> {
                         Some(callee.clone()),
                     );
                 }
-                if sig.vararg && self.direct_vararg_call_requires_boundary(callee) {
+                if sig.vararg && self.direct_vararg_call_requires_boundary(callee, args) {
                     self.add_seed(
                         OmegaSeedKind::VarargCallBoundary,
                         SeedTarget::Callsite(callsite),
@@ -1200,8 +1232,8 @@ impl<'a> Builder<'a> {
         id
     }
 
-    fn direct_vararg_call_requires_boundary(&self, callee: &str) -> bool {
-        if is_known_benign_vararg_callee(callee) {
+    fn direct_vararg_call_requires_boundary(&self, callee: &str, args: &[String]) -> bool {
+        if direct_vararg_call_is_benign(self.pir, callee, args) {
             return false;
         }
         let Some(func) = self
@@ -1433,20 +1465,13 @@ fn external_constant_result_model(callee: &str) -> bool {
         .starts_with("__ctype_get_")
 }
 
-fn is_standard_printf_family(callee: &str) -> bool {
-    matches!(
-        callee.strip_prefix('@').unwrap_or(callee),
-        "printf"
-            | "fprintf"
-            | "sprintf"
-            | "snprintf"
-            | "dprintf"
-            | "vprintf"
-            | "vfprintf"
-            | "vsprintf"
-            | "vsnprintf"
-            | "vdprintf"
-    )
+fn printf_format_arg(callee: &str) -> Option<usize> {
+    match callee.strip_prefix('@').unwrap_or(callee) {
+        "printf" => Some(0),
+        "fprintf" | "sprintf" | "dprintf" => Some(1),
+        "snprintf" => Some(2),
+        _ => None,
+    }
 }
 
 fn owner_scope(owner: &Owner) -> Scope {
@@ -1551,10 +1576,7 @@ pub fn positionally_modeled_vararg_functions(pir: &Pir, opts: &PagOpts) -> BTree
         .collect()
 }
 
-pub fn is_known_benign_vararg_callee(callee: &str) -> bool {
-    if is_standard_printf_family(callee) {
-        return true;
-    }
+fn is_known_benign_vararg_callee(callee: &str) -> bool {
     matches!(
         callee,
         // tmux formatting/logging wrappers inspected for M4.3.
@@ -1580,6 +1602,174 @@ pub fn is_known_benign_vararg_callee(callee: &str) -> bool {
     )
 }
 
+/// Whether this direct variadic call has a proved pointer-safe ABI boundary. Project-specific
+/// wrappers retain their inspected whole-function contracts. Standard printf-family calls are
+/// accepted only when the exact format operand resolves to a constant LLVM byte string and its
+/// parsed conversion sequence contains no `%n`; every unsupported or dynamic shape fails closed.
+pub fn direct_vararg_call_is_benign(pir: &Pir, callee: &str, args: &[String]) -> bool {
+    if is_known_benign_vararg_callee(callee) {
+        return true;
+    }
+    proven_printf_effect(pir, callee, args).is_some()
+}
+
+pub fn proven_printf_effect(
+    pir: &Pir,
+    callee: &str,
+    args: &[String],
+) -> Option<ProvenPrintfEffect> {
+    let format_index = printf_format_arg(callee)?;
+    let safe = args
+        .get(format_index)
+        .and_then(|operand| constant_format_bytes(pir, operand))
+        .is_some_and(|format| format_is_proven_percent_n_free(&format));
+    if !safe {
+        return None;
+    }
+    match callee.strip_prefix('@').unwrap_or(callee) {
+        "printf" | "fprintf" | "dprintf" => Some(ProvenPrintfEffect::NoClientWrite),
+        "sprintf" | "snprintf" => Some(ProvenPrintfEffect::WritesArg { index: 0 }),
+        _ => None,
+    }
+}
+
+fn constant_format_bytes(pir: &Pir, operand: &str) -> Option<Vec<u8>> {
+    let key = llvm_global_operand_key(operand)?;
+    let global = pir
+        .globals
+        .iter()
+        .find(|global| global.key == key || global.key.strip_prefix('@') == Some(key.as_str()))?;
+    if !global.is_const {
+        return None;
+    }
+    decode_llvm_c_string(global.initializer_ir.as_deref()?)
+}
+
+fn llvm_global_operand_key(operand: &str) -> Option<String> {
+    let at = operand.find('@')?;
+    let tail = &operand[at + 1..];
+    if tail.starts_with('"') {
+        return None;
+    }
+    let len = tail
+        .bytes()
+        .take_while(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b'$' | b'-')
+        })
+        .count();
+    (len > 0).then(|| tail[..len].to_string())
+}
+
+fn decode_llvm_c_string(initializer: &str) -> Option<Vec<u8>> {
+    let start = initializer.find("c\"")? + 2;
+    let encoded = initializer.get(start..initializer.len().checked_sub(1)?)?;
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let raw = encoded.as_bytes();
+    let mut index = 0usize;
+    while index < raw.len() {
+        if raw[index] == b'\\' {
+            let hi = *raw.get(index + 1)?;
+            let lo = *raw.get(index + 2)?;
+            bytes.push(hex_nibble(hi)? << 4 | hex_nibble(lo)?);
+            index += 3;
+        } else {
+            bytes.push(raw[index]);
+            index += 1;
+        }
+    }
+    if let Some(nul) = bytes.iter().position(|byte| *byte == 0) {
+        bytes.truncate(nul);
+    }
+    Some(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn format_is_proven_percent_n_free(format: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < format.len() {
+        if format[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if format.get(index) == Some(&b'%') {
+            index += 1;
+            continue;
+        }
+
+        // Optional positional argument, flags, width, precision, and length modifiers.
+        let positional_start = index;
+        while format.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if format.get(index) != Some(&b'$') {
+            index = positional_start;
+        } else {
+            index += 1;
+        }
+        while format
+            .get(index)
+            .is_some_and(|byte| b"#0- +'I".contains(byte))
+        {
+            index += 1;
+        }
+        if format.get(index) == Some(&b'*') {
+            index += 1;
+            while format.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            if format.get(index) == Some(&b'$') {
+                index += 1;
+            }
+        } else {
+            while format.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+        }
+        if format.get(index) == Some(&b'.') {
+            index += 1;
+            if format.get(index) == Some(&b'*') {
+                index += 1;
+                while format.get(index).is_some_and(u8::is_ascii_digit) {
+                    index += 1;
+                }
+                if format.get(index) == Some(&b'$') {
+                    index += 1;
+                }
+            } else {
+                while format.get(index).is_some_and(u8::is_ascii_digit) {
+                    index += 1;
+                }
+            }
+        }
+        while format
+            .get(index)
+            .is_some_and(|byte| b"hljztLq".contains(byte))
+        {
+            index += 1;
+        }
+        if format.get(index) == Some(&b'n') {
+            return false;
+        }
+        let Some(conversion) = format.get(index) else {
+            return false;
+        };
+        if !b"diouxXfFeEgGaAcspmCS%".contains(conversion) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 fn is_exported_func(marked: bool, key: &str, opts: &PagOpts) -> bool {
     opts.exports.contains(key)
         || (opts.build_mode == BuildMode::Library && marked)
@@ -1592,22 +1782,94 @@ fn is_exported_global(marked: bool, key: &str, opts: &PagOpts) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{EdgeKind, NodeKind, ObjectKind, OmegaSeedKind, Pag, PagOpts, SeedTarget};
-    use pangs_pir::Pir;
+    use super::{
+        direct_vararg_call_is_benign, EdgeKind, NodeKind, ObjectKind, OmegaSeedKind, Pag, PagOpts,
+        SeedTarget,
+    };
+    use pangs_pir::{Global, Pir};
+
+    #[test]
+    fn printf_format_proof_decodes_literals_and_fails_closed() {
+        let format = |key: &str, initializer: &str, is_const: bool| Global {
+            key: key.to_string(),
+            is_const,
+            mutable: !is_const,
+            initializer_ir: Some(initializer.to_string()),
+            ..Global::default()
+        };
+        let pir = Pir {
+            module: "printf-formats".to_string(),
+            source: None,
+            lowering: Default::default(),
+            target: None,
+            functions: vec![],
+            globals: vec![
+                format("safe", "[16 x i8] c\"%2$.*3$s %%n\\00\"", true),
+                format("percent_n", "[5 x i8] c\"%hhn\\00\"", true),
+                format("encoded", "[3 x i8] c\"\\25n\\00\"", true),
+                format("unknown", "[4 x i8] c\"%wn\\00\"", true),
+                format("mutable", "[3 x i8] c\"%s\\00\"", false),
+            ],
+            global_init: vec![],
+        };
+        let fprintf_args = |format: &str| {
+            vec![
+                "stream".to_string(),
+                format.to_string(),
+                "value".to_string(),
+            ]
+        };
+
+        assert!(direct_vararg_call_is_benign(
+            &pir,
+            "fprintf",
+            &fprintf_args("i8* getelementptr ([16 x i8], [16 x i8]* @safe, i64 0, i64 0)")
+        ));
+        assert!(!direct_vararg_call_is_benign(
+            &pir,
+            "fprintf",
+            &fprintf_args("@percent_n")
+        ));
+        assert!(!direct_vararg_call_is_benign(
+            &pir,
+            "fprintf",
+            &fprintf_args("@encoded")
+        ));
+        assert!(!direct_vararg_call_is_benign(
+            &pir,
+            "fprintf",
+            &fprintf_args("@unknown")
+        ));
+        assert!(!direct_vararg_call_is_benign(
+            &pir,
+            "fprintf",
+            &fprintf_args("@mutable")
+        ));
+        assert!(!direct_vararg_call_is_benign(
+            &pir,
+            "fprintf",
+            &fprintf_args("dynamic_format")
+        ));
+    }
 
     #[test]
     fn modeled_externals_do_not_create_omega_boundaries() {
         let pir: Pir = serde_json::from_str(
             r#"{
                 "module":"libc-summary",
-                "globals":[],
+                "globals":[
+                    {"key":"@fmt_safe","is_const":true,"mutable":false,"initializer_ir":"[3 x i8] c\"%s\\00\""},
+                    {"key":"@fmt_percent_n","is_const":true,"mutable":false,"initializer_ir":"[3 x i8] c\"%n\\00\""}
+                ],
                 "functions":[
                     {"key":"main","exported":true,"sig":{"ret":{"class":"void"},"params":[]},"body":[
                         {"kind":"call_direct","callee":"strchr","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["input","zero"],"dest":"found"},
                         {"kind":"call_direct","callee":"__ctype_b_loc","sig":{"ret":{"class":"integer"},"params":[]},"dest":"ctype"},
                         {"kind":"call_direct","callee":"__ctype_get_mb_cur_max","sig":{"ret":{"class":"integer"},"params":[]},"dest":"mb_cur_max"},
-                        {"kind":"call_direct","callee":"fprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"args":["stream","format","input"],"dest":"printed"},
-                        {"kind":"call_direct","callee":"sprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"args":["output","format","input"],"dest":"formatted"},
+                        {"kind":"call_direct","callee":"fprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"args":["stream","@fmt_safe","input"],"dest":"printed"},
+                        {"kind":"call_direct","callee":"fprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"args":["stream","@fmt_percent_n","output"],"dest":"counted"},
+                        {"kind":"call_direct","callee":"fprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"args":["stream","dynamic_format","input"],"dest":"dynamic"},
+                        {"kind":"call_direct","callee":"sprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"args":["output","@fmt_safe","input"],"dest":"formatted"},
                         {"kind":"call_direct","callee":"unmodeled_search","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"args":["input"],"dest":"unknown"}
                     ]},
                     {"key":"strchr","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"body":[]},
@@ -1676,30 +1938,52 @@ mod tests {
                 && seed.target == SeedTarget::Callsite(ctype_get.id)
         }));
 
-        let fprintf = pag
+        let fprintf_calls = pag
             .callsites
             .iter()
-            .find(|callsite| callsite.callee.as_deref() == Some("fprintf"))
-            .unwrap();
-        // `%n` and custom streams can write/escape through external behavior, so retain the
-        // ordinary external boundary. Only the opaque variadic-ABI boundary is discharged.
-        assert!(fprintf.external_boundary);
-        assert!(pag.omega_seeds.iter().any(|seed| {
-            seed.kind == OmegaSeedKind::ExternalCallBoundary
-                && seed.target == SeedTarget::Callsite(fprintf.id)
-        }));
+            .filter(|callsite| callsite.callee.as_deref() == Some("fprintf"))
+            .collect::<Vec<_>>();
+        assert_eq!(fprintf_calls.len(), 3);
+        let fprintf = fprintf_calls[0];
+        assert!(!fprintf.external_boundary);
         assert!(!pag.omega_seeds.iter().any(|seed| {
-            seed.kind == OmegaSeedKind::VarargCallBoundary
-                && seed.target == SeedTarget::Callsite(fprintf.id)
+            matches!(
+                seed.kind,
+                OmegaSeedKind::ExternalCallBoundary | OmegaSeedKind::VarargCallBoundary
+            ) && seed.target == SeedTarget::Callsite(fprintf.id)
         }));
+        assert!(!pag
+            .edges
+            .iter()
+            .any(|edge| { edge.kind == EdgeKind::Store && edge.dst == fprintf.args[0] }));
+        assert_eq!(
+            pag.omega_seeds
+                .iter()
+                .filter(|seed| {
+                    seed.kind == OmegaSeedKind::VarargCallBoundary
+                        && fprintf_calls
+                            .iter()
+                            .any(|callsite| seed.target == SeedTarget::Callsite(callsite.id))
+                })
+                .count(),
+            2,
+            "%n and dynamic formats must fail closed"
+        );
+        for callsite in &fprintf_calls[1..] {
+            assert!(callsite.external_boundary);
+            assert!(pag.omega_seeds.iter().any(|seed| {
+                seed.kind == OmegaSeedKind::ExternalCallBoundary
+                    && seed.target == SeedTarget::Callsite(callsite.id)
+            }));
+        }
 
         let sprintf = pag
             .callsites
             .iter()
             .find(|callsite| callsite.callee.as_deref() == Some("sprintf"))
             .unwrap();
-        assert!(sprintf.external_boundary);
-        assert!(pag.omega_seeds.iter().any(|seed| {
+        assert!(!sprintf.external_boundary);
+        assert!(!pag.omega_seeds.iter().any(|seed| {
             seed.kind == OmegaSeedKind::ExternalCallBoundary
                 && seed.target == SeedTarget::Callsite(sprintf.id)
         }));
@@ -1707,6 +1991,10 @@ mod tests {
             seed.kind == OmegaSeedKind::VarargCallBoundary
                 && seed.target == SeedTarget::Callsite(sprintf.id)
         }));
+        assert!(pag
+            .edges
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Store && edge.dst == sprintf.args[0]));
 
         let unmodeled = pag
             .callsites

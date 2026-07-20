@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use pangs_pag::{
-    is_known_benign_vararg_callee, positionally_modeled_vararg_functions,
-    BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts,
+    direct_vararg_call_is_benign, positionally_modeled_vararg_functions, BuildMode as PagBuildMode,
+    Edge, EdgeKind, Owner, Pag, PagOpts,
 };
 use pangs_pir::{
     fsa_compatible, Access, LoweringStats, Pir, ScalarOp, ScalarTypeClass, Stmt, SymbolLinkage,
@@ -924,10 +924,11 @@ impl Analysis {
                             &callsite_key,
                             &positional_vararg_functions,
                         );
-                        if let Stmt::CallDirect { sig, .. } = stmt {
+                        if let Stmt::CallDirect { sig, args, .. } = stmt {
                             if let Some(kind) = direct_vararg_audit_kind(
                                 module,
                                 callee,
+                                Some(args),
                                 &positional_vararg_functions,
                             ) {
                                 record_vararg_deferred_audit(
@@ -3091,7 +3092,7 @@ fn detect_direct_call_audits(
             audit_taints,
             module,
             caller,
-            direct_vararg_audit_kind(module, callee, positional_vararg_functions),
+            direct_vararg_audit_kind(module, callee, Some(args), positional_vararg_functions),
             Some(format!("callee:{callee}")),
             sig,
             args,
@@ -3232,9 +3233,10 @@ fn record_vararg_deferred_audit(
 fn direct_vararg_audit_kind(
     module: &Pir,
     callee: &str,
+    args: Option<&[String]>,
     positional_vararg_functions: &BTreeSet<String>,
 ) -> Option<&'static str> {
-    if is_known_benign_vararg_callee(callee) {
+    if direct_vararg_call_is_benign(module, callee, args.unwrap_or_default()) {
         return None;
     }
     match module.functions.iter().find(|func| func.key == callee) {
@@ -3286,7 +3288,7 @@ fn indirect_vararg_site_is_safe(
             .map(|func| {
                 func.sig.vararg
                     && !func.external
-                    && direct_vararg_audit_kind(module, target, positional_vararg_functions)
+                    && direct_vararg_audit_kind(module, target, None, positional_vararg_functions)
                         .is_none()
             })
             .unwrap_or(false)
