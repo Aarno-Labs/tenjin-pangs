@@ -3494,6 +3494,7 @@ mod tests {
             pangs_pir::Stmt::PtrToInt {
                 dest: "%fp_bits".into(),
                 source: "%fp".into(),
+                comparison_only: false,
                 loc: None,
             },
             pangs_pir::Stmt::Assign {
@@ -3504,6 +3505,7 @@ mod tests {
             pangs_pir::Stmt::PtrToInt {
                 dest: "%mixed_bits".into(),
                 source: "%mixed".into(),
+                comparison_only: false,
                 loc: None,
             },
         ]);

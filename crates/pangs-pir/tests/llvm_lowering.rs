@@ -833,6 +833,98 @@ entry:
 }
 
 #[test]
+fn llvm_sys_classifies_closed_ptrtoint_comparison_use_chains() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("ptrtoint_uses.ll");
+    fs::write(
+        &ll_path,
+        r#"
+declare void @sink(i64)
+
+define i1 @direct_compare(i8* %p, i8* %q) {
+entry:
+  %pi = ptrtoint i8* %p to i64
+  %qi = ptrtoint i8* %q to i64
+  %cmp = icmp ult i64 %pi, %qi
+  ret i1 %cmp
+}
+
+define i1 @arithmetic_compare(i8* %p) {
+entry:
+  %bits = ptrtoint i8* %p to i64
+  %masked = and i64 %bits, -2
+  %cmp = icmp eq i64 %masked, 0
+  ret i1 %cmp
+}
+
+define i1 @select_compare(i1 %condition, i8* %p) {
+entry:
+  %bits = ptrtoint i8* %p to i64
+  %selected = select i1 %condition, i64 %bits, i64 0
+  %cmp = icmp eq i64 %selected, 0
+  ret i1 %cmp
+}
+
+define i1 @unsupported_arithmetic(i8* %p) {
+entry:
+  %bits = ptrtoint i8* %p to i64
+  %product = mul i64 %bits, 2
+  %cmp = icmp eq i64 %product, 0
+  ret i1 %cmp
+}
+
+define void @externally_observed(i8* %p) {
+entry:
+  %bits = ptrtoint i8* %p to i64
+  call void @sink(i64 %bits)
+  ret void
+}
+
+define i8* @reified(i8* %p) {
+entry:
+  %bits = ptrtoint i8* %p to i64
+  %again = inttoptr i64 %bits to i8*
+  ret i8* %again
+}
+
+define void @mixed_use(i8* %p) {
+entry:
+  %bits = ptrtoint i8* %p to i64
+  %cmp = icmp eq i64 %bits, 0
+  call void @sink(i64 %bits)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    let comparison_only = |function: &str| {
+        let function = pir
+            .functions
+            .iter()
+            .find(|candidate| candidate.key == function)
+            .unwrap();
+        function.body.iter().any(|statement| {
+            matches!(
+                statement,
+                Stmt::PtrToInt {
+                    comparison_only: true,
+                    ..
+                }
+            )
+        })
+    };
+    assert!(comparison_only("direct_compare"));
+    assert!(comparison_only("arithmetic_compare"));
+    assert!(comparison_only("select_compare"));
+    assert!(!comparison_only("unsupported_arithmetic"));
+    assert!(!comparison_only("externally_observed"));
+    assert!(!comparison_only("reified"));
+    assert!(!comparison_only("mixed_use"));
+}
+
+#[test]
 fn lowers_unknown_intrinsics_with_pointer_and_non_pointer_shapes() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("unknown_intrinsics.ll");

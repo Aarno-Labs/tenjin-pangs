@@ -80,6 +80,7 @@ fn add_disconnected_and_connected_audits(pir: &mut Pir) {
         Stmt::PtrToInt {
             dest: "%fp_bits".into(),
             source: "%fp".into(),
+            comparison_only: false,
             loc: None,
         },
         Stmt::Assign {
@@ -90,6 +91,7 @@ fn add_disconnected_and_connected_audits(pir: &mut Pir) {
         Stmt::PtrToInt {
             dest: "%mixed_bits".into(),
             source: "%mixed".into(),
+            comparison_only: false,
             loc: None,
         },
     ]);
@@ -1830,6 +1832,58 @@ fn steens_ptrtoint_marks_only_the_pointee_global_as_external() {
     assert_eq!(analysis.escape(global), EscapeStatus::External);
     assert!(!analysis.globals()[global].never_written);
     assert!(analysis.call_edges().is_empty());
+}
+
+#[test]
+fn comparison_only_ptrtoint_does_not_escape_global_or_emit_fnptr_audit() {
+    let mut global_pir = Pir::from_path(m1_4_fixture("ptrtoint_escape.pir.json")).unwrap();
+    let Stmt::PtrToInt {
+        comparison_only, ..
+    } = &mut global_pir.functions[0].body[1]
+    else {
+        panic!("fixture must retain its ptrtoint")
+    };
+    *comparison_only = true;
+    let global_analysis = Analysis::run(
+        &global_pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let global = global_analysis.lookup_global("@G").unwrap();
+    assert_eq!(global_analysis.escape(global), EscapeStatus::Module);
+    assert!(global_analysis.globals()[global].never_written);
+
+    let mut fnptr_pir = Pir::from_path(m1_5_fixture("fnptr_int_punning.pir.json")).unwrap();
+    let driver = fnptr_pir
+        .functions
+        .iter_mut()
+        .find(|function| function.key == "driver")
+        .unwrap();
+    driver.body.truncate(2);
+    let Stmt::PtrToInt {
+        comparison_only, ..
+    } = &mut driver.body[1]
+    else {
+        panic!("fixture must retain its ptrtoint")
+    };
+    *comparison_only = true;
+    let fnptr_analysis = Analysis::run(
+        &fnptr_pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    assert!(!fnptr_analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "fnptr_ptrtoint"));
 }
 
 #[test]

@@ -837,6 +837,56 @@ unsafe fn function_param_names(function: LLVMValueRef, fctx: &mut FunctionCtx) -
     out
 }
 
+/// Proves that a `ptrtoint` result remains inside the small integer domain whose only terminal
+/// operation is `icmp`. Unknown users fail closed. Cyclic phi graphs are accepted only when every
+/// edge leaving the cycle eventually reaches a supported comparison/arithmetic node.
+unsafe fn ptrtoint_has_closed_comparison_uses(value: LLVMValueRef) -> bool {
+    unsafe fn visit(
+        value: LLVMValueRef,
+        visiting: &mut BTreeSet<usize>,
+        memo: &mut BTreeMap<usize, bool>,
+    ) -> bool {
+        let key = value as usize;
+        if let Some(&closed) = memo.get(&key) {
+            return closed;
+        }
+        if !visiting.insert(key) {
+            return true;
+        }
+
+        let mut current_use = LLVMGetFirstUse(value);
+        let mut closed = true;
+        while !current_use.is_null() {
+            let user = LLVMGetUser(current_use);
+            if user.is_null() || LLVMIsAInstruction(user).is_null() {
+                closed = false;
+                break;
+            }
+            closed = match LLVMGetInstructionOpcode(user) {
+                LLVMOpcode::LLVMICmp => true,
+                LLVMOpcode::LLVMAdd
+                | LLVMOpcode::LLVMSub
+                | LLVMOpcode::LLVMAnd
+                | LLVMOpcode::LLVMOr
+                | LLVMOpcode::LLVMXor
+                | LLVMOpcode::LLVMPHI
+                | LLVMOpcode::LLVMSelect => visit(user, visiting, memo),
+                _ => false,
+            };
+            if !closed {
+                break;
+            }
+            current_use = LLVMGetNextUse(current_use);
+        }
+
+        visiting.remove(&key);
+        memo.insert(key, closed);
+        closed
+    }
+
+    visit(value, &mut BTreeSet::new(), &mut BTreeMap::new())
+}
+
 unsafe fn lower_instruction(
     ctx: &ModuleCtx,
     fctx: &mut FunctionCtx,
@@ -969,6 +1019,7 @@ unsafe fn lower_instruction(
             body.push(Stmt::PtrToInt {
                 dest: fctx.local_key(inst),
                 source: fctx.operand_key(source),
+                comparison_only: ptrtoint_has_closed_comparison_uses(inst),
                 loc: loc(inst),
             });
             lowering.bump_modeled("ptrtoint");
@@ -1772,6 +1823,7 @@ unsafe fn lower_constant_expr_value_inner(
                 body.push(Stmt::PtrToInt {
                     dest: dest.clone(),
                     source,
+                    comparison_only: false,
                     loc: None,
                 });
                 lowering.bump_modeled("global_init_ptrtoint");

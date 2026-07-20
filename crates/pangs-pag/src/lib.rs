@@ -897,16 +897,23 @@ impl<'a> Builder<'a> {
                     loc.clone(),
                 );
             }
-            Stmt::PtrToInt { dest, source, loc } => {
+            Stmt::PtrToInt {
+                dest,
+                source,
+                comparison_only,
+                loc,
+            } => {
                 let src = self.operand_node(func_index, owner_scope(&owner), source);
                 self.value_node(func_index, owner_scope(&owner), dest);
-                self.add_seed(
-                    OmegaSeedKind::PtrToInt,
-                    SeedTarget::Node(src),
-                    Some(owner),
-                    loc.clone(),
-                    Some(source.clone()),
-                );
+                if !comparison_only {
+                    self.add_seed(
+                        OmegaSeedKind::PtrToInt,
+                        SeedTarget::Node(src),
+                        Some(owner),
+                        loc.clone(),
+                        Some(source.clone()),
+                    );
+                }
             }
             Stmt::IntToPtr { dest, source, loc } => {
                 self.operand_node(func_index, owner_scope(&owner), source);
@@ -1551,5 +1558,31 @@ mod tests {
             seed.kind == OmegaSeedKind::ExternalCallBoundary
                 && seed.target == SeedTarget::Callsite(unmodeled.id)
         }));
+    }
+
+    #[test]
+    fn comparison_only_ptrtoint_does_not_seed_omega() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"ptrtoint-uses",
+                "globals":[{"key":"g","mutable":true}],
+                "functions":[{"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                    {"kind":"ptr_to_int","dest":"closed","source":"g","comparison_only":true},
+                    {"kind":"ptr_to_int","dest":"escaping","source":"g"}
+                ]}]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let ptrtoint_seeds = pag
+            .omega_seeds
+            .iter()
+            .filter(|seed| seed.kind == OmegaSeedKind::PtrToInt)
+            .collect::<Vec<_>>();
+        assert_eq!(ptrtoint_seeds.len(), 1);
+        let SeedTarget::Node(node) = ptrtoint_seeds[0].target else {
+            panic!("ptrtoint seed must target the source node")
+        };
+        assert_eq!(pag.nodes[node.0 as usize].label, "sym:global:g");
     }
 }

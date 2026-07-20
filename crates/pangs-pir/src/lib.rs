@@ -265,6 +265,10 @@ pub enum Stmt {
     PtrToInt {
         dest: String,
         source: String,
+        /// True only when LLVM def-use inspection proved that the integer result is confined to
+        /// comparisons through the supported arithmetic/select/phi closure.
+        #[serde(default, skip_serializing_if = "is_false")]
+        comparison_only: bool,
         #[serde(default)]
         loc: Option<Loc>,
     },

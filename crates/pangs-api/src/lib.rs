@@ -1040,7 +1040,12 @@ impl Analysis {
                             },
                         );
                     }
-                    Stmt::PtrToInt { source, loc, .. } => {
+                    Stmt::PtrToInt {
+                        source,
+                        comparison_only: false,
+                        loc,
+                        ..
+                    } => {
                         deferred_audits.push(DeferredAudit::PtrToInt {
                             caller,
                             owner: func.key.clone(),
