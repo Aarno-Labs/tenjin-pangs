@@ -14,8 +14,11 @@ agents picking up a single work item cold.*
 **In scope (v1):** D1 (manifest + fact assembly + cascade), D2 (overrides), D2b (shared
 coupling post-pass), D3 (atomic eligibility), D4 (mutex eligibility), D5 (marker
 contract), the contract test harnesses, and a de-risking spike (D0) on marker survival.
-D3 and D4 are implemented; their production materializers remain outside this
-repository.
+D3, D4, and the analysis-side D5 marker contract are implemented; their production
+materializers remain outside this repository. D5 includes the shared marker codec,
+artifact emission, inventory validation, and the repository's mock-materializer /
+fixture-rewriter round-trip contract harness. It does not claim integration with the
+production C-to-C materializer or C-to-Rust translator.
 
 Ground rules, restated as implementation invariants — every PR touching this layer is
 reviewable against them:
@@ -891,10 +894,10 @@ pins with and without `accept_risk`, and conflicting member pins. The mock mater
 also verifies whole-group demotion for a failed joint `once-lock`/`mutex` rewrite and
 member-only demotion for `immutable`/`localize`.
 
-### D5 — marker contract (~150 lines analysis-side + harness)
+### D5 — marker contract (implemented; analysis-side + harness)
 
-Deliverables: (a) marker codec already in D1a — this
-item adds the **marker inventory** schema (key → marker symbol → kind) appended to the
+Delivered: (a) marker codec already in D1a — this item adds the **marker inventory**
+schema (key → marker symbol → kind) appended to the
 manifest by the C→C tool and *validated* by a `pangs-manifest` helper the Rust rewriter
 calls (every disposition needing a marker has one; no orphan markers); (b) generation
 of the marker artifacts from a manifest (`pangs-dispose --emit-markers <dir>`), **two
@@ -902,9 +905,11 @@ outputs** per `DISPOSITION.md` §5.2's linkage contract: `pangs_markers.h` with 
 declarations only (include-anywhere safe) and `pangs_markers.c` with the empty
 definitions (compiled and linked exactly once); (c) the round-trip harness (§5).
 
-**Acceptance:** the round-trip test — toy program + manifest → mock C→C materializer
-plants markers → real translator → fixture rewriter matches every inventory entry,
-deletes all `pangs_*` symbols, output greps clean.
+**Acceptance (implemented repository boundary):** the round-trip contract test — toy
+program + manifest → mock C→C materializer plants markers → fixture translator output
+→ fixture rewriter matches every inventory entry, deletes all `pangs_*` symbols, and
+the output greps clean. Production marker planting and survival through the real
+translator are the next integration milestone, not unfinished analysis-side D5 work.
 
 ### D3 — atomic eligibility (gated; build iff the §7 counter is material)
 
@@ -969,9 +974,10 @@ degenerate but useful cascade (`immutable`/`localize`/`unhandled`). M2+O-items f
 the `once-lock` slot; D2b can land any time after D1b (its ONCELOCK evidence input
 and `strategy_support.once_lock` derivation simply stay empty/`null` until O1–O5
 exist — note the within-run pipeline order is O1–O5 → D2b → fact assembly →
-`pangs-dispose`, which is independent of this landing order). D5 waits for D0 and for
-the C→C tool to be ready to consume dispositions — until then the round-trip
-harness's mock materializer (§5) stands in. This ordering means **the disposition layer is never
+`pangs-dispose`, which is independent of this landing order). D5's analysis-side
+contract no longer waits for D0 or the production C→C tool: the round-trip harness's
+mock materializer (§5) stands in at the repository boundary. Real-translator survival
+remains a production integration gate. This ordering means **the disposition layer is never
 the blocker**: each analysis improvement lights up cascade entries in an
 already-shipping manifest.
 
@@ -1054,7 +1060,7 @@ completed in about 89 seconds (13.1 seconds fact indexing, 75.1 seconds phase fa
 | Risk | Mitigation |
 |---|---|
 | Marker calls don't survive the translator (whole §5 contract collapses) | D0 spike first; documented fallback = C→C-emitted source map; decision recorded here |
-| Translator and production Rust rewriter not available to this repo (D0 cannot run; D5's final validation can't use the real rewriter) | blocked pending commands/repositories/flags from the project owner (record here when known); the §5 fixture rewriter stands in for D5 testing; D5 is the only dependent item; everything else proceeds |
+| Translator and production Rust rewriter not available to this repo (D0 cannot run and production marker survival is not yet validated) | production-integration work pending commands/repositories/flags from the project owner; the §5 fixture rewriter completes the analysis-side D5 contract test |
 | Key instability across runs (path spelling, harness rename scheme drifting) breaks overrides | grammar + normalization fixed in §1.1, owned by lowering; uniqueness asserted at fact assembly; parse/format property tests; `unmatched-key` is loud by design |
 | Schema churn while O6 and the C→C tool are being written against it | D1a lands first and freezes v2 via golden tests; additive-only rule; unknown-field preservation protects mixed-version tooling |
 | Coupling heuristic too permissive/strict | advisory for all consumers except D3, which re-derives; threshold is config; over-grouping documented in tests as intended v1 behavior |

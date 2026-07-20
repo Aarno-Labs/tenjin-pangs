@@ -658,15 +658,18 @@ Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
   per-global lock recipes, and shared-lock support certificates for coupling groups.
   Static certification remains distinct from source readiness: an unmapped declaration
   or an empty runtime accessor set carries a blocked materialization status.
-- **D5 — marker contract (~150 lines analysis-side).** Marker name mangling +
-  collision check + inventory schema; the insertion itself is C→C-tool work, and the
-  consumption is Rust-rewriter work, but the name scheme and inventory format are owned
-  here so all three agree.
+- **D5 — marker contract (implemented analysis-side).** Shared marker name mangling +
+  collision check, `pangs_markers.h`/`.c` artifact emission, inventory schema and
+  validation, plus a mock-materializer / fixture-rewriter round-trip harness. The
+  insertion itself remains production C→C-tool work, and consumption remains
+  production Rust-rewriter work, but the name scheme and inventory format are owned
+  here so all three agree. The harness validates the repository boundary; it does not
+  claim survival through the unavailable production C-to-Rust translator.
 
 Order: D1 → D2 → D2b (v1, alongside O-items; D1 is a prerequisite for consuming
-ONCELOCK output at all under the new interface), then D3's static certificate and D5
-when the C→C tool is ready to consume dispositions. D3 and D4 now populate their
-certificate slots; their C/Rust materializers remain future boundary work.
+ONCELOCK output at all under the new interface), then D3's static certificate and D5.
+D3 and D4 now populate their certificate slots, and D5's analysis-side contract is
+complete; their production C/Rust materializers remain future boundary work.
 
 ### Testing
 
@@ -676,9 +679,11 @@ certificate slots; their C/Rust materializers remain future boundary work.
   (the trace invariant binds to `cascade_chosen`, not the final `chosen` — §3.2).
 - Override matrix tests: each §4.2 outcome × (global pin, group pin, cascade cap,
   unmatched key).
-- Round-trip marker test: emit markers into a toy program, translate, verify the Rust
-  rewriter matches every inventory entry and the final output contains no `pangs_*`
-  symbol.
+- Round-trip marker contract test: emit markers into a toy program, pass them through
+  the fixture translator representation, verify the fixture Rust rewriter matches
+  every inventory entry, and require that the final output contains no `pangs_*`
+  symbol. A real-translator survival test belongs to production materializer
+  integration.
 
 ## 10. Measurements and gates (extends lite M3)
 
