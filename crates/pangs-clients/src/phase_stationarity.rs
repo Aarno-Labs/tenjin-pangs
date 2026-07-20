@@ -146,6 +146,73 @@ pub(crate) struct SpineInputs {
     pub(crate) observations: BTreeMap<GlobalId, Vec<Observation>>,
 }
 
+/// The transitive read/write membership needed at a call boundary.
+///
+/// Mod/ref rows retain provenance, so a function can have many rows that describe the same
+/// `(GlobalId, Access)` pair.  Spine construction only consumes membership in that pair set.  A
+/// two-bit mask per global therefore preserves all of the information needed here while dropping
+/// duplicate provenance as it is streamed from the analysis.
+struct GlobalAccessSet {
+    masks: Vec<u8>,
+}
+
+impl GlobalAccessSet {
+    const REF: u8 = 1 << 0;
+    const MOD: u8 = 1 << 1;
+
+    fn from_transitive_accesses(analysis: &Analysis, function: FuncId) -> Self {
+        let mut result = Self {
+            masks: vec![0; analysis.globals().len()],
+        };
+        for (access, affected) in analysis.transitive_accesses(function) {
+            match affected {
+                AffectedGlobals::Finite(globals) => {
+                    for &global in globals {
+                        result.insert(global, access);
+                    }
+                }
+                AffectedGlobals::ModuleWide => result.insert_all(access),
+            }
+        }
+        result
+    }
+
+    fn bit(access: Access) -> u8 {
+        match access {
+            Access::Ref => Self::REF,
+            Access::Mod => Self::MOD,
+        }
+    }
+
+    fn insert(&mut self, global: GlobalId, access: Access) {
+        self.masks[global.0 as usize] |= Self::bit(access);
+    }
+
+    fn insert_all(&mut self, access: Access) {
+        let bit = Self::bit(access);
+        for mask in &mut self.masks {
+            *mask |= bit;
+        }
+    }
+
+    fn accesses(&self) -> impl Iterator<Item = (GlobalId, Access)> + '_ {
+        self.masks.iter().enumerate().flat_map(|(index, &mask)| {
+            [Access::Ref, Access::Mod]
+                .into_iter()
+                .filter(move |&access| mask & Self::bit(access) != 0)
+                .map(move |access| (GlobalId(index as u32), access))
+        })
+    }
+
+    fn globals(&self, access: Access) -> impl Iterator<Item = GlobalId> + '_ {
+        let bit = Self::bit(access);
+        self.masks
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, &mask)| (mask & bit != 0).then_some(GlobalId(index as u32)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BoundaryOrigin {
     pub(crate) function: FuncId,
@@ -649,7 +716,7 @@ pub(crate) fn assemble_spine_inputs(
         .values()
         .flat_map(|callsites| callsites.iter().copied())
         .collect::<BTreeSet<_>>();
-    let mut callee_access_cache = BTreeMap::<FuncId, Vec<(GlobalId, Access)>>::new();
+    let mut callee_access_cache = BTreeMap::<FuncId, GlobalAccessSet>::new();
     let Some(body) = module
         .functions
         .get(function.0 as usize)
@@ -724,16 +791,9 @@ pub(crate) fn assemble_spine_inputs(
                 }
                 for callee in internal_callees {
                     let accesses = callee_access_cache.entry(callee).or_insert_with(|| {
-                        analysis
-                            .modref(callee)
-                            .flat_map(|row| {
-                                affected_globals(analysis, &row)
-                                    .into_iter()
-                                    .map(move |global| (global, row.access))
-                            })
-                            .collect()
+                        GlobalAccessSet::from_transitive_accesses(analysis, callee)
                     });
-                    for &(global, access) in accesses.iter() {
+                    for (global, access) in accesses.accesses() {
                         add_access(
                             &mut generated[boundary as usize],
                             &mut observations,
@@ -831,20 +891,9 @@ pub(crate) fn assemble_spine_inputs(
         if reader == function && escaped.key == "main" {
             continue;
         }
-        let accesses = callee_access_cache.entry(reader).or_insert_with(|| {
-            analysis
-                .modref(reader)
-                .flat_map(|row| {
-                    affected_globals(analysis, &row)
-                        .into_iter()
-                        .map(move |global| (global, row.access))
-                })
-                .collect()
-        });
-        let read_globals = accesses
-            .iter()
-            .filter_map(|(global, access)| (*access == Access::Ref).then_some(*global))
-            .collect::<BTreeSet<_>>();
+        let accesses = callee_access_cache
+            .entry(reader)
+            .or_insert_with(|| GlobalAccessSet::from_transitive_accesses(analysis, reader));
         let escape_boundaries = escaped
             .escape_sources
             .iter()
@@ -863,7 +912,7 @@ pub(crate) fn assemble_spine_inputs(
         } else {
             escape_boundaries
         };
-        for global in read_globals {
+        for global in accesses.globals(Access::Ref) {
             for &boundary in &escape_boundaries {
                 observations.entry(global).or_default().insert(Observation {
                     boundary,
@@ -2152,14 +2201,37 @@ mod tests {
 
     use pangs_api::{Analysis, BuildMode, CallsiteId, Opts, Stage};
     use pangs_manifest::Certificate;
-    use pangs_pir::{StatementBoundary, StatementCfg};
+    use pangs_pir::{Access, StatementBoundary, StatementCfg};
     use serde_json::json;
 
     use super::{
         assemble_spine_inputs, certificate_slots, descent_candidate, evaluate_kill_rules,
-        evaluate_with_descent, select_publication, splice_unique_call, FuncId, GlobalId,
-        Observation, Quiescence, SelectionFailure,
+        evaluate_with_descent, select_publication, splice_unique_call, FuncId, GlobalAccessSet,
+        GlobalId, Observation, Quiescence, SelectionFailure,
     };
+
+    #[test]
+    fn global_access_set_deduplicates_each_access_kind() {
+        let mut accesses = GlobalAccessSet { masks: vec![0; 3] };
+        accesses.insert(GlobalId(1), Access::Ref);
+        accesses.insert(GlobalId(1), Access::Ref);
+        accesses.insert(GlobalId(1), Access::Mod);
+        accesses.insert_all(Access::Mod);
+
+        assert_eq!(
+            accesses.accesses().collect::<Vec<_>>(),
+            vec![
+                (GlobalId(0), Access::Mod),
+                (GlobalId(1), Access::Ref),
+                (GlobalId(1), Access::Mod),
+                (GlobalId(2), Access::Mod),
+            ]
+        );
+        assert_eq!(
+            accesses.globals(Access::Ref).collect::<Vec<_>>(),
+            vec![GlobalId(1)]
+        );
+    }
 
     fn violation_witnesses(analysis: &Analysis) -> Vec<Option<pangs_manifest::Witness>> {
         crate::DispositionFactRows::new(analysis).violation
