@@ -1668,6 +1668,11 @@ fn decode_llvm_c_string(initializer: &str) -> Option<Vec<u8>> {
     let mut index = 0usize;
     while index < raw.len() {
         if raw[index] == b'\\' {
+            if raw.get(index + 1) == Some(&b'\\') {
+                bytes.push(b'\\');
+                index += 2;
+                continue;
+            }
             let hi = *raw.get(index + 1)?;
             let lo = *raw.get(index + 2)?;
             bytes.push(hex_nibble(hi)? << 4 | hex_nibble(lo)?);
@@ -1805,8 +1810,10 @@ mod tests {
             functions: vec![],
             globals: vec![
                 format("safe", "[16 x i8] c\"%2$.*3$s %%n\\00\"", true),
+                format("escaped_backslash", "[6 x i8] c\"\\\\%03o\\00\"", true),
                 format("percent_n", "[5 x i8] c\"%hhn\\00\"", true),
                 format("encoded", "[3 x i8] c\"\\25n\\00\"", true),
+                format("invalid_escape", "[3 x i8] c\"\\xz\\00\"", true),
                 format("unknown", "[4 x i8] c\"%wn\\00\"", true),
                 format("mutable", "[3 x i8] c\"%s\\00\"", false),
             ],
@@ -1825,6 +1832,11 @@ mod tests {
             "fprintf",
             &fprintf_args("i8* getelementptr ([16 x i8], [16 x i8]* @safe, i64 0, i64 0)")
         ));
+        assert!(direct_vararg_call_is_benign(
+            &pir,
+            "fprintf",
+            &fprintf_args("@escaped_backslash")
+        ));
         assert!(!direct_vararg_call_is_benign(
             &pir,
             "fprintf",
@@ -1834,6 +1846,11 @@ mod tests {
             &pir,
             "fprintf",
             &fprintf_args("@encoded")
+        ));
+        assert!(!direct_vararg_call_is_benign(
+            &pir,
+            "fprintf",
+            &fprintf_args("@invalid_escape")
         ));
         assert!(!direct_vararg_call_is_benign(
             &pir,
