@@ -2956,6 +2956,29 @@ fn audit_memops_on_fnptr_aggregates_are_reported_but_scalar_fnptr_memops_are_not
         })
         .all(|finding| finding.global_flow == pangs_api::AuditGlobalFlow::Finite(vec![])));
 
+    let mut certified_pir = pir.clone();
+    let certified_memcpy = certified_pir.functions[0]
+        .body
+        .iter_mut()
+        .find(|stmt| matches!(stmt, Stmt::Memcpy { .. }))
+        .unwrap();
+    let Stmt::Memcpy {
+        proven_fnptr_init, ..
+    } = certified_memcpy
+    else {
+        unreachable!()
+    };
+    *proven_fnptr_init = true;
+    let certified_analysis = Analysis::run(&certified_pir, &Opts::default()).unwrap();
+    assert!(!certified_analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "memcpy_fnptr_aggregate"));
+    assert!(certified_analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "memset_fnptr_aggregate"));
+
     let mut external_pir = pir.clone();
     external_pir.functions[0].body.splice(
         1..1,
@@ -2976,6 +2999,7 @@ fn audit_memops_on_fnptr_aggregates_are_reported_but_scalar_fnptr_memops_are_not
                 dst: "%agg_external".to_string(),
                 src: "%agg".to_string(),
                 bytes: Some(16),
+                proven_fnptr_init: false,
                 loc: None,
             },
         ],
@@ -3029,6 +3053,7 @@ fn audit_memops_on_fnptr_aggregates_are_reported_but_scalar_fnptr_memops_are_not
                     dst: "%slot".to_string(),
                     src: "%slot".to_string(),
                     bytes: Some(8),
+                    proven_fnptr_init: false,
                     loc: None,
                 },
                 Stmt::Memset {
@@ -3231,6 +3256,13 @@ fn steens_memcpy_modref_exports_aliased_direct_symbol_and_unknown_rows() {
     let direct_expr_dst = analysis.lookup_global("@DirectExprDst").unwrap();
     let direct_expr_src = analysis.lookup_global("@DirectExprSrc").unwrap();
     let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();
+
+    assert!(analysis.globals()[dst_aliased].runtime_written);
+    assert!(analysis.globals()[direct_dst].runtime_written);
+    assert!(analysis.globals()[direct_expr_dst].runtime_written);
+    assert!(!analysis.globals()[src_aliased].runtime_written);
+    assert!(!analysis.globals()[direct_src].runtime_written);
+    assert!(!analysis.globals()[direct_expr_src].runtime_written);
 
     assert!(raw_modrefs.iter().any(|mr| {
         mr.func == main

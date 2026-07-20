@@ -3517,6 +3517,7 @@ mod tests {
                 dst: "%callbacks".into(),
                 src: "%callbacks".into(),
                 bytes: Some(16),
+                proven_fnptr_init: false,
                 loc: None,
             },
         ]);

@@ -300,6 +300,11 @@ pub enum Stmt {
         src: String,
         #[serde(default)]
         bytes: Option<u64>,
+        /// The LLVM lowerer proved that this is an exact-size copy from a local aggregate
+        /// whose every function-pointer field is initialized by a concrete function or null.
+        /// Hand-written PIR and unrecognized LLVM patterns remain false and fail closed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        proven_fnptr_init: bool,
         #[serde(default)]
         loc: Option<Loc>,
     },

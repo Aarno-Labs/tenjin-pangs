@@ -1067,7 +1067,10 @@ impl<'a> Solver<'a> {
         let mut stored_classes = BTreeSet::new();
         let mut runtime_stored_classes = BTreeSet::new();
         for edge in &self.pag.edges {
-            if !matches!(edge.kind, pangs_pag::EdgeKind::Store) {
+            if !matches!(
+                edge.kind,
+                pangs_pag::EdgeKind::Store | pangs_pag::EdgeKind::Memcpy { .. }
+            ) {
                 continue;
             }
             let dst = self.class_of(edge.dst);

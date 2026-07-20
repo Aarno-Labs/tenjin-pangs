@@ -1030,22 +1030,30 @@ impl Analysis {
                             witness,
                         );
                     }
-                    Stmt::Memcpy { dst, src, loc, .. } => {
-                        detect_memory_aggregate_audits(
-                            &mut findings,
-                            &mut audit_taints,
-                            &mut deferred_audits,
-                            &mut noloc_ord,
-                            caller,
-                            &func.key,
-                            "memcpy_fnptr_aggregate",
-                            loc,
-                            [dst.as_str(), src.as_str()]
-                                .into_iter()
-                                .filter(|value| aggregate_fnptrs.contains(value))
-                                .map(ToOwned::to_owned)
-                                .collect(),
-                        );
+                    Stmt::Memcpy {
+                        dst,
+                        src,
+                        proven_fnptr_init,
+                        loc,
+                        ..
+                    } => {
+                        if !proven_fnptr_init {
+                            detect_memory_aggregate_audits(
+                                &mut findings,
+                                &mut audit_taints,
+                                &mut deferred_audits,
+                                &mut noloc_ord,
+                                caller,
+                                &func.key,
+                                "memcpy_fnptr_aggregate",
+                                loc,
+                                [dst.as_str(), src.as_str()]
+                                    .into_iter()
+                                    .filter(|value| aggregate_fnptrs.contains(value))
+                                    .map(ToOwned::to_owned)
+                                    .collect(),
+                            );
+                        }
                     }
                     Stmt::Memset { dst, loc, .. } => {
                         detect_memory_aggregate_audits(

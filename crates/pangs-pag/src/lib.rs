@@ -946,6 +946,7 @@ impl<'a> Builder<'a> {
                 src,
                 bytes,
                 loc,
+                ..
             } => {
                 let src = self.operand_node(func_index, owner_scope(&owner), src);
                 let dst = self.operand_node(func_index, owner_scope(&owner), dst);
@@ -1365,7 +1366,15 @@ impl<'a> Builder<'a> {
         // are the bare symbol (`hello`); hand-written fixtures may use either form. Try the
         // operand verbatim first, then with a leading `@` stripped, so both resolve.
         let symbol = self.resolve_symbol(operand);
-        if let Some(index) = self.globals.get(symbol).copied() {
+        let global_index = self.globals.get(symbol).copied().or_else(|| {
+            llvm_pointer_cast_global_operand(operand).and_then(|global| {
+                self.globals
+                    .get(global.as_str())
+                    .or_else(|| self.globals.get(&format!("@{global}")))
+                    .copied()
+            })
+        });
+        if let Some(index) = global_index {
             let value = self.add_node(
                 NodeKey::SymbolValue(SymbolKind::Global, index),
                 format!("sym:global:{}", operand),
@@ -1674,6 +1683,23 @@ fn llvm_global_operand_key(operand: &str) -> Option<String> {
         })
         .count();
     (len > 0).then(|| tail[..len].to_string())
+}
+
+/// Extract the allocation named by an exact LLVM constant pointer cast.  This is deliberately
+/// narrower than `llvm_global_operand_key`: a GEP or expression mentioning multiple globals is
+/// not an exact root address and must retain its own value node.
+fn llvm_pointer_cast_global_operand(operand: &str) -> Option<String> {
+    if !(operand.contains(" bitcast (") || operand.contains(" addrspacecast ("))
+        || operand.contains("getelementptr")
+    {
+        return None;
+    }
+    let key = llvm_global_operand_key(operand)?;
+    let first_at = operand.find('@')?;
+    if operand[first_at + 1..].contains('@') {
+        return None;
+    }
+    Some(key)
 }
 
 fn decode_llvm_c_string(initializer: &str) -> Option<Vec<u8>> {

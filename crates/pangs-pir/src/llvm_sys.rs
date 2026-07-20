@@ -227,6 +227,13 @@ impl FunctionCtx {
         if !LLVMIsAConstantPointerNull(value).is_null() {
             return "null".to_string();
         }
+        // Preserve the exact allocation identity of a global hidden only by a constant
+        // pointer cast.  In particular, Clang emits aggregate assignment destinations as
+        // `i8* bitcast (%T* @global to i8*)`; treating that text as an unrelated local value
+        // loses the write to the global in the PAG.
+        if let Some(global) = constant_pointer_cast_global(value) {
+            return format!("@{}", value_name(global));
+        }
         if !LLVMIsAUndefValue(value).is_null() {
             return "undef".to_string();
         }
@@ -1832,7 +1839,7 @@ unsafe fn lower_va_arg(
 }
 
 unsafe fn lower_intrinsic_call(
-    _ctx: &ModuleCtx,
+    ctx: &ModuleCtx,
     fctx: &mut FunctionCtx,
     callee: &str,
     inst: LLVMValueRef,
@@ -1856,10 +1863,13 @@ unsafe fn lower_intrinsic_call(
 
     if callee.starts_with("llvm.memcpy.") || callee.starts_with("llvm.memmove.") {
         if LLVMGetNumArgOperands(inst) >= 3 {
+            let bytes = constant_u64(LLVMGetOperand(inst, 2));
             body.push(Stmt::Memcpy {
                 dst: fctx.operand_key(LLVMGetOperand(inst, 0)),
                 src: fctx.operand_key(LLVMGetOperand(inst, 1)),
-                bytes: constant_u64(LLVMGetOperand(inst, 2)),
+                bytes,
+                proven_fnptr_init: callee.starts_with("llvm.memcpy.")
+                    && proven_initialized_fnptr_aggregate_copy(ctx, inst, bytes),
                 loc: loc(inst),
             });
             lowering.bump_modeled(if callee.starts_with("llvm.memmove.") {
@@ -2047,6 +2057,229 @@ unsafe fn lower_global_initializer_value(
         return true;
     }
     false
+}
+
+/// Strip only address-preserving constant pointer casts and return their global allocation.
+/// GEPs are intentionally excluded: callers relying on an exact root address must not silently
+/// discard a nonzero offset.
+unsafe fn constant_pointer_cast_global(mut value: LLVMValueRef) -> Option<LLVMValueRef> {
+    while !LLVMIsAConstantExpr(value).is_null()
+        && matches!(
+            LLVMGetConstOpcode(value),
+            LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast
+        )
+    {
+        value = LLVMGetOperand(value, 0);
+    }
+    (!LLVMIsAGlobalVariable(value).is_null()).then_some(value)
+}
+
+unsafe fn strip_pointer_casts(mut value: LLVMValueRef) -> LLVMValueRef {
+    loop {
+        let opcode = if !LLVMIsAConstantExpr(value).is_null() {
+            Some(LLVMGetConstOpcode(value))
+        } else if !LLVMIsAInstruction(value).is_null() {
+            Some(LLVMGetInstructionOpcode(value))
+        } else {
+            None
+        };
+        if !matches!(
+            opcode,
+            Some(LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast)
+        ) {
+            return value;
+        }
+        value = LLVMGetOperand(value, 0);
+    }
+}
+
+unsafe fn is_function_pointer_type(ty: LLVMTypeRef) -> bool {
+    LLVMGetTypeKind(ty) == LLVMTypeKind::LLVMPointerTypeKind
+        && LLVMGetTypeKind(LLVMGetElementType(ty)) == LLVMTypeKind::LLVMFunctionTypeKind
+}
+
+unsafe fn exact_pointer_offset_from_root(
+    ctx: &ModuleCtx,
+    value: LLVMValueRef,
+    root: LLVMValueRef,
+) -> Option<u64> {
+    let value = strip_pointer_casts(value);
+    if value == root {
+        return Some(0);
+    }
+    let opcode = if !LLVMIsAConstantExpr(value).is_null() {
+        LLVMGetConstOpcode(value)
+    } else if !LLVMIsAGetElementPtrInst(value).is_null() {
+        LLVMOpcode::LLVMGetElementPtr
+    } else {
+        return None;
+    };
+    if opcode != LLVMOpcode::LLVMGetElementPtr {
+        return None;
+    }
+    let base = LLVMGetOperand(value, 0);
+    let base_offset = exact_pointer_offset_from_root(ctx, base, root)?;
+    let mut indices = Vec::new();
+    for index in 1..LLVMGetNumOperands(value) {
+        indices.push(constant_i64(LLVMGetOperand(value, index as u32))?);
+    }
+    let offset = gep_offset_from_indices(ctx, LLVMGetGEPSourceElementType(value), &indices)?;
+    base_offset.checked_add(u64::try_from(offset).ok()?)
+}
+
+unsafe fn concrete_function_or_null(mut value: LLVMValueRef) -> bool {
+    if !LLVMIsAConstantPointerNull(value).is_null() {
+        return true;
+    }
+    loop {
+        if !LLVMIsAFunction(value).is_null() {
+            return true;
+        }
+        if !LLVMIsAConstantExpr(value).is_null()
+            && matches!(
+                LLVMGetConstOpcode(value),
+                LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast
+            )
+        {
+            value = LLVMGetOperand(value, 0);
+            continue;
+        }
+        return false;
+    }
+}
+
+unsafe fn direct_callee_name(call: LLVMValueRef) -> Option<String> {
+    let callee = strip_pointer_casts(LLVMGetCalledValue(call));
+    (!LLVMIsAFunction(callee).is_null()).then(|| value_name(callee))
+}
+
+/// Certify Clang's lowering of an assignment from a local callback-table compound literal.
+///
+/// This deliberately accepts a very narrow LLVM shape.  The source must be a struct alloca of
+/// only function-pointer fields; every field must be initialized in the memcpy's basic block by
+/// a dominating store of a concrete function/null; the copy and destination global must have
+/// exactly the same ABI size and type; and every use of the temporary address must be one of the
+/// checked GEP/cast/store operations (plus lifetime/debug intrinsics).  Anything else fails
+/// closed and retains the aggregate-memory audit.
+unsafe fn proven_initialized_fnptr_aggregate_copy(
+    ctx: &ModuleCtx,
+    memcpy: LLVMValueRef,
+    bytes: Option<u64>,
+) -> bool {
+    let Some(bytes) = bytes else {
+        return false;
+    };
+    let destination = strip_pointer_casts(LLVMGetOperand(memcpy, 0));
+    if LLVMIsAGlobalVariable(destination).is_null() {
+        return false;
+    }
+    let source = strip_pointer_casts(LLVMGetOperand(memcpy, 1));
+    if LLVMIsAAllocaInst(source).is_null() {
+        return false;
+    }
+
+    let source_ty = LLVMGetAllocatedType(source);
+    if LLVMGetTypeKind(source_ty) != LLVMTypeKind::LLVMStructTypeKind
+        || LLVMIsPackedStruct(source_ty) != 0
+    {
+        return false;
+    }
+    let destination_ty = LLVMGetElementType(LLVMTypeOf(destination));
+    if source_ty != destination_ty
+        || LLVMABISizeOfType(ctx.data_layout, source_ty) != bytes
+        || LLVMABISizeOfType(ctx.data_layout, destination_ty) != bytes
+    {
+        return false;
+    }
+
+    let field_count = LLVMCountStructElementTypes(source_ty);
+    if field_count == 0
+        || (0..field_count)
+            .any(|field| !is_function_pointer_type(LLVMStructGetTypeAtIndex(source_ty, field)))
+    {
+        return false;
+    }
+    let expected_offsets = (0..field_count)
+        .map(|field| LLVMOffsetOfElement(ctx.data_layout, source_ty, field))
+        .collect::<BTreeSet<_>>();
+
+    let block = LLVMGetInstructionParent(memcpy);
+    let mut before_memcpy = BTreeSet::new();
+    let mut cursor = LLVMGetFirstInstruction(block);
+    while !cursor.is_null() && cursor != memcpy {
+        before_memcpy.insert(cursor as usize);
+        cursor = LLVMGetNextInstruction(cursor);
+    }
+    if cursor != memcpy {
+        return false;
+    }
+
+    let mut initialized_offsets = BTreeSet::new();
+    let mut work = vec![source];
+    let mut visited = BTreeSet::new();
+    while let Some(value) = work.pop() {
+        if !visited.insert(value as usize) {
+            continue;
+        }
+        let mut usage = LLVMGetFirstUse(value);
+        while !usage.is_null() {
+            let user = LLVMGetUser(usage);
+            let opcode = if !LLVMIsAInstruction(user).is_null() {
+                Some(LLVMGetInstructionOpcode(user))
+            } else if !LLVMIsAConstantExpr(user).is_null() {
+                Some(LLVMGetConstOpcode(user))
+            } else {
+                None
+            };
+            match opcode {
+                Some(LLVMOpcode::LLVMGetElementPtr) => {
+                    if LLVMGetOperand(user, 0) != value {
+                        return false;
+                    }
+                    work.push(user);
+                }
+                Some(LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast) => {
+                    if LLVMGetOperand(user, 0) != value {
+                        return false;
+                    }
+                    work.push(user);
+                }
+                Some(LLVMOpcode::LLVMStore) => {
+                    if LLVMGetOperand(user, 1) != value
+                        || LLVMGetInstructionParent(user) != block
+                        || !before_memcpy.contains(&(user as usize))
+                        || !concrete_function_or_null(LLVMGetOperand(user, 0))
+                    {
+                        return false;
+                    }
+                    let Some(offset) = exact_pointer_offset_from_root(ctx, value, source) else {
+                        return false;
+                    };
+                    if !expected_offsets.contains(&offset) {
+                        return false;
+                    }
+                    initialized_offsets.insert(offset);
+                }
+                Some(LLVMOpcode::LLVMCall) if user == memcpy => {
+                    if LLVMGetOperand(memcpy, 1) != value {
+                        return false;
+                    }
+                }
+                Some(LLVMOpcode::LLVMCall) => {
+                    let benign = direct_callee_name(user).is_some_and(|callee| {
+                        callee.starts_with("llvm.lifetime.") || callee.starts_with("llvm.dbg.")
+                    });
+                    if !benign {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            usage = LLVMGetNextUse(usage);
+        }
+    }
+
+    initialized_offsets == expected_offsets
 }
 
 unsafe fn lower_constant_expr_value(

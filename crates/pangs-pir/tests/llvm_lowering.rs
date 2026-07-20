@@ -723,6 +723,79 @@ entry:
 }
 
 #[test]
+fn certifies_only_exact_fully_initialized_function_pointer_aggregate_copies() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("fnptr-init-copy.ll");
+    fs::write(
+        &ll_path,
+        r#"
+%Callbacks = type { void ()*, void ()* }
+@good_table = global %Callbacks zeroinitializer
+@partial_table = global %Callbacks zeroinitializer
+@unknown_table = global %Callbacks zeroinitializer
+
+declare void @llvm.memcpy.p0i8.p0i8.i64(i8* nocapture writeonly, i8* nocapture readonly, i64, i1 immarg)
+declare void @cb0()
+declare void @cb1()
+
+define void @copies(void ()* %unknown) {
+entry:
+  %good = alloca %Callbacks
+  %good0 = getelementptr %Callbacks, %Callbacks* %good, i64 0, i32 0
+  store void ()* @cb0, void ()** %good0
+  %good1 = getelementptr %Callbacks, %Callbacks* %good, i64 0, i32 1
+  store void ()* @cb1, void ()** %good1
+  %good.src = bitcast %Callbacks* %good to i8*
+  call void @llvm.memcpy.p0i8.p0i8.i64(i8* bitcast (%Callbacks* @good_table to i8*), i8* %good.src, i64 16, i1 false)
+
+  %partial = alloca %Callbacks
+  %partial0 = getelementptr %Callbacks, %Callbacks* %partial, i64 0, i32 0
+  store void ()* @cb0, void ()** %partial0
+  %partial.src = bitcast %Callbacks* %partial to i8*
+  call void @llvm.memcpy.p0i8.p0i8.i64(i8* bitcast (%Callbacks* @partial_table to i8*), i8* %partial.src, i64 16, i1 false)
+
+  %unknown.local = alloca %Callbacks
+  %unknown0 = getelementptr %Callbacks, %Callbacks* %unknown.local, i64 0, i32 0
+  store void ()* %unknown, void ()** %unknown0
+  %unknown1 = getelementptr %Callbacks, %Callbacks* %unknown.local, i64 0, i32 1
+  store void ()* @cb1, void ()** %unknown1
+  %unknown.src = bitcast %Callbacks* %unknown.local to i8*
+  call void @llvm.memcpy.p0i8.p0i8.i64(i8* bitcast (%Callbacks* @unknown_table to i8*), i8* %unknown.src, i64 16, i1 false)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    let copies = pir
+        .functions
+        .iter()
+        .find(|func| func.key == "copies")
+        .unwrap();
+    let memcpys = copies
+        .body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Memcpy {
+                dst,
+                proven_fnptr_init,
+                ..
+            } => Some((dst.as_str(), *proven_fnptr_init)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        memcpys,
+        vec![
+            ("@good_table", true),
+            ("@partial_table", false),
+            ("@unknown_table", false),
+        ]
+    );
+}
+
+#[test]
 fn llvm_sys_lowers_value_flow_memory_intrinsics_and_atomics_from_ll() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("flow.ll");
