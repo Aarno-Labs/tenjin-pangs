@@ -1005,9 +1005,11 @@ impl<'a> Builder<'a> {
                     .then(|| external_readonly_result_model(callee))
                     .flatten()
                     .zip(result);
+                let pure_constant_external = is_external && external_constant_result_model(callee);
                 let external_boundary = !fresh_allocation
                     && return_alias.is_none()
                     && external_readonly_result.is_none()
+                    && !pure_constant_external
                     && self
                         .functions
                         .get(callee)
@@ -1371,6 +1373,16 @@ fn external_readonly_result_model(callee: &str) -> Option<&'static str> {
     matches!(callee.strip_prefix('@').unwrap_or(callee), "__ctype_b_loc").then_some("glibc-ctype-b")
 }
 
+/// Glibc's `__ctype_get_*` accessors return process-invariant scalar values.  They do not
+/// observe or modify client storage, so treating them as an external boundary would introduce
+/// spurious module-wide effects into disposition analysis.
+fn external_constant_result_model(callee: &str) -> bool {
+    callee
+        .strip_prefix('@')
+        .unwrap_or(callee)
+        .starts_with("__ctype_get_")
+}
+
 fn owner_scope(owner: &Owner) -> Scope {
     match owner {
         Owner::Module => Scope::Module,
@@ -1453,7 +1465,7 @@ mod tests {
     use pangs_pir::Pir;
 
     #[test]
-    fn pure_external_search_return_aliases_arg0_without_an_omega_boundary() {
+    fn modeled_externals_do_not_create_omega_boundaries() {
         let pir: Pir = serde_json::from_str(
             r#"{
                 "module":"libc-summary",
@@ -1462,10 +1474,12 @@ mod tests {
                     {"key":"main","exported":true,"sig":{"ret":{"class":"void"},"params":[]},"body":[
                         {"kind":"call_direct","callee":"strchr","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["input","zero"],"dest":"found"},
                         {"kind":"call_direct","callee":"__ctype_b_loc","sig":{"ret":{"class":"integer"},"params":[]},"dest":"ctype"},
+                        {"kind":"call_direct","callee":"__ctype_get_mb_cur_max","sig":{"ret":{"class":"integer"},"params":[]},"dest":"mb_cur_max"},
                         {"kind":"call_direct","callee":"unmodeled_search","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"args":["input"],"dest":"unknown"}
                     ]},
                     {"key":"strchr","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"body":[]},
                     {"key":"__ctype_b_loc","external":true,"sig":{"ret":{"class":"integer"},"params":[]},"body":[]},
+                    {"key":"__ctype_get_mb_cur_max","external":true,"sig":{"ret":{"class":"integer"},"params":[]},"body":[]},
                     {"key":"unmodeled_search","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"body":[]}
                 ]
             }"#,
@@ -1514,6 +1528,17 @@ mod tests {
             .unwrap();
         assert!(pag.edges.iter().any(|edge| {
             edge.kind == EdgeKind::AddrOf && edge.src == slot.id && Some(edge.dst) == ctype.result
+        }));
+
+        let ctype_get = pag
+            .callsites
+            .iter()
+            .find(|callsite| callsite.callee.as_deref() == Some("__ctype_get_mb_cur_max"))
+            .unwrap();
+        assert!(!ctype_get.external_boundary);
+        assert!(!pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::ExternalCallBoundary
+                && seed.target == SeedTarget::Callsite(ctype_get.id)
         }));
 
         let unmodeled = pag
