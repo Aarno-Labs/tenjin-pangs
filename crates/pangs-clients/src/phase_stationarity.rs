@@ -695,7 +695,16 @@ pub(crate) fn assemble_spine_inputs(
                     match callee {
                         Callee::Func(callee) => {
                             if analysis.functions()[*callee].external {
-                                has_unknown |= !modeled_registry_call;
+                                // An external declaration is not automatically a read or write of
+                                // every client global.  The summary intentionally says nothing
+                                // about libc-owned state; pointer/direct-access facts account for
+                                // effects on client storage passed to the call.  Keep Ω for APIs
+                                // that can retain/call client pointers or whose effects are not
+                                // known.
+                                has_unknown |= !modeled_registry_call
+                                    && !external_has_no_client_global_effect(
+                                        &analysis.functions()[*callee].key,
+                                    );
                                 continue;
                             }
                             internal_callees.push(*callee);
@@ -803,8 +812,11 @@ pub(crate) fn assemble_spine_inputs(
         }
     }
 
-    // An escaped reader is observable at each known external-call escape site. Sources that
-    // cannot be placed on this spine are conservatively observable at entry.
+    // An escaped reader is observable at each known external-call escape site on this spine.
+    // Do not project a registration in an unrelated function onto this function's entry: that
+    // incorrectly makes a callback registered after initialization observable before `main`
+    // begins. Source-less escapes remain conservative at the reader's own entry. In particular,
+    // `main` is the executable entry point, not a callback.
     let callsite_by_key = analysis
         .callsites()
         .iter()
@@ -816,6 +828,9 @@ pub(crate) fn assemble_spine_inputs(
             continue;
         }
         let reader = FuncId(index as u32);
+        if reader == function && escaped.key == "main" {
+            continue;
+        }
         let accesses = callee_access_cache.entry(reader).or_insert_with(|| {
             analysis
                 .modref(reader)
@@ -833,16 +848,21 @@ pub(crate) fn assemble_spine_inputs(
         let escape_boundaries = escaped
             .escape_sources
             .iter()
-            .map(|source| {
+            .filter_map(|source| {
                 source
                     .strip_prefix("external-call:")
                     .or_else(|| source.strip_prefix("vararg-call:"))
                     .and_then(|key| callsite_by_key.get(key))
+                    .filter(|callsite| !callsite_has_no_client_global_effect(analysis, **callsite))
                     .and_then(|callsite| boundary_by_callsite.get(callsite))
                     .copied()
-                    .unwrap_or(cfg.entry)
             })
             .collect::<BTreeSet<_>>();
+        let escape_boundaries = if escape_boundaries.is_empty() && reader == function {
+            BTreeSet::from([cfg.entry])
+        } else {
+            escape_boundaries
+        };
         for global in read_globals {
             for &boundary in &escape_boundaries {
                 observations.entry(global).or_default().insert(Observation {
@@ -865,6 +885,117 @@ pub(crate) fn assemble_spine_inputs(
             .map(|(global, sites)| (global, sites.into_iter().collect()))
             .collect(),
     }
+}
+
+/// External APIs known not to read or write *client* globals merely by being called.
+///
+/// This is deliberately not a purity table: `fprintf`, `setlocale`, and allocation routines may
+/// mutate libc state, but that state is outside the module being dispositioned. Direct and
+/// pointer-derived accesses to client storage remain represented by the normal access ledger.
+/// APIs which can invoke/retain a client callback, create a thread, or have unknown client-memory
+/// effects are intentionally absent and therefore retain the conservative Ω treatment.
+fn external_has_no_client_global_effect(callee: &str) -> bool {
+    let callee = callee.strip_prefix('@').unwrap_or(callee);
+    callee.starts_with("__ctype_get_")
+        || callee.starts_with("llvm.memcpy.")
+        || callee.starts_with("llvm.memmove.")
+        || callee.starts_with("llvm.memset.")
+        || callee.starts_with("llvm.va_")
+        || matches!(
+            callee,
+            "__ctype_b_loc"
+                | "__errno_location"
+                | "__xstat"
+                | "__xstat64"
+                | "__fxstat"
+                | "__fxstat64"
+                | "__lxstat"
+                | "__lxstat64"
+                | "atoi"
+                | "atol"
+                | "atoll"
+                | "bsearch"
+                | "calloc"
+                | "closedir"
+                | "exit"
+                | "fclose"
+                | "fcntl"
+                | "fdopen"
+                | "fgets"
+                | "fopen"
+                | "fopen64"
+                | "fprintf"
+                | "fputc"
+                | "fputs"
+                | "fread"
+                | "free"
+                | "fwrite"
+                | "getenv"
+                | "getgrgid"
+                | "gethostname"
+                | "getpwuid"
+                | "getxattr"
+                | "isatty"
+                | "iswprint"
+                | "lstat"
+                | "lstat64"
+                | "localtime"
+                | "malloc"
+                | "mbstowcs"
+                | "memcmp"
+                | "memchr"
+                | "memmove"
+                | "memcpy"
+                | "memset"
+                | "nl_langinfo"
+                | "open"
+                | "opendir"
+                | "printf"
+                | "putc"
+                | "readdir"
+                | "readdir64"
+                | "readlink"
+                | "realloc"
+                | "realpath"
+                | "setlocale"
+                | "snprintf"
+                | "sprintf"
+                | "stat"
+                | "stat64"
+                | "strcasecmp"
+                | "strchr"
+                | "strcmp"
+                | "strcoll"
+                | "strcpy"
+                | "strftime"
+                | "strlen"
+                | "strncmp"
+                | "strncpy"
+                | "strrchr"
+                | "strstr"
+                | "strtok"
+                | "strtoul"
+                | "strverscmp"
+                | "time"
+                | "tolower"
+        )
+}
+
+/// Whether a solved callsite is wholly covered by the client-global effect summary. Unknown and
+/// internal targets deliberately make this false: they need ordinary interprocedural handling.
+fn callsite_has_no_client_global_effect(analysis: &Analysis, callsite: CallsiteId) -> bool {
+    let mut has_target = false;
+    for target in analysis.callees(callsite) {
+        has_target = true;
+        let Callee::Func(function) = target else {
+            return false;
+        };
+        let info = &analysis.functions()[*function];
+        if !info.external || !external_has_no_client_global_effect(&info.key) {
+            return false;
+        }
+    }
+    has_target
 }
 
 fn add_access(
@@ -2393,6 +2524,48 @@ mod tests {
                     routable_pre_p: true,
                 }]
         }));
+    }
+
+    #[test]
+    fn libc_client_state_calls_do_not_generate_module_wide_effects() {
+        let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
+        let pir: pangs_pir::Pir = serde_json::from_value(json!({
+            "module":"phase-libc-summary",
+            "functions":[
+                {"key":"main", "sig":signature(), "body":[
+                    {"kind":"call_direct", "callee":"fprintf", "sig":signature(), "args":[]},
+                    {"kind":"call_direct", "callee":"setlocale", "sig":signature(), "args":[]},
+                    {"kind":"call_direct", "callee":"__ctype_get_mb_cur_max", "sig":signature(), "args":[]}
+                ]},
+                {"key":"fprintf", "sig":signature(), "external":true},
+                {"key":"setlocale", "sig":signature(), "external":true},
+                {"key":"__ctype_get_mb_cur_max", "sig":signature(), "external":true}
+            ],
+            "globals":[{"key":"@a"},{"key":"@b"}]
+        }))
+        .unwrap();
+        let analysis = Analysis::run_with_disposition(
+            &pir,
+            &Opts {
+                stage: Stage::Steens,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let cfg = StatementCfg {
+            entry: 0,
+            boundaries: (0..3)
+                .map(|id| StatementBoundary {
+                    stmt_indices: vec![id],
+                    ..boundary(id, &[], &[])
+                })
+                .collect(),
+            source_mapping_available: true,
+        };
+        let inputs = assemble_spine_inputs(&analysis, &pir, FuncId(0), &cfg, &BTreeMap::new());
+        assert!(inputs.generated_writes.iter().all(Vec::is_empty));
+        assert!(inputs.observations.is_empty());
     }
 
     #[test]
