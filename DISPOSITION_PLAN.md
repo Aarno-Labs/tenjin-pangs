@@ -609,28 +609,18 @@ below is a shared record and is fixed here:
     base type (enums: their underlying type; pointers/booleans: absent); `class`
     records which rule fired so the §7 gate counter can be broken down without
     re-parsing spellings.
-- **`localization(g)`** — assembled from `ComponentInfo` (`compute_components`),
-  stated exactly because it feeds a cascade guard:
-  - A global may appear in the `mutable_globals` of **several** components (each
-    component collects its members' modref targets). The verdict is the
-    conjunction: `verdict: "ok"` iff `g` appears in at least one component and
-    **every** containing component has `frozen: false` (which in the current code
-    is `taint.is_empty()`). Note this is deliberately stricter than the existing
-    `in_rewritable_components` metric, which counts membership in *any* non-frozen
-    component — localizing `g` rewrites all its accessors, so every containing
-    component must be rewritable.
-  - `component` field: the lexicographically smallest containing component id
-    (evidence, not identity).
-  - `blockers`: the categories in the union of the frozen containing components'
-    `taint` entries, mapped by kind — `unknown_caller` → `unknown-caller-taint`,
-    `unknown_callee` → `unknown-callee-taint`, everything else (`unknown_global`
-    and all audit-taint kinds such as `inline_asm`, `fnptr_ptrtoint`) →
-    `frozen-component` with the original taint kind preserved in the blocker
-    witness's `note` and the taint's witness key parsed into its `site`. To keep
-    artifacts corpus-bounded, emit one canonical representative witness per blocker
-    code and record the number of summarized taint entries as `evidence_count` in
-    that blocker's extension map; blockers are sorted by the canonical witness key.
-  - `g` in no component at all ⇒ `localization: null` (the client did not cover
+- **`localization(g)`** — assembled from the single `ContextRewritePlan`, stated
+  exactly because it feeds a cascade guard:
+  - The plan starts at accessors of localizable mutable globals and closes backward over
+    internal callers to executable `main`. It records the exact signatures and call sites
+    that must receive the one context parameter.
+  - `verdict: "ok"` iff the field's rewrite slice has no unrewritable boundary. Ordinary
+    outgoing calls to external APIs do not participate in the slice and keep their ABI.
+  - `component` is the context-plan identifier (`ctx0001`), not a call-graph component.
+  - `blockers` are exact rewrite boundaries: `unknown-caller-taint` for an unrewritable
+    incoming caller of a context-taking function, and `unknown-callee-taint` for a required
+    callsite with an unresolved alternative target.
+  - `g` with no accessor in the context plan ⇒ `localization: null` (the client did not cover
     it; surfaces as `fact-not-computed` in the trace rather than a fabricated
     verdict).
 - **Spawn / signal-registration API registries.** A registry entry carries its

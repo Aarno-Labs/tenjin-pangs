@@ -291,6 +291,35 @@ pub struct ComponentInfo {
     pub mutable_globals: Vec<GlobalId>,
 }
 
+/// One field's participation in the program-wide context rewrite.  The context itself is shared;
+/// this per-field record exists solely to explain which boundary prevents that field from joining
+/// the common rewrite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextFieldPlan {
+    pub global: GlobalId,
+    pub accessors: Vec<FuncId>,
+    pub functions: Vec<FuncId>,
+    pub rewrite_callsites: Vec<CallsiteId>,
+    pub blockers: Vec<ContextRewriteBlocker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRewriteBlocker {
+    pub kind: String,
+    pub function: FuncId,
+    pub callsite: Option<CallsiteId>,
+}
+
+/// The source-rewrite slice for the single context object constructed by an executable's `main`.
+/// Components remain useful diagnostics, but are deliberately not the eligibility criterion.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextRewritePlan {
+    pub id: String,
+    pub functions: Vec<FuncId>,
+    pub rewrite_callsites: Vec<CallsiteId>,
+    pub fields: Vec<ContextFieldPlan>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Taint {
     pub kind: String,
@@ -702,6 +731,8 @@ pub struct Analysis {
     #[serde(skip)]
     transitive_modrefs: TransitiveModRefs,
     components: Vec<ComponentInfo>,
+    #[serde(skip)]
+    context_rewrite_plan: ContextRewritePlan,
     findings: Vec<Finding>,
     metrics: Metrics,
     #[serde(skip)]
@@ -1603,6 +1634,14 @@ impl Analysis {
             &audit_taints,
         );
         let components_us = components_started.elapsed().as_micros() as u64;
+        let context_rewrite_plan = compute_context_rewrite_plan(
+            &functions,
+            &globals,
+            &callsites,
+            &call_edges,
+            &modrefs,
+            opts.build_mode,
+        );
         let mutable_globals_total = globals
             .iter()
             .filter(|g| g.mutable && !g.stationary)
@@ -1809,6 +1848,7 @@ impl Analysis {
             stationarity,
             transitive_modrefs,
             components,
+            context_rewrite_plan,
             findings,
             metrics,
             func_lookup,
@@ -1856,6 +1896,10 @@ impl Analysis {
 
     pub fn components(&self) -> &[ComponentInfo] {
         &self.components
+    }
+
+    pub fn context_rewrite_plan(&self) -> &ContextRewritePlan {
+        &self.context_rewrite_plan
     }
 
     pub fn component(&self, id: ComponentId) -> &ComponentInfo {
@@ -5172,6 +5216,125 @@ fn edge_accesses(
     }
 }
 
+fn compute_context_rewrite_plan(
+    funcs: &[FuncInfo],
+    globals: &[GlobalInfo],
+    _callsites: &[CallsiteInfo],
+    edges: &[CallEdge],
+    modrefs: &[ModRef],
+    build_mode: BuildMode,
+) -> ContextRewritePlan {
+    let mut accessors = vec![BTreeSet::<FuncId>::new(); globals.len()];
+    for mr in modrefs {
+        if let GlobalTarget::Name(global) = mr.global {
+            let info = &globals[global.0 as usize];
+            if info.mutable && !info.stationary {
+                accessors[global.0 as usize].insert(mr.func);
+            }
+        }
+    }
+
+    // Reverse internal call edges are the only paths over which the context must be threaded.
+    // External calls keep their ABI; they are not context recipients and cannot connect callers.
+    let mut callers = vec![Vec::<(FuncId, Option<CallsiteId>)>::new(); funcs.len()];
+    let mut unknown_callers = vec![false; funcs.len()];
+    let mut unknown_by_callsite = BTreeSet::<CallsiteId>::new();
+    let mut internal_targets_by_callsite = BTreeMap::<CallsiteId, BTreeSet<FuncId>>::new();
+    for edge in edges {
+        match (&edge.caller, &edge.callee) {
+            (Caller::Func(caller), Callee::Func(callee))
+                if !funcs[caller.0 as usize].external && !funcs[callee.0 as usize].external =>
+            {
+                callers[callee.0 as usize].push((*caller, edge.callsite));
+                if let Some(site) = edge.callsite {
+                    internal_targets_by_callsite
+                        .entry(site)
+                        .or_default()
+                        .insert(*callee);
+                }
+            }
+            (Caller::Unknown(_), Callee::Func(callee)) => {
+                unknown_callers[callee.0 as usize] = true;
+            }
+            (Caller::Func(_), Callee::Unknown(_)) => {
+                if let Some(site) = edge.callsite {
+                    unknown_by_callsite.insert(site);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut plan_functions = BTreeSet::new();
+    let mut plan_callsites = BTreeSet::new();
+    let mut fields = Vec::new();
+    for (index, field_accessors) in accessors.into_iter().enumerate() {
+        if field_accessors.is_empty() {
+            continue;
+        }
+        let mut functions = field_accessors.clone();
+        let mut work = field_accessors.iter().copied().collect::<Vec<_>>();
+        let mut rewrite_callsites = BTreeSet::new();
+        while let Some(callee) = work.pop() {
+            for (caller, callsite) in &callers[callee.0 as usize] {
+                if let Some(site) = callsite {
+                    rewrite_callsites.insert(*site);
+                }
+                if functions.insert(*caller) {
+                    work.push(*caller);
+                }
+            }
+        }
+
+        let mut blockers = Vec::new();
+        for function in &functions {
+            // `main` is entered by the executable runtime, not by a source callsite whose ABI
+            // we need to rewrite.
+            let executable_entry =
+                build_mode == BuildMode::Executable && funcs[function.0 as usize].key == "main";
+            if unknown_callers[function.0 as usize] && !executable_entry {
+                blockers.push(ContextRewriteBlocker {
+                    kind: "unknown-caller-taint".into(),
+                    function: *function,
+                    callsite: None,
+                });
+            }
+        }
+        for site in &rewrite_callsites {
+            // A callsite with a context-taking internal target and an unresolved alternative
+            // cannot be rewritten to one ABI without a wrapper plan.
+            if unknown_by_callsite.contains(site)
+                && internal_targets_by_callsite
+                    .get(site)
+                    .is_some_and(|targets| targets.iter().any(|target| functions.contains(target)))
+            {
+                blockers.push(ContextRewriteBlocker {
+                    kind: "unknown-callee-taint".into(),
+                    function: _callsites[site.0 as usize].caller,
+                    callsite: Some(*site),
+                });
+            }
+        }
+        blockers.sort_by_key(|b| (b.kind.clone(), b.function, b.callsite));
+        blockers.dedup_by_key(|b| (b.kind.clone(), b.function, b.callsite));
+        plan_functions.extend(functions.iter().copied());
+        plan_callsites.extend(rewrite_callsites.iter().copied());
+        fields.push(ContextFieldPlan {
+            global: GlobalId(index as u32),
+            accessors: field_accessors.into_iter().collect(),
+            functions: functions.into_iter().collect(),
+            rewrite_callsites: rewrite_callsites.into_iter().collect(),
+            blockers,
+        });
+    }
+    ContextRewritePlan {
+        id: "ctx0001".into(),
+        functions: plan_functions.into_iter().collect(),
+        rewrite_callsites: plan_callsites.into_iter().collect(),
+        fields,
+    }
+}
+
 fn compute_components(
     funcs: &[FuncInfo],
     globals: &[GlobalInfo],
@@ -6023,6 +6186,32 @@ mod component_tests {
         }
     }
 
+    fn global(key: &str) -> GlobalInfo {
+        GlobalInfo {
+            key: key.to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            stationary: false,
+            never_written: false,
+            runtime_written: true,
+            escape: EscapeStatus::Module,
+            address_escaped: false,
+            escape_witness: None,
+            exported: false,
+            is_definition: true,
+            linkage: SymbolLinkage::Internal,
+            type_spelling: None,
+            size_bits: None,
+            align_bits: None,
+            path_error: None,
+            scalar_class: None,
+            signed: None,
+            initializer_ir: None,
+        }
+    }
+
     #[test]
     fn components_do_not_connect_internal_callers_through_external_declarations() {
         let funcs = vec![
@@ -6059,5 +6248,101 @@ mod component_tests {
 
         assert_eq!(components.len(), 1);
         assert_eq!(components[0].members, vec![FuncId(1), FuncId(0)]);
+    }
+
+    #[test]
+    fn context_rewrite_ignores_ordinary_outbound_external_calls() {
+        let funcs = vec![
+            func("main", false),
+            func("uses_global", false),
+            func("printf", true),
+        ];
+        let mut main_to_uses = edge(0, 1);
+        main_to_uses.callsite = Some(CallsiteId(0));
+        let mut main_to_printf = edge(0, 2);
+        main_to_printf.callsite = Some(CallsiteId(1));
+        let modrefs = vec![ModRef {
+            func: FuncId(1),
+            global: GlobalTarget::Name(GlobalId(0)),
+            access: Access::Ref,
+            via: Via::Direct,
+            witness: None,
+            detail: None,
+            address_node: None,
+            pointee_globals: Vec::new(),
+            global_candidates: GlobalCandidateSet::Finite(Rc::from([GlobalId(0)])),
+        }];
+        let callsites = vec![
+            CallsiteInfo {
+                key: "main@uses#0".into(),
+                caller: FuncId(0),
+                kind: CallKind::Direct,
+                loc: None,
+                synthetic: false,
+            },
+            CallsiteInfo {
+                key: "main@printf#1".into(),
+                caller: FuncId(0),
+                kind: CallKind::Direct,
+                loc: None,
+                synthetic: false,
+            },
+        ];
+        let plan = compute_context_rewrite_plan(
+            &funcs,
+            &[global("g")],
+            &callsites,
+            &[main_to_uses, main_to_printf],
+            &modrefs,
+            BuildMode::Executable,
+        );
+
+        assert_eq!(plan.functions, vec![FuncId(0), FuncId(1)]);
+        assert_eq!(plan.rewrite_callsites, vec![CallsiteId(0)]);
+        assert!(plan.fields[0].blockers.is_empty());
+    }
+
+    #[test]
+    fn context_rewrite_blocks_an_unknown_incoming_caller_of_a_rewritten_function() {
+        let funcs = vec![func("main", false), func("uses_global", false)];
+        let mut main_to_uses = edge(0, 1);
+        main_to_uses.callsite = Some(CallsiteId(0));
+        let modrefs = vec![ModRef {
+            func: FuncId(1),
+            global: GlobalTarget::Name(GlobalId(0)),
+            access: Access::Ref,
+            via: Via::Direct,
+            witness: None,
+            detail: None,
+            address_node: None,
+            pointee_globals: Vec::new(),
+            global_candidates: GlobalCandidateSet::Finite(Rc::from([GlobalId(0)])),
+        }];
+        let callsites = vec![CallsiteInfo {
+            key: "main@uses#0".into(),
+            caller: FuncId(0),
+            kind: CallKind::Direct,
+            loc: None,
+            synthetic: false,
+        }];
+        let unknown_incoming = CallEdge {
+            caller: Caller::Unknown("callback".into()),
+            callsite: None,
+            callee: Callee::Func(FuncId(1)),
+            kind: CallKind::Indirect,
+            tier: Tier::Andersen,
+        };
+        let plan = compute_context_rewrite_plan(
+            &funcs,
+            &[global("g")],
+            &callsites,
+            &[main_to_uses, unknown_incoming],
+            &modrefs,
+            BuildMode::Executable,
+        );
+
+        assert_eq!(plan.fields[0].blockers.len(), 1);
+        assert_eq!(plan.fields[0].blockers[0].kind, "unknown-caller-taint");
+        assert_eq!(plan.fields[0].blockers[0].function, FuncId(1));
     }
 }

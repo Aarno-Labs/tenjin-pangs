@@ -2473,89 +2473,37 @@ fn access_set_failure(
 }
 
 fn localization_index(analysis: &Analysis) -> Vec<Option<Localization>> {
-    let mut chosen_component: Vec<Option<usize>> = vec![None; analysis.globals().len()];
-    let mut blockers_by_global = (0..analysis.globals().len())
-        .map(|_| BTreeMap::new())
-        .collect::<Vec<BTreeMap<String, (LocalizationBlocker, u64)>>>();
-    for (component_index, component) in analysis.components().iter().enumerate() {
-        for global in &component.mutable_globals {
-            let index = global.0 as usize;
-            let replace = match chosen_component[index] {
-                Some(current) => component.id < analysis.components()[current].id,
-                None => true,
-            };
-            if replace {
-                chosen_component[index] = Some(component_index);
-            }
-            if !component.frozen {
-                continue;
-            }
-            for taint in &component.taint {
-                let code = match taint.kind.as_str() {
-                    "unknown_caller" => "unknown-caller-taint",
-                    "unknown_callee" => "unknown-callee-taint",
-                    _ => "frozen-component",
-                };
-                let note = taint.witness.as_deref().unwrap_or(&taint.kind);
-                match blockers_by_global[index].entry(code.into()) {
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        let (representative, count) = entry.get_mut();
-                        *count += 1;
-                        if representative
-                            .witness
-                            .note
-                            .as_deref()
-                            .is_some_and(|old| note < old)
-                        {
-                            representative.witness.note = Some(note.into());
-                        }
-                    }
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert((
-                            LocalizationBlocker {
-                                code: code.into(),
-                                witness: Witness {
-                                    kind: code.into(),
-                                    site: None,
-                                    symbol: None,
-                                    note: Some(note.into()),
-                                    extra: Extra::new(),
-                                },
-                                extra: Extra::new(),
-                            },
-                            1,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    chosen_component
-        .into_iter()
-        .enumerate()
-        .map(|(index, component)| {
-            let component = &analysis.components()[component?];
-            let blockers = std::mem::take(&mut blockers_by_global[index])
-                .into_values()
-                .map(|(mut blocker, count)| {
+    let mut out = vec![None; analysis.globals().len()];
+    let plan = analysis.context_rewrite_plan();
+    for field in &plan.fields {
+        let blockers = field
+            .blockers
+            .iter()
+            .map(|blocker| LocalizationBlocker {
+                code: blocker.kind.clone(),
+                witness: function_witness(
+                    analysis,
+                    blocker.function,
+                    &blocker.kind,
                     blocker
-                        .extra
-                        .insert("evidence_count".into(), serde_json::json!(count));
-                    blocker
-                })
-                .collect::<Vec<_>>();
-            Some(Localization {
-                component: component.id.clone(),
-                verdict: if blockers.is_empty() {
-                    LocalizationVerdict::Ok
-                } else {
-                    LocalizationVerdict::Blocked
-                },
-                blockers,
+                        .callsite
+                        .map(|site| analysis.callsites()[site].key.clone()),
+                ),
                 extra: Extra::new(),
             })
-        })
-        .collect()
+            .collect::<Vec<_>>();
+        out[field.global.0 as usize] = Some(Localization {
+            component: plan.id.clone(),
+            verdict: if blockers.is_empty() {
+                LocalizationVerdict::Ok
+            } else {
+                LocalizationVerdict::Blocked
+            },
+            blockers,
+            extra: Extra::new(),
+        });
+    }
+    out
 }
 
 pub fn validate_export_dir(outdir: &Path) -> Result<()> {
@@ -3293,6 +3241,7 @@ impl StationarityWriterRecord {
 struct ComponentsRecord {
     components: Vec<ComponentExport>,
     coverage: Coverage,
+    context_rewrite: ContextRewriteExport,
 }
 
 impl ComponentsRecord {
@@ -3307,6 +3256,74 @@ impl ComponentsRecord {
                 mutable_globals_total: analysis.metrics().mutable_globals_total,
                 in_rewritable_components: analysis.metrics().in_rewritable_components,
             },
+            context_rewrite: ContextRewriteExport::from_analysis(analysis),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ContextRewriteExport {
+    id: String,
+    functions: Vec<String>,
+    rewrite_callsites: Vec<String>,
+    fields: Vec<ContextFieldExport>,
+}
+
+#[derive(Serialize)]
+struct ContextFieldExport {
+    global: String,
+    accessors: Vec<String>,
+    functions: Vec<String>,
+    rewrite_callsites: Vec<String>,
+    blockers: Vec<ContextRewriteBlockerExport>,
+}
+
+#[derive(Serialize)]
+struct ContextRewriteBlockerExport {
+    kind: String,
+    function: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    callsite: Option<String>,
+}
+
+impl ContextRewriteExport {
+    fn from_analysis(analysis: &Analysis) -> Self {
+        let plan = analysis.context_rewrite_plan();
+        let function_name = |id| analysis.functions()[id].key.clone();
+        let callsite_key = |id| analysis.callsites()[id].key.clone();
+        Self {
+            id: plan.id.clone(),
+            functions: plan.functions.iter().copied().map(function_name).collect(),
+            rewrite_callsites: plan
+                .rewrite_callsites
+                .iter()
+                .copied()
+                .map(callsite_key)
+                .collect(),
+            fields: plan
+                .fields
+                .iter()
+                .map(|field| ContextFieldExport {
+                    global: analysis.globals()[field.global].key.clone(),
+                    accessors: field.accessors.iter().copied().map(function_name).collect(),
+                    functions: field.functions.iter().copied().map(function_name).collect(),
+                    rewrite_callsites: field
+                        .rewrite_callsites
+                        .iter()
+                        .copied()
+                        .map(callsite_key)
+                        .collect(),
+                    blockers: field
+                        .blockers
+                        .iter()
+                        .map(|blocker| ContextRewriteBlockerExport {
+                            kind: blocker.kind.clone(),
+                            function: function_name(blocker.function),
+                            callsite: blocker.callsite.map(callsite_key),
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
     }
 }

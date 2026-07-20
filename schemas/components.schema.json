@@ -3,7 +3,7 @@
   "title": "PANGS components",
   "type": "object",
   "additionalProperties": false,
-  "required": ["components", "coverage"],
+  "required": ["components", "coverage", "context_rewrite"],
   "$defs": {
     "taint": {
       "type": "object",
@@ -68,6 +68,39 @@
           "minimum": 0
         }
       }
+    },
+    "context_rewrite_blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "function"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1},
+        "function": {"type": "string", "minLength": 1},
+        "callsite": {"type": "string", "minLength": 1}
+      }
+    },
+    "context_rewrite_field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["global", "accessors", "functions", "rewrite_callsites", "blockers"],
+      "properties": {
+        "global": {"type": "string", "minLength": 1},
+        "accessors": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "functions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "rewrite_callsites": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "blockers": {"type": "array", "items": {"$ref": "#/$defs/context_rewrite_blocker"}}
+      }
+    },
+    "context_rewrite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "functions", "rewrite_callsites", "fields"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "functions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "rewrite_callsites": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "fields": {"type": "array", "items": {"$ref": "#/$defs/context_rewrite_field"}}
+      }
     }
   },
   "properties": {
@@ -79,6 +112,9 @@
     },
     "coverage": {
       "$ref": "#/$defs/coverage"
+    },
+    "context_rewrite": {
+      "$ref": "#/$defs/context_rewrite"
     }
   }
 }

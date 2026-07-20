@@ -279,11 +279,13 @@ outer loop.
 
 ## 7. Primary client: localization of mutable globals
 
-**The client's model.** A bipartite caller↔callee graph with designated *unknown-caller*
-and *unknown-callee* nodes. Rewriting a function's signature (to accept the context
-struct) requires rewriting every call site in unison; therefore any connected component
-that touches an unknown node is frozen — we cannot edit call sites in third-party code,
-and we must not change the ABI of function pointers that flow to unknown call sites.
+**The client's model.** One context struct, constructed by executable `main`, is threaded
+through the reverse-caller closure of functions that access localized globals. The rewrite
+plan records the exact internal call sites whose callees gain the context parameter. An
+ordinary outgoing call to an external API keeps its ABI and is not a context boundary.
+An *unknown-caller* boundary blocks only when it can invoke a function whose signature must
+change; an *unknown-callee* boundary blocks only when a required rewritten call site has an
+unresolved alternative target. Components remain useful diagnostics, not the eligibility gate.
 
 **What the analysis must supply**, in order of correctness-criticality:
 
@@ -291,9 +293,10 @@ and we must not change the ABI of function pointers that flow to unknown call si
    edge means the callee's signature changes while that call site keeps the old ABI — a
    miscompile, not a compile error; missed *direct* edges at least fail loudly at compile
    time).
-2. **Sound "touches-unknown" classification.** This maps exactly onto the Ω machinery
-   (§4A, PIP): *unknown-callee* = any icall whose function-pointer pts includes Ω, plus
-   any call to external code; *unknown-caller* = any function whose address escapes to Ω
+2. **Sound rewrite-boundary classification.** This maps exactly onto the Ω machinery
+   (§4A, PIP): *unknown-callee* = an Ω alternative at a call site which must invoke a
+   context-taking target; *unknown-caller* = any function whose address escapes to Ω and
+   whose signature must change
    (passed to qsort/pthread_create/signal in third-party or libc code, stored where
    external code can read it, exported from a library build). The escaped-bit is computed
    inside the tier-C/D fixpoint for free, and it is monotone — exactly the right shape for
