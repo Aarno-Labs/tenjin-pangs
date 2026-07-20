@@ -957,7 +957,23 @@ impl<'a> Builder<'a> {
                     loc.clone(),
                 );
             }
-            Stmt::Memset { .. } => {}
+            Stmt::Memset { dst, loc, .. } => {
+                // Model the write even though the fill byte is not a pointer.  The synthetic
+                // source prevents the pointer solver from interpreting the scalar operand,
+                // while the Store edge lets allocation-specific write proofs see the effect.
+                let destination = self.operand_node(func_index, owner_scope(&owner), dst);
+                let source = self.add_node(
+                    NodeKey::ExternalNonPointerWrite(func_index, stmt_index),
+                    format!(
+                        "val:{}:@memset-nonpointer-write:{stmt_index}",
+                        owner_name(&owner)
+                    ),
+                    NodeKind::Value {
+                        scope: owner_scope(&owner),
+                    },
+                );
+                self.add_edge(EdgeKind::Store, source, destination, owner, loc.clone());
+            }
             Stmt::Unknown {
                 operands,
                 results,

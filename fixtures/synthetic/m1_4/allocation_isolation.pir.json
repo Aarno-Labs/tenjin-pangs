@@ -1,0 +1,29 @@
+{
+  "module": "m1_4.allocation_isolation",
+  "functions": [
+    {
+      "key": "main",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        { "kind": "gep", "dest": "%safe.field", "base": "@Safe", "byte_off": null },
+        { "kind": "assign", "dest": "%merged", "sources": ["%safe.field", "@Esc"] },
+        { "kind": "store", "address": "@Esc", "value": "0" },
+        {
+          "kind": "unknown",
+          "op": "opaque",
+          "operands": ["@Esc"],
+          "results": [],
+          "reason": "test external escape"
+        }
+      ]
+    }
+  ],
+  "globals": [
+    { "key": "@Safe", "exported": false, "mutable": true },
+    { "key": "@Esc", "exported": false, "mutable": true }
+  ]
+}

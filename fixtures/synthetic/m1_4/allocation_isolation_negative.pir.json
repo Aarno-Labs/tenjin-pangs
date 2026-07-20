@@ -1,0 +1,27 @@
+{
+  "module": "m1_4.allocation_isolation_negative",
+  "functions": [
+    {
+      "key": "main",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        { "kind": "gep", "dest": "%field", "base": "@G", "byte_off": null },
+        { "kind": "store", "address": "%field", "value": "0" },
+        {
+          "kind": "unknown",
+          "op": "opaque",
+          "operands": ["%field"],
+          "results": [],
+          "reason": "test external escape"
+        }
+      ]
+    }
+  ],
+  "globals": [
+    { "key": "@G", "exported": false, "mutable": true }
+  ]
+}

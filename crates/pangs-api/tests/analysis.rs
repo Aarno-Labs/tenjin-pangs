@@ -447,6 +447,37 @@ fn m2_4_initval_stationary_dispatch_table_resolves_exactly() {
 }
 
 #[test]
+fn m2_4_initval_accepts_llvm_sigil_on_function_constants() {
+    let mut pir = Pir::from_path(m2_4_fixture("initval_dispatch_table.pir.json")).unwrap();
+    for stmt in &mut pir.global_init {
+        if let Stmt::Store { value, .. } = stmt {
+            if matches!(value.as_str(), "target" | "other") {
+                *value = format!("@{value}");
+            }
+        }
+    }
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_single_simple_target(&analysis, "other");
+    let table = analysis.lookup_global("@Table").unwrap();
+    let verdict = analysis
+        .stationarity_verdicts()
+        .iter()
+        .find(|verdict| verdict.global == table)
+        .unwrap();
+    assert!(verdict.complete_initval);
+    assert!(verdict.initval_diagnostics.is_empty());
+}
+
+#[test]
 fn m2_4_runtime_write_blocks_initval_exact_dispatch_resolution() {
     let pir = Pir::from_path(m2_4_fixture(
         "initval_runtime_write_is_not_stationary.pir.json",
@@ -1813,6 +1844,49 @@ fn steens_uses_escape_bits_for_unknown_callers_and_never_written() {
     assert_eq!(analysis.escape(local), EscapeStatus::Module);
     assert!(!analysis.globals()[exported_slot].never_written);
     assert!(analysis.globals()[local].never_written);
+}
+
+#[test]
+fn allocation_provenance_separates_dynamic_gep_global_from_coarse_class_taint() {
+    let pir = Pir::from_path(m1_4_fixture("allocation_isolation.pir.json")).unwrap();
+    for stage in [Stage::Steens, Stage::Andersen] {
+        let analysis = Analysis::run(
+            &pir,
+            &Opts {
+                stage,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+
+        let safe = analysis.lookup_global("@Safe").unwrap();
+        let escaped = analysis.lookup_global("@Esc").unwrap();
+        assert_eq!(analysis.escape(safe), EscapeStatus::Module);
+        assert!(!analysis.globals()[safe].address_escaped);
+        assert!(!analysis.globals()[safe].runtime_written);
+        assert_eq!(analysis.escape(escaped), EscapeStatus::External);
+        assert!(analysis.globals()[escaped].runtime_written);
+    }
+}
+
+#[test]
+fn allocation_provenance_keeps_dynamic_gep_write_and_escape_fail_closed() {
+    let pir = Pir::from_path(m1_4_fixture("allocation_isolation_negative.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let global = analysis.lookup_global("@G").unwrap();
+    assert_eq!(analysis.escape(global), EscapeStatus::External);
+    assert!(analysis.globals()[global].address_escaped);
+    assert!(analysis.globals()[global].runtime_written);
 }
 
 #[test]

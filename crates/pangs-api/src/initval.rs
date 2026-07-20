@@ -239,7 +239,11 @@ impl<'a> InitValResolver<'a> {
     }
 
     fn resolve_global_init_value(&self, before_stmt: usize, value: &str) -> Option<SlotValue> {
-        if let Some(&target_index) = self.functions.get(value) {
+        // LLVM constants retain their `@` sigil in global initializers, while PIR function
+        // keys do not.  Global lookup already accepts both spellings; function constants must
+        // do the same or aggregate callback tables are spuriously incomplete.
+        let symbol = value.strip_prefix('@').unwrap_or(value);
+        if let Some(&target_index) = self.functions.get(symbol) {
             let target = &self.module.functions[target_index];
             let mut out = SlotValue::default();
             out.targets.insert(target.key.clone());

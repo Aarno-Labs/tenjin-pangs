@@ -369,6 +369,254 @@ impl SteensClasses {
     }
 }
 
+/// Prove, independently of Steensgaard class identity, that selected global allocations are
+/// neither written after initialization nor exposed to code outside the modeled program.
+///
+/// This deliberately tracks only the address of an allocation, not values stored in it.  The
+/// supported address-preserving operations are exhaustive for the PAG: address-of, assign,
+/// GEP (including unknown offsets), direct-call bindings already present as Assign edges, and
+/// solved internal indirect-call bindings added below.  Storing the address itself rejects the
+/// proof rather than attempting a memory-flow analysis.  Any unmodeled/external use also rejects
+/// it.  Consequently a successful proof can safely narrow a union-induced class-level escape or
+/// write fact without narrowing any actual pointer behavior.
+fn allocation_isolated_globals(
+    pir: &Pir,
+    pag: &Pag,
+    indirect_calls: &[IndirectCallResolution],
+    unknown_callers: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut flow = vec![Vec::<NodeId>::new(); pag.nodes.len()];
+    for edge in &pag.edges {
+        if matches!(
+            edge.kind,
+            pangs_pag::EdgeKind::AddrOf
+                | pangs_pag::EdgeKind::Assign
+                | pangs_pag::EdgeKind::Gep { .. }
+        ) {
+            flow[edge.src.0 as usize].push(edge.dst);
+        }
+    }
+
+    let mut params: HashMap<(String, u32), NodeId> = HashMap::new();
+    let mut returns: HashMap<String, NodeId> = HashMap::new();
+    let mut global_objects: HashMap<String, NodeId> = HashMap::new();
+    for node in &pag.nodes {
+        match &node.kind {
+            NodeKind::Param { func, index } => {
+                params.insert((func.clone(), *index), node.id);
+            }
+            NodeKind::Return { func } => {
+                returns.insert(func.clone(), node.id);
+            }
+            NodeKind::Object {
+                object: ObjectKind::Global,
+                key,
+                ..
+            } => {
+                global_objects.insert(key.clone(), node.id);
+            }
+            _ => {}
+        }
+    }
+
+    let functions: HashMap<&str, &pangs_pir::Func> = pir
+        .functions
+        .iter()
+        .map(|func| (func.key.as_str(), func))
+        .collect();
+    let resolutions: HashMap<&str, &IndirectCallResolution> = indirect_calls
+        .iter()
+        .map(|resolution| (resolution.callsite_key.as_str(), resolution))
+        .collect();
+    let mut unsafe_indirect_sites = BTreeSet::new();
+    for callsite in &pag.callsites {
+        if callsite.kind != CallKind::Indirect {
+            continue;
+        }
+        let Some(resolution) = resolutions.get(callsite.key.as_str()) else {
+            unsafe_indirect_sites.insert(callsite.id);
+            continue;
+        };
+        let mut unsafe_site = resolution.unknown_callee || resolution.targets.is_empty();
+        for target in &resolution.targets {
+            let Some(function) = functions.get(target.as_str()) else {
+                unsafe_site = true;
+                continue;
+            };
+            if function.external {
+                unsafe_site = true;
+                continue;
+            }
+            for (index, &arg) in callsite.args.iter().enumerate() {
+                if let Some(&param) = params.get(&(target.clone(), index as u32)) {
+                    flow[arg.0 as usize].push(param);
+                }
+            }
+            if let (Some(&ret), Some(result)) = (returns.get(target), callsite.result) {
+                flow[ret.0 as usize].push(result);
+            }
+        }
+        if unsafe_site {
+            unsafe_indirect_sites.insert(callsite.id);
+        }
+    }
+
+    let closure = |seeds: &[NodeId]| {
+        let mut reached = vec![false; pag.nodes.len()];
+        let mut queue = VecDeque::new();
+        for &seed in seeds {
+            if !reached[seed.0 as usize] {
+                reached[seed.0 as usize] = true;
+                queue.push_back(seed);
+            }
+        }
+        while let Some(node) = queue.pop_front() {
+            for &next in &flow[node.0 as usize] {
+                if !reached[next.0 as usize] {
+                    reached[next.0 as usize] = true;
+                    queue.push_back(next);
+                }
+            }
+        }
+        reached
+    };
+
+    // An integer-forged pointer that reaches a write or opaque call can designate any
+    // allocation, so no allocation-specific no-write certificate is available in that case.
+    let forged_seeds = pag
+        .omega_seeds
+        .iter()
+        .filter_map(|seed| {
+            (seed.kind == OmegaSeedKind::IntToPtr)
+                .then_some(seed.target)
+                .and_then(|target| match target {
+                    SeedTarget::Node(node) => Some(node),
+                    SeedTarget::Callsite(_) => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    let forged = closure(&forged_seeds);
+    let forged_write = pag.edges.iter().any(|edge| {
+        matches!(
+            edge.kind,
+            pangs_pag::EdgeKind::Store | pangs_pag::EdgeKind::Memcpy { .. }
+        ) && forged[edge.dst.0 as usize]
+    }) || pag.callsites.iter().any(|callsite| {
+        (callsite.external_boundary || unsafe_indirect_sites.contains(&callsite.id))
+            && callsite.args.iter().any(|arg| forged[arg.0 as usize])
+    }) || pag.omega_seeds.iter().any(|seed| match seed.target {
+        SeedTarget::Node(node) => {
+            seed.kind == OmegaSeedKind::UnknownOperandEscape && forged[node.0 as usize]
+        }
+        SeedTarget::Callsite(_) => false,
+    });
+    if forged_write {
+        return BTreeSet::new();
+    }
+
+    let runtime_direct_writes = pir
+        .functions
+        .iter()
+        .flat_map(|func| &func.body)
+        .filter_map(|stmt| match stmt {
+            pangs_pir::Stmt::GlobalRef {
+                global,
+                access: pangs_pir::Access::Mod,
+                ..
+            } => Some(global.as_str()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    let mut isolated = BTreeSet::new();
+    'global: for global in &pir.globals {
+        let Some(&object) = global_objects.get(&global.key) else {
+            continue;
+        };
+        if runtime_direct_writes.contains(global.key.as_str()) {
+            continue;
+        }
+        let reached = closure(&[object]);
+
+        for edge in &pag.edges {
+            match edge.kind {
+                pangs_pag::EdgeKind::Store => {
+                    // Writing through the derived address is a runtime mutation.  Storing the
+                    // derived address makes later memory flow relevant, which this proof
+                    // intentionally rejects instead of approximating optimistically.
+                    if matches!(edge.owner, pangs_pag::Owner::Function(_))
+                        && reached[edge.dst.0 as usize]
+                    {
+                        continue 'global;
+                    }
+                    if reached[edge.src.0 as usize] {
+                        continue 'global;
+                    }
+                }
+                pangs_pag::EdgeKind::Memcpy { .. }
+                    if matches!(edge.owner, pangs_pag::Owner::Function(_))
+                        && reached[edge.dst.0 as usize] =>
+                {
+                    continue 'global;
+                }
+                _ => {}
+            }
+        }
+
+        for seed in &pag.omega_seeds {
+            match seed.target {
+                SeedTarget::Node(node)
+                    if reached[node.0 as usize]
+                        && matches!(
+                            seed.kind,
+                            OmegaSeedKind::ExportedSymbol
+                                | OmegaSeedKind::PtrToInt
+                                | OmegaSeedKind::UnknownOperandEscape
+                        ) =>
+                {
+                    continue 'global;
+                }
+                SeedTarget::Callsite(id) => {
+                    let Some(callsite) = pag.callsites.get(id.0 as usize) else {
+                        continue 'global;
+                    };
+                    if callsite
+                        .args
+                        .iter()
+                        .chain(callsite.operand.iter())
+                        .any(|node| reached[node.0 as usize])
+                    {
+                        continue 'global;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for callsite in &pag.callsites {
+            if (callsite.external_boundary || unsafe_indirect_sites.contains(&callsite.id))
+                && callsite
+                    .args
+                    .iter()
+                    .chain(callsite.operand.iter())
+                    .any(|node| reached[node.0 as usize])
+            {
+                continue 'global;
+            }
+        }
+
+        if pag.nodes.iter().any(|node| {
+            matches!(&node.kind, NodeKind::Return { func } if unknown_callers.contains(func))
+                && reached[node.id.0 as usize]
+        }) {
+            continue;
+        }
+
+        isolated.insert(global.key.clone());
+    }
+    isolated
+}
+
 #[derive(Debug, Clone)]
 struct FunctionMeta {
     sig: Signature,
@@ -831,22 +1079,35 @@ impl<'a> Solver<'a> {
             }
         }
 
+        let isolated_globals =
+            allocation_isolated_globals(self.pir, self.pag, &indirect_calls, &unknown_callers);
+
         let mut globals = BTreeMap::new();
         for (global_index, global) in self.pir.globals.iter().enumerate() {
             let Some(class) = self.global_object_class(global_index) else {
                 continue;
             };
             let root = self.find(class);
-            let escape_external = self.classes[root].esc;
-            let escape_sources = self.classes[root]
+            let mut escape_external = self.classes[root].esc;
+            let mut escape_sources = self.classes[root]
                 .escape_sources
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>();
             let own_export = format!("exported-symbol:obj:global:{}", global.key);
-            let address_escape = escape_sources.iter().any(|source| source != &own_export);
+            let mut address_escape = escape_sources.iter().any(|source| source != &own_export);
             let never_written = !escape_external && !stored_classes.contains(&root);
-            let runtime_written = runtime_stored_classes.contains(&root);
+            let mut runtime_written = runtime_stored_classes.contains(&root);
+            if isolated_globals.contains(&global.key) {
+                // Steensgaard may merge a dynamically-indexed aggregate with an unrelated,
+                // externally exposed pointer class.  A completed allocation-provenance proof
+                // is strictly narrower: every flow of this object's own address was followed,
+                // and no runtime write or external boundary was reached.
+                escape_external = false;
+                address_escape = false;
+                escape_sources.clear();
+                runtime_written = false;
+            }
             globals.insert(
                 global.key.clone(),
                 GlobalResolution {
