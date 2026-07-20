@@ -20,6 +20,11 @@ artifact emission, inventory validation, and the repository's mock-materializer 
 fixture-rewriter round-trip contract harness. It does not claim integration with the
 production C-to-C materializer or C-to-Rust translator.
 
+**Status (2026-07-19): analysis-side v1 complete.** D1, D2, D2b, D3, D4, and D5
+are implemented and pass the final compliance audit. D0's real-translator survival
+spike and all production materializer/rewriter work are the next integration milestone,
+not analysis-side v1 gaps.
+
 Ground rules, restated as implementation invariants — every PR touching this layer is
 reviewable against them:
 
@@ -270,7 +275,7 @@ regenerates exactly the `source: "override"` records and preserves
 `analysis`/`entry-spine` records semantically unchanged — byte-identical after
 canonical re-emission — so the D2 idempotence test covers this artifact too.
 
-### 1.5 Fact and certificate encodings (schema v2, frozen by D1a's golden)
+### 1.5 Fact and certificate encodings (introduced in schema v2; current schema v3)
 
 These shapes complete `DISPOSITION.md` §2/§3.
 
@@ -458,7 +463,7 @@ The D2 idempotence test is therefore exact: `pangs-dispose` on its own output wi
 same config and overrides is a byte-level no-op across both artifacts, and changing
 only the overrides file changes only dispose-owned content.
 
-### 1.8 Concrete shared-record shapes (completing schema v2)
+### 1.8 Concrete shared-record shapes (introduced in schema v2; current schema v3)
 
 Typing rule for D1a: **shared records are strongly typed now; pass-owned certificate
 payloads are typed envelopes around opaque values.** Concretely, the certificate-slot
@@ -681,7 +686,7 @@ conventions):
 
 | Crate | Contents | Depended on by |
 |---|---|---|
-| `pangs-manifest` | schema v2 serde types (`Key`, `Meta`, `Facts`, `PhaseStationarity`, `Disposition`, `CascadeTrace`, `CouplingGroup`, `RunHeader`, `OverrideReport`, `AuditRecord`), key grammar + parser (§1.1), marker codec (§1.2), schema-version constants, canonical JSON read/write | analysis, `pangs-dispose`, C→C tool, Rust rewriter — **the one shared dependency; keep it std+serde+serde_json+sha2 only** (`sha2` earns its slot: §1.4 audit ids) |
+| `pangs-manifest` | schema v3 serde types (additively evolved from v2: `Key`, `Meta`, `Facts`, `PhaseStationarity`, `Disposition`, `CascadeTrace`, `CouplingGroup`, `RunHeader`, `OverrideReport`, `AuditRecord`), key grammar + parser (§1.1), marker codec (§1.2), schema-version constants, canonical JSON read/write | analysis, `pangs-dispose`, C→C tool, Rust rewriter — **the one shared dependency; keep it std+serde+serde_json+sha2 only** (`sha2` earns its slot: §1.4 audit ids) |
 | `pangs-dispose` | the policy stage: cascade evaluator, override machinery, group disposition resolution, report + ledger emission. Library + thin CLI | CI, users |
 | (existing analysis crate, phase F) | fact-assembly post-pass, coupling post-pass (D2b), marker-inventory schema checks | — |
 
@@ -703,7 +708,7 @@ scope.
 
 ## 3. Work items
 
-### D1 — manifest, fact assembly, cascade (~400 lines + crate scaffolding)
+### D1 — manifest, fact assembly, cascade (implemented)
 
 Split for independent landing:
 
@@ -730,7 +735,8 @@ Split for independent landing:
   `phase_stationarity` and `coupling_group` are wired in when O6/D2b land — until
   then the slots are `null`, which the cascade already tolerates (ground rule 6).
 
-  **Repository readiness (audited 2026-07-15):** D1b is *not* pure assembly over
+  **Historical repository-readiness audit (2026-07-15; gaps now closed):** D1b was
+  *not* pure assembly over
   currently exported facts. `GlobalInfo` (`crates/pangs-api/src/lib.rs`) today
   carries only `is_const`/`mutable`/`stationary`/`never_written`/`escape` — no
   linkage, no C type spelling or size, **no definition-vs-declaration bit**, and no
@@ -805,7 +811,7 @@ present/absent/null) asserting (a) `cascade_chosen`'s guard holds, (b) every
 other entries appear (§1.5 trace rule — the invariant binds `cascade_trace` to
 `cascade_chosen`, never to the final `chosen`), (c) determinism.
 
-### D2 — override machinery (~250 lines, in `pangs-dispose`)
+### D2 — override machinery (implemented in `pangs-dispose`)
 
 TOML format per `DISPOSITION.md` §4.1 (serde + `toml`). Validation per §4.2, in this
 order per override: key resolution (§1.1 grammar; unmatched ⇒ `unmatched-key`) →
@@ -843,7 +849,7 @@ resolved group disposition rejected as a rule-3 group conflict) — plus exit-co
 assertions (§1.3), plus idempotence: re-running `pangs-dispose` on its own output
 with the same overrides is a byte-level no-op.
 
-### D2b — shared coupling post-pass (~200 lines, phase F)
+### D2b — shared coupling post-pass (implemented in phase F)
 
 The component consumes **hard ONCELOCK evidence** (for certified globals):
 publication-interval overlap ∧
@@ -912,10 +918,10 @@ program + manifest → mock C→C materializer plants markers → fixture transl
 the output greps clean. Production marker planting and survival through the real
 translator are the next integration milestone, not unfinished analysis-side D5 work.
 
-### D3 — atomic eligibility (gated; build iff the §7 counter is material)
+### D3 — atomic eligibility (implemented)
 
-Specified now so the gate counter measures the right thing; sized when scheduled.
-Certificate requires **all** of: `word_sized_scalar`; `access_set_complete`; every
+The gate was passed and the pass was built. Its certificate requires **all** of:
+`word_sized_scalar`; `access_set_complete`; every
 access site classifiable as load, store, or a recognized RMW shape (`g++`, `g += k`,
 `g = g op k` — classified on IR, emitted per-site so the rewriter knows
 `load(Relaxed)` vs `fetch_add`); no address-taken use incompatible with retyping
@@ -1049,9 +1055,11 @@ on 2026-07-16. The run produced 3,204 keyed mutable globals and no unkeyed globa
 | atomic | 1,864 | 1,035 word-sized scalars | 0 access-complete | 0 |
 | mutex | 1,864 | 0 signal-context-safe survivors | 0 | 0 |
 
-All 3,204 access sets failed on `omega-access-path`, so Vim alone provides no case
-for scheduling D3 or D4. The decision remains open until the required PHP measurement
-is available. Corpus-scale validation also recorded 68 coupling groups (1,181 grouped
+All 3,204 access sets failed on `omega-access-path`, so Vim alone provided no case
+for scheduling D3 or D4. This historical Vim-only gate result was later superseded by
+the sibling-corpus measurements that justified and validated both passes; PHP coverage
+is not an analysis-side v1 completion condition. Corpus-scale validation also recorded
+68 coupling groups (1,181 grouped
 globals) represented by 1,113 proof-forest edges; the optimized disposition portion
 completed in about 89 seconds (13.1 seconds fact indexing, 75.1 seconds phase facts,
 13 milliseconds coupling) within the analysis run's 23.2 GB peak RSS.

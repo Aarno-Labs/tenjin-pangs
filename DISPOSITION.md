@@ -129,18 +129,18 @@ Per-global facts, with producers:
 
 | Fact | Type | Producer | Status |
 |---|---|---|---|
-| `written` | evidenced bool, *may-runtime-written* semantics; static initializer stores are excluded (witness when true: a runtime write site, or the external escape that prevents ruling writes out — `DISPOSITION_PLAN.md` §1.9) | F runtime `writers(o)` scan | exists (`never_written`) plus additive store-owner classification |
-| `omega_escaped_address` | evidenced bool (witness when true: the escape site) | Ω machinery | exists |
-| `violation_taint` | evidenced bool (witness when true: an address-relevant, access-shape-relevant, or unresolved violation finding) — gates every strategy, §1; value-only/unrelated findings remain diagnostics | A′ relevance routing | built by F3 |
-| `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) — **reporting fact, not a guard**: thread visibility alone defeats no strategy (thread readers are a primary OnceLock use case; the thread-*writer* kill rule lives inside the phase-stationarity certificate) | F scan over spawn sites | specified; exported by D1b |
-| `signal_context_access` | evidenced bool (true iff accessed under a registered signal handler; witness when true: registration site + accessing function) | F scan over Ω escape sites of handlers | new, cheap |
-| `access_set_complete` | evidenced bool (true iff analysis bounds every possible accessor; **witness when false**: module-wide Ω, address escape, or library name reachability) | F scan | built by D1b; bounded indirect/rewrite compatibility is diagnosed separately for D3/D4 |
-| `word_sized_scalar` | `{ value, type_spelling?, size_bits?, class?, signed? }` — true iff the type has a matching Rust atomic on the target (`DISPOSITION_PLAN.md` §1.9; the name is historical shorthand, not "pointer-width only") | lowering metadata (O1b) | exists after O1b |
-| `phase_stationarity` | certificate slot (null \| certified \| failed+codes+witnesses) | ONCELOCK pass | specified |
+| `written` | evidenced bool, *may-runtime-written* semantics; static initializer stores are excluded (witness when true: a runtime write site, or the external escape that prevents ruling writes out — `DISPOSITION_PLAN.md` §1.9) | F runtime `writers(o)` scan | implemented |
+| `omega_escaped_address` | evidenced bool (witness when true: the escape site) | Ω machinery | implemented |
+| `violation_taint` | evidenced bool (witness when true: an address-relevant, access-shape-relevant, or unresolved violation finding) — gates every strategy, §1; value-only/unrelated findings remain diagnostics | A′ relevance routing | implemented |
+| `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) — **reporting fact, not a guard**: thread visibility alone defeats no strategy (thread readers are a primary OnceLock use case; the thread-*writer* kill rule lives inside the phase-stationarity certificate) | F scan over spawn sites | implemented |
+| `signal_context_access` | evidenced bool (true iff accessed under a registered signal handler; witness when true: registration site + accessing function) | F scan over Ω escape sites of handlers | implemented |
+| `access_set_complete` | evidenced bool (true iff analysis bounds every possible accessor; **witness when false**: module-wide Ω, address escape, or library name reachability) | F scan | implemented; bounded indirect/rewrite compatibility is diagnosed separately for D3/D4 |
+| `word_sized_scalar` | `{ value, type_spelling?, size_bits?, class?, signed? }` — true iff the type has a matching Rust atomic on the target (`DISPOSITION_PLAN.md` §1.9; the name is historical shorthand, not "pointer-width only") | lowering metadata (O1b) | implemented |
+| `phase_stationarity` | certificate slot (null \| certified \| failed+codes+witnesses) | ONCELOCK pass | implemented |
 | `atomic_eligibility` | certificate slot | D3 access-lowering pass (§9) | implemented |
 | `mutex_eligibility` | certificate slot | D4 final-call-graph reentrancy pass (§9) | implemented |
-| `coupling_group` | group id | shared coupling analysis (§6) | generalizes ONCELOCK §2.3 |
-| `localization` | localization verdict (null \| ok \| blocked+blockers) | existing client (`DESIGN.md` §7) | exists |
+| `coupling_group` | group id | shared coupling analysis (§6) | implemented |
+| `localization` | localization verdict (null \| ok \| blocked+blockers) | existing client (`DESIGN.md` §7) | implemented |
 
 Rule of construction: every fact is either derivable from the materialized solution in
 one scan, or it does not belong in the vector. Nothing here re-enters the solver.
@@ -636,12 +636,12 @@ None of these amendments change A′–D′ or any solver semantics.
 
 Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
 
-- **D1 — manifest + policy stage (~400 lines).** Fact-vector assembly from existing
-  scans; cascade evaluation with trace; schema v2 emission; run-header reproducibility
+- **D1 — manifest + policy stage (implemented).** Fact-vector assembly from existing
+  scans; cascade evaluation with trace; schema v3 emission; run-header reproducibility
   fields. No new analysis.
-- **D2 — override machinery (~250 lines).** TOML parsing, §4.2 validation, override
+- **D2 — override machinery (implemented).** TOML parsing, §4.2 validation, override
   report, soundness-inventory append for accepted risks, CI exit-code discipline.
-- **D2b — shared coupling post-pass (~200 lines).** Extracted from O6's clustering;
+- **D2b — shared coupling post-pass (implemented).** Extracted from O6's clustering;
   derives hard common-publication groups, group evidence records, and group disposition
   resolution for joint strategies.
 - **D3 — atomic eligibility pass (implemented).** Produces a per-global certificate
