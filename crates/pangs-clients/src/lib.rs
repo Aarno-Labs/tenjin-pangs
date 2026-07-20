@@ -3508,6 +3508,17 @@ mod tests {
                 comparison_only: false,
                 loc: None,
             },
+            pangs_pir::Stmt::Alloca {
+                dest: "%callbacks".into(),
+                ty: "{ void ()*, i32 }".into(),
+                loc: None,
+            },
+            pangs_pir::Stmt::Memcpy {
+                dst: "%callbacks".into(),
+                src: "%callbacks".into(),
+                bytes: Some(16),
+                loc: None,
+            },
         ]);
     }
 
@@ -4102,6 +4113,10 @@ mod tests {
         assert!(facts.violation_diagnostics[g01.0 as usize]
             .iter()
             .filter(|diagnostic| diagnostic.finding_kind == "fnptr_ptrtoint")
+            .all(|diagnostic| diagnostic.classification == ViolationRelevance::Unrelated));
+        assert!(facts.violation_diagnostics[g01.0 as usize]
+            .iter()
+            .filter(|diagnostic| diagnostic.finding_kind == "memcpy_fnptr_aggregate")
             .all(|diagnostic| diagnostic.classification == ViolationRelevance::Unrelated));
     }
 

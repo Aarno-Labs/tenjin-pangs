@@ -2857,6 +2857,79 @@ fn audit_memops_on_fnptr_aggregates_are_reported_but_scalar_fnptr_memops_are_not
         .taint
         .iter()
         .any(|taint| taint.kind == "memset_fnptr_aggregate"));
+    assert!(analysis
+        .audit_findings()
+        .iter()
+        .filter(|finding| {
+            finding.kind == "memcpy_fnptr_aggregate" || finding.kind == "memset_fnptr_aggregate"
+        })
+        .all(|finding| finding.global_flow == pangs_api::AuditGlobalFlow::NotComputed));
+
+    let solved_analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    assert!(solved_analysis
+        .audit_findings()
+        .iter()
+        .filter(|finding| {
+            finding.kind == "memcpy_fnptr_aggregate" || finding.kind == "memset_fnptr_aggregate"
+        })
+        .all(|finding| finding.global_flow == pangs_api::AuditGlobalFlow::Finite(vec![])));
+
+    let mut external_pir = pir.clone();
+    external_pir.functions[0].body.splice(
+        1..1,
+        [
+            Stmt::CallDirect {
+                callee: "external_source".to_string(),
+                sig: sig(AbiClass::Integer, vec![]),
+                args: vec![],
+                dest: Some("%external".to_string()),
+                loc: None,
+            },
+            Stmt::Assign {
+                dest: "%agg_external".to_string(),
+                sources: vec!["%agg".to_string(), "%external".to_string()],
+                loc: None,
+            },
+            Stmt::Memcpy {
+                dst: "%agg_external".to_string(),
+                src: "%agg".to_string(),
+                bytes: Some(16),
+                loc: None,
+            },
+        ],
+    );
+    external_pir.functions.push(Func {
+        key: "external_source".to_string(),
+        sig: sig(AbiClass::Integer, vec![]),
+        param_names: vec![],
+        file: None,
+        line: None,
+        external: true,
+        exported: false,
+        address_taken: false,
+        body: vec![],
+    });
+    let external_analysis = Analysis::run(
+        &external_pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    assert!(external_analysis.audit_findings().iter().any(|finding| {
+        finding.kind == "memcpy_fnptr_aggregate"
+            && finding.global_flow == pangs_api::AuditGlobalFlow::ModuleWide
+    }));
 
     let scalar = Pir {
         module: "m".to_string(),

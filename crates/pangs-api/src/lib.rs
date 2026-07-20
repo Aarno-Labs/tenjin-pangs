@@ -622,6 +622,11 @@ pub enum M2AblationMode {
 
 #[derive(Debug)]
 enum DeferredAudit {
+    MemoryAggregateFlow {
+        finding_index: usize,
+        owner: String,
+        values: Vec<String>,
+    },
     PtrToInt {
         caller: FuncId,
         owner: String,
@@ -1029,6 +1034,7 @@ impl Analysis {
                         detect_memory_aggregate_audits(
                             &mut findings,
                             &mut audit_taints,
+                            &mut deferred_audits,
                             &mut noloc_ord,
                             caller,
                             &func.key,
@@ -1045,6 +1051,7 @@ impl Analysis {
                         detect_memory_aggregate_audits(
                             &mut findings,
                             &mut audit_taints,
+                            &mut deferred_audits,
                             &mut noloc_ord,
                             caller,
                             &func.key,
@@ -2093,6 +2100,15 @@ fn emit_deferred_steens_audits(
 ) {
     for item in deferred {
         match item {
+            DeferredAudit::MemoryAggregateFlow {
+                finding_index,
+                owner,
+                values,
+            } => {
+                let global_flow =
+                    audit_global_flow(module, &owner, &values, node_summaries, global_lookup);
+                findings[finding_index].global_flow = global_flow;
+            }
             DeferredAudit::PtrToInt {
                 caller,
                 owner,
@@ -3173,6 +3189,7 @@ fn detect_vararg_fnptr_audit(
 fn detect_memory_aggregate_audits(
     findings: &mut Vec<Finding>,
     audit_taints: &mut BTreeMap<FuncId, Vec<Taint>>,
+    deferred: &mut Vec<DeferredAudit>,
     noloc_ord: &mut BTreeMap<(String, String), u32>,
     caller: FuncId,
     owner: &str,
@@ -3183,14 +3200,21 @@ fn detect_memory_aggregate_audits(
     if values.is_empty() {
         return;
     }
-    let mut affected = values
-        .into_iter()
+    let mut values = values;
+    values.sort();
+    values.dedup();
+    let affected = values
+        .iter()
         .map(|value| format!("value:{value}"))
         .collect::<Vec<_>>();
-    affected.sort();
-    affected.dedup();
     let witness = witness_key(owner, loc, noloc_ord, "audit");
+    let finding_index = findings.len();
     push_audit_finding(findings, audit_taints, caller, kind, loc, affected, witness);
+    deferred.push(DeferredAudit::MemoryAggregateFlow {
+        finding_index,
+        owner: owner.to_string(),
+        values,
+    });
 }
 
 fn record_vararg_deferred_audit(
