@@ -973,6 +973,9 @@ fn llvm_sys_classifies_closed_ptrtoint_comparison_use_chains() {
         &ll_path,
         r#"
 declare void @sink(i64)
+declare void @sink_ptr(i8*)
+declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1 immarg)
+@observed_difference = global i64 0
 
 define i1 @direct_compare(i8* %p, i8* %q) {
 entry:
@@ -1027,6 +1030,60 @@ entry:
   call void @sink(i64 %bits)
   ret void
 }
+
+define void @closed_pointer_difference(i8* %p, i8* %q, i8* %dst) {
+entry:
+  %len.addr = alloca i32
+  %pi = ptrtoint i8* %p to i64
+  %qi = ptrtoint i8* %q to i64
+  %delta = sub i64 %pi, %qi
+  %plus_one = add i64 %delta, 1
+  %narrow = trunc i64 %plus_one to i32
+  store i32 %narrow, i32* %len.addr
+  %loaded = load i32, i32* %len.addr
+  %wide = sext i32 %loaded to i64
+  call void @llvm.memcpy.p0i8.p0i8.i64(i8* %dst, i8* %q, i64 %wide, i1 false)
+  %indexed = getelementptr i8, i8* %dst, i64 %wide
+  store i8 0, i8* %indexed
+  ret void
+}
+
+define void @escaping_pointer_difference(i8* %p, i8* %q) {
+entry:
+  %pi = ptrtoint i8* %p to i64
+  %qi = ptrtoint i8* %q to i64
+  %delta = sub i64 %pi, %qi
+  call void @sink(i64 %delta)
+  ret void
+}
+
+define i8* @reified_pointer_difference(i8* %p, i8* %q) {
+entry:
+  %pi = ptrtoint i8* %p to i64
+  %qi = ptrtoint i8* %q to i64
+  %delta = sub i64 %pi, %qi
+  %again = inttoptr i64 %delta to i8*
+  ret i8* %again
+}
+
+define void @stored_pointer_difference(i8* %p, i8* %q) {
+entry:
+  %pi = ptrtoint i8* %p to i64
+  %qi = ptrtoint i8* %q to i64
+  %delta = sub i64 %pi, %qi
+  store i64 %delta, i64* @observed_difference
+  ret void
+}
+
+define void @escaping_derived_address(i8* %p, i8* %q, i8* %base) {
+entry:
+  %pi = ptrtoint i8* %p to i64
+  %qi = ptrtoint i8* %q to i64
+  %delta = sub i64 %pi, %qi
+  %derived = getelementptr i8, i8* %base, i64 %delta
+  call void @sink_ptr(i8* %derived)
+  ret void
+}
 "#,
     )
     .unwrap();
@@ -1038,15 +1095,17 @@ entry:
             .iter()
             .find(|candidate| candidate.key == function)
             .unwrap();
-        function.body.iter().any(|statement| {
-            matches!(
-                statement,
+        let conversions = function
+            .body
+            .iter()
+            .filter_map(|statement| match statement {
                 Stmt::PtrToInt {
-                    comparison_only: true,
-                    ..
-                }
-            )
-        })
+                    comparison_only, ..
+                } => Some(*comparison_only),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        !conversions.is_empty() && conversions.into_iter().all(|closed| closed)
     };
     assert!(comparison_only("direct_compare"));
     assert!(comparison_only("arithmetic_compare"));
@@ -1055,6 +1114,11 @@ entry:
     assert!(!comparison_only("externally_observed"));
     assert!(!comparison_only("reified"));
     assert!(!comparison_only("mixed_use"));
+    assert!(comparison_only("closed_pointer_difference"));
+    assert!(!comparison_only("escaping_pointer_difference"));
+    assert!(!comparison_only("reified_pointer_difference"));
+    assert!(!comparison_only("stored_pointer_difference"));
+    assert!(!comparison_only("escaping_derived_address"));
 }
 
 #[test]
