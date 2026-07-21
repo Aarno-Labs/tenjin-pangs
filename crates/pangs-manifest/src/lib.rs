@@ -199,6 +199,100 @@ pub struct Witness {
     pub extra: Extra,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ViolationRelevance {
+    AddressRelevant,
+    AccessShapeRelevant,
+    ValueOnly,
+    Unrelated,
+    Unresolved,
+}
+
+impl ViolationRelevance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AddressRelevant => "address-relevant",
+            Self::AccessShapeRelevant => "access-shape-relevant",
+            Self::ValueOnly => "value-only",
+            Self::Unrelated => "unrelated",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViolationRelevanceDiagnostic {
+    pub classification: ViolationRelevance,
+    pub finding_kind: String,
+    #[serde(with = "violation_relevance_witness")]
+    pub witness: Witness,
+}
+
+mod violation_relevance_witness {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{Extra, Site, Witness};
+
+    #[derive(Serialize)]
+    struct CanonicalSite<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        col: Option<u32>,
+        file: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        function: Option<&'a str>,
+        line: u32,
+        #[serde(flatten)]
+        extra: &'a Extra,
+    }
+
+    impl<'a> From<&'a Site> for CanonicalSite<'a> {
+        fn from(site: &'a Site) -> Self {
+            Self {
+                col: site.col,
+                file: &site.file,
+                function: site.function.as_deref(),
+                line: site.line,
+                extra: &site.extra,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CanonicalWitness<'a> {
+        kind: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        site: Option<CanonicalSite<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        symbol: Option<&'a str>,
+        #[serde(flatten)]
+        extra: &'a Extra,
+    }
+
+    pub fn serialize<S>(witness: &Witness, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        CanonicalWitness {
+            kind: &witness.kind,
+            note: witness.note.as_deref(),
+            site: witness.site.as_ref().map(CanonicalSite::from),
+            symbol: witness.symbol.as_deref(),
+            extra: &witness.extra,
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Witness, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Witness::deserialize(deserializer)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidencedBool {
     pub value: bool,
@@ -316,6 +410,8 @@ pub struct Facts {
     pub mutex_eligibility: Option<Certificate>,
     pub coupling_group: Option<String>,
     pub localization: Option<Localization>,
+    #[serde(default)]
+    pub violation_relevance: Vec<ViolationRelevanceDiagnostic>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -1311,6 +1407,36 @@ mod tests {
         assert!(text.find("a_future").unwrap() < text.find("z_future").unwrap());
         let reparsed: Witness = serde_json::from_str(&text).unwrap();
         assert_eq!(to_canonical_json(&reparsed).unwrap(), text.as_bytes());
+    }
+
+    #[test]
+    fn typed_violation_diagnostic_preserves_legacy_json_order() {
+        let diagnostic = ViolationRelevanceDiagnostic {
+            classification: ViolationRelevance::Unrelated,
+            finding_kind: "fnptr_ptrtoint".into(),
+            witness: Witness {
+                kind: "violation-unrelated".into(),
+                site: Some(Site {
+                    file: "src/a.c".into(),
+                    line: 7,
+                    col: Some(3),
+                    function: Some("f".into()),
+                    extra: Extra::new(),
+                }),
+                symbol: Some("g".into()),
+                note: Some("fnptr_ptrtoint".into()),
+                extra: Extra::new(),
+            },
+        };
+        let text = serde_json::to_string(&diagnostic).unwrap();
+        assert_eq!(
+            text,
+            r#"{"classification":"unrelated","finding_kind":"fnptr_ptrtoint","witness":{"kind":"violation-unrelated","note":"fnptr_ptrtoint","site":{"col":3,"file":"src/a.c","function":"f","line":7},"symbol":"g"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ViolationRelevanceDiagnostic>(&text).unwrap(),
+            diagnostic
+        );
     }
 
     #[test]

@@ -22,7 +22,8 @@ use pangs_manifest::{
     EvidencedBool, Extra, Facts, GlobalRecord as DispositionGlobal, GroupStrategySupport, Key,
     Linkage, Localization, LocalizationBlocker, LocalizationVerdict,
     Manifest as DispositionManifest, Meta, OnceLockGroupSupport, RunHeader, ScalarClass, Site,
-    UnkeyedGlobal, Witness, WordSizedScalar, SCHEMA_VERSION,
+    UnkeyedGlobal, ViolationRelevance as ManifestViolationRelevance, ViolationRelevanceDiagnostic,
+    Witness, WordSizedScalar, SCHEMA_VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -247,10 +248,8 @@ pub fn assemble_disposition_artifacts(
                 mutex_eligibility: None,
                 coupling_group: None,
                 localization,
-                extra: BTreeMap::from([(
-                    "violation_relevance".into(),
-                    serde_json::to_value(&fact_rows.violation_diagnostics[index])?,
-                )]),
+                violation_relevance: fact_rows.violation_diagnostics[index].clone(),
+                extra: Extra::new(),
             },
             disposition: None,
             extra: Extra::new(),
@@ -2053,16 +2052,6 @@ enum ViolationRelevance {
 }
 
 impl ViolationRelevance {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AddressRelevant => "address-relevant",
-            Self::AccessShapeRelevant => "access-shape-relevant",
-            Self::ValueOnly => "value-only",
-            Self::Unrelated => "unrelated",
-            Self::Unresolved => "unresolved",
-        }
-    }
-
     fn is_hard(self) -> bool {
         matches!(
             self,
@@ -2081,11 +2070,16 @@ impl ViolationRelevance {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct ViolationRelevanceDiagnostic {
-    classification: ViolationRelevance,
-    finding_kind: String,
-    witness: Witness,
+impl From<ViolationRelevance> for ManifestViolationRelevance {
+    fn from(value: ViolationRelevance) -> Self {
+        match value {
+            ViolationRelevance::AddressRelevant => Self::AddressRelevant,
+            ViolationRelevance::AccessShapeRelevant => Self::AccessShapeRelevant,
+            ViolationRelevance::ValueOnly => Self::ValueOnly,
+            ViolationRelevance::Unrelated => Self::Unrelated,
+            ViolationRelevance::Unresolved => Self::Unresolved,
+        }
+    }
 }
 
 impl<'a> DispositionFactRows<'a> {
@@ -2175,7 +2169,7 @@ impl<'a> DispositionFactRows<'a> {
                     violation[index] = Some(witness.clone());
                 }
                 violation_diagnostics[index].push(ViolationRelevanceDiagnostic {
-                    classification: relevance,
+                    classification: relevance.into(),
                     finding_kind: finding.kind.clone(),
                     witness,
                 });
@@ -4121,11 +4115,11 @@ mod tests {
         assert!(facts.violation_diagnostics[g01.0 as usize]
             .iter()
             .filter(|diagnostic| diagnostic.finding_kind == "fnptr_ptrtoint")
-            .all(|diagnostic| diagnostic.classification == ViolationRelevance::Unrelated));
+            .all(|diagnostic| diagnostic.classification == ViolationRelevance::Unrelated.into()));
         assert!(facts.violation_diagnostics[g01.0 as usize]
             .iter()
             .filter(|diagnostic| diagnostic.finding_kind == "memcpy_fnptr_aggregate")
-            .all(|diagnostic| diagnostic.classification == ViolationRelevance::Unrelated));
+            .all(|diagnostic| diagnostic.classification == ViolationRelevance::Unrelated.into()));
     }
 
     #[test]
@@ -4185,11 +4179,11 @@ mod tests {
         assert!(!global.facts.violation_taint.value);
         assert!(global.facts.access_set_complete.value);
         assert_eq!(
-            global.facts.extra["violation_relevance"][0]["classification"],
-            "unrelated"
+            global.facts.violation_relevance[0].classification,
+            pangs_manifest::ViolationRelevance::Unrelated
         );
         assert_eq!(
-            global.facts.extra["violation_relevance"][0]["finding_kind"],
+            global.facts.violation_relevance[0].finding_kind,
             "fnptr_varargs_external"
         );
     }
@@ -4234,7 +4228,7 @@ mod tests {
         assert_eq!(witness.kind, "violation-address-relevant");
         assert_eq!(
             facts.violation_diagnostics[global.0 as usize][0].classification,
-            ViolationRelevance::AddressRelevant
+            ViolationRelevance::AddressRelevant.into()
         );
     }
 

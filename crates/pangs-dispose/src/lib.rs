@@ -1249,6 +1249,7 @@ mod tests {
             mutex_eligibility: None,
             coupling_group: None,
             localization: None,
+            violation_relevance: Vec::new(),
             extra: Extra::new(),
         }
     }

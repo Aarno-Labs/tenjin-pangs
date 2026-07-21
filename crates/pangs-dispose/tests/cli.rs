@@ -69,6 +69,7 @@ fn fixture() -> (Manifest, Vec<AuditRecord>) {
                 mutex_eligibility: None,
                 coupling_group: None,
                 localization: None,
+                violation_relevance: Vec::new(),
                 extra: Extra::new(),
             },
             disposition: None,
