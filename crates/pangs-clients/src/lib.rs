@@ -2131,13 +2131,16 @@ impl<'a> DispositionFactRows<'a> {
                 indirect_access_sites_by_function[site.func.0 as usize].push(site);
             }
         }
-
-        let mut violation = vec![None; global_count];
-        let mut violation_diagnostics = vec![Vec::new(); global_count];
-        for finding in analysis.audit_findings() {
-            let Some(function) = finding.function else {
-                continue;
-            };
+        let finding_functions = analysis
+            .audit_findings()
+            .iter()
+            .filter_map(|finding| finding.function)
+            .collect::<BTreeSet<_>>();
+        // Candidate rows depend only on the finding's function. Large programs often have
+        // several findings in the same high-fanout function, so expanding retained target sets
+        // once per function avoids rebuilding an identical map for every finding.
+        let mut rows_by_global_by_function = vec![None; analysis.functions().len()];
+        for function in finding_functions {
             let mut rows_by_global = BTreeMap::<GlobalId, Vec<&ModRef>>::new();
             for row in &modrefs_by_function[function.0 as usize] {
                 match analysis.affected_globals(row) {
@@ -2153,14 +2156,27 @@ impl<'a> DispositionFactRows<'a> {
                     }
                 }
             }
-            for (global, rows) in rows_by_global {
+            rows_by_global_by_function[function.0 as usize] = Some(rows_by_global);
+        }
+
+        let mut violation = vec![None; global_count];
+        let mut violation_diagnostics = vec![Vec::new(); global_count];
+        for finding in analysis.audit_findings() {
+            let Some(function) = finding.function else {
+                continue;
+            };
+            let rows_by_global = rows_by_global_by_function[function.0 as usize]
+                .as_ref()
+                .expect("finding-bearing function has a relevance index");
+            let affected_nodes = violation_affected_nodes(analysis, finding, function);
+            for (&global, rows) in rows_by_global {
                 let relevance = classify_violation_relevance_indexed(
                     analysis,
                     finding,
-                    function,
                     global,
-                    &rows,
+                    rows,
                     Some(&indirect_access_sites_by_function[function.0 as usize]),
+                    &affected_nodes,
                 );
                 let witness =
                     violation_relevance_witness(analysis, finding, function, global, relevance);
@@ -2200,23 +2216,38 @@ fn classify_violation_relevance(
         .access_sites_for_global(global)
         .filter(|site| site.func == function && site.via != pangs_api::Via::Direct)
         .collect::<Vec<_>>();
+    let affected_nodes = violation_affected_nodes(analysis, finding, function);
     classify_violation_relevance_indexed(
         analysis,
         finding,
-        function,
         global,
         rows,
         Some(&indirect_sites),
+        &affected_nodes,
     )
+}
+
+fn violation_affected_nodes(
+    analysis: &Analysis,
+    finding: &pangs_api::Finding,
+    function: FuncId,
+) -> BTreeSet<String> {
+    let function_key = &analysis.functions()[function].key;
+    finding
+        .affected
+        .iter()
+        .filter_map(|affected| affected.strip_prefix("value:"))
+        .flat_map(|value| [value.to_owned(), format!("val:{function_key}:{value}")])
+        .collect()
 }
 
 fn classify_violation_relevance_indexed(
     analysis: &Analysis,
     finding: &pangs_api::Finding,
-    function: FuncId,
     global: GlobalId,
     rows: &[&ModRef],
     indirect_sites: Option<&[&pangs_api::AccessSite]>,
+    affected_nodes: &BTreeSet<String>,
 ) -> ViolationRelevance {
     let global_key = &analysis.globals()[global].key;
     if finding.affected.iter().any(|affected| {
@@ -2228,13 +2259,6 @@ fn classify_violation_relevance_indexed(
         return ViolationRelevance::AddressRelevant;
     }
 
-    let function_key = &analysis.functions()[function].key;
-    let affected_nodes = finding
-        .affected
-        .iter()
-        .filter_map(|affected| affected.strip_prefix("value:"))
-        .flat_map(|value| [value.to_owned(), format!("val:{function_key}:{value}")])
-        .collect::<BTreeSet<_>>();
     if rows.iter().any(|row| {
         row.address_node
             .as_ref()
