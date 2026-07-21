@@ -248,19 +248,60 @@ pub enum AffectedGlobals<'a> {
     ModuleWide,
 }
 
-/// Unaggregated local memory-access provenance retained for refactoring clients. Unlike
-/// `ModRef`, this records every analyzed site and is never serialized in ordinary analysis
-/// output. Unknown pointer targets are expanded over the client-visible global universe.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Local memory-access provenance retained for refactoring clients.
+///
+/// A pointer access can affect many globals.  The target relation is stored as an interned bitset
+/// instead of materializing one `AccessSite` per `(site, global)` pair; `globals` and `affects`
+/// expose the same relation to clients without retaining its Cartesian expansion.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessSite {
     pub func: FuncId,
-    pub global: GlobalId,
     pub access: Access,
     pub via: Via,
     pub volatile: bool,
     pub atomic_rmw: Option<AtomicRmwAccess>,
     pub loc: Option<LocInfo>,
     pub statement_index: Option<u32>,
+    targets: Rc<[u64]>,
+}
+
+impl AccessSite {
+    pub fn globals(&self) -> impl Iterator<Item = GlobalId> + '_ {
+        self.targets
+            .iter()
+            .enumerate()
+            .flat_map(|(word_index, &word)| {
+                SetBits(word).map(move |bit| GlobalId((word_index * 64 + bit as usize) as u32))
+            })
+    }
+
+    pub fn affects(&self, global: GlobalId) -> bool {
+        let index = global.0 as usize;
+        self.targets
+            .get(index / 64)
+            .is_some_and(|word| word & (1_u64 << (index % 64)) != 0)
+    }
+
+    pub fn target_count(&self) -> usize {
+        self.targets
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+}
+
+struct SetBits(u64);
+
+impl Iterator for SetBits {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.0 != 0).then(|| {
+            let bit = self.0.trailing_zeros();
+            self.0 &= self.0 - 1;
+            bit
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -881,7 +922,7 @@ impl Analysis {
         let mut callsites = Vec::new();
         let mut call_edges = Vec::new();
         let mut modrefs = ModRefBuilder::new();
-        let mut access_sites = Vec::new();
+        let mut access_sites = AccessSiteBuilder::new(globals.len());
         let mut findings = Vec::new();
         let mut audit_taints = BTreeMap::<FuncId, Vec<Taint>>::new();
         let mut deferred_audits = Vec::<DeferredAudit>::new();
@@ -1100,18 +1141,20 @@ impl Analysis {
                         loc,
                     } => {
                         if let Some(&gid) = global_lookup.get(global) {
-                            access_sites.push(AccessSite {
-                                func: caller,
-                                global: gid,
-                                access: *access,
-                                via: Via::Direct,
-                                volatile: *volatile,
-                                atomic_rmw: (*access == Access::Mod)
-                                    .then(|| direct_atomic_rmw(&func.body, stmt_idx, global))
-                                    .flatten(),
-                                loc: loc.as_ref().map(loc_info),
-                                statement_index: Some(stmt_idx as u32),
-                            });
+                            access_sites.push_one(
+                                AccessSiteKey {
+                                    func: caller,
+                                    access: *access,
+                                    via: Via::Direct,
+                                    volatile: *volatile,
+                                    atomic_rmw: (*access == Access::Mod)
+                                        .then(|| direct_atomic_rmw(&func.body, stmt_idx, global))
+                                        .flatten(),
+                                    loc: loc.as_ref().map(loc_info),
+                                    statement_index: Some(stmt_idx as u32),
+                                },
+                                gid,
+                            );
                             if matches!(access, Access::Mod) {
                                 globals[gid.0 as usize].never_written = false;
                                 globals[gid.0 as usize].runtime_written = true;
@@ -1575,48 +1618,7 @@ impl Analysis {
         let modref_dedup_started = Instant::now();
         let mut pointer_modref_metrics = modrefs.metrics();
         let modrefs = modrefs.into_vec();
-        access_sites.sort_by(|left, right| {
-            (
-                left.func,
-                left.global,
-                left.statement_index,
-                &left.loc,
-                left.access,
-                left.via,
-            )
-                .cmp(&(
-                    right.func,
-                    right.global,
-                    right.statement_index,
-                    &right.loc,
-                    right.access,
-                    right.via,
-                ))
-        });
-        let indexed_locations = access_sites
-            .iter()
-            .filter(|site| site.statement_index.is_some())
-            .map(|site| {
-                (
-                    site.func,
-                    site.global,
-                    site.access,
-                    site.via,
-                    site.loc.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        access_sites.retain(|site| {
-            site.statement_index.is_some()
-                || !indexed_locations.contains(&(
-                    site.func,
-                    site.global,
-                    site.access,
-                    site.via,
-                    site.loc.clone(),
-                ))
-        });
-        access_sites.dedup();
+        let access_sites = access_sites.finish();
         let modref_dedup_us = modref_dedup_started.elapsed().as_micros() as u64;
 
         let stationarity_started = Instant::now();
@@ -1950,6 +1952,12 @@ impl Analysis {
 
     pub fn access_sites(&self) -> &[AccessSite] {
         &self.access_sites
+    }
+
+    pub fn access_sites_for_global(&self, global: GlobalId) -> impl Iterator<Item = &AccessSite> {
+        self.access_sites
+            .iter()
+            .filter(move |site| site.affects(global))
     }
 
     pub fn stationarity_verdicts(&self) -> &[StationarityVerdict] {
@@ -3525,6 +3533,119 @@ struct ModRefBuilder {
     profile: PointerModRefProfile,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AccessSiteKey {
+    func: FuncId,
+    statement_index: Option<u32>,
+    loc: Option<LocInfo>,
+    access: Access,
+    via: Via,
+    volatile: bool,
+    atomic_rmw: Option<AtomicRmwAccess>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct IndexedAccessLocation {
+    func: FuncId,
+    access: Access,
+    via: Via,
+    loc: Option<LocInfo>,
+}
+
+/// Builds the compressed access-site relation.  Equal site metadata is unioned before storage,
+/// and equal target bitsets are interned when the finished ledger is assembled.
+struct AccessSiteBuilder {
+    global_count: usize,
+    by_site: BTreeMap<AccessSiteKey, Vec<u64>>,
+}
+
+impl AccessSiteBuilder {
+    fn new(global_count: usize) -> Self {
+        Self {
+            global_count,
+            by_site: BTreeMap::new(),
+        }
+    }
+
+    fn push_one(&mut self, key: AccessSiteKey, global: GlobalId) {
+        self.push_targets(key, std::iter::once(global));
+    }
+
+    fn push_targets(&mut self, key: AccessSiteKey, targets: impl IntoIterator<Item = GlobalId>) {
+        let words = self.global_count.div_ceil(64);
+        let bits = self.by_site.entry(key).or_insert_with(|| vec![0; words]);
+        for global in targets {
+            let index = global.0 as usize;
+            if index < self.global_count {
+                bits[index / 64] |= 1_u64 << (index % 64);
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<AccessSite> {
+        // Preserve the historical cleanup rule: an exact statement-indexed site supersedes an
+        // otherwise equal location-only site for the globals covered by that exact record.
+        let mut indexed = BTreeMap::<IndexedAccessLocation, Vec<u64>>::new();
+        for (key, targets) in &self.by_site {
+            if key.statement_index.is_none() {
+                continue;
+            }
+            let location = IndexedAccessLocation {
+                func: key.func,
+                access: key.access,
+                via: key.via,
+                loc: key.loc.clone(),
+            };
+            let exact = indexed
+                .entry(location)
+                .or_insert_with(|| vec![0; targets.len()]);
+            for (exact, targets) in exact.iter_mut().zip(targets) {
+                *exact |= targets;
+            }
+        }
+
+        let mut interned = HashMap::<Rc<[u64]>, ()>::new();
+        let mut result = Vec::with_capacity(self.by_site.len());
+        for (key, mut targets) in std::mem::take(&mut self.by_site) {
+            if key.statement_index.is_none() {
+                let location = IndexedAccessLocation {
+                    func: key.func,
+                    access: key.access,
+                    via: key.via,
+                    loc: key.loc.clone(),
+                };
+                if let Some(exact) = indexed.get(&location) {
+                    for (targets, exact) in targets.iter_mut().zip(exact) {
+                        *targets &= !exact;
+                    }
+                }
+            }
+            if targets.iter().all(|&word| word == 0) {
+                continue;
+            }
+            let candidate = Rc::<[u64]>::from(targets);
+            let targets = interned
+                .get_key_value(&candidate)
+                .map(|(existing, ())| Rc::clone(existing))
+                .unwrap_or_else(|| {
+                    interned.insert(Rc::clone(&candidate), ());
+                    candidate
+                });
+            result.push(AccessSite {
+                func: key.func,
+                access: key.access,
+                via: key.via,
+                volatile: key.volatile,
+                atomic_rmw: key.atomic_rmw,
+                loc: key.loc,
+                statement_index: key.statement_index,
+                targets,
+            });
+        }
+        result
+    }
+}
+
 impl ModRefBuilder {
     fn new() -> Self {
         Self {
@@ -4703,7 +4824,7 @@ fn global_ids_for_keys<'a>(
 
 fn push_pointer_modrefs_from_pag(
     modrefs: &mut ModRefBuilder,
-    access_sites: &mut Vec<AccessSite>,
+    access_sites: &mut AccessSiteBuilder,
     func_lookup: &HashMap<String, FuncId>,
     global_lookup: &HashMap<String, GlobalId>,
     pag: &Pag,
@@ -4794,16 +4915,18 @@ fn push_pointer_modrefs_from_pag(
                     .global_bases
                     .get(&pointer_access.address_node)
                 {
-                    access_sites.push(AccessSite {
-                        func,
-                        global: gid,
-                        access: pointer_access.access,
-                        via: Via::Aliased,
-                        volatile: false,
-                        atomic_rmw: None,
-                        loc: site_loc.clone(),
-                        statement_index: None,
-                    });
+                    access_sites.push_one(
+                        AccessSiteKey {
+                            func,
+                            access: pointer_access.access,
+                            via: Via::Aliased,
+                            volatile: false,
+                            atomic_rmw: None,
+                            loc: site_loc.clone(),
+                            statement_index: None,
+                        },
+                        gid,
+                    );
                     push_local_pointer_modref_row(
                         &mut local_rows,
                         gid,
@@ -4839,10 +4962,9 @@ fn push_pointer_modrefs_from_pag(
             if summary.external && site_globals.is_empty() {
                 site_globals.extend((0..global_lookup.len()).map(|index| GlobalId(index as u32)));
             }
-            for gid in site_globals {
-                access_sites.push(AccessSite {
+            access_sites.push_targets(
+                AccessSiteKey {
                     func,
-                    global: gid,
                     access: pointer_access.access,
                     via: if summary.external {
                         Via::Unknown
@@ -4853,8 +4975,9 @@ fn push_pointer_modrefs_from_pag(
                     atomic_rmw: None,
                     loc: site_loc.clone(),
                     statement_index: None,
-                });
-            }
+                },
+                site_globals,
+            );
 
             if phase == ModRefSourcePhase::PagPointer {
                 local_accesses.push(
@@ -4949,7 +5072,7 @@ fn push_pointer_modrefs_from_pag(
 
 fn push_pointer_memcpy_constexpr_modrefs_from_pir(
     modrefs: &mut ModRefBuilder,
-    access_sites: &mut Vec<AccessSite>,
+    access_sites: &mut AccessSiteBuilder,
     module: &Pir,
     func_lookup: &HashMap<String, FuncId>,
     global_lookup: &HashMap<String, GlobalId>,
@@ -4971,16 +5094,18 @@ fn push_pointer_memcpy_constexpr_modrefs_from_pir(
                     continue;
                 };
                 let witness = witness_key(&func.key, loc, noloc_ord, "global");
-                access_sites.push(AccessSite {
-                    func: func_id,
-                    global: gid,
-                    access,
-                    via: Via::Aliased,
-                    volatile: false,
-                    atomic_rmw: None,
-                    loc: loc.as_ref().map(loc_info),
-                    statement_index: Some(statement_index as u32),
-                });
+                access_sites.push_one(
+                    AccessSiteKey {
+                        func: func_id,
+                        access,
+                        via: Via::Aliased,
+                        volatile: false,
+                        atomic_rmw: None,
+                        loc: loc.as_ref().map(loc_info),
+                        statement_index: Some(statement_index as u32),
+                    },
+                    gid,
+                );
                 modrefs.push_named_empty(
                     func_id,
                     gid,
@@ -4996,7 +5121,7 @@ fn push_pointer_memcpy_constexpr_modrefs_from_pir(
 
 fn push_pointer_memset_modrefs_from_pir(
     modrefs: &mut ModRefBuilder,
-    access_sites: &mut Vec<AccessSite>,
+    access_sites: &mut AccessSiteBuilder,
     module: &Pir,
     func_lookup: &HashMap<String, FuncId>,
     global_lookup: &HashMap<String, GlobalId>,
@@ -5014,16 +5139,18 @@ fn push_pointer_memset_modrefs_from_pir(
             };
             if let Some(&gid) = global_lookup.get(dst) {
                 let witness = witness_key(&func.key, loc, noloc_ord, "global");
-                access_sites.push(AccessSite {
-                    func: func_id,
-                    global: gid,
-                    access: Access::Mod,
-                    via: Via::Aliased,
-                    volatile: false,
-                    atomic_rmw: None,
-                    loc: loc.as_ref().map(loc_info),
-                    statement_index: Some(statement_index as u32),
-                });
+                access_sites.push_one(
+                    AccessSiteKey {
+                        func: func_id,
+                        access: Access::Mod,
+                        via: Via::Aliased,
+                        volatile: false,
+                        atomic_rmw: None,
+                        loc: loc.as_ref().map(loc_info),
+                        statement_index: Some(statement_index as u32),
+                    },
+                    gid,
+                );
                 modrefs.push_named_empty(
                     func_id,
                     gid,
@@ -5036,16 +5163,18 @@ fn push_pointer_memset_modrefs_from_pir(
             }
             if let Some(gid) = label_known_global(dst, global_lookup) {
                 let witness = witness_key(&func.key, loc, noloc_ord, "global");
-                access_sites.push(AccessSite {
-                    func: func_id,
-                    global: gid,
-                    access: Access::Mod,
-                    via: Via::Aliased,
-                    volatile: false,
-                    atomic_rmw: None,
-                    loc: loc.as_ref().map(loc_info),
-                    statement_index: Some(statement_index as u32),
-                });
+                access_sites.push_one(
+                    AccessSiteKey {
+                        func: func_id,
+                        access: Access::Mod,
+                        via: Via::Aliased,
+                        volatile: false,
+                        atomic_rmw: None,
+                        loc: loc.as_ref().map(loc_info),
+                        statement_index: Some(statement_index as u32),
+                    },
+                    gid,
+                );
                 modrefs.push_named_empty(
                     func_id,
                     gid,
@@ -5069,10 +5198,9 @@ fn push_pointer_memset_modrefs_from_pir(
             if resolution.external && site_globals.is_empty() {
                 site_globals.extend((0..global_lookup.len()).map(|index| GlobalId(index as u32)));
             }
-            for gid in site_globals {
-                access_sites.push(AccessSite {
+            access_sites.push_targets(
+                AccessSiteKey {
                     func: func_id,
-                    global: gid,
                     access: Access::Mod,
                     via: if resolution.external {
                         Via::Unknown
@@ -5083,8 +5211,9 @@ fn push_pointer_memset_modrefs_from_pir(
                     atomic_rmw: None,
                     loc: loc.as_ref().map(loc_info),
                     statement_index: Some(statement_index as u32),
-                });
-            }
+                },
+                site_globals,
+            );
             let fanout = resolution
                 .pointee_globals
                 .iter()
@@ -6250,6 +6379,59 @@ fn find(parent: &mut [usize], x: usize) -> usize {
         parent[x] = find(parent, parent[x]);
     }
     parent[x]
+}
+
+#[cfg(test)]
+mod access_site_tests {
+    use std::rc::Rc;
+
+    use pangs_pir::Access;
+
+    use super::{AccessSiteBuilder, AccessSiteKey, FuncId, GlobalId, LocInfo, Via};
+
+    fn key(func: u32, statement_index: Option<u32>) -> AccessSiteKey {
+        AccessSiteKey {
+            func: FuncId(func),
+            access: Access::Ref,
+            via: Via::Aliased,
+            volatile: false,
+            atomic_rmw: None,
+            loc: Some(LocInfo {
+                file: "site.c".into(),
+                line: 7,
+                col: 3,
+            }),
+            statement_index,
+        }
+    }
+
+    #[test]
+    fn compressed_sites_union_targets_and_preserve_indexed_precedence() {
+        let mut builder = AccessSiteBuilder::new(4);
+        builder.push_targets(key(0, None), [GlobalId(0), GlobalId(1)]);
+        builder.push_targets(key(0, None), [GlobalId(1), GlobalId(2)]);
+        builder.push_one(key(0, Some(4)), GlobalId(1));
+        builder.push_targets(key(1, None), [GlobalId(0), GlobalId(2)]);
+
+        let sites = builder.finish();
+        assert_eq!(sites.len(), 3);
+        let location_only = sites
+            .iter()
+            .find(|site| site.func == FuncId(0) && site.statement_index.is_none())
+            .unwrap();
+        assert_eq!(
+            location_only.globals().collect::<Vec<_>>(),
+            vec![GlobalId(0), GlobalId(2)]
+        );
+        let indexed = sites
+            .iter()
+            .find(|site| site.statement_index == Some(4))
+            .unwrap();
+        assert_eq!(indexed.globals().collect::<Vec<_>>(), vec![GlobalId(1)]);
+
+        let same_targets = sites.iter().find(|site| site.func == FuncId(1)).unwrap();
+        assert!(Rc::ptr_eq(&location_only.targets, &same_targets.targets));
+    }
 }
 
 #[cfg(test)]

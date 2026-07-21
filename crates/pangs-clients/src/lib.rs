@@ -817,27 +817,33 @@ fn assemble_atomic_eligibility(
 ) {
     let mut access_site_counts = vec![0_usize; analysis.globals().len()];
     for site in analysis.access_sites() {
-        access_site_counts[site.global.0 as usize] += 1;
+        for global in site.globals() {
+            access_site_counts[global.0 as usize] += 1;
+        }
     }
     // Do not build the detailed access index unless at least one global has passed every coarse
     // per-global gate.
-    let mut needs_detailed_check = false;
+    let mut detailed_globals = vec![false; analysis.globals().len()];
     for global in globals.iter() {
-        let Some(_) = analysis.lookup_global(&global.meta.llvm_name) else {
+        let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) else {
             continue;
         };
         let width = global.facts.word_sized_scalar.size_bits;
         let signal_lock_free = !global.facts.signal_context_access.value
             || width.is_some_and(|width| target.supported_atomic_widths.contains(&width));
-        needs_detailed_check |= global.facts.word_sized_scalar.value
+        detailed_globals[gid.0 as usize] = global.facts.word_sized_scalar.value
             && global.facts.access_set_complete.value
             && !global.facts.violation_taint.value
             && signal_lock_free;
     }
     let mut access_by_global = vec![Vec::new(); analysis.globals().len()];
-    if needs_detailed_check {
+    if detailed_globals.iter().any(|&needed| needed) {
         for site in analysis.access_sites() {
-            access_by_global[site.global.0 as usize].push(site);
+            for global in site.globals() {
+                if detailed_globals[global.0 as usize] {
+                    access_by_global[global.0 as usize].push(site);
+                }
+            }
         }
     }
     for global in globals {
@@ -1155,8 +1161,10 @@ fn assemble_mutex_eligibility(
     let mut accessors_by_global = vec![BTreeSet::new(); analysis.globals().len()];
     let mut access_site_counts = vec![0_usize; analysis.globals().len()];
     for site in analysis.access_sites() {
-        accessors_by_global[site.global.0 as usize].insert(site.func);
-        access_site_counts[site.global.0 as usize] += 1;
+        for global in site.globals() {
+            accessors_by_global[global.0 as usize].insert(site.func);
+            access_site_counts[global.0 as usize] += 1;
+        }
     }
 
     for global in globals {
@@ -1348,7 +1356,9 @@ fn assemble_group_mutex_support(
         .collect::<BTreeMap<_, _>>();
     let mut accessors_by_global = vec![BTreeSet::new(); analysis.globals().len()];
     for site in analysis.access_sites() {
-        accessors_by_global[site.global.0 as usize].insert(site.func);
+        for global in site.globals() {
+            accessors_by_global[global.0 as usize].insert(site.func);
+        }
     }
 
     for group in groups {
@@ -2120,17 +2130,11 @@ impl<'a> DispositionFactRows<'a> {
         for row in analysis.modrefs() {
             modrefs_by_function[row.func.0 as usize].push(row);
         }
-        let mut indirect_access_locations =
-            BTreeMap::<(FuncId, GlobalId), BTreeSet<(String, u32)>>::new();
+        let mut indirect_access_sites_by_function =
+            vec![Vec::<&pangs_api::AccessSite>::new(); analysis.functions().len()];
         for site in analysis.access_sites() {
-            if site.via == pangs_api::Via::Direct {
-                continue;
-            }
-            if let Some(loc) = &site.loc {
-                indirect_access_locations
-                    .entry((site.func, site.global))
-                    .or_default()
-                    .insert((loc.file.clone(), loc.line));
+            if site.via != pangs_api::Via::Direct && site.loc.is_some() {
+                indirect_access_sites_by_function[site.func.0 as usize].push(site);
             }
         }
 
@@ -2162,7 +2166,7 @@ impl<'a> DispositionFactRows<'a> {
                     function,
                     global,
                     &rows,
-                    indirect_access_locations.get(&(function, global)),
+                    Some(&indirect_access_sites_by_function[function.0 as usize]),
                 );
                 let witness =
                     violation_relevance_witness(analysis, finding, function, global, relevance);
@@ -2198,21 +2202,17 @@ fn classify_violation_relevance(
     global: GlobalId,
     rows: &[&ModRef],
 ) -> ViolationRelevance {
-    let indirect_locations = analysis
-        .access_sites()
-        .iter()
-        .filter(|site| {
-            site.func == function && site.global == global && site.via != pangs_api::Via::Direct
-        })
-        .filter_map(|site| site.loc.as_ref().map(|loc| (loc.file.clone(), loc.line)))
-        .collect::<BTreeSet<_>>();
+    let indirect_sites = analysis
+        .access_sites_for_global(global)
+        .filter(|site| site.func == function && site.via != pangs_api::Via::Direct)
+        .collect::<Vec<_>>();
     classify_violation_relevance_indexed(
         analysis,
         finding,
         function,
         global,
         rows,
-        Some(&indirect_locations),
+        Some(&indirect_sites),
     )
 }
 
@@ -2222,7 +2222,7 @@ fn classify_violation_relevance_indexed(
     function: FuncId,
     global: GlobalId,
     rows: &[&ModRef],
-    indirect_locations: Option<&BTreeSet<(String, u32)>>,
+    indirect_sites: Option<&[&pangs_api::AccessSite]>,
 ) -> ViolationRelevance {
     let global_key = &analysis.globals()[global].key;
     if finding.affected.iter().any(|affected| {
@@ -2266,8 +2266,15 @@ fn classify_violation_relevance_indexed(
             .as_ref()
             .zip(finding.line)
             .is_some_and(|(file, line)| {
-                indirect_locations
-                    .is_some_and(|locations| locations.contains(&(file.clone(), line)))
+                indirect_sites.is_some_and(|sites| {
+                    sites.iter().any(|site| {
+                        site.affects(global)
+                            && site
+                                .loc
+                                .as_ref()
+                                .is_some_and(|loc| loc.file == *file && loc.line == line)
+                    })
+                })
             })
     {
         return ViolationRelevance::AccessShapeRelevant;

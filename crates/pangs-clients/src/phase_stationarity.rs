@@ -838,14 +838,16 @@ pub(crate) fn assemble_spine_inputs(
             boundaries.extend(cfg.boundaries.iter().map(|boundary| boundary.id));
         }
         for boundary in boundaries {
-            add_access(
-                &mut generated[boundary as usize],
-                &mut observations,
-                boundary,
-                site.global,
-                site.access,
-                true,
-            );
+            for global in site.globals() {
+                add_access(
+                    &mut generated[boundary as usize],
+                    &mut observations,
+                    boundary,
+                    global,
+                    site.access,
+                    true,
+                );
+            }
         }
     }
 
@@ -1561,11 +1563,7 @@ fn build_payload(
     let mut pre_readers = Vec::new();
     let mut pre_functions = BTreeSet::<FuncId>::new();
     let mut post_functions = BTreeSet::<FuncId>::new();
-    for access in analysis
-        .access_sites()
-        .iter()
-        .filter(|site| site.global == global)
-    {
+    for access in analysis.access_sites_for_global(global) {
         let (before, after, incomparable) = if spine_functions.contains(&access.func) {
             let boundary = access_boundary(module, &evaluation.spine, access).ok_or_else(|| {
                 (
@@ -1573,6 +1571,7 @@ fn build_payload(
                     access_witness(
                         analysis,
                         access,
+                        global,
                         "spine access site cannot be mapped to a statement boundary",
                     ),
                 )
@@ -1597,7 +1596,12 @@ fn build_payload(
         let site = access_site(analysis, access).ok_or_else(|| {
             (
                 "no-entry-spine",
-                access_witness(analysis, access, "access site lacks source coordinates"),
+                access_witness(
+                    analysis,
+                    access,
+                    global,
+                    "access site lacks source coordinates",
+                ),
             )
         })?;
         let function = analysis.functions()[access.func].key.clone();
@@ -1606,7 +1610,12 @@ fn build_payload(
                 if !before || after || incomparable {
                     return Err((
                         "never-quiescent",
-                        access_witness(analysis, access, "writer is not provably pre-publication"),
+                        access_witness(
+                            analysis,
+                            access,
+                            global,
+                            "writer is not provably pre-publication",
+                        ),
                     ));
                 }
                 pre_functions.insert(access.func);
@@ -1618,6 +1627,7 @@ fn build_payload(
                     access_witness(
                         analysis,
                         access,
+                        global,
                         "reader is dominance-incomparable with publication",
                     ),
                 ))
@@ -1802,11 +1812,16 @@ fn access_site(analysis: &Analysis, access: &pangs_api::AccessSite) -> Option<Si
     })
 }
 
-fn access_witness(analysis: &Analysis, access: &pangs_api::AccessSite, note: &str) -> Witness {
+fn access_witness(
+    analysis: &Analysis,
+    access: &pangs_api::AccessSite,
+    global: GlobalId,
+    note: &str,
+) -> Witness {
     Witness {
         kind: "phase-access-site".into(),
         site: access_site(analysis, access),
-        symbol: Some(analysis.globals()[access.global].key.clone()),
+        symbol: Some(analysis.globals()[global].key.clone()),
         note: Some(note.into()),
         extra: Extra::new(),
     }

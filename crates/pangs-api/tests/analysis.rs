@@ -1158,7 +1158,7 @@ fn direct_global_modref_marks_never_written_and_preserves_direct_witness() {
         analysis
             .access_sites()
             .iter()
-            .filter(|site| site.func == writer && site.global == global)
+            .filter(|site| site.func == writer && site.affects(global))
             .map(|site| (site.statement_index, site.access))
             .collect::<Vec<_>>(),
         vec![
@@ -3206,7 +3206,7 @@ fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
     }));
     assert!(steens.access_sites().iter().any(|site| {
         site.func == main
-            && site.global == aliased
+            && site.affects(aliased)
             && site.access == Access::Mod
             && site.via == pangs_api::Via::Aliased
             && site
@@ -3217,7 +3217,7 @@ fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
     for global in [direct, aliased] {
         assert!(steens.access_sites().iter().any(|site| {
             site.func == main
-                && site.global == global
+                && site.affects(global)
                 && site.access == Access::Mod
                 && site.via == pangs_api::Via::Unknown
                 && site.loc.as_ref().is_some_and(|loc| loc.line == 7)
