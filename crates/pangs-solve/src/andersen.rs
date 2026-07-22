@@ -953,8 +953,7 @@ impl<'a> Refiner<'a> {
             }
             if andersen_profile_enabled() {
                 eprintln!(
-                    "pangs andersen profile: round {} target map changed; rerunning fixed-graph solve",
-                    rounds
+                    "pangs andersen profile: round {rounds} target map changed; rerunning fixed-graph solve"
                 );
             }
             target_map = new_map;

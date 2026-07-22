@@ -1354,7 +1354,7 @@ impl<'a> Builder<'a> {
             ),
             Scope::GlobalInit => self.add_node(
                 NodeKey::GlobalInitValue(key.to_string()),
-                format!("val:global_init:{}", key),
+                format!("val:global_init:{key}"),
                 NodeKind::Value { scope },
             ),
             Scope::Module => unreachable!("module-scoped values are symbols"),
@@ -1377,7 +1377,7 @@ impl<'a> Builder<'a> {
         if let Some(index) = global_index {
             let value = self.add_node(
                 NodeKey::SymbolValue(SymbolKind::Global, index),
-                format!("sym:global:{}", operand),
+                format!("sym:global:{operand}"),
                 NodeKind::Value {
                     scope: Scope::Module,
                 },
@@ -1388,7 +1388,7 @@ impl<'a> Builder<'a> {
         if let Some(index) = self.functions.get(symbol).copied() {
             let value = self.add_node(
                 NodeKey::SymbolValue(SymbolKind::Function, index),
-                format!("sym:function:{}", operand),
+                format!("sym:function:{operand}"),
                 NodeKind::Value {
                     scope: Scope::Module,
                 },

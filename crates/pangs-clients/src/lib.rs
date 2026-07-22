@@ -554,7 +554,7 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
                     .map(|entry| entry.targets.clone())
                     .unwrap_or_else(|| direct_entry.into_iter().collect());
                 let widened_entries = if unresolved {
-                    address_taken_entries.iter().copied().collect::<Vec<_>>()
+                    address_taken_entries.to_vec()
                 } else {
                     Vec::new()
                 };
@@ -4463,7 +4463,7 @@ pub fn check_traces(dir: &Path, trace: &Path) -> Result<TraceReport> {
             .or_default()
             .entry(callsite.to_string())
             .or_insert_with(|| (BTreeSet::new(), false));
-        match (&row["callee"]).get("func").and_then(Value::as_str) {
+        match row["callee"].get("func").and_then(Value::as_str) {
             Some(func) => {
                 entry.0.insert(func.to_string());
             }

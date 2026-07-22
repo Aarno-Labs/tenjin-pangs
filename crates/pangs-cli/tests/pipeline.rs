@@ -647,9 +647,7 @@ fn analyze_validate_checked_in_m1_1_fixtures() {
         ] {
             assert!(
                 out.join(artifact).exists(),
-                "{} should exist for {}",
-                artifact,
-                name
+                "{artifact} should exist for {name}"
             );
         }
     }

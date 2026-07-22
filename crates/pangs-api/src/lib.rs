@@ -1264,9 +1264,7 @@ impl Analysis {
                 let pag_started = Instant::now();
                 let indirect_vararg_keys = indirect_callsites
                     .iter()
-                    .filter_map(|(cs, _, sig)| {
-                        sig.vararg.then(|| callsites[cs.0 as usize].key.clone())
-                    })
+                    .filter(|&(cs, _, sig)| sig.vararg).map(|(cs, _, sig)| callsites[cs.0 as usize].key.clone())
                     .collect::<BTreeSet<_>>();
                 let mut pag = Pag::from_pir(
                     module,
@@ -2523,7 +2521,6 @@ fn collect_targeted_stationarity_writers(
             .collect(),
         target_unknown_writers
             .into_iter()
-            .map(|(global, writers)| (global, StationarityWriters::from(writers)))
             .collect(),
     )
 }
@@ -2836,7 +2833,7 @@ fn push_callsite(
             false,
         )
     } else {
-        (format!("{}@!noloc#{}", caller, ord), None, true)
+        (format!("{caller}@!noloc#{ord}"), None, true)
     };
     callsites.push(CallsiteInfo {
         key,
