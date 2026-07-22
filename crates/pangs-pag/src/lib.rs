@@ -1626,6 +1626,356 @@ pub fn direct_vararg_call_is_benign(pir: &Pir, callee: &str, args: &[String]) ->
         return true;
     }
     proven_printf_effect(pir, callee, args).is_some()
+        || internal_vfprintf_forwarder_format_index(pir, callee)
+            .and_then(|index| args.get(index))
+            .and_then(|operand| constant_format_bytes(pir, operand))
+            .is_some_and(|format| format_is_proven_percent_n_free(&format))
+}
+
+/// Recognize a closed `printf`-style wrapper whose variadic tail is consumed only by one
+/// `vfprintf` call. The returned index identifies the wrapper's fixed format parameter. This is a
+/// deliberately structural proof: unfamiliar `va_list` aliases or uses reject the whole wrapper.
+fn internal_vfprintf_forwarder_format_index(pir: &Pir, callee: &str) -> Option<usize> {
+    let func = pir.functions.iter().find(|func| func.key == callee)?;
+    if func.external || !func.sig.vararg || func.param_names.len() != func.sig.params.len() {
+        return None;
+    }
+
+    let starts = func
+        .body
+        .iter()
+        .filter_map(|stmt| vararg_intrinsic_operand(stmt, "llvm.va_start"))
+        .collect::<Vec<_>>();
+    let ends = func
+        .body
+        .iter()
+        .filter_map(|stmt| vararg_intrinsic_operand(stmt, "llvm.va_end"))
+        .collect::<Vec<_>>();
+    let forwards = func
+        .body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::CallDirect { callee, args, .. }
+                if callee.strip_prefix('@').unwrap_or(callee) == "vfprintf" && args.len() == 3 =>
+            {
+                Some((args[1].as_str(), args[2].as_str()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if starts.is_empty() || starts.len() != ends.len() || forwards.len() != 1 {
+        return None;
+    }
+
+    let mut start_roots = starts
+        .iter()
+        .map(|value| unique_local_alloca_root(func, value))
+        .collect::<Option<Vec<_>>>()?;
+    let mut end_roots = ends
+        .iter()
+        .map(|value| unique_local_alloca_root(func, value))
+        .collect::<Option<Vec<_>>>()?;
+    start_roots.sort_unstable();
+    end_roots.sort_unstable();
+    if start_roots != end_roots {
+        return None;
+    }
+    let forward_root = unique_local_alloca_root(func, forwards[0].1)?;
+    if !start_roots.contains(&forward_root) {
+        return None;
+    }
+    let va_list_roots = start_roots.into_iter().collect::<BTreeSet<_>>();
+    let va_list_values = local_pointer_derivatives(func, &va_list_roots);
+    let start_values = starts.into_iter().collect::<BTreeSet<_>>();
+    let end_values = ends.into_iter().collect::<BTreeSet<_>>();
+    if func.body.iter().any(|stmt| {
+        stmt_input_operands(stmt).iter().any(|operand| {
+            va_list_values.contains(*operand)
+                && !va_list_use_is_expected(
+                    stmt,
+                    operand,
+                    &start_values,
+                    &end_values,
+                    forwards[0].1,
+                )
+        })
+    }) {
+        return None;
+    }
+
+    let format_value = forwards[0].0;
+    let indexes = func
+        .param_names
+        .iter()
+        .enumerate()
+        .filter_map(|(index, param)| {
+            value_is_unchanged_copy(func, param, format_value).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    (indexes.len() == 1).then_some(indexes[0])
+}
+
+fn vararg_intrinsic_operand<'a>(stmt: &'a Stmt, expected: &str) -> Option<&'a str> {
+    match stmt {
+        Stmt::Unknown {
+            op,
+            operands,
+            results,
+            reason,
+            ..
+        } if op == expected
+            && reason == "varargs_intrinsic"
+            && operands.len() == 1
+            && results.is_empty() =>
+        {
+            Some(operands[0].as_str())
+        }
+        _ => None,
+    }
+}
+
+fn local_alloca_roots<'a>(func: &'a pangs_pir::Func, value: &str) -> Option<BTreeSet<&'a str>> {
+    fn visit<'a>(
+        func: &'a pangs_pir::Func,
+        value: &str,
+        visiting: &mut BTreeSet<String>,
+        roots: &mut BTreeSet<&'a str>,
+    ) -> Option<()> {
+        if !visiting.insert(value.to_string()) {
+            return None;
+        }
+        let stmt = func
+            .body
+            .iter()
+            .find(|stmt| stmt_destination(stmt) == Some(value))?;
+        match stmt {
+            Stmt::Alloca { dest, .. } => {
+                roots.insert(dest);
+            }
+            Stmt::Assign { sources, .. } if !sources.is_empty() => {
+                for source in sources {
+                    visit(func, source, visiting, roots)?;
+                }
+            }
+            Stmt::Gep { base, .. } => visit(func, base, visiting, roots)?,
+            _ => return None,
+        }
+        visiting.remove(value);
+        Some(())
+    }
+
+    let mut roots = BTreeSet::new();
+    visit(func, value, &mut BTreeSet::new(), &mut roots)?;
+    Some(roots)
+}
+
+fn unique_local_alloca_root<'a>(func: &'a pangs_pir::Func, value: &str) -> Option<&'a str> {
+    let roots = local_alloca_roots(func, value)?;
+    (roots.len() == 1).then(|| *roots.first().expect("one root was checked"))
+}
+
+fn local_pointer_derivatives<'a>(
+    func: &'a pangs_pir::Func,
+    roots: &BTreeSet<&'a str>,
+) -> BTreeSet<&'a str> {
+    let mut derived = roots.clone();
+    loop {
+        let old_len = derived.len();
+        for stmt in &func.body {
+            match stmt {
+                Stmt::Assign { dest, sources, .. }
+                    if sources
+                        .iter()
+                        .any(|source| derived.contains(source.as_str())) =>
+                {
+                    derived.insert(dest);
+                }
+                Stmt::Gep { dest, base, .. } if derived.contains(base.as_str()) => {
+                    derived.insert(dest);
+                }
+                _ => {}
+            }
+        }
+        if derived.len() == old_len {
+            return derived;
+        }
+    }
+}
+
+fn value_is_unchanged_copy(func: &pangs_pir::Func, source: &str, target: &str) -> bool {
+    let mut values = BTreeSet::from([source]);
+    let mut slots = BTreeSet::<&str>::new();
+    loop {
+        let old_values = values.len();
+        let old_slots = slots.len();
+        for stmt in &func.body {
+            match stmt {
+                Stmt::Assign { dest, sources, .. }
+                    if !sources.is_empty()
+                        && sources.iter().all(|value| values.contains(value.as_str())) =>
+                {
+                    values.insert(dest);
+                }
+                Stmt::Load { dest, address, .. }
+                    if exact_local_alloca_root(func, address)
+                        .is_some_and(|root| slots.contains(root)) =>
+                {
+                    values.insert(dest);
+                }
+                _ => {}
+            }
+        }
+        let candidates = func.body.iter().filter_map(|stmt| match stmt {
+            Stmt::Store { address, value, .. } if values.contains(value.as_str()) => {
+                exact_local_alloca_root(func, address)
+            }
+            _ => None,
+        });
+        for root in candidates {
+            let stores = func.body.iter().filter_map(|stmt| match stmt {
+                Stmt::Store { address, value, .. }
+                    if exact_local_alloca_root(func, address) == Some(root) =>
+                {
+                    Some(value.as_str())
+                }
+                _ => None,
+            });
+            if stores.clone().count() > 0
+                && stores.clone().all(|value| values.contains(value))
+                && local_slot_uses_are_confined(func, root)
+            {
+                slots.insert(root);
+            }
+        }
+        if values.len() == old_values && slots.len() == old_slots {
+            break;
+        }
+    }
+    values.contains(target)
+}
+
+fn exact_local_alloca_root<'a>(func: &'a pangs_pir::Func, value: &str) -> Option<&'a str> {
+    fn visit<'a>(
+        func: &'a pangs_pir::Func,
+        value: &str,
+        visiting: &mut BTreeSet<String>,
+    ) -> Option<&'a str> {
+        if !visiting.insert(value.to_string()) {
+            return None;
+        }
+        let stmt = func
+            .body
+            .iter()
+            .find(|stmt| stmt_destination(stmt) == Some(value))?;
+        let root = match stmt {
+            Stmt::Alloca { dest, .. } => Some(dest.as_str()),
+            Stmt::Assign { sources, .. } if !sources.is_empty() => {
+                let roots = sources
+                    .iter()
+                    .map(|source| visit(func, source, visiting))
+                    .collect::<Option<BTreeSet<_>>>()?;
+                (roots.len() == 1).then(|| *roots.first().expect("one root was checked"))
+            }
+            Stmt::Gep {
+                base,
+                byte_off: Some(0),
+                ..
+            } => visit(func, base, visiting),
+            _ => None,
+        };
+        visiting.remove(value);
+        root
+    }
+    visit(func, value, &mut BTreeSet::new())
+}
+
+fn local_slot_uses_are_confined<'a>(func: &'a pangs_pir::Func, root: &'a str) -> bool {
+    let derived = local_pointer_derivatives(func, &BTreeSet::from([root]));
+    func.body.iter().all(|stmt| match stmt {
+        Stmt::Assign { .. } => true,
+        Stmt::Gep {
+            base,
+            byte_off: Some(0),
+            ..
+        } => !derived.contains(base.as_str()) || exact_local_alloca_root(func, base) == Some(root),
+        Stmt::Load { address, .. } => {
+            !derived.contains(address.as_str())
+                || exact_local_alloca_root(func, address) == Some(root)
+        }
+        Stmt::Store { address, value, .. } => {
+            !derived.contains(value.as_str())
+                && (!derived.contains(address.as_str())
+                    || exact_local_alloca_root(func, address) == Some(root))
+        }
+        _ => !stmt_input_operands(stmt)
+            .iter()
+            .any(|operand| derived.contains(*operand)),
+    })
+}
+
+fn stmt_destination(stmt: &Stmt) -> Option<&str> {
+    match stmt {
+        Stmt::Alloca { dest, .. }
+        | Stmt::Assign { dest, .. }
+        | Stmt::ScalarOp { dest, .. }
+        | Stmt::Load { dest, .. }
+        | Stmt::Gep { dest, .. }
+        | Stmt::PtrToInt { dest, .. }
+        | Stmt::IntToPtr { dest, .. }
+        | Stmt::VarArg { dest, .. } => Some(dest),
+        Stmt::CallDirect { dest, .. } | Stmt::CallIndirect { dest, .. } => dest.as_deref(),
+        _ => None,
+    }
+}
+
+fn stmt_input_operands(stmt: &Stmt) -> Vec<&str> {
+    match stmt {
+        Stmt::Alloca { .. } | Stmt::GlobalRef { .. } => Vec::new(),
+        Stmt::Assign { sources, .. } => sources.iter().map(String::as_str).collect(),
+        Stmt::ScalarOp { lhs, rhs, .. } => vec![lhs, rhs],
+        Stmt::Load { address, .. } => vec![address],
+        Stmt::Store { address, value, .. } => vec![address, value],
+        Stmt::Gep { base, .. } => vec![base],
+        Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => vec![source],
+        Stmt::VarArg { .. } => Vec::new(),
+        Stmt::Memcpy { dst, src, .. } => vec![dst, src],
+        Stmt::Memset { dst, value, .. } => vec![dst, value],
+        Stmt::Unknown { operands, .. } => operands.iter().map(String::as_str).collect(),
+        Stmt::Return { value, .. } => value.iter().map(String::as_str).collect(),
+        Stmt::CallDirect { args, .. } => args.iter().map(String::as_str).collect(),
+        Stmt::CallIndirect { operand, args, .. } => std::iter::once(operand.as_str())
+            .chain(args.iter().map(String::as_str))
+            .collect(),
+    }
+}
+
+fn va_list_use_is_expected(
+    stmt: &Stmt,
+    operand: &str,
+    starts: &BTreeSet<&str>,
+    ends: &BTreeSet<&str>,
+    forwarded: &str,
+) -> bool {
+    match stmt {
+        Stmt::Assign { sources, .. } => sources.iter().any(|source| source == operand),
+        Stmt::Gep { base, .. } => base == operand,
+        Stmt::Unknown { op, operands, .. }
+            if matches!(op.as_str(), "llvm.va_start" | "llvm.va_end") =>
+        {
+            operands.len() == 1
+                && operands[0] == operand
+                && ((op == "llvm.va_start" && starts.contains(operand))
+                    || (op == "llvm.va_end" && ends.contains(operand)))
+        }
+        Stmt::CallDirect { callee, args, .. } => {
+            callee.strip_prefix('@').unwrap_or(callee) == "vfprintf"
+                && args
+                    .get(2)
+                    .is_some_and(|arg| arg == operand && operand == forwarded)
+                && args.iter().filter(|arg| arg.as_str() == operand).count() == 1
+        }
+        _ => false,
+    }
 }
 
 pub fn proven_printf_effect(
@@ -1898,6 +2248,77 @@ mod tests {
             &pir,
             "fprintf",
             &fprintf_args("dynamic_format")
+        ));
+    }
+
+    #[test]
+    fn internal_vfprintf_forwarder_requires_constant_safe_format_and_closed_va_list() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"printf-wrapper",
+                "globals":[
+                    {"key":"safe","is_const":true,"mutable":false,"initializer_ir":"[3 x i8] c\"%d\\00\""},
+                    {"key":"percent_n","is_const":true,"mutable":false,"initializer_ir":"[3 x i8] c\"%n\\00\""}
+                ],
+                "functions":[{
+                    "key":"report",
+                    "sig":{"ret":{"class":"void"},"params":[{"class":"integer"}],"vararg":true},
+                    "param_names":["%fmt"],
+                    "body":[
+                        {"kind":"alloca","dest":"%fmt.addr","ty":"i8*"},
+                        {"kind":"alloca","dest":"%ap","ty":"va_list"},
+                        {"kind":"alloca","dest":"%unused-ap","ty":"va_list"},
+                        {"kind":"store","address":"%fmt.addr","value":"%fmt"},
+                        {"kind":"load","dest":"%fmt.load","address":"%fmt.addr"},
+                        {"kind":"gep","dest":"%unused.start","base":"%unused-ap","byte_off":0},
+                        {"kind":"unknown","op":"llvm.va_start","operands":["%unused.start"],"reason":"varargs_intrinsic"},
+                        {"kind":"gep","dest":"%unused.end","base":"%unused-ap","byte_off":0},
+                        {"kind":"unknown","op":"llvm.va_end","operands":["%unused.end"],"reason":"varargs_intrinsic"},
+                        {"kind":"gep","dest":"%ap.start","base":"%ap","byte_off":0},
+                        {"kind":"unknown","op":"llvm.va_start","operands":["%ap.start"],"reason":"varargs_intrinsic"},
+                        {"kind":"gep","dest":"%ap.forward","base":"%ap","byte_off":0},
+                        {"kind":"call_direct","callee":"vfprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"},{"class":"integer"}]},"args":["%stream","%fmt.load","%ap.forward"]},
+                        {"kind":"gep","dest":"%ap.end","base":"%ap","byte_off":0},
+                        {"kind":"unknown","op":"llvm.va_end","operands":["%ap.end"],"reason":"varargs_intrinsic"}
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(direct_vararg_call_is_benign(
+            &pir,
+            "report",
+            &["@safe".to_string(), "%value".to_string()]
+        ));
+        assert!(!direct_vararg_call_is_benign(
+            &pir,
+            "report",
+            &["@percent_n".to_string(), "%value".to_string()]
+        ));
+        assert!(!direct_vararg_call_is_benign(
+            &pir,
+            "report",
+            &["%dynamic".to_string(), "%value".to_string()]
+        ));
+
+        let mut escaped = pir.clone();
+        escaped.functions[0].body.push(pangs_pir::Stmt::CallDirect {
+            callee: "consume_list".to_string(),
+            sig: pangs_pir::Signature {
+                ret: pangs_pir::AbiClass::Void,
+                params: vec![pangs_pir::Param::Integer],
+                vararg: false,
+                cc: "ccc".to_string(),
+            },
+            args: vec!["%ap.forward".to_string()],
+            dest: None,
+            loc: None,
+        });
+        assert!(!direct_vararg_call_is_benign(
+            &escaped,
+            "report",
+            &["@safe".to_string(), "%value".to_string()]
         ));
     }
 

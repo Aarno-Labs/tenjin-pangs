@@ -64,6 +64,16 @@ makes per-component soundness auditable); the TeaDSA call/return-site filter
 (instruction-local SSA validity filtering on call-argument/return-value edges — cheap,
 and its precision is frozen into the graph for every downstream phase).
 
+Variadic boundaries fail closed unless their consumption is explicit. In addition to
+positionally recognized `va_arg` operations and constant `%n`-free calls to the standard
+`printf` family, PAG construction recognizes internal `vfprintf` forwarding wrappers.
+The wrapper proof requires the fixed format parameter to reach `vfprintf` unchanged,
+every `va_list` to have matched `va_start`/`va_end` roots, exactly one list to be forwarded,
+and every list-derived pointer use to be part of that construction, destruction, or call.
+Each wrapper call is then safe only when its actual format is a decodable constant with a
+supported, `%n`-free conversion sequence. Unknown formats, `va_copy`, other consumers,
+escaping list aliases, and unfamiliar dataflow retain the ordinary Ω boundary and audit.
+
 **Cut:**
 - **Typed heap clones** (cclyzer use-based back-propagation). v1 uses plain
   allocation-site objects. This deletes the back-propagation pass, the clone/site-object
