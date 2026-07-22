@@ -187,6 +187,14 @@ address never exists as a program value, so class-unification side effects alone
 including it in a finite `pointee_globals` set. Universal external rows bypass the filter, as do
 modules containing inline assembly without a complete value-flow certificate. When candidates are
 removed, `pointee_globals_unfiltered` retains the original class envelope for differential checks.
+Post-filter node resolutions also carry non-authoritative `pointee_provenance` diagnostics. The
+solver accumulates whether the surviving class involved direct address flow, scalar/unknown
+payload flow, by-value aggregate binding, memory merging, or call/return merging, then adds the
+finite-external or universal-origin classification. High-fanout ModRef rows append these labels to
+their detail string; unknown external rows do the same. When filtering changed the class envelope,
+the detail also reports `prefilter_pointee_count` and `address_filtered_count`. The labels diagnose
+where precision was lost; they are intentionally excluded from every soundness guard and
+eligibility predicate.
 
 ## 4. The residual risk, named
 

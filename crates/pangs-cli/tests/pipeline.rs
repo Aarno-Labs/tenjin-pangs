@@ -1766,6 +1766,10 @@ fn analyze_steens_collapses_high_fanout_pointer_modref_to_unknown() {
                 .as_str()
                 .unwrap()
                 .starts_with("high_fanout_pointer_modref:source=pag_pointer")
+            && row["detail"]
+                .as_str()
+                .unwrap()
+                .contains("provenance=direct_address_flow,scalar_or_unknown_payload,memory_merging")
             && row.get("pointee_globals").is_none()
             && row["candidate_scope"] == "finite-collapsed"
             && row["pointee_global_count"] == 17
@@ -1813,7 +1817,8 @@ fn analyze_andersen_refines_spurious_external_store_address_modref() {
             && row["access"] == "mod"
             && row["via"] == "unknown"
             && row["witness"] == "driver@m5_store.c:8:1#0"
-            && row["detail"] == "edge:store|omega:steens_external|pointee_count=1"
+            && row["detail"]
+                == "edge:store|omega:steens_external|pointee_count=1:provenance=direct_address_flow,scalar_or_unknown_payload,memory_merging,universal_origin"
             && row["address_node"] == "val:driver:%gp"
             && row["pointee_globals"] == serde_json::json!(["@Table"])
             // The same Steensgaard class also contains an inttoptr source. Named pointees

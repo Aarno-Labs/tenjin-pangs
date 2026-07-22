@@ -365,6 +365,13 @@ Run this on `sym_count_xjtr_0` and representative corpus cases. This confirms wh
 type loss, aggregate binding, or memory merging is the dominant source and establishes A/B
 metrics for candidate-set sizes.
 
+The implemented post-filter diagnostic is `NodeResolution.pointee_provenance`. It accumulates
+class-level categories for surviving candidates and is appended to collapsed high-fanout ModRef
+details and unknown external rows. Rows changed by filtering also report the pre-filter pointee
+count and number removed. It is deliberately explanatory rather than a certificate: class-level
+attribution may name more than one contributing mechanism, and no client may use the labels to
+remove candidates.
+
 ### Stage 3: semantic pointer kinds and by-value aggregate correctness
 
 Preserve pointer-versus-non-pointer semantics separately from ABI classes and stop emitting

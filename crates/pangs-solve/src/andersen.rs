@@ -187,6 +187,9 @@ fn finish_andersen(
             node.external_universal = resolution.external_universal;
             node.pointee_globals = resolution.pointee_globals.into();
             node.pointee_globals_unfiltered = resolution.pointee_globals_unfiltered.into();
+            if node.pointee_globals.is_empty() {
+                node.pointee_provenance = Default::default();
+            }
             node.external_sources = resolution.external_sources;
         }
     }

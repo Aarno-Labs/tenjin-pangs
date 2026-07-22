@@ -3584,7 +3584,10 @@ fn andersen_refines_spurious_external_store_address_modref() {
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("driver@m5_store.c:8:1#0")
-            && mr.detail.as_deref() == Some("edge:store|omega:steens_external|pointee_count=1")
+            && mr.detail.as_deref()
+                == Some(
+                    "edge:store|omega:steens_external|pointee_count=1:provenance=direct_address_flow,scalar_or_unknown_payload,memory_merging,universal_origin",
+                )
             && mr.address_node.as_deref() == Some("val:driver:%gp")
             && mr.pointee_globals == vec!["@Table".to_string()]
     }));

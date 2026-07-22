@@ -192,8 +192,86 @@ pub struct NodeResolution {
     /// envelope as this list when non-empty, or `pointee_globals` otherwise.
     #[serde(default, skip_serializing_if = "SharedStringList::is_empty")]
     pub pointee_globals_unfiltered: SharedStringList,
+    /// Diagnostic provenance accumulated by the solver class that produced the post-filter
+    /// pointee set. These labels explain which precision-losing mechanisms participated; they
+    /// are not certificates and never affect solving or eligibility.
+    #[serde(default, skip_serializing_if = "SharedProvenanceList::is_empty")]
+    pub pointee_provenance: SharedProvenanceList,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointeeProvenance {
+    DirectAddressFlow,
+    ScalarOrUnknownPayload,
+    ByValueAggregateBinding,
+    MemoryMerging,
+    CallReturnMerging,
+    FiniteExternalRegion,
+    UniversalOrigin,
+}
+
+impl PointeeProvenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectAddressFlow => "direct_address_flow",
+            Self::ScalarOrUnknownPayload => "scalar_or_unknown_payload",
+            Self::ByValueAggregateBinding => "by_value_aggregate_binding",
+            Self::MemoryMerging => "memory_merging",
+            Self::CallReturnMerging => "call_return_merging",
+            Self::FiniteExternalRegion => "finite_external_region",
+            Self::UniversalOrigin => "universal_origin",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct SharedProvenanceList(Arc<[PointeeProvenance]>);
+
+impl SharedProvenanceList {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Deref for SharedProvenanceList {
+    type Target = [PointeeProvenance];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Vec<PointeeProvenance>> for SharedProvenanceList {
+    fn from(values: Vec<PointeeProvenance>) -> Self {
+        Self(values.into())
+    }
+}
+
+impl PartialEq<Vec<PointeeProvenance>> for SharedProvenanceList {
+    fn eq(&self, other: &Vec<PointeeProvenance>) -> bool {
+        self.0.as_ref() == other.as_slice()
+    }
+}
+
+impl Serialize for SharedProvenanceList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedProvenanceList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<PointeeProvenance>::deserialize(deserializer).map(Self::from)
+    }
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -680,6 +758,48 @@ struct ClassData {
     processed_fn_objs: HashSet<usize>,
     processed_external_icall_sites: HashSet<usize>,
     global_objs: HashSet<usize>,
+    provenance: u8,
+}
+
+const PROV_DIRECT_ADDRESS: u8 = 1 << 0;
+const PROV_SCALAR_OR_UNKNOWN_PAYLOAD: u8 = 1 << 1;
+const PROV_BY_VALUE_AGGREGATE: u8 = 1 << 2;
+const PROV_MEMORY_MERGING: u8 = 1 << 3;
+const PROV_CALL_RETURN: u8 = 1 << 4;
+
+fn meta_param_is_by_value(sig: &Signature, index: usize) -> bool {
+    sig.params
+        .get(index)
+        .is_some_and(|param| matches!(param, pangs_pir::Param::Byval { .. }))
+}
+
+fn pointee_provenance_labels(mask: u8, external: bool, universal: bool) -> Vec<PointeeProvenance> {
+    let mut labels = Vec::new();
+    for (bit, label) in [
+        (PROV_DIRECT_ADDRESS, PointeeProvenance::DirectAddressFlow),
+        (
+            PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
+            PointeeProvenance::ScalarOrUnknownPayload,
+        ),
+        (
+            PROV_BY_VALUE_AGGREGATE,
+            PointeeProvenance::ByValueAggregateBinding,
+        ),
+        (PROV_MEMORY_MERGING, PointeeProvenance::MemoryMerging),
+        (PROV_CALL_RETURN, PointeeProvenance::CallReturnMerging),
+    ] {
+        if mask & bit != 0 {
+            labels.push(label);
+        }
+    }
+    if universal {
+        labels.push(PointeeProvenance::UniversalOrigin);
+    } else if external {
+        labels.push(PointeeProvenance::FiniteExternalRegion);
+    }
+    labels.sort();
+    labels.dedup();
+    labels
 }
 
 #[derive(Clone)]
@@ -1045,31 +1165,39 @@ impl<'a> Solver<'a> {
                     let ptr = self.class_of(edge.dst);
                     let obj = self.class_of(edge.src);
                     let pointee = self.pointee_of(ptr);
-                    self.join(pointee, obj);
+                    self.join(pointee, obj, PROV_DIRECT_ADDRESS);
                 }
                 pangs_pag::EdgeKind::Assign => {
                     let src = self.class_of(edge.src);
                     let dst = self.class_of(edge.dst);
-                    self.join(src, dst);
+                    self.join(src, dst, self.assign_provenance(edge.src, edge.dst));
                 }
                 pangs_pag::EdgeKind::Load => {
                     let dst = self.class_of(edge.dst);
                     let src = self.class_of(edge.src);
                     let pointee = self.pointee_of(src);
-                    self.join(dst, pointee);
+                    self.join(
+                        dst,
+                        pointee,
+                        PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
+                    );
                 }
                 pangs_pag::EdgeKind::Store => {
                     let src = self.class_of(edge.src);
                     let dst = self.class_of(edge.dst);
                     let pointee = self.pointee_of(dst);
-                    self.join(pointee, src);
+                    self.join(
+                        pointee,
+                        src,
+                        PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
+                    );
                 }
                 pangs_pag::EdgeKind::Gep { .. } => {
                     let dst = self.class_of(edge.dst);
                     let src = self.class_of(edge.src);
                     let dst_p = self.pointee_of(dst);
                     let src_p = self.pointee_of(src);
-                    self.join(dst_p, src_p);
+                    self.join(dst_p, src_p, PROV_DIRECT_ADDRESS);
                 }
                 pangs_pag::EdgeKind::Memcpy { .. } => {
                     let dst = self.class_of(edge.dst);
@@ -1078,10 +1206,40 @@ impl<'a> Solver<'a> {
                     let src_p = self.pointee_of(src);
                     let dst_pp = self.pointee_of(dst_p);
                     let src_pp = self.pointee_of(src_p);
-                    self.join(dst_pp, src_pp);
+                    self.join(
+                        dst_pp,
+                        src_pp,
+                        PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
+                    );
                 }
             }
         }
+    }
+
+    fn assign_provenance(&self, src: NodeId, dst: NodeId) -> u8 {
+        let mut provenance = PROV_DIRECT_ADDRESS;
+        for node in [src, dst] {
+            match &self.pag.nodes[node.0 as usize].kind {
+                NodeKind::Param { func, index } => {
+                    provenance |= PROV_CALL_RETURN;
+                    if self
+                        .function_name_to_index
+                        .get(func)
+                        .is_some_and(|&func_index| {
+                            meta_param_is_by_value(
+                                &self.function_meta[func_index].sig,
+                                *index as usize,
+                            )
+                        })
+                    {
+                        provenance |= PROV_BY_VALUE_AGGREGATE;
+                    }
+                }
+                NodeKind::Return { .. } => provenance |= PROV_CALL_RETURN,
+                _ => {}
+            }
+        }
+        provenance
     }
 
     fn register_indirect_calls(&mut self) {
@@ -1117,7 +1275,9 @@ impl<'a> Solver<'a> {
                 (OmegaSeedKind::PtrToInt, SeedTarget::Node(id))
                 | (OmegaSeedKind::UnknownOperandEscape, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
+                    self.add_class_provenance(class, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
                     let pointee = self.pointee_of(class);
+                    self.add_class_provenance(pointee, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
                     self.set_esc_with_source(
                         pointee,
                         format!("{:?}:{}", seed.kind, self.pag.nodes[id.0 as usize].label),
@@ -1125,10 +1285,12 @@ impl<'a> Solver<'a> {
                 }
                 (OmegaSeedKind::IntToPtr, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
+                    self.add_class_provenance(class, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
                     self.set_universal_ext(class);
                 }
                 (OmegaSeedKind::UnknownResultExternal, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
+                    self.add_class_provenance(class, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
                     self.set_ext(class);
                 }
                 (OmegaSeedKind::ExternalCallBoundary, SeedTarget::Callsite(id)) => {
@@ -1156,6 +1318,11 @@ impl<'a> Solver<'a> {
                 self.set_ext(class);
             }
         }
+    }
+
+    fn add_class_provenance(&mut self, class: usize, provenance: u8) {
+        let root = self.find(class);
+        self.classes[root].provenance |= provenance;
     }
 
     fn finish(mut self) -> SolveResult {
@@ -1288,6 +1455,8 @@ impl<'a> Solver<'a> {
             vec![None; self.classes.len()];
         let mut reaches_function_pointer_by_root: Vec<Option<bool>> =
             vec![None; self.classes.len()];
+        let mut pointee_provenance_by_key =
+            HashMap::<(u8, bool, bool), SharedProvenanceList>::new();
         let mut node_summary_by_root: Vec<Option<CachedRootNodeSummary>> =
             vec![None; self.classes.len()];
         let mut nodes = BTreeMap::new();
@@ -1375,6 +1544,25 @@ impl<'a> Solver<'a> {
                     (filtered, envelope)
                 })
                 .unwrap_or_default();
+            let pointee_provenance = if pointee_globals.is_empty() {
+                SharedProvenanceList::default()
+            } else {
+                let pointee_mask = summary
+                    .pointee
+                    .map(|pointee| self.classes[pointee].provenance)
+                    .unwrap_or(0);
+                let key = (
+                    self.classes[root].provenance | pointee_mask,
+                    summary.external,
+                    self.classes[root].universal,
+                );
+                pointee_provenance_by_key
+                    .entry(key)
+                    .or_insert_with(|| {
+                        SharedProvenanceList::from(pointee_provenance_labels(key.0, key.1, key.2))
+                    })
+                    .clone()
+            };
             nodes.insert(
                 node.label.clone(),
                 NodeResolution {
@@ -1383,6 +1571,7 @@ impl<'a> Solver<'a> {
                     external_universal: self.classes[root].universal,
                     pointee_globals,
                     pointee_globals_unfiltered,
+                    pointee_provenance,
                     external_sources: if summary.external {
                         vec!["omega:steens_external".to_string()]
                     } else {
@@ -1694,18 +1883,22 @@ impl<'a> Solver<'a> {
         if external {
             self.apply_external_call(site_index);
         }
-        for (arg, param) in callsite.args.iter().zip(param_nodes.iter()) {
+        for (index, (arg, param)) in callsite.args.iter().zip(param_nodes.iter()).enumerate() {
             if param.0 == u32::MAX {
                 continue;
             }
             let arg = self.class_of(*arg);
             let param = self.class_of(*param);
-            self.join(arg, param);
+            let mut provenance = PROV_CALL_RETURN;
+            if meta_param_is_by_value(&self.function_meta[func_index].sig, index) {
+                provenance |= PROV_BY_VALUE_AGGREGATE;
+            }
+            self.join(arg, param, provenance);
         }
         if let (Some(result), Some(ret)) = (callsite.result, ret_node) {
             let result = self.class_of(result);
             let ret = self.class_of(ret);
-            self.join(result, ret);
+            self.join(result, ret, PROV_CALL_RETURN);
         }
     }
 
@@ -1825,11 +2018,12 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn join(&mut self, left: usize, right: usize) -> usize {
+    fn join(&mut self, left: usize, right: usize, provenance: u8) -> usize {
         self.metrics.steens_join_attempts += 1;
         let mut a = self.find(left);
         let mut b = self.find(right);
         if a == b {
+            self.classes[a].provenance |= provenance;
             return a;
         }
         self.metrics.steens_join_successes += 1;
@@ -1843,6 +2037,7 @@ impl<'a> Solver<'a> {
         self.classes[a].ext |= self.classes[b].ext;
         self.classes[a].universal |= self.classes[b].universal;
         self.classes[a].esc |= self.classes[b].esc;
+        self.classes[a].provenance |= self.classes[b].provenance | provenance;
         let other_escape_sources = std::mem::take(&mut self.classes[b].escape_sources);
         self.classes[a].escape_sources.extend(other_escape_sources);
 
@@ -1875,7 +2070,7 @@ impl<'a> Solver<'a> {
         }
 
         let pointee = match (self.classes[a].pointee, self.classes[b].pointee) {
-            (Some(pa), Some(pb)) => Some(self.join(pa, pb)),
+            (Some(pa), Some(pb)) => Some(self.join(pa, pb, provenance)),
             (Some(pa), None) => Some(self.find(pa)),
             (None, Some(pb)) => Some(self.find(pb)),
             (None, None) => None,
@@ -2157,7 +2352,7 @@ mod tests {
             omega_seeds: Vec::new(),
         };
         let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
-        let pointee = solver.join(0, 1);
+        let pointee = solver.join(0, 1, 0);
         solver.classes[4].pointee = Some(pointee);
         solver.classes[4].universal = universal;
         solver.finish().nodes.remove("val:query").unwrap()
@@ -2175,16 +2370,41 @@ mod tests {
 
     #[test]
     fn universal_or_violation_tainted_enumeration_keeps_unexposed_globals() {
-        for resolution in [
-            address_exposure_filter_fixture(false, true),
-            address_exposure_filter_fixture(true, false),
-        ] {
+        let universal = address_exposure_filter_fixture(false, true);
+        assert_eq!(
+            universal.pointee_provenance,
+            vec![PointeeProvenance::UniversalOrigin]
+        );
+        for resolution in [universal, address_exposure_filter_fixture(true, false)] {
             assert_eq!(
                 &*resolution.pointee_globals,
                 &["closed".to_string(), "exposed".to_string()]
             );
             assert!(resolution.pointee_globals_unfiltered.is_empty());
         }
+    }
+
+    #[test]
+    fn pointee_provenance_labels_cover_every_diagnostic_category() {
+        assert_eq!(
+            pointee_provenance_labels(
+                PROV_DIRECT_ADDRESS
+                    | PROV_SCALAR_OR_UNKNOWN_PAYLOAD
+                    | PROV_BY_VALUE_AGGREGATE
+                    | PROV_MEMORY_MERGING
+                    | PROV_CALL_RETURN,
+                true,
+                false,
+            ),
+            vec![
+                PointeeProvenance::DirectAddressFlow,
+                PointeeProvenance::ScalarOrUnknownPayload,
+                PointeeProvenance::ByValueAggregateBinding,
+                PointeeProvenance::MemoryMerging,
+                PointeeProvenance::CallReturnMerging,
+                PointeeProvenance::FiniteExternalRegion,
+            ]
+        );
     }
 
     #[test]
@@ -2234,7 +2454,7 @@ mod tests {
         assert_eq!(solver.metrics.steens_seen_pairs_new, 2);
         assert_eq!(solver.metrics.steens_indirect_bindings, 2);
 
-        let root = solver.join(0, 1);
+        let root = solver.join(0, 1, 0);
         solver.process_class(root);
 
         assert_eq!(solver.metrics.steens_seen_pairs_new, 4);
@@ -2293,7 +2513,7 @@ mod tests {
         assert_eq!(solver.metrics.steens_external_call_applications, 1);
 
         solver.classes[1].icall_sites.insert(1);
-        let root = solver.join(0, 1);
+        let root = solver.join(0, 1, 0);
         solver.process_class(root);
         solver.process_class(root);
 

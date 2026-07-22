@@ -17,6 +17,7 @@ use pangs_solve::{
     debug_assert_narrows, solve_andersen_with_overrides,
     solve_andersen_with_overrides_and_target_points_to, solve_steensgaard,
     solve_steensgaard_with_target_points_to, IndirectCallResolution, NodeResolution,
+    PointeeProvenance, SharedProvenanceList,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -4286,9 +4287,11 @@ struct ModRefNodeSummaryData {
     pointee_global_ids: Rc<[GlobalId]>,
     pointee_global_sample: Rc<[String]>,
     pointee_global_count: usize,
+    unfiltered_pointee_global_count: usize,
     pointee_has_string: bool,
     external_source_suffix: Option<String>,
     direct_symbol_global: Option<GlobalId>,
+    pointee_provenance: SharedProvenanceList,
 }
 
 #[derive(Debug, Clone)]
@@ -4679,6 +4682,12 @@ fn push_high_fanout_pointer_modref_fallback(
     if summary.pointee_has_string {
         detail.push_str(":pointee_has_string=true");
     }
+    append_address_filter_counts(
+        &mut detail,
+        summary.pointee_global_count,
+        summary.unfiltered_pointee_global_count,
+    );
+    append_pointee_provenance(&mut detail, &summary.pointee_provenance);
     modrefs.push_with_phase(
         ModRef {
             func,
@@ -4781,19 +4790,49 @@ fn build_modref_node_summary_data(
         .pointee_globals
         .iter()
         .any(|global_key| looks_like_string_global_key(global_key));
+    let unfiltered_pointee_global_count = if resolution.pointee_globals_unfiltered.is_empty() {
+        resolution.pointee_globals.len()
+    } else {
+        resolution.pointee_globals_unfiltered.len()
+    };
     ModRefNodeSummaryData {
         external: resolution.external,
         external_universal: resolution.external_universal,
         pointee_global_ids,
         pointee_global_sample,
         pointee_global_count: resolution.pointee_globals.len(),
+        unfiltered_pointee_global_count,
         pointee_has_string,
         external_source_suffix: resolution
             .external
             .then(|| modref_external_source_suffix(&resolution.external_sources))
             .flatten(),
         direct_symbol_global,
+        pointee_provenance: resolution.pointee_provenance.clone(),
     }
+}
+
+fn append_pointee_provenance(detail: &mut String, provenance: &[PointeeProvenance]) {
+    if provenance.is_empty() {
+        return;
+    }
+    detail.push_str(":provenance=");
+    for (index, label) in provenance.iter().enumerate() {
+        if index != 0 {
+            detail.push(',');
+        }
+        detail.push_str(label.as_str());
+    }
+}
+
+fn append_address_filter_counts(detail: &mut String, filtered: usize, unfiltered: usize) {
+    if unfiltered <= filtered {
+        return;
+    }
+    detail.push_str(&format!(
+        ":prefilter_pointee_count={unfiltered}:address_filtered_count={}",
+        unfiltered - filtered
+    ));
 }
 
 fn global_key_by_id(global_lookup: &HashMap<String, GlobalId>) -> Vec<String> {
@@ -5035,6 +5074,17 @@ fn push_pointer_modrefs_from_pag(
             }
 
             if summary.external {
+                let mut detail = modref_detail_with_external_suffix_and_pointee_count(
+                    pointer_access.detail,
+                    summary.external_source_suffix.as_deref(),
+                    summary.pointee_global_count,
+                );
+                append_address_filter_counts(
+                    &mut detail,
+                    summary.pointee_global_count,
+                    summary.unfiltered_pointee_global_count,
+                );
+                append_pointee_provenance(&mut detail, &summary.pointee_provenance);
                 modrefs.push_with_phase(
                     ModRef {
                         func,
@@ -5042,11 +5092,7 @@ fn push_pointer_modrefs_from_pag(
                         access: pointer_access.access,
                         via: Via::Unknown,
                         witness: witness.clone(),
-                        detail: Some(modref_detail_with_external_suffix_and_pointee_count(
-                            pointer_access.detail,
-                            summary.external_source_suffix.as_deref(),
-                            summary.pointee_global_count,
-                        )),
+                        detail: Some(detail),
                         address_node: Some(summary.label.to_string()),
                         pointee_globals: global_keys_for_ids(
                             &summary.pointee_global_ids,
@@ -5238,6 +5284,16 @@ fn push_pointer_memset_modrefs_from_pir(
                 {
                     detail.push_str(":pointee_has_string=true");
                 }
+                append_address_filter_counts(
+                    &mut detail,
+                    resolution.pointee_globals.len(),
+                    if resolution.pointee_globals_unfiltered.is_empty() {
+                        resolution.pointee_globals.len()
+                    } else {
+                        resolution.pointee_globals_unfiltered.len()
+                    },
+                );
+                append_pointee_provenance(&mut detail, &resolution.pointee_provenance);
                 modrefs.push_with_phase(
                     ModRef {
                         func: func_id,
@@ -5271,6 +5327,20 @@ fn push_pointer_memset_modrefs_from_pir(
                 );
             }
             if resolution.external {
+                let mut detail = modref_detail_with_external_sources(
+                    "stmt:memset_dst",
+                    &resolution.external_sources,
+                );
+                append_address_filter_counts(
+                    &mut detail,
+                    resolution.pointee_globals.len(),
+                    if resolution.pointee_globals_unfiltered.is_empty() {
+                        resolution.pointee_globals.len()
+                    } else {
+                        resolution.pointee_globals_unfiltered.len()
+                    },
+                );
+                append_pointee_provenance(&mut detail, &resolution.pointee_provenance);
                 modrefs.push_with_phase(
                     ModRef {
                         func: func_id,
@@ -5278,10 +5348,7 @@ fn push_pointer_memset_modrefs_from_pir(
                         access: Access::Mod,
                         via: Via::Unknown,
                         witness,
-                        detail: Some(modref_detail_with_external_sources(
-                            "stmt:memset_dst",
-                            &resolution.external_sources,
-                        )),
+                        detail: Some(detail),
                         address_node: Some(label.clone()),
                         pointee_globals: resolution.pointee_globals.to_vec(),
                         global_candidates: finite_or_module_wide(
