@@ -1290,6 +1290,7 @@ impl<'a> Builder<'a> {
         id
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_callsite(
         &mut self,
         func_index: usize,
