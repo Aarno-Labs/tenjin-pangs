@@ -428,6 +428,7 @@ impl<'a> QueryGraph<'a> {
         let mut edges = pag
             .edges
             .iter()
+            .filter(|edge| pag_edge_carries_pointer(pag, edge))
             .map(|edge| QueryEdge {
                 kind: edge.kind,
                 src: edge.src,
@@ -887,21 +888,43 @@ fn append_indirect_call_binding_edges(
             }
             if let Some(target_params) = params.get(target.as_str()) {
                 for (arg, param) in callsite.args.iter().zip(target_params.values()) {
-                    edges.push(QueryEdge {
-                        kind: EdgeKind::Assign,
-                        src: *arg,
-                        dst: *param,
-                    });
+                    if pointer_transfer(pag, *arg, *param) {
+                        edges.push(QueryEdge {
+                            kind: EdgeKind::Assign,
+                            src: *arg,
+                            dst: *param,
+                        });
+                    }
                 }
             }
             if let (Some(result), Some(ret)) = (callsite.result, returns.get(target.as_str())) {
-                edges.push(QueryEdge {
-                    kind: EdgeKind::Assign,
-                    src: *ret,
-                    dst: result,
-                });
+                if pointer_transfer(pag, *ret, result) {
+                    edges.push(QueryEdge {
+                        kind: EdgeKind::Assign,
+                        src: *ret,
+                        dst: result,
+                    });
+                }
             }
         }
+    }
+}
+
+fn pointer_transfer(pag: &Pag, src: NodeId, dst: NodeId) -> bool {
+    pag.nodes[src.0 as usize].value_kind.may_carry_pointer()
+        && pag.nodes[dst.0 as usize].value_kind.may_carry_pointer()
+}
+
+fn pag_edge_carries_pointer(pag: &Pag, edge: &pangs_pag::Edge) -> bool {
+    match edge.kind {
+        EdgeKind::Assign => pointer_transfer(pag, edge.src, edge.dst),
+        EdgeKind::Load => pag.nodes[edge.dst.0 as usize]
+            .value_kind
+            .may_carry_pointer(),
+        EdgeKind::Store => pag.nodes[edge.src.0 as usize]
+            .value_kind
+            .may_carry_pointer(),
+        EdgeKind::AddrOf | EdgeKind::Gep { .. } | EdgeKind::Memcpy { .. } => true,
     }
 }
 

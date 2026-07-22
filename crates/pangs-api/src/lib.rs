@@ -1830,7 +1830,13 @@ impl Analysis {
             findings_dedup_us,
             components_us,
             metrics_bookkeeping_us: 0,
-            lowering: (!module.lowering.is_empty()).then(|| module.lowering.clone()),
+            lowering: {
+                // Semantic value kinds are solver input, not counters. Keep them in serialized
+                // PIR, but do not duplicate the potentially large map in analysis metrics.
+                let mut lowering = module.lowering.clone();
+                lowering.semantic_value_kinds.clear();
+                (!lowering.is_empty()).then_some(lowering)
+            },
         };
         let metrics_bookkeeping_us = metrics_bookkeeping_started.elapsed().as_micros() as u64;
 

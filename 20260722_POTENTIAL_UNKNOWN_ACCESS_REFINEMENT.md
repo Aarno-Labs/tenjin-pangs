@@ -383,6 +383,16 @@ This is the preferred foundational change because every later certificate or que
 from a cleaner graph. Measure changes in PAG size, solver time, ModRef fanout, and disposition
 coverage on Surprisetalk plus the established small-to-large profiling corpus.
 
+Implemented: LLVM lowering now exports semantic value kinds separately from ABI classes, PAG
+nodes preserve them, and Steensgaard, Andersen, and the experimental CFL engine omit pointer
+payload constraints only for proven non-pointer transfers. Scalar memory edges remain available
+to access clients. Pointer-bearing aggregate SSA operations retain only their pointer-bearing
+payload; pointer-width ABI carriers and all missing, opaque, external, or type-punned cases fail
+closed. Ordinary scalar refinement leaves raw PAG node/edge counts stable while the effective
+solver constraint count and union partitions shrink. Direct internal `byval` bindings additionally use a fresh copy
+object and an explicit memory-payload copy rather than aliasing caller and callee addresses;
+unresolved indirect by-value bindings retain the conservative alias model.
+
 ### Stage 4: general global-centric access-set certificate
 
 Implement a summary-based address-flow closure for disposition. Begin with SSA operations,

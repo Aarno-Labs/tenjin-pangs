@@ -20,7 +20,8 @@ use llvm_sys::{
 
 use crate::{
     AbiClass, Access, Func, Global, Loc, LoweringStats, Param, Pir, PirError, ScalarTypeClass,
-    Signature, StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo, VarArgPosition,
+    Signature, StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo, ValueKind,
+    VarArgPosition,
 };
 
 mod ptrint;
@@ -175,34 +176,60 @@ struct ModuleCtx {
 
 struct FunctionCtx {
     func_name: String,
+    data_layout: LLVMTargetDataRef,
     unnamed: BTreeMap<usize, String>,
     next_unnamed: u64,
     positional_varargs: BTreeMap<usize, VarArgPosition>,
+    value_kinds: BTreeMap<String, ValueKind>,
 }
 
 impl FunctionCtx {
-    fn new(func_name: String, positional_varargs: BTreeMap<usize, VarArgPosition>) -> Self {
+    fn new(
+        func_name: String,
+        data_layout: LLVMTargetDataRef,
+        positional_varargs: BTreeMap<usize, VarArgPosition>,
+    ) -> Self {
         Self {
             func_name,
+            data_layout,
             unnamed: BTreeMap::new(),
             next_unnamed: 0,
             positional_varargs,
+            value_kinds: BTreeMap::new(),
         }
+    }
+
+    fn note_kind(&mut self, key: &str, kind: ValueKind) {
+        self.value_kinds
+            .entry(key.to_string())
+            .and_modify(|old| {
+                if *old != kind {
+                    *old = ValueKind::Unknown;
+                }
+            })
+            .or_insert(kind);
     }
 
     unsafe fn local_key(&mut self, value: LLVMValueRef) -> String {
         let name = value_name(value);
-        if !name.is_empty() {
-            return format!("%{}::{name}", self.func_name);
-        }
-        let key = value as usize;
-        if let Some(existing) = self.unnamed.get(&key) {
-            return existing.clone();
-        }
-        let generated = format!("%{}::tmp{}", self.func_name, self.next_unnamed);
-        self.next_unnamed += 1;
-        self.unnamed.insert(key, generated.clone());
-        generated
+        let result = if !name.is_empty() {
+            format!("%{}::{name}", self.func_name)
+        } else {
+            let key = value as usize;
+            if let Some(existing) = self.unnamed.get(&key) {
+                existing.clone()
+            } else {
+                let generated = format!("%{}::tmp{}", self.func_name, self.next_unnamed);
+                self.next_unnamed += 1;
+                self.unnamed.insert(key, generated.clone());
+                generated
+            }
+        };
+        self.note_kind(
+            &result,
+            semantic_value_kind_for_value(self.data_layout, value),
+        );
+        result
     }
 
     unsafe fn operand_key(&mut self, value: LLVMValueRef) -> String {
@@ -219,14 +246,19 @@ impl FunctionCtx {
         if !LLVMIsAConstantInt(value).is_null() {
             let width = LLVMGetIntTypeWidth(LLVMTypeOf(value));
             if width <= 64 {
-                return LLVMConstIntGetSExtValue(value).to_string();
+                let key = LLVMConstIntGetSExtValue(value).to_string();
+                self.note_kind(&key, ValueKind::NonPointer);
+                return key;
             }
             // LLVMConstIntGetSExtValue aborts for values whose significant bits do not
             // fit in i64. Wide integers cannot be D3 atomics on current targets, but
             // scalar lowering must still retain them without crashing.
-            return value_string(value);
+            let key = value_string(value);
+            self.note_kind(&key, ValueKind::NonPointer);
+            return key;
         }
         if !LLVMIsAConstantPointerNull(value).is_null() {
+            self.note_kind("null", ValueKind::Pointer);
             return "null".to_string();
         }
         // Preserve the exact allocation identity of a global hidden only by a constant
@@ -242,7 +274,9 @@ impl FunctionCtx {
         if !LLVMIsAPoisonValue(value).is_null() {
             return "poison".to_string();
         }
-        value_string(value)
+        let key = value_string(value);
+        self.note_kind(&key, semantic_value_kind_for_value(self.data_layout, value));
+        key
     }
 }
 
@@ -596,7 +630,7 @@ unsafe fn lower_function(
     let key = value_name(function);
     let mut body = Vec::new();
     let positional_varargs = recognize_positional_varargs(ctx, function);
-    let mut fctx = FunctionCtx::new(key.clone(), positional_varargs);
+    let mut fctx = FunctionCtx::new(key.clone(), ctx.data_layout, positional_varargs);
     let param_names = function_param_names(function, &mut fctx);
     lower_personality_function(ctx, function, lowering);
 
@@ -641,6 +675,9 @@ unsafe fn lower_function(
 
     let statement_cfg = build_statement_cfg(&blocks, raw_boundaries, has_function_debug);
     lowering.statement_cfgs.insert(key.clone(), statement_cfg);
+
+    let value_kinds = std::mem::take(&mut fctx.value_kinds);
+    lowering.semantic_value_kinds.extend(value_kinds);
 
     Func {
         key: key.clone(),
@@ -3098,6 +3135,98 @@ unsafe fn push_operands(value: LLVMValueRef, stack: &mut Vec<LLVMValueRef>) {
 
 unsafe fn is_pointer_like_type(ty: LLVMTypeRef) -> bool {
     type_contains_pointer_shallow(ty)
+}
+
+/// Classify LLVM values for pointer-payload constraints independently of their ABI class.
+/// Pointer-width integers arriving from memory, calls, arguments, or aggregate operations stay
+/// unknown: front ends may use those values as ABI-coerced aggregate carriers.  Narrow integers
+/// and values of intrinsically scalar types are proven non-pointer.  Integer-to-pointer recovery
+/// remains protected independently by the existing universal Ω seed.
+unsafe fn semantic_value_kind_for_value(
+    data_layout: LLVMTargetDataRef,
+    value: LLVMValueRef,
+) -> ValueKind {
+    let ty = LLVMTypeOf(value);
+    if LLVMGetTypeKind(ty) == LLVMTypeKind::LLVMIntegerTypeKind
+        && u64::from(LLVMGetIntTypeWidth(ty))
+            == u64::from(LLVMPointerSize(data_layout)).saturating_mul(8)
+    {
+        let carrier = !LLVMIsAArgument(value).is_null()
+            || (!LLVMIsAInstruction(value).is_null()
+                && matches!(
+                    LLVMGetInstructionOpcode(value),
+                    LLVMOpcode::LLVMLoad
+                        | LLVMOpcode::LLVMCall
+                        | LLVMOpcode::LLVMInvoke
+                        | LLVMOpcode::LLVMCallBr
+                        | LLVMOpcode::LLVMPHI
+                        | LLVMOpcode::LLVMSelect
+                        | LLVMOpcode::LLVMExtractValue
+                        | LLVMOpcode::LLVMInsertValue
+                ));
+        if carrier {
+            return ValueKind::Unknown;
+        }
+    }
+    semantic_value_kind(ty)
+}
+
+unsafe fn semantic_value_kind(ty: LLVMTypeRef) -> ValueKind {
+    match LLVMGetTypeKind(ty) {
+        LLVMTypeKind::LLVMPointerTypeKind => ValueKind::Pointer,
+        LLVMTypeKind::LLVMStructTypeKind => {
+            if LLVMIsOpaqueStruct(ty) != 0 {
+                return ValueKind::Unknown;
+            }
+            let count = LLVMCountStructElementTypes(ty);
+            let mut elements = vec![ptr::null_mut(); count as usize];
+            LLVMGetStructElementTypes(ty, elements.as_mut_ptr());
+            semantic_aggregate_kind(elements)
+        }
+        LLVMTypeKind::LLVMArrayTypeKind => match semantic_value_kind(LLVMGetElementType(ty)) {
+            ValueKind::Pointer | ValueKind::PointerAggregate => ValueKind::PointerAggregate,
+            ValueKind::NonPointer => ValueKind::NonPointer,
+            ValueKind::Unknown => ValueKind::Unknown,
+        },
+        // Pointer vectors and scalable/target extension types retain the fail-closed path used
+        // by the existing violation discipline.
+        LLVMTypeKind::LLVMVectorTypeKind => {
+            if type_contains_pointer_shallow(LLVMGetElementType(ty)) {
+                ValueKind::Unknown
+            } else {
+                ValueKind::NonPointer
+            }
+        }
+        LLVMTypeKind::LLVMVoidTypeKind
+        | LLVMTypeKind::LLVMHalfTypeKind
+        | LLVMTypeKind::LLVMFloatTypeKind
+        | LLVMTypeKind::LLVMDoubleTypeKind
+        | LLVMTypeKind::LLVMX86_FP80TypeKind
+        | LLVMTypeKind::LLVMFP128TypeKind
+        | LLVMTypeKind::LLVMPPC_FP128TypeKind
+        | LLVMTypeKind::LLVMLabelTypeKind
+        | LLVMTypeKind::LLVMIntegerTypeKind
+        | LLVMTypeKind::LLVMMetadataTypeKind
+        | LLVMTypeKind::LLVMX86_MMXTypeKind
+        | LLVMTypeKind::LLVMTokenTypeKind => ValueKind::NonPointer,
+        _ => ValueKind::Unknown,
+    }
+}
+
+unsafe fn semantic_aggregate_kind(elements: Vec<LLVMTypeRef>) -> ValueKind {
+    let mut has_pointer = false;
+    for element in elements {
+        match semantic_value_kind(element) {
+            ValueKind::Pointer | ValueKind::PointerAggregate => has_pointer = true,
+            ValueKind::Unknown => return ValueKind::Unknown,
+            ValueKind::NonPointer => {}
+        }
+    }
+    if has_pointer {
+        ValueKind::PointerAggregate
+    } else {
+        ValueKind::NonPointer
+    }
 }
 
 unsafe fn is_pointer_vector_type(ty: LLVMTypeRef) -> bool {

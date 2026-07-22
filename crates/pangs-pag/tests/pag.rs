@@ -585,3 +585,84 @@ fn binds_named_function_parameters_into_the_body_graph() {
         matches!(edge.kind, pangs_pag::EdgeKind::Assign) && edge.src == param && edge.dst == value
     }));
 }
+
+#[test]
+fn direct_byval_binding_uses_a_fresh_copy_object() {
+    let byval_sig = sig(AbiClass::Void, vec![Param::Byval { size: 16 }]);
+    let pir = Pir {
+        module: "byval-copy".into(),
+        source: None,
+        lowering: Default::default(),
+        target: None,
+        functions: vec![
+            Func {
+                key: "callee".into(),
+                sig: byval_sig.clone(),
+                param_names: vec!["%callee::arg".into()],
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: Vec::new(),
+            },
+            Func {
+                key: "caller".into(),
+                sig: sig(AbiClass::Void, Vec::new()),
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![
+                    Stmt::Alloca {
+                        dest: "%caller::src".into(),
+                        ty: "{ i8*, i64 }".into(),
+                        loc: None,
+                    },
+                    Stmt::CallDirect {
+                        callee: "callee".into(),
+                        sig: byval_sig,
+                        args: vec!["%caller::src".into()],
+                        dest: None,
+                        loc: None,
+                    },
+                ],
+            },
+        ],
+        globals: Vec::new(),
+        global_init: Vec::new(),
+    };
+    let pag = Pag::from_pir(&pir, &PagOpts::default());
+    let actual = pag
+        .nodes
+        .iter()
+        .find(|node| node.label == "val:caller:%caller::src")
+        .unwrap()
+        .id;
+    let param = pag
+        .nodes
+        .iter()
+        .find(|node| node.label == "param:callee:0")
+        .unwrap()
+        .id;
+    let copy = pag
+        .nodes
+        .iter()
+        .find(|node| node.label == "obj:byval:caller:1:0")
+        .unwrap()
+        .id;
+
+    assert!(pag.edges.iter().any(|edge| {
+        edge.kind == pangs_pag::EdgeKind::AddrOf && edge.src == copy && edge.dst == param
+    }));
+    assert!(pag.edges.iter().any(|edge| {
+        edge.kind == pangs_pag::EdgeKind::Memcpy { bytes: Some(16) }
+            && edge.src == actual
+            && edge.dst == param
+    }));
+    assert!(!pag.edges.iter().any(|edge| {
+        edge.kind == pangs_pag::EdgeKind::Assign && edge.src == actual && edge.dst == param
+    }));
+}

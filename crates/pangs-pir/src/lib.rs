@@ -63,6 +63,27 @@ pub struct Pir {
     pub global_init: Vec<Stmt>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueKind {
+    /// No semantic proof is available; pointer clients must fail closed.
+    #[default]
+    Unknown,
+    /// A proven non-pointer scalar (or aggregate containing no pointer fields).
+    NonPointer,
+    /// An LLVM pointer value.
+    Pointer,
+    /// An aggregate carrier with one or more pointer-bearing fields.  Scalar fields are not
+    /// pointer payload; current PAG constraints conservatively union only the pointer fields.
+    PointerAggregate,
+}
+
+impl ValueKind {
+    pub fn may_carry_pointer(self) -> bool {
+        !matches!(self, Self::NonPointer)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetInfo {
     pub triple: String,
@@ -376,6 +397,11 @@ pub enum Stmt {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoweringStats {
+    /// Semantic LLVM value kinds keyed by stable PIR operand spelling.  This is kept separate
+    /// from ABI classes: both pointers and integers commonly occupy the `integer` class, but
+    /// only the former carry pointer-analysis payload.  Missing entries mean `Unknown`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub semantic_value_kinds: BTreeMap<String, ValueKind>,
     #[serde(default)]
     pub functions: u64,
     #[serde(default)]
@@ -451,6 +477,7 @@ impl LoweringStats {
             && self.tainted_counts.is_empty()
             && self.missing_debug_locations.is_empty()
             && self.non_ccc_calling_conventions.is_empty()
+            && self.semantic_value_kinds.is_empty()
     }
 
     pub fn bump_instruction(&mut self, op: impl Into<String>) {

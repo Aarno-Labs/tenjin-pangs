@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use pangs_pir::{Param, Pir, ScalarTypeClass, Stmt, VarArgPosition};
+use pangs_pir::{Param, Pir, ScalarTypeClass, Stmt, ValueKind, VarArgPosition};
 use tempfile::TempDir;
 
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
@@ -1820,6 +1820,14 @@ lpad:
     .unwrap();
 
     let pir = pir_from_llvm_sys(&ll_path);
+    assert_eq!(
+        pir.lowering.semantic_value_kinds.get("%agg_and_eh::agg0"),
+        Some(&ValueKind::PointerAggregate)
+    );
+    assert_eq!(
+        pir.lowering.semantic_value_kinds.get("%agg_and_eh::field"),
+        Some(&ValueKind::Pointer)
+    );
     assert!(
         pir.functions
             .iter()

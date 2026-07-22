@@ -445,6 +445,16 @@ impl<'a> Refiner<'a> {
         refiner
     }
 
+    fn node_may_carry_pointer(&self, node: NodeId) -> bool {
+        self.pag.nodes[node.0 as usize]
+            .value_kind
+            .may_carry_pointer()
+    }
+
+    fn pointer_transfer(&self, src: NodeId, dst: NodeId) -> bool {
+        self.node_may_carry_pointer(src) && self.node_may_carry_pointer(dst)
+    }
+
     // ----- partition extraction + interesting-set + oversize guard ----------------------
 
     fn ap_find(&mut self, mut x: usize) -> usize {
@@ -999,13 +1009,25 @@ impl<'a> Refiner<'a> {
             }
             match edge.kind {
                 EdgeKind::AddrOf => solve.add_pts(edge.dst.0, edge.src.0),
-                EdgeKind::Assign => solve.add_copy(edge.src.0, edge.dst.0),
-                EdgeKind::Load => solve.loads.entry(edge.src.0).or_default().push(edge.dst.0),
-                EdgeKind::Store => solve
-                    .stores
-                    .entry(edge.dst.0)
-                    .or_default()
-                    .push((edge.src.0, None)),
+                EdgeKind::Assign => {
+                    if self.pointer_transfer(edge.src, edge.dst) {
+                        solve.add_copy(edge.src.0, edge.dst.0);
+                    }
+                }
+                EdgeKind::Load => {
+                    if self.node_may_carry_pointer(edge.dst) {
+                        solve.loads.entry(edge.src.0).or_default().push(edge.dst.0);
+                    }
+                }
+                EdgeKind::Store => {
+                    if self.node_may_carry_pointer(edge.src) {
+                        solve
+                            .stores
+                            .entry(edge.dst.0)
+                            .or_default()
+                            .push((edge.src.0, None));
+                    }
+                }
                 EdgeKind::Gep { byte_off } => {
                     if let Some(byte_off) = byte_off {
                         solve.known_offsets.insert(byte_off);
@@ -1032,11 +1054,15 @@ impl<'a> Refiner<'a> {
                 }
                 for (i, &arg) in cs.args.iter().enumerate() {
                     if let Some(&param) = self.param_nodes.get(&(f, i)) {
-                        solve.add_copy(arg.0, param.0);
+                        if self.pointer_transfer(arg, param) {
+                            solve.add_copy(arg.0, param.0);
+                        }
                     }
                 }
                 if let (Some(result), Some(&ret)) = (cs.result, self.ret_nodes.get(&f)) {
-                    solve.add_copy(ret.0, result.0);
+                    if self.pointer_transfer(ret, result) {
+                        solve.add_copy(ret.0, result.0);
+                    }
                 }
             }
         }
@@ -1198,6 +1224,9 @@ impl<'a> Refiner<'a> {
             };
             for param_index in 0..self.pir.functions[func_index].sig.params.len() {
                 if let Some(&param) = self.param_nodes.get(&(func_index, param_index)) {
+                    if !self.node_may_carry_pointer(param) {
+                        continue;
+                    }
                     self.seed_points_to_region(
                         solve,
                         param,

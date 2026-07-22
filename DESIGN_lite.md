@@ -196,6 +196,20 @@ the detail also reports `prefilter_pointee_count` and `address_filtered_count`. 
 where precision was lost; they are intentionally excluded from every soundness guard and
 eligibility predicate.
 
+Pointer payload is classified independently of ABI class. LLVM lowering records each stable PIR
+value as proven non-pointer, pointer, pointer-bearing aggregate, or unknown; the PAG carries that
+kind on value nodes. Assign/load/store and internal call/return constraints enter the pointer
+solvers only when their payload may contain a pointer. The memory-access edge itself is retained
+for scalar loads and stores, so ModRef and mutation clients do not lose the access. Aggregate SSA
+carriers conservatively union their pointer-bearing fields while proven scalar fields contribute no
+pointer constraint. Pointer-width integers loaded from memory, passed through ABI parameters, or
+produced by calls and aggregate operations remain unknown because they may be ABI-coerced
+aggregate carriers. Missing metadata, opaque aggregates, pointer vectors, external boundaries,
+integer-forged pointers, and other type-punned cases likewise keep the conservative behavior.
+Known direct `byval` calls use a fresh copy object plus a memory-payload copy instead of equating
+the caller's aggregate address with the callee parameter. Indirect by-value bindings remain
+conservative until a target-specific synthetic-copy representation is available.
+
 ## 4. The residual risk, named
 
 The cut precision is tier-E context-sensitivity, which CORAL's finding III says

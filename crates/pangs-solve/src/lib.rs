@@ -497,7 +497,14 @@ fn allocation_isolation(
             pangs_pag::EdgeKind::AddrOf
                 | pangs_pag::EdgeKind::Assign
                 | pangs_pag::EdgeKind::Gep { .. }
-        ) {
+        ) && (edge.kind != pangs_pag::EdgeKind::Assign
+            || (pag.nodes[edge.src.0 as usize]
+                .value_kind
+                .may_carry_pointer()
+                && pag.nodes[edge.dst.0 as usize]
+                    .value_kind
+                    .may_carry_pointer()))
+        {
             flow[edge.src.0 as usize].push(edge.dst);
         }
     }
@@ -554,11 +561,19 @@ fn allocation_isolation(
             }
             for (index, &arg) in callsite.args.iter().enumerate() {
                 if let Some(&param) = params.get(&(target.clone(), index as u32)) {
-                    flow[arg.0 as usize].push(param);
+                    if pag.nodes[arg.0 as usize].value_kind.may_carry_pointer()
+                        && pag.nodes[param.0 as usize].value_kind.may_carry_pointer()
+                    {
+                        flow[arg.0 as usize].push(param);
+                    }
                 }
             }
             if let (Some(&ret), Some(result)) = (returns.get(target), callsite.result) {
-                flow[ret.0 as usize].push(result);
+                if pag.nodes[ret.0 as usize].value_kind.may_carry_pointer()
+                    && pag.nodes[result.0 as usize].value_kind.may_carry_pointer()
+                {
+                    flow[ret.0 as usize].push(result);
+                }
             }
         }
         if unsafe_site {
@@ -1168,11 +1183,17 @@ impl<'a> Solver<'a> {
                     self.join(pointee, obj, PROV_DIRECT_ADDRESS);
                 }
                 pangs_pag::EdgeKind::Assign => {
+                    if !self.pointer_transfer(edge.src, edge.dst) {
+                        continue;
+                    }
                     let src = self.class_of(edge.src);
                     let dst = self.class_of(edge.dst);
                     self.join(src, dst, self.assign_provenance(edge.src, edge.dst));
                 }
                 pangs_pag::EdgeKind::Load => {
+                    if !self.node_may_carry_pointer(edge.dst) {
+                        continue;
+                    }
                     let dst = self.class_of(edge.dst);
                     let src = self.class_of(edge.src);
                     let pointee = self.pointee_of(src);
@@ -1183,6 +1204,9 @@ impl<'a> Solver<'a> {
                     );
                 }
                 pangs_pag::EdgeKind::Store => {
+                    if !self.node_may_carry_pointer(edge.src) {
+                        continue;
+                    }
                     let src = self.class_of(edge.src);
                     let dst = self.class_of(edge.dst);
                     let pointee = self.pointee_of(dst);
@@ -1887,6 +1911,9 @@ impl<'a> Solver<'a> {
             if param.0 == u32::MAX {
                 continue;
             }
+            if !self.pointer_transfer(*arg, *param) {
+                continue;
+            }
             let arg = self.class_of(*arg);
             let param = self.class_of(*param);
             let mut provenance = PROV_CALL_RETURN;
@@ -1896,6 +1923,9 @@ impl<'a> Solver<'a> {
             self.join(arg, param, provenance);
         }
         if let (Some(result), Some(ret)) = (callsite.result, ret_node) {
+            if !self.pointer_transfer(ret, result) {
+                return;
+            }
             let result = self.class_of(result);
             let ret = self.class_of(ret);
             self.join(result, ret, PROV_CALL_RETURN);
@@ -1959,6 +1989,16 @@ impl<'a> Solver<'a> {
 
     fn class_of(&mut self, node: NodeId) -> usize {
         self.find(node.0 as usize)
+    }
+
+    fn node_may_carry_pointer(&self, node: NodeId) -> bool {
+        self.pag.nodes[node.0 as usize]
+            .value_kind
+            .may_carry_pointer()
+    }
+
+    fn pointer_transfer(&self, src: NodeId, dst: NodeId) -> bool {
+        self.node_may_carry_pointer(src) && self.node_may_carry_pointer(dst)
     }
 
     fn pointee_of(&mut self, class: usize) -> usize {
@@ -2164,7 +2204,7 @@ mod tests {
     use std::path::Path;
 
     use pangs_pag::{CallKind, Callsite, CallsiteId, Node, NodeId, NodeKind, Pag, PagOpts, Scope};
-    use pangs_pir::{AbiClass, Func, Global};
+    use pangs_pir::{AbiClass, Func, Global, Stmt, ValueKind};
 
     use super::*;
 
@@ -2172,6 +2212,97 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/synthetic/m1_4")
             .join(name)
+    }
+
+    #[test]
+    fn proven_scalar_memory_payload_does_not_join_pointer_fields() {
+        let mut lowering = pangs_pir::LoweringStats::default();
+        lowering.semantic_value_kinds.extend([
+            ("%f::scalar.addr".into(), ValueKind::Pointer),
+            ("%f::pointer.addr".into(), ValueKind::Pointer),
+            ("%f::scalar".into(), ValueKind::NonPointer),
+            ("%f::pointer".into(), ValueKind::Pointer),
+            ("7".into(), ValueKind::NonPointer),
+        ]);
+        let pir = Pir {
+            module: "semantic-payload".into(),
+            source: None,
+            lowering,
+            target: None,
+            functions: vec![Func {
+                key: "f".into(),
+                sig: void_sig(),
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![
+                    Stmt::Gep {
+                        dest: "%f::scalar.addr".into(),
+                        base: "@aggregate".into(),
+                        byte_off: Some(0),
+                        loc: None,
+                    },
+                    Stmt::Store {
+                        address: "%f::scalar.addr".into(),
+                        value: "7".into(),
+                        loc: None,
+                    },
+                    Stmt::Gep {
+                        dest: "%f::pointer.addr".into(),
+                        base: "@aggregate".into(),
+                        byte_off: Some(8),
+                        loc: None,
+                    },
+                    Stmt::Store {
+                        address: "%f::pointer.addr".into(),
+                        value: "@target".into(),
+                        loc: None,
+                    },
+                    Stmt::Load {
+                        dest: "%f::scalar".into(),
+                        address: "%f::scalar.addr".into(),
+                        loc: None,
+                    },
+                    Stmt::Load {
+                        dest: "%f::pointer".into(),
+                        address: "%f::pointer.addr".into(),
+                        loc: None,
+                    },
+                ],
+            }],
+            globals: vec![
+                Global {
+                    key: "aggregate".into(),
+                    ..Global::default()
+                },
+                Global {
+                    key: "target".into(),
+                    ..Global::default()
+                },
+            ],
+            global_init: Vec::new(),
+        };
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        assert!(pag.edges.iter().any(|edge| {
+            edge.kind == pangs_pag::EdgeKind::Store
+                && pag.nodes[edge.src.0 as usize].label.ends_with(":7")
+        }));
+
+        for solved in [
+            solve_steensgaard(&pir, &pag, BuildMode::Executable),
+            solve_andersen(&pir, &pag, BuildMode::Executable, u64::MAX),
+        ] {
+            let scalar = solved.nodes.get("val:f:%f::scalar");
+            assert!(
+                scalar.is_none_or(|node| node.pointee_globals.is_empty()),
+                "proven scalar load acquired a pointer target"
+            );
+            let pointer = solved.nodes.get("val:f:%f::pointer").unwrap();
+            assert!(pointer.pointee_globals.iter().any(|key| key == "target"));
+        }
     }
 
     #[test]
@@ -2277,6 +2408,7 @@ mod tests {
                     key: "closed".into(),
                     owner: None,
                 },
+                value_kind: Default::default(),
             },
             Node {
                 id: NodeId(1),
@@ -2286,6 +2418,7 @@ mod tests {
                     key: "exposed".into(),
                     owner: None,
                 },
+                value_kind: Default::default(),
             },
             Node {
                 id: NodeId(2),
@@ -2293,6 +2426,7 @@ mod tests {
                 kind: NodeKind::Value {
                     scope: Scope::Module,
                 },
+                value_kind: Default::default(),
             },
             Node {
                 id: NodeId(3),
@@ -2300,6 +2434,7 @@ mod tests {
                 kind: NodeKind::Value {
                     scope: Scope::Module,
                 },
+                value_kind: Default::default(),
             },
             Node {
                 id: NodeId(4),
@@ -2307,6 +2442,7 @@ mod tests {
                 kind: NodeKind::Value {
                     scope: Scope::Module,
                 },
+                value_kind: Default::default(),
             },
             Node {
                 id: NodeId(5),
@@ -2314,6 +2450,7 @@ mod tests {
                 kind: NodeKind::Value {
                     scope: Scope::Module,
                 },
+                value_kind: Default::default(),
             },
         ];
         let edges = vec![
@@ -2429,6 +2566,7 @@ mod tests {
                     kind: NodeKind::Value {
                         scope: Scope::Module,
                     },
+                    value_kind: Default::default(),
                 },
                 Node {
                     id: NodeId(1),
@@ -2436,6 +2574,7 @@ mod tests {
                     kind: NodeKind::Value {
                         scope: Scope::Module,
                     },
+                    value_kind: Default::default(),
                 },
             ],
             edges: Vec::new(),
@@ -2490,6 +2629,7 @@ mod tests {
                     kind: NodeKind::Value {
                         scope: Scope::Module,
                     },
+                    value_kind: Default::default(),
                 },
                 Node {
                     id: NodeId(1),
@@ -2497,6 +2637,7 @@ mod tests {
                     kind: NodeKind::Value {
                         scope: Scope::Module,
                     },
+                    value_kind: Default::default(),
                 },
             ],
             edges: Vec::new(),

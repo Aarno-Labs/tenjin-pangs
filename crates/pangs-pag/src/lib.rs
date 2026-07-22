@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use pangs_pir::{external_return_alias_arg, Loc, Pir, Signature, Stmt, VarArgPosition};
+use pangs_pir::{external_return_alias_arg, Loc, Pir, Signature, Stmt, ValueKind, VarArgPosition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -466,6 +466,10 @@ pub struct Node {
     pub id: NodeId,
     pub label: String,
     pub kind: NodeKind,
+    /// Semantic pointer-payload kind, independent of ABI register class.  Older PAG fixtures
+    /// deserialize as `Unknown` and therefore retain the conservative behavior.
+    #[serde(default)]
+    pub value_kind: ValueKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -677,6 +681,7 @@ enum NodeKey {
     GlobalObject(usize),
     FunctionObject(usize),
     AllocaObject(usize, usize),
+    ByvalObject(usize, usize, usize),
     HeapObject(usize, usize),
     ExternalReadonlyObject(String),
     Param(usize, usize),
@@ -1120,14 +1125,51 @@ impl<'a> Builder<'a> {
                                 .copied()
                                 .zip(0..callee_func.sig.params.len())
                             {
-                                if let Some(param) = self
+                                let Some(param) = self
                                     .node_ids
                                     .get(&NodeKey::Param(callee_index, param_index))
+                                    .copied()
+                                else {
+                                    continue;
+                                };
+                                if let Some(pangs_pir::Param::Byval { size }) =
+                                    callee_func.sig.params.get(param_index)
                                 {
+                                    // A `byval` parameter points at a fresh callee copy rather
+                                    // than aliasing the caller's aggregate address. Copy memory
+                                    // payload into an explicit object so pointer-bearing fields
+                                    // still flow without equating the two addresses.
+                                    let object = self.add_node(
+                                        NodeKey::ByvalObject(func_index, stmt_index, param_index),
+                                        format!(
+                                            "obj:byval:{}:{stmt_index}:{param_index}",
+                                            owner_name(&owner)
+                                        ),
+                                        NodeKind::Object {
+                                            object: ObjectKind::Alloca,
+                                            key: format!("byval@{stmt_index}:{param_index}"),
+                                            owner: Some(owner_name(&owner).to_string()),
+                                        },
+                                    );
+                                    self.add_edge(
+                                        EdgeKind::AddrOf,
+                                        object,
+                                        param,
+                                        owner.clone(),
+                                        loc.clone(),
+                                    );
+                                    self.add_edge(
+                                        EdgeKind::Memcpy { bytes: Some(*size) },
+                                        arg,
+                                        param,
+                                        owner.clone(),
+                                        loc.clone(),
+                                    );
+                                } else {
                                     self.add_edge(
                                         EdgeKind::Assign,
                                         arg,
-                                        *param,
+                                        param,
                                         owner.clone(),
                                         loc.clone(),
                                     );
@@ -1244,9 +1286,44 @@ impl<'a> Builder<'a> {
             return *id;
         }
         let id = NodeId(self.nodes.len() as u32);
-        self.nodes.push(Node { id, label, kind });
+        let value_kind = self.value_kind(&key, &kind);
+        self.nodes.push(Node {
+            id,
+            label,
+            kind,
+            value_kind,
+        });
         self.node_ids.insert(key, id);
         id
+    }
+
+    fn value_kind(&self, key: &NodeKey, _kind: &NodeKind) -> ValueKind {
+        match key {
+            NodeKey::SymbolValue(..) => ValueKind::Pointer,
+            NodeKey::FunctionValue(_, value) | NodeKey::GlobalInitValue(value) => self
+                .pir
+                .lowering
+                .semantic_value_kinds
+                .get(value)
+                .copied()
+                .unwrap_or(ValueKind::Unknown),
+            NodeKey::ExternalNonPointerWrite(..) => ValueKind::NonPointer,
+            NodeKey::Param(func_index, param_index) => self
+                .pir
+                .functions
+                .get(*func_index)
+                .and_then(|func| func.param_names.get(*param_index))
+                .and_then(|name| self.pir.lowering.semantic_value_kinds.get(name))
+                .copied()
+                .unwrap_or(ValueKind::Unknown),
+            NodeKey::Return(_) | NodeKey::GlobalObject(_) | NodeKey::FunctionObject(_) => {
+                ValueKind::Unknown
+            }
+            NodeKey::AllocaObject(..)
+            | NodeKey::ByvalObject(..)
+            | NodeKey::HeapObject(..)
+            | NodeKey::ExternalReadonlyObject(_) => ValueKind::Unknown,
+        }
     }
 
     fn direct_vararg_call_requires_boundary(&self, callee: &str, args: &[String]) -> bool {
