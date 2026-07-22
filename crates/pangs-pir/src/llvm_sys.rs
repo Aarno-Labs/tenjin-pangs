@@ -3869,6 +3869,7 @@ unsafe fn is_indirect_call(inst: LLVMValueRef) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn emit_trace(
     builder: LLVMBuilderRef,
     hook: LLVMValueRef,
