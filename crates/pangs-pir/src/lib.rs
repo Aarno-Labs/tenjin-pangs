@@ -7,6 +7,17 @@ use thiserror::Error;
 
 mod llvm_sys;
 
+/// Exact-name external functions whose nullable pointer result is derived from one pointer
+/// argument. These shared semantic facts are consumed by PAG boundary modeling and structural
+/// pointer-provenance validation in the LLVM front end.
+pub fn external_return_alias_arg(callee: &str) -> Option<usize> {
+    matches!(
+        callee.strip_prefix('@').unwrap_or(callee),
+        "strchr" | "strrchr" | "strstr" | "strpbrk" | "memchr"
+    )
+    .then_some(0)
+}
+
 /// Instrument every indirect call in an LLVM `.bc`/`.ll` module with a runtime trace hook
 /// and write the result to `output` (M1.8 dynamic icall validation). Returns the number of
 /// instrumented sites.
@@ -274,9 +285,9 @@ pub enum Stmt {
     PtrToInt {
         dest: String,
         source: String,
-        /// True only when LLVM def-use inspection proved that the integer result is confined to
-        /// comparisons through the supported arithmetic/select/phi closure, or is one operand
-        /// of a closed, non-reifying pointer-difference idiom.
+        /// Legacy serialized spelling for a conversion whose integer use was proved innocuous:
+        /// either a closed comparison computation or one operand of a relocation-invariant
+        /// pointer difference with a common structural provenance root.
         #[serde(default, skip_serializing_if = "is_false")]
         comparison_only: bool,
         #[serde(default)]

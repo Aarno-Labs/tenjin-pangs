@@ -143,6 +143,16 @@ demand queries: golden-file the whole solution on small inputs, diff across chan
 detection → Ω-taint, FSA envelope, KELP safe-fallback discipline, byte-offset field
 sensitivity. Soundness is the hard constraint and is untouched.
 
+`ptrtoint` validation is use-sensitive and fails closed. A raw integer address is exempt from the
+Ω seed only when its complete SSA use graph terminates in supported comparisons, or when it is one
+operand of a paired subtraction whose source pointers have exactly one common structural
+provenance root. The latter produces a relocation-invariant relative offset: translating the
+common allocation changes both operands equally and leaves their modular difference unchanged, so
+the offset may subsequently be stored, returned, or passed through integer wrappers. Distinct or
+unknown roots, mixed raw-address uses, arbitrary memory-loaded pointer provenance, and unmatched
+conversions retain the normal violation and Ω treatment. This proof is isolated in the PIR LLVM
+front end's pointer-integer-use module rather than distributed through individual clients.
+
 External calls remain Ω boundaries by default.  A small exact-name summary may replace
 that boundary only when it encodes a documented, auditable pointer transfer; unlisted
 or shape-mismatched calls remain Ω.

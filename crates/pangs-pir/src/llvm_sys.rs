@@ -23,6 +23,8 @@ use crate::{
     Signature, StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo, VarArgPosition,
 };
 
+mod ptrint;
+
 type AliasMap = BTreeMap<String, AliasTarget>;
 
 const MAX_CONSTANT_EXPR_LOWER_DEPTH: usize = 4096;
@@ -1153,262 +1155,6 @@ unsafe fn instruction_block_is_cyclic(instruction: LLVMValueRef) -> bool {
     false
 }
 
-/// Proves that a `ptrtoint` result remains inside the small integer domain whose only terminal
-/// operation is `icmp`. Unknown users fail closed. Cyclic phi graphs are accepted only when every
-/// edge leaving the cycle eventually reaches a supported comparison/arithmetic node.
-unsafe fn ptrtoint_has_closed_comparison_uses(value: LLVMValueRef) -> bool {
-    unsafe fn visit(
-        value: LLVMValueRef,
-        visiting: &mut BTreeSet<usize>,
-        memo: &mut BTreeMap<usize, bool>,
-    ) -> bool {
-        let key = value as usize;
-        if let Some(&closed) = memo.get(&key) {
-            return closed;
-        }
-        if !visiting.insert(key) {
-            return true;
-        }
-
-        let mut current_use = LLVMGetFirstUse(value);
-        let mut closed = true;
-        while !current_use.is_null() {
-            let user = LLVMGetUser(current_use);
-            if user.is_null() || LLVMIsAInstruction(user).is_null() {
-                closed = false;
-                break;
-            }
-            closed = match LLVMGetInstructionOpcode(user) {
-                LLVMOpcode::LLVMICmp => true,
-                LLVMOpcode::LLVMAdd
-                | LLVMOpcode::LLVMSub
-                | LLVMOpcode::LLVMAnd
-                | LLVMOpcode::LLVMOr
-                | LLVMOpcode::LLVMXor
-                | LLVMOpcode::LLVMPHI
-                | LLVMOpcode::LLVMSelect => visit(user, visiting, memo),
-                _ => false,
-            };
-            if !closed {
-                break;
-            }
-            current_use = LLVMGetNextUse(current_use);
-        }
-
-        visiting.remove(&key);
-        memo.insert(key, closed);
-        closed
-    }
-
-    visit(value, &mut BTreeSet::new(), &mut BTreeMap::new())
-}
-
-/// Proves the Clang-style lowering of a pointer difference:
-///
-/// ```text
-/// lhs.i = ptrtoint lhs
-/// rhs.i = ptrtoint rhs
-/// delta = sub lhs.i, rhs.i
-/// ```
-///
-/// Both converted values must be used only by the same kind of paired subtraction.  The delta
-/// may remain in local integer computation, including scalar alloca spills, comparisons, memory
-/// intrinsic lengths, and GEP indices.  Anything that can reify or externally expose the integer
-/// representation fails closed.
-unsafe fn ptrtoint_has_closed_pointer_difference_uses(value: LLVMValueRef) -> bool {
-    unsafe fn benign_intrinsic_use(user: LLVMValueRef, value: LLVMValueRef) -> bool {
-        let Some(callee) = direct_symbol_name(LLVMGetCalledValue(user)) else {
-            return false;
-        };
-        if callee.starts_with("llvm.dbg.") || callee.starts_with("llvm.lifetime.") {
-            return true;
-        }
-        (callee.starts_with("llvm.memcpy.")
-            || callee.starts_with("llvm.memmove.")
-            || callee.starts_with("llvm.memset."))
-            && LLVMGetNumArgOperands(user) >= 3
-            && LLVMGetOperand(user, 2) == value
-    }
-
-    unsafe fn visit_local_slot(
-        slot: LLVMValueRef,
-        visiting: &mut BTreeSet<usize>,
-        memo: &mut BTreeMap<usize, bool>,
-    ) -> bool {
-        let slot = strip_pointer_casts(slot);
-        if LLVMIsAAllocaInst(slot).is_null()
-            || LLVMGetTypeKind(LLVMGetAllocatedType(slot)) != LLVMTypeKind::LLVMIntegerTypeKind
-        {
-            return false;
-        }
-        let key = slot as usize;
-        if let Some(&closed) = memo.get(&key) {
-            return closed;
-        }
-        if !visiting.insert(key) {
-            return true;
-        }
-
-        let mut usage = LLVMGetFirstUse(slot);
-        let mut closed = true;
-        while !usage.is_null() {
-            let user = LLVMGetUser(usage);
-            if user.is_null() || LLVMIsAInstruction(user).is_null() {
-                closed = false;
-                break;
-            }
-            closed = match LLVMGetInstructionOpcode(user) {
-                LLVMOpcode::LLVMLoad if LLVMGetOperand(user, 0) == slot => {
-                    visit_integer_flow(user, visiting, memo)
-                }
-                LLVMOpcode::LLVMStore if LLVMGetOperand(user, 1) == slot => true,
-                LLVMOpcode::LLVMCall => benign_intrinsic_use(user, slot),
-                _ => false,
-            };
-            if !closed {
-                break;
-            }
-            usage = LLVMGetNextUse(usage);
-        }
-
-        visiting.remove(&key);
-        memo.insert(key, closed);
-        closed
-    }
-
-    unsafe fn visit_integer_flow(
-        value: LLVMValueRef,
-        visiting: &mut BTreeSet<usize>,
-        memo: &mut BTreeMap<usize, bool>,
-    ) -> bool {
-        let key = value as usize;
-        if let Some(&closed) = memo.get(&key) {
-            return closed;
-        }
-        if !visiting.insert(key) {
-            return true;
-        }
-
-        let mut usage = LLVMGetFirstUse(value);
-        let mut closed = true;
-        while !usage.is_null() {
-            let user = LLVMGetUser(usage);
-            if user.is_null() || LLVMIsAInstruction(user).is_null() {
-                closed = false;
-                break;
-            }
-            closed = match LLVMGetInstructionOpcode(user) {
-                LLVMOpcode::LLVMAdd
-                | LLVMOpcode::LLVMSub
-                | LLVMOpcode::LLVMAnd
-                | LLVMOpcode::LLVMOr
-                | LLVMOpcode::LLVMXor
-                | LLVMOpcode::LLVMTrunc
-                | LLVMOpcode::LLVMZExt
-                | LLVMOpcode::LLVMSExt
-                | LLVMOpcode::LLVMPHI
-                | LLVMOpcode::LLVMSelect => visit_integer_flow(user, visiting, memo),
-                LLVMOpcode::LLVMICmp => true,
-                LLVMOpcode::LLVMGetElementPtr if LLVMGetOperand(user, 0) != value => {
-                    visit_derived_address(user, visiting, memo)
-                }
-                LLVMOpcode::LLVMStore if LLVMGetOperand(user, 0) == value => {
-                    visit_local_slot(LLVMGetOperand(user, 1), visiting, memo)
-                }
-                LLVMOpcode::LLVMCall => benign_intrinsic_use(user, value),
-                _ => false,
-            };
-            if !closed {
-                break;
-            }
-            usage = LLVMGetNextUse(usage);
-        }
-
-        visiting.remove(&key);
-        memo.insert(key, closed);
-        closed
-    }
-
-    unsafe fn visit_derived_address(
-        value: LLVMValueRef,
-        visiting: &mut BTreeSet<usize>,
-        memo: &mut BTreeMap<usize, bool>,
-    ) -> bool {
-        let key = value as usize;
-        if let Some(&closed) = memo.get(&key) {
-            return closed;
-        }
-        if !visiting.insert(key) {
-            return true;
-        }
-
-        let mut usage = LLVMGetFirstUse(value);
-        let mut closed = true;
-        while !usage.is_null() {
-            let user = LLVMGetUser(usage);
-            if user.is_null() || LLVMIsAInstruction(user).is_null() {
-                closed = false;
-                break;
-            }
-            closed = match LLVMGetInstructionOpcode(user) {
-                LLVMOpcode::LLVMLoad if LLVMGetOperand(user, 0) == value => true,
-                LLVMOpcode::LLVMStore if LLVMGetOperand(user, 1) == value => true,
-                LLVMOpcode::LLVMGetElementPtr
-                | LLVMOpcode::LLVMBitCast
-                | LLVMOpcode::LLVMAddrSpaceCast => visit_derived_address(user, visiting, memo),
-                LLVMOpcode::LLVMICmp => true,
-                _ => false,
-            };
-            if !closed {
-                break;
-            }
-            usage = LLVMGetNextUse(usage);
-        }
-
-        visiting.remove(&key);
-        memo.insert(key, closed);
-        closed
-    }
-
-    let mut usage = LLVMGetFirstUse(value);
-    let mut saw_difference = false;
-    while !usage.is_null() {
-        let difference = LLVMGetUser(usage);
-        if difference.is_null()
-            || LLVMIsAInstruction(difference).is_null()
-            || LLVMGetInstructionOpcode(difference) != LLVMOpcode::LLVMSub
-        {
-            return false;
-        }
-        let lhs = LLVMGetOperand(difference, 0);
-        let rhs = LLVMGetOperand(difference, 1);
-        if (lhs != value && rhs != value)
-            || LLVMIsAInstruction(lhs).is_null()
-            || LLVMIsAInstruction(rhs).is_null()
-            || LLVMGetInstructionOpcode(lhs) != LLVMOpcode::LLVMPtrToInt
-            || LLVMGetInstructionOpcode(rhs) != LLVMOpcode::LLVMPtrToInt
-            || LLVMTypeOf(lhs) != LLVMTypeOf(rhs)
-        {
-            return false;
-        }
-        for converted in [lhs, rhs] {
-            let converted_use = LLVMGetFirstUse(converted);
-            if converted_use.is_null()
-                || LLVMGetUser(converted_use) != difference
-                || !LLVMGetNextUse(converted_use).is_null()
-            {
-                return false;
-            }
-        }
-        if !visit_integer_flow(difference, &mut BTreeSet::new(), &mut BTreeMap::new()) {
-            return false;
-        }
-        saw_difference = true;
-        usage = LLVMGetNextUse(usage);
-    }
-    saw_difference
-}
-
 unsafe fn lower_instruction(
     ctx: &ModuleCtx,
     fctx: &mut FunctionCtx,
@@ -1550,8 +1296,10 @@ unsafe fn lower_instruction(
             body.push(Stmt::PtrToInt {
                 dest: fctx.local_key(inst),
                 source: fctx.operand_key(source),
-                comparison_only: ptrtoint_has_closed_comparison_uses(inst)
-                    || ptrtoint_has_closed_pointer_difference_uses(inst),
+                // `comparison_only` is the legacy serialized spelling for a conversion whose
+                // integer use has been proved non-address-observing. The structured classifier
+                // lives in its own module; retaining the field avoids a PIR schema break.
+                comparison_only: ptrint::classify(inst).is_innocuous(),
                 loc: loc(inst),
             });
             lowering.bump_modeled("ptrtoint");
@@ -2281,7 +2029,7 @@ unsafe fn constant_pointer_cast_global(mut value: LLVMValueRef) -> Option<LLVMVa
     (!LLVMIsAGlobalVariable(value).is_null()).then_some(value)
 }
 
-unsafe fn strip_pointer_casts(mut value: LLVMValueRef) -> LLVMValueRef {
+pub(super) unsafe fn strip_pointer_casts(mut value: LLVMValueRef) -> LLVMValueRef {
     loop {
         let opcode = if !LLVMIsAConstantExpr(value).is_null() {
             Some(LLVMGetConstOpcode(value))
@@ -3280,7 +3028,7 @@ unsafe fn call_result_key(fctx: &mut FunctionCtx, inst: LLVMValueRef) -> Option<
     }
 }
 
-unsafe fn direct_symbol_name(value: LLVMValueRef) -> Option<String> {
+pub(super) unsafe fn direct_symbol_name(value: LLVMValueRef) -> Option<String> {
     let mut value = value;
     let mut visited = BTreeSet::new();
     loop {

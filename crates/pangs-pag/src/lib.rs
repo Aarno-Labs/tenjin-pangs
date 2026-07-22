@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use pangs_pir::{Loc, Pir, Signature, Stmt, VarArgPosition};
+use pangs_pir::{external_return_alias_arg, Loc, Pir, Signature, Stmt, VarArgPosition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -1461,17 +1461,6 @@ fn is_fresh_allocator(callee: &str) -> bool {
         callee.strip_prefix('@').unwrap_or(callee),
         "malloc" | "calloc" | "aligned_alloc"
     )
-}
-
-/// Exact-name external functions whose nullable pointer result is derived from argument 0.
-/// These are pure searches: unlike a generic external call, they neither write through their
-/// pointer arguments nor manufacture an unrelated pointer result.
-fn external_return_alias_arg(callee: &str) -> Option<usize> {
-    matches!(
-        callee.strip_prefix('@').unwrap_or(callee),
-        "strchr" | "strrchr" | "strstr" | "strpbrk" | "memchr"
-    )
-    .then_some(0)
 }
 
 /// Exact-name external functions whose pointer result leads only to stable external readonly
