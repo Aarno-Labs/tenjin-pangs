@@ -351,6 +351,7 @@ struct Refiner<'a> {
 }
 
 impl<'a> Refiner<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         pir: &'a Pir,
         pag: &'a Pag,

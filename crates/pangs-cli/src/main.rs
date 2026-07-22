@@ -166,6 +166,7 @@ enum QueryCommand {
     },
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum QueryModeArg {
     FieldInsensitive,

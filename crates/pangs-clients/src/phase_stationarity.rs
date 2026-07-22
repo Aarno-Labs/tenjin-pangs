@@ -533,6 +533,7 @@ fn evaluate_with_descent_cached(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(crate) fn splice_unique_call(
     parent_function: FuncId,
@@ -1108,6 +1109,7 @@ fn affected_globals(analysis: &Analysis, row: &pangs_api::ModRef) -> Vec<GlobalI
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn certificate_slots(
     analysis: &Analysis,
     module: &Pir,
