@@ -352,8 +352,9 @@ pub struct ContextFieldPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextRewriteBlocker {
     pub kind: String,
-    pub function: FuncId,
+    pub function: Option<FuncId>,
     pub callsite: Option<CallsiteId>,
+    pub initializer: Option<String>,
 }
 
 /// The source-rewrite slice for the single context object constructed by an executable's `main`.
@@ -1704,6 +1705,7 @@ impl Analysis {
             &callsites,
             &call_edges,
             &modrefs,
+            &aggregate_initializer_address_users(module),
             opts.build_mode,
         );
         let mutable_globals_total = globals
@@ -5483,6 +5485,7 @@ fn compute_context_rewrite_plan(
     _callsites: &[CallsiteInfo],
     edges: &[CallEdge],
     modrefs: &[ModRef],
+    initializer_address_users: &BTreeMap<String, BTreeSet<String>>,
     build_mode: BuildMode,
 ) -> ContextRewritePlan {
     let mut accessors = vec![BTreeSet::<FuncId>::new(); globals.len()];
@@ -5556,8 +5559,9 @@ fn compute_context_rewrite_plan(
             if unknown_callers[function.0 as usize] && !executable_entry {
                 blockers.push(ContextRewriteBlocker {
                     kind: "unknown-caller-taint".into(),
-                    function: *function,
+                    function: Some(*function),
                     callsite: None,
+                    initializer: None,
                 });
             }
         }
@@ -5571,13 +5575,38 @@ fn compute_context_rewrite_plan(
             {
                 blockers.push(ContextRewriteBlocker {
                     kind: "unknown-callee-taint".into(),
-                    function: _callsites[site.0 as usize].caller,
+                    function: Some(_callsites[site.0 as usize].caller),
                     callsite: Some(*site),
+                    initializer: None,
                 });
             }
         }
-        blockers.sort_by_key(|b| (b.kind.clone(), b.function, b.callsite));
-        blockers.dedup_by_key(|b| (b.kind.clone(), b.function, b.callsite));
+        if let Some(initializers) = initializer_address_users.get(&globals[index].key) {
+            blockers.extend(initializers.iter().cloned().map(|initializer| {
+                ContextRewriteBlocker {
+                    kind: "aggregate-initializer-address-dependency".into(),
+                    function: None,
+                    callsite: None,
+                    initializer: Some(initializer),
+                }
+            }));
+        }
+        blockers.sort_by_key(|b| {
+            (
+                b.kind.clone(),
+                b.function,
+                b.callsite,
+                b.initializer.clone(),
+            )
+        });
+        blockers.dedup_by_key(|b| {
+            (
+                b.kind.clone(),
+                b.function,
+                b.callsite,
+                b.initializer.clone(),
+            )
+        });
         plan_functions.extend(functions.iter().copied());
         plan_callsites.extend(rewrite_callsites.iter().copied());
         fields.push(ContextFieldPlan {
@@ -5594,6 +5623,79 @@ fn compute_context_rewrite_plan(
         rewrite_callsites: plan_callsites.into_iter().collect(),
         fields,
     }
+}
+
+fn aggregate_initializer_address_users(module: &Pir) -> BTreeMap<String, BTreeSet<String>> {
+    let mut users = BTreeMap::<String, BTreeSet<String>>::new();
+    for initializer in &module.globals {
+        for referenced in &initializer.init_refs {
+            users
+                .entry(referenced.clone())
+                .or_default()
+                .insert(initializer.key.clone());
+        }
+    }
+
+    // `init_refs` intentionally mirrors the legacy cc2json relation and therefore does not
+    // recurse through constant expressions. The lowered global-init body does: recover bases of
+    // GEP/cast/select chains here so an interior address retained by an initializer also blocks
+    // localization. A leading GlobalRef(Mod) identifies the initializer that owns the following
+    // statements; this is the ordering contract of `lower_global_initializers`.
+    let mut operand_globals = BTreeMap::<String, String>::new();
+    for global in &module.globals {
+        operand_globals.insert(global.key.clone(), global.key.clone());
+        operand_globals.insert(
+            format!("@{}", global.key.strip_prefix('@').unwrap_or(&global.key)),
+            global.key.clone(),
+        );
+    }
+    let mut owner = None::<String>;
+    for stmt in &module.global_init {
+        if let Stmt::GlobalRef {
+            global,
+            access: Access::Mod,
+            ..
+        } = stmt
+        {
+            owner = operand_globals
+                .get(global)
+                .cloned()
+                .or_else(|| Some(global.clone()));
+            continue;
+        }
+        let Some(initializer) = owner.as_ref() else {
+            continue;
+        };
+        let mut record = |operand: &str| {
+            if let Some(referenced) = operand_globals.get(operand) {
+                if referenced != initializer {
+                    users
+                        .entry(referenced.clone())
+                        .or_default()
+                        .insert(initializer.clone());
+                }
+            }
+        };
+        match stmt {
+            Stmt::Assign { sources, .. } => sources.iter().for_each(|source| record(source)),
+            Stmt::Store { address, value, .. } => {
+                record(address);
+                record(value);
+            }
+            Stmt::Gep { base, .. } => record(base),
+            Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => record(source),
+            Stmt::Unknown { operands, .. } => {
+                operands.iter().for_each(|operand| record(operand));
+            }
+            Stmt::GlobalRef {
+                global,
+                access: Access::Ref,
+                ..
+            } => record(global),
+            _ => {}
+        }
+    }
+    users
 }
 
 fn compute_components(
@@ -6608,6 +6710,7 @@ mod component_tests {
             &callsites,
             &[main_to_uses, main_to_printf],
             &modrefs,
+            &BTreeMap::new(),
             BuildMode::Executable,
         );
 
@@ -6652,11 +6755,97 @@ mod component_tests {
             &callsites,
             &[main_to_uses, unknown_incoming],
             &modrefs,
+            &BTreeMap::new(),
             BuildMode::Executable,
         );
 
         assert_eq!(plan.fields[0].blockers.len(), 1);
         assert_eq!(plan.fields[0].blockers[0].kind, "unknown-caller-taint");
-        assert_eq!(plan.fields[0].blockers[0].function, FuncId(1));
+        assert_eq!(plan.fields[0].blockers[0].function, Some(FuncId(1)));
+    }
+
+    #[test]
+    fn context_rewrite_blocks_an_address_captured_by_a_static_initializer() {
+        let funcs = vec![func("main", false)];
+        let modrefs = vec![ModRef {
+            func: FuncId(0),
+            global: GlobalTarget::Name(GlobalId(0)),
+            access: Access::Ref,
+            via: Via::Direct,
+            witness: None,
+            detail: None,
+            address_node: None,
+            pointee_globals: Vec::new(),
+            global_candidates: GlobalCandidateSet::Finite(Rc::from([GlobalId(0)])),
+        }];
+        let initializer_users = BTreeMap::from([(
+            "g".to_string(),
+            BTreeSet::from(["address_table".to_string()]),
+        )]);
+
+        let plan = compute_context_rewrite_plan(
+            &funcs,
+            &[global("g")],
+            &[],
+            &[],
+            &modrefs,
+            &initializer_users,
+            BuildMode::Executable,
+        );
+
+        assert_eq!(plan.fields[0].blockers.len(), 1);
+        let blocker = &plan.fields[0].blockers[0];
+        assert_eq!(blocker.kind, "aggregate-initializer-address-dependency");
+        assert_eq!(blocker.function, None);
+        assert_eq!(blocker.callsite, None);
+        assert_eq!(blocker.initializer.as_deref(), Some("address_table"));
+    }
+
+    #[test]
+    fn initializer_address_users_include_constant_gep_bases() {
+        let module = Pir {
+            module: "initializer-gep".into(),
+            source: None,
+            lowering: LoweringStats::default(),
+            target: None,
+            functions: Vec::new(),
+            globals: vec![
+                pangs_pir::Global {
+                    key: "array".into(),
+                    ..pangs_pir::Global::default()
+                },
+                pangs_pir::Global {
+                    key: "interior_pointer".into(),
+                    ..pangs_pir::Global::default()
+                },
+            ],
+            global_init: vec![
+                Stmt::GlobalRef {
+                    global: "interior_pointer".into(),
+                    access: Access::Mod,
+                    volatile: false,
+                    loc: None,
+                },
+                Stmt::Gep {
+                    dest: "@__global_init::0".into(),
+                    base: "@array".into(),
+                    byte_off: Some(1),
+                    loc: None,
+                },
+                Stmt::Store {
+                    address: "@interior_pointer".into(),
+                    value: "@__global_init::0".into(),
+                    loc: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            aggregate_initializer_address_users(&module),
+            BTreeMap::from([(
+                "array".to_string(),
+                BTreeSet::from(["interior_pointer".to_string()]),
+            )])
+        );
     }
 }

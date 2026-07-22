@@ -2474,6 +2474,36 @@ fn function_witness(
     }
 }
 
+fn initializer_address_witness(
+    analysis: &Analysis,
+    localized_global: GlobalId,
+    initializer: &str,
+    kind: &str,
+) -> Witness {
+    let owner = analysis
+        .globals()
+        .iter()
+        .find(|global| global.key == initializer);
+    let target = &analysis.globals()[localized_global].key;
+    Witness {
+        kind: kind.into(),
+        site: owner.and_then(|info| {
+            info.file.as_ref().zip(info.line).map(|(file, line)| Site {
+                file: file.clone(),
+                line,
+                col: None,
+                function: None,
+                extra: Extra::new(),
+            })
+        }),
+        symbol: Some(initializer.to_string()),
+        note: Some(format!(
+            "static initializer for {initializer} retains the address of {target}"
+        )),
+        extra: Extra::new(),
+    }
+}
+
 fn access_set_failure(
     analysis: &Analysis,
     llvm_name: &str,
@@ -2514,14 +2544,20 @@ fn localization_index(analysis: &Analysis) -> Vec<Option<Localization>> {
             .iter()
             .map(|blocker| LocalizationBlocker {
                 code: blocker.kind.clone(),
-                witness: function_witness(
-                    analysis,
-                    blocker.function,
-                    &blocker.kind,
-                    blocker
-                        .callsite
-                        .map(|site| analysis.callsites()[site].key.clone()),
-                ),
+                witness: if let Some(initializer) = &blocker.initializer {
+                    initializer_address_witness(analysis, field.global, initializer, &blocker.kind)
+                } else {
+                    function_witness(
+                        analysis,
+                        blocker
+                            .function
+                            .expect("function rewrite blocker must name a function"),
+                        &blocker.kind,
+                        blocker
+                            .callsite
+                            .map(|site| analysis.callsites()[site].key.clone()),
+                    )
+                },
                 extra: Extra::new(),
             })
             .collect::<Vec<_>>();
@@ -3314,9 +3350,12 @@ struct ContextFieldExport {
 #[derive(Serialize)]
 struct ContextRewriteBlockerExport {
     kind: String,
-    function: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     callsite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initializer: Option<String>,
 }
 
 impl ContextRewriteExport {
@@ -3351,8 +3390,9 @@ impl ContextRewriteExport {
                         .iter()
                         .map(|blocker| ContextRewriteBlockerExport {
                             kind: blocker.kind.clone(),
-                            function: function_name(blocker.function),
+                            function: blocker.function.map(function_name),
                             callsite: blocker.callsite.map(callsite_key),
+                            initializer: blocker.initializer.clone(),
                         })
                         .collect(),
                 })
@@ -3463,16 +3503,18 @@ mod tests {
 
     use std::time::Instant;
 
-    use pangs_api::{Analysis, GlobalId, Opts};
-    use pangs_manifest::{Certificate, Extra, Key, Site};
+    use jsonschema::JSONSchema;
+    use pangs_api::{Analysis, BuildMode, GlobalId, Opts};
+    use pangs_manifest::{Certificate, Extra, Key, LocalizationVerdict, Site};
     use pangs_pir::Pir;
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
         assemble_disposition_artifacts, check_traces, classify_violation_relevance,
-        coupling_group_id, export_analysis, once_lock_pair_evidence, report, validate_export_dir,
-        violation_relevance_witness, CertifiedGroupEvidence, DispositionFactRows,
+        coupling_group_id, export_analysis, load_schema_for_artifact, localization_index,
+        once_lock_pair_evidence, report, validate_export_dir, validate_value_against_schema,
+        violation_relevance_witness, CertifiedGroupEvidence, ComponentsRecord, DispositionFactRows,
         ViolationRelevance,
     };
 
@@ -3680,6 +3722,57 @@ mod tests {
             certificate["source_materialization"]["code"],
             "declaration-source-unmapped"
         );
+    }
+
+    #[test]
+    fn localization_reports_static_initializer_address_dependency() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        pir.globals.push(pangs_pir::Global {
+            key: "address_table".into(),
+            file: Some("fixtures/synthetic/trivial/trivial.c".into()),
+            line: Some(2),
+            is_const: true,
+            mutable: false,
+            init_refs: vec!["g_counter".into()],
+            ..pangs_pir::Global::default()
+        });
+        let opts = Opts {
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let global = analysis.lookup_global("g_counter").unwrap();
+
+        let localization = localization_index(&analysis)[global.0 as usize]
+            .as_ref()
+            .unwrap()
+            .clone();
+
+        assert_eq!(localization.verdict, LocalizationVerdict::Blocked);
+        assert_eq!(localization.blockers.len(), 1);
+        assert_eq!(
+            localization.blockers[0].code,
+            "aggregate-initializer-address-dependency"
+        );
+        assert_eq!(
+            localization.blockers[0].witness.symbol.as_deref(),
+            Some("address_table")
+        );
+        assert_eq!(
+            localization.blockers[0].witness.note.as_deref(),
+            Some("static initializer for address_table retains the address of g_counter")
+        );
+
+        let components = serde_json::to_value(ComponentsRecord::from_analysis(&analysis)).unwrap();
+        let blocker = &components["context_rewrite"]["fields"][0]["blockers"][0];
+        assert_eq!(blocker["initializer"], "address_table");
+        assert!(blocker.get("function").is_none());
+        let schema_json = Box::leak(Box::new(
+            load_schema_for_artifact("components.json").unwrap(),
+        ));
+        let schema = JSONSchema::compile(schema_json).unwrap();
+        validate_value_against_schema(&schema, &components, "initializer blocker").unwrap();
     }
 
     #[test]

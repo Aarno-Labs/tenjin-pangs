@@ -375,7 +375,7 @@ built. Failure-code and `diagnostics` registries are owned by the producing pass
     "verdict": "ok" | "blocked",
     "blockers": [ { "code": "<registry>", "witness": <Witness> }, ... ] }
 // blockers non-empty iff blocked; initial code registry: unknown-caller-taint,
-// unknown-callee-taint, frozen-component
+// unknown-callee-taint, aggregate-initializer-address-dependency, frozen-component
 ```
 
 The cascade guard "localization verdict OK" is `verdict == "ok"`.
@@ -619,7 +619,10 @@ below is a shared record and is fixed here:
   - `component` is the context-plan identifier (`ctx0001`), not a call-graph component.
   - `blockers` are exact rewrite boundaries: `unknown-caller-taint` for an unrewritable
     incoming caller of a context-taking function, and `unknown-callee-taint` for a required
-    callsite with an unresolved alternative target.
+    callsite with an unresolved alternative target. An
+    `aggregate-initializer-address-dependency` records a static initializer that retains the
+    global's link-time address; localization remains blocked until the source rewrite can rebuild
+    such aggregates from the runtime context address.
   - `g` with no accessor in the context plan ⇒ `localization: null` (the client did not cover
     it; surfaces as `fact-not-computed` in the trace rather than a fabricated
     verdict).
