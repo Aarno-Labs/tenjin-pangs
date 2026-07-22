@@ -1877,6 +1877,31 @@ fn allocation_provenance_separates_dynamic_gep_global_from_coarse_class_taint() 
 }
 
 #[test]
+fn allocation_provenance_separates_address_and_write_isolation() {
+    let pir = Pir::from_path(m1_4_fixture("allocation_isolation_written.pir.json")).unwrap();
+    for stage in [Stage::Steens, Stage::Andersen] {
+        let analysis = Analysis::run(
+            &pir,
+            &Opts {
+                stage,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+
+        let candidate = analysis.lookup_global("@Candidate").unwrap();
+        let escaped = analysis.lookup_global("@Escaped").unwrap();
+        assert_eq!(analysis.escape(candidate), EscapeStatus::Module);
+        assert!(!analysis.globals()[candidate].address_escaped);
+        assert!(analysis.globals()[candidate].runtime_written);
+        assert_eq!(analysis.escape(escaped), EscapeStatus::External);
+        assert!(analysis.globals()[escaped].address_escaped);
+        assert!(analysis.globals()[escaped].runtime_written);
+    }
+}
+
+#[test]
 fn allocation_provenance_keeps_dynamic_gep_write_and_escape_fail_closed() {
     let pir = Pir::from_path(m1_4_fixture("allocation_isolation_negative.pir.json")).unwrap();
     let analysis = Analysis::run(

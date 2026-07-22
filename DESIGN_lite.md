@@ -120,7 +120,10 @@ With an exhaustive materialized solution, every client is a scan, not a query en
 - **writers(o):** scan stores whose pointer pts includes `o` — the demand query becomes
   a table lookup. Mutability lattice (`never-written` → `stationary` (B1) →
   `thread-confined` → `shared`) computed in one pass.
-- **Escape:** Ω bits straight out of C'/D'.
+- **Escape:** Ω bits from C'/D', narrowed per allocation by an independent address-flow proof
+  when Steensgaard has merged unrelated storage. Address isolation and write isolation are
+  separate certificates: a known runtime write does not by itself make the allocation's address
+  externally reachable.
 - **Globals localization:** unchanged from `DESIGN.md` §7 — transitive mod/ref over the
   final call graph, Ω-derived unknown-caller/callee taint, component verdicts.
 

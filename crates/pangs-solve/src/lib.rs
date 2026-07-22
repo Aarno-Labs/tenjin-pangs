@@ -378,22 +378,29 @@ impl SteensClasses {
     }
 }
 
-/// Prove, independently of Steensgaard class identity, that selected global allocations are
-/// neither written after initialization nor exposed to code outside the modeled program.
+#[derive(Debug, Default)]
+struct AllocationIsolation {
+    address: BTreeSet<String>,
+    write: BTreeSet<String>,
+}
+
+/// Prove, independently of Steensgaard class identity, whether selected global allocations have
+/// isolated addresses and, separately, whether they are never written after initialization.
 ///
 /// This deliberately tracks only the address of an allocation, not values stored in it.  The
 /// supported address-preserving operations are exhaustive for the PAG: address-of, assign,
 /// GEP (including unknown offsets), direct-call bindings already present as Assign edges, and
 /// solved internal indirect-call bindings added below.  Storing the address itself rejects the
 /// proof rather than attempting a memory-flow analysis.  Any unmodeled/external use also rejects
-/// it.  Consequently a successful proof can safely narrow a union-induced class-level escape or
-/// write fact without narrowing any actual pointer behavior.
-fn allocation_isolated_globals(
+/// it. A store *through* the derived address invalidates only write isolation; storing the address
+/// itself invalidates both results. Consequently each successful result can safely narrow its
+/// corresponding union-induced class-level fact without narrowing any actual pointer behavior.
+fn allocation_isolation(
     pir: &Pir,
     pag: &Pag,
     indirect_calls: &[IndirectCallResolution],
     unknown_callers: &BTreeSet<String>,
-) -> BTreeSet<String> {
+) -> AllocationIsolation {
     let mut flow = vec![Vec::<NodeId>::new(); pag.nodes.len()];
     for edge in &pag.edges {
         if matches!(
@@ -520,7 +527,7 @@ fn allocation_isolated_globals(
         SeedTarget::Callsite(_) => false,
     });
     if forged_write {
-        return BTreeSet::new();
+        return AllocationIsolation::default();
     }
 
     let runtime_direct_writes = pir
@@ -537,15 +544,14 @@ fn allocation_isolated_globals(
         })
         .collect::<BTreeSet<_>>();
 
-    let mut isolated = BTreeSet::new();
-    'global: for global in &pir.globals {
+    let mut isolated = AllocationIsolation::default();
+    for global in &pir.globals {
         let Some(&object) = global_objects.get(&global.key) else {
             continue;
         };
-        if runtime_direct_writes.contains(global.key.as_str()) {
-            continue;
-        }
         let reached = closure(&[object]);
+        let mut address_isolated = true;
+        let mut write_isolated = !runtime_direct_writes.contains(global.key.as_str());
 
         for edge in &pag.edges {
             match edge.kind {
@@ -556,17 +562,18 @@ fn allocation_isolated_globals(
                     if matches!(edge.owner, pangs_pag::Owner::Function(_))
                         && reached[edge.dst.0 as usize]
                     {
-                        continue 'global;
+                        write_isolated = false;
                     }
                     if reached[edge.src.0 as usize] {
-                        continue 'global;
+                        address_isolated = false;
+                        write_isolated = false;
                     }
                 }
                 pangs_pag::EdgeKind::Memcpy { .. }
                     if matches!(edge.owner, pangs_pag::Owner::Function(_))
                         && reached[edge.dst.0 as usize] =>
                 {
-                    continue 'global;
+                    write_isolated = false;
                 }
                 _ => {}
             }
@@ -583,11 +590,14 @@ fn allocation_isolated_globals(
                                 | OmegaSeedKind::UnknownOperandEscape
                         ) =>
                 {
-                    continue 'global;
+                    address_isolated = false;
+                    write_isolated = false;
                 }
                 SeedTarget::Callsite(id) => {
                     let Some(callsite) = pag.callsites.get(id.0 as usize) else {
-                        continue 'global;
+                        address_isolated = false;
+                        write_isolated = false;
+                        continue;
                     };
                     if callsite
                         .args
@@ -595,7 +605,8 @@ fn allocation_isolated_globals(
                         .chain(callsite.operand.iter())
                         .any(|node| reached[node.0 as usize])
                     {
-                        continue 'global;
+                        address_isolated = false;
+                        write_isolated = false;
                     }
                 }
                 _ => {}
@@ -610,7 +621,8 @@ fn allocation_isolated_globals(
                     .chain(callsite.operand.iter())
                     .any(|node| reached[node.0 as usize])
             {
-                continue 'global;
+                address_isolated = false;
+                write_isolated = false;
             }
         }
 
@@ -618,10 +630,16 @@ fn allocation_isolated_globals(
             matches!(&node.kind, NodeKind::Return { func } if unknown_callers.contains(func))
                 && reached[node.id.0 as usize]
         }) {
-            continue;
+            address_isolated = false;
+            write_isolated = false;
         }
 
-        isolated.insert(global.key.clone());
+        if address_isolated {
+            isolated.address.insert(global.key.clone());
+            if write_isolated {
+                isolated.write.insert(global.key.clone());
+            }
+        }
     }
     isolated
 }
@@ -1098,8 +1116,7 @@ impl<'a> Solver<'a> {
             }
         }
 
-        let isolated_globals =
-            allocation_isolated_globals(self.pir, self.pag, &indirect_calls, &unknown_callers);
+        let isolation = allocation_isolation(self.pir, self.pag, &indirect_calls, &unknown_callers);
 
         let mut globals = BTreeMap::new();
         for (global_index, global) in self.pir.globals.iter().enumerate() {
@@ -1117,14 +1134,17 @@ impl<'a> Solver<'a> {
             let mut address_escape = escape_sources.iter().any(|source| source != &own_export);
             let never_written = !escape_external && !stored_classes.contains(&root);
             let mut runtime_written = runtime_stored_classes.contains(&root);
-            if isolated_globals.contains(&global.key) {
+            if isolation.address.contains(&global.key) {
                 // Steensgaard may merge a dynamically-indexed aggregate with an unrelated,
                 // externally exposed pointer class.  A completed allocation-provenance proof
-                // is strictly narrower: every flow of this object's own address was followed,
-                // and no runtime write or external boundary was reached.
+                // is strictly narrower: every flow of this object's own address was followed
+                // and no external boundary was reached. Runtime writes through that address do
+                // not make the address escape and are retained independently below.
                 escape_external = false;
                 address_escape = false;
                 escape_sources.clear();
+            }
+            if isolation.write.contains(&global.key) {
                 runtime_written = false;
             }
             globals.insert(

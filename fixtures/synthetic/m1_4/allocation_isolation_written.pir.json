@@ -1,0 +1,32 @@
+{
+  "module": "m1_4.allocation_isolation_written",
+  "functions": [
+    {
+      "key": "main",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        { "kind": "alloca", "dest": "%escaped_slot", "ty": "i32" },
+        { "kind": "store", "address": "%escaped_slot", "value": "0" },
+        { "kind": "store", "address": "@Candidate", "value": "0" },
+        { "kind": "global_ref", "global": "@Candidate", "access": "mod" },
+        { "kind": "store", "address": "@Escaped", "value": "0" },
+        { "kind": "global_ref", "global": "@Escaped", "access": "mod" },
+        {
+          "kind": "unknown",
+          "op": "opaque",
+          "operands": ["%escaped_slot", "@Escaped"],
+          "results": [],
+          "reason": "test external escape"
+        }
+      ]
+    }
+  ],
+  "globals": [
+    { "key": "@Candidate", "exported": false, "mutable": true },
+    { "key": "@Escaped", "exported": false, "mutable": true }
+  ]
+}
