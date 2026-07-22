@@ -71,7 +71,10 @@ M1.5 is independent of it and can proceed in parallel.
 - **Oversize guard (sound fallback).** A per-partition budget (constraints × pts bits);
   a partition exceeding it keeps its Steensgaard-level answer, is tagged `steens` in
   provenance, and is counted in stats. This caps the OOM risk CORAL's baselines hit
-  without any soundness cost.
+  without any soundness cost. Sparse partitions of at most 4,096 nodes and 4,096 edges
+  receive a bounded provenance-preserving promotion when they contain no integer-forged
+  source; larger or universal partitions retain the fallback. This prevents the fallback
+  from collapsing separated external origins on medium application partitions.
 - **Outputs** replace the M1.4-derived ones in the client pipeline: icall targets,
   pointer-aware pts for M1.6, per-edge provenance `tier: "andersen"`.
 - **Acceptance:** per-icall targets ⊆ M1.4's targets ⊆ FSA (the narrowing ledger,

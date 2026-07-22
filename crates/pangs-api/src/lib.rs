@@ -2251,7 +2251,7 @@ fn audit_global_flow(
         let Some(summary) = node_summaries.get(&label) else {
             return AuditGlobalFlow::ModuleWide;
         };
-        if summary.external {
+        if summary.external_universal {
             return AuditGlobalFlow::ModuleWide;
         }
         globals.extend(
@@ -4282,6 +4282,7 @@ struct PointerAccess {
 #[derive(Debug, Clone)]
 struct ModRefNodeSummaryData {
     external: bool,
+    external_universal: bool,
     pointee_global_ids: Rc<[GlobalId]>,
     pointee_global_sample: Rc<[String]>,
     pointee_global_count: usize,
@@ -4782,6 +4783,7 @@ fn build_modref_node_summary_data(
         .any(|global_key| looks_like_string_global_key(global_key));
     ModRefNodeSummaryData {
         external: resolution.external,
+        external_universal: resolution.external_universal,
         pointee_global_ids,
         pointee_global_sample,
         pointee_global_count: resolution.pointee_globals.len(),
@@ -4959,8 +4961,10 @@ fn push_pointer_modrefs_from_pag(
                         && summary.direct_symbol_global == Some(*gid))
                 })
                 .collect::<Vec<_>>();
-            if summary.external && site_globals.is_empty() {
+            if summary.external_universal {
                 site_globals.extend((0..global_lookup.len()).map(|index| GlobalId(index as u32)));
+                site_globals.sort();
+                site_globals.dedup();
             }
             access_sites.push_targets(
                 AccessSiteKey {
@@ -5048,9 +5052,10 @@ fn push_pointer_modrefs_from_pag(
                             &summary.pointee_global_ids,
                             &global_key_by_id,
                         ),
-                        global_candidates: finite_or_module_wide(Rc::clone(
-                            &summary.pointee_global_ids,
-                        )),
+                        global_candidates: finite_or_module_wide(
+                            Rc::clone(&summary.pointee_global_ids),
+                            summary.external_universal,
+                        ),
                     },
                     Some(phase),
                 );
@@ -5195,8 +5200,10 @@ fn push_pointer_memset_modrefs_from_pir(
                 .iter()
                 .filter_map(|key| global_lookup.get(key).copied())
                 .collect::<Vec<_>>();
-            if resolution.external && site_globals.is_empty() {
+            if resolution.external_universal {
                 site_globals.extend((0..global_lookup.len()).map(|index| GlobalId(index as u32)));
+                site_globals.sort();
+                site_globals.dedup();
             }
             access_sites.push_targets(
                 AccessSiteKey {
@@ -5277,10 +5284,10 @@ fn push_pointer_memset_modrefs_from_pir(
                         )),
                         address_node: Some(label.clone()),
                         pointee_globals: resolution.pointee_globals.to_vec(),
-                        global_candidates: finite_or_module_wide(global_ids_for_keys(
-                            resolution.pointee_globals.iter(),
-                            global_lookup,
-                        )),
+                        global_candidates: finite_or_module_wide(
+                            global_ids_for_keys(resolution.pointee_globals.iter(), global_lookup),
+                            resolution.external_universal,
+                        ),
                     },
                     Some(ModRefSourcePhase::MemsetMemcpy),
                 );
@@ -5855,8 +5862,8 @@ fn merge_global_candidates(existing: &mut GlobalCandidateSet, incoming: GlobalCa
     *existing = GlobalCandidateSet::Finite(Rc::from(merged));
 }
 
-fn finite_or_module_wide(globals: Rc<[GlobalId]>) -> GlobalCandidateSet {
-    if globals.is_empty() {
+fn finite_or_module_wide(globals: Rc<[GlobalId]>, external_universal: bool) -> GlobalCandidateSet {
+    if external_universal {
         GlobalCandidateSet::ModuleWide
     } else {
         GlobalCandidateSet::Finite(globals)

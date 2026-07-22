@@ -179,6 +179,12 @@ pub struct NodeResolution {
     pub reaches_function_pointer: bool,
     #[serde(default)]
     pub external: bool,
+    /// True only when the external provenance can denote an arbitrary client allocation
+    /// (currently integer-forged pointers and conservative Steensgaard fallbacks).  Other
+    /// external regions denote foreign storage and contribute only explicitly connected
+    /// named allocations.
+    #[serde(default)]
+    pub external_universal: bool,
     #[serde(default)]
     pub pointee_globals: SharedStringList,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -358,6 +364,9 @@ pub struct SteensClasses {
     pub pointee: Vec<Option<usize>>,
     /// `ext[root]` — class members may point to external/escaped memory (PIP `p ⊒ Ω`).
     pub ext: Vec<bool>,
+    /// `universal[root]` — external provenance includes an integer-forged pointer and may
+    /// therefore designate any client allocation.
+    pub universal: Vec<bool>,
     /// `esc[root]` — class members are reachable by external code (PIP `Ω ⊒ {x}`).
     pub esc: Vec<bool>,
 }
@@ -633,6 +642,7 @@ struct ClassData {
     node_count: usize,
     pointee: Option<usize>,
     ext: bool,
+    universal: bool,
     esc: bool,
     escape_sources: BTreeSet<String>,
     icall_sites: HashSet<usize>,
@@ -867,12 +877,14 @@ impl<'a> Solver<'a> {
         }
         let mut pointee = vec![None; total];
         let mut ext = vec![false; total];
+        let mut universal = vec![false; total];
         let mut esc = vec![false; total];
         for i in 0..total {
             let root = self.find(i);
             if root == i {
                 pointee[i] = self.classes[i].pointee.map(|p| self.find(p));
                 ext[i] = self.classes[i].ext;
+                universal[i] = self.classes[i].universal;
                 esc[i] = self.classes[i].esc;
             }
         }
@@ -880,6 +892,7 @@ impl<'a> Solver<'a> {
             node_class,
             pointee,
             ext,
+            universal,
             esc,
         }
     }
@@ -969,8 +982,11 @@ impl<'a> Solver<'a> {
                         format!("{:?}:{}", seed.kind, self.pag.nodes[id.0 as usize].label),
                     );
                 }
-                (OmegaSeedKind::IntToPtr, SeedTarget::Node(id))
-                | (OmegaSeedKind::UnknownResultExternal, SeedTarget::Node(id)) => {
+                (OmegaSeedKind::IntToPtr, SeedTarget::Node(id)) => {
+                    let class = self.class_of(id);
+                    self.set_universal_ext(class);
+                }
+                (OmegaSeedKind::UnknownResultExternal, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
                     self.set_ext(class);
                 }
@@ -1187,6 +1203,7 @@ impl<'a> Solver<'a> {
                 NodeResolution {
                     reaches_function_pointer: summary.reaches_function_pointer,
                     external: summary.external,
+                    external_universal: self.classes[root].universal,
                     pointee_globals,
                     external_sources: if summary.external {
                         vec!["omega:steens_external".to_string()]
@@ -1335,12 +1352,17 @@ impl<'a> Solver<'a> {
         self.metrics.steens_process_class_calls += 1;
         let root = self.find(class);
         let ext = self.classes[root].ext;
+        let universal = self.classes[root].universal;
         let esc = self.classes[root].esc;
         let escape_sources = self.classes[root].escape_sources.clone();
 
         if ext || esc {
             if let Some(pointee) = self.classes[root].pointee {
-                self.set_ext(pointee);
+                if universal {
+                    self.set_universal_ext(pointee);
+                } else {
+                    self.set_ext(pointee);
+                }
                 if escape_sources.is_empty() {
                     self.set_esc_with_source(pointee, "derived:external-pointee".into());
                 } else {
@@ -1594,6 +1616,16 @@ impl<'a> Solver<'a> {
         }
     }
 
+    fn set_universal_ext(&mut self, class: usize) {
+        let root = self.find(class);
+        let changed = !self.classes[root].ext || !self.classes[root].universal;
+        self.classes[root].ext = true;
+        self.classes[root].universal = true;
+        if changed {
+            self.enqueue(root);
+        }
+    }
+
     fn set_esc_with_source(&mut self, class: usize, source: String) {
         let root = self.find(class);
         let changed = self.classes[root].escape_sources.insert(source);
@@ -1631,6 +1663,7 @@ impl<'a> Solver<'a> {
         self.classes[a].size += self.classes[b].size;
         self.classes[a].node_count += self.classes[b].node_count;
         self.classes[a].ext |= self.classes[b].ext;
+        self.classes[a].universal |= self.classes[b].universal;
         self.classes[a].esc |= self.classes[b].esc;
         let other_escape_sources = std::mem::take(&mut self.classes[b].escape_sources);
         self.classes[a].escape_sources.extend(other_escape_sources);

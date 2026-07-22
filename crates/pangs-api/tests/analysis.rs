@@ -30,6 +30,12 @@ fn m1_4_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn m1_4b_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/m1_4b")
+        .join(name)
+}
+
 fn m1_5_fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/synthetic/m1_5")
@@ -2904,6 +2910,31 @@ fn audit_findings_retain_finite_global_flow_for_relevance_clients() {
 }
 
 #[test]
+fn entry_argument_audit_does_not_flow_to_unrelated_boundary_globals() {
+    let pir = Pir::from_path(m1_4b_fixture("external_provenance_regions.pir.json")).unwrap();
+    let analysis = Analysis::run_with_disposition(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            partition_budget: 1_000_000,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let finding = analysis
+        .audit_findings()
+        .iter()
+        .find(|finding| finding.affected == ["value:%path"])
+        .expect("the non-comparison ptrtoint remains auditable");
+    assert_eq!(
+        finding.global_flow,
+        pangs_api::AuditGlobalFlow::Finite(vec![])
+    );
+}
+
+#[test]
 fn audit_memops_on_fnptr_aggregates_are_reported_but_scalar_fnptr_memops_are_not() {
     let pir = Pir::from_path(m1_5_fixture("fnptr_aggregate_memops.pir.json")).unwrap();
     let analysis = Analysis::run(&pir, &Opts::default()).unwrap();
@@ -3026,7 +3057,9 @@ fn audit_memops_on_fnptr_aggregates_are_reported_but_scalar_fnptr_memops_are_not
     .unwrap();
     assert!(external_analysis.audit_findings().iter().any(|finding| {
         finding.kind == "memcpy_fnptr_aggregate"
-            && finding.global_flow == pangs_api::AuditGlobalFlow::ModuleWide
+            // An unknown external return is its own region. It remains externally tainted,
+            // but does not implicate unrelated module globals without a connecting flow.
+            && finding.global_flow == pangs_api::AuditGlobalFlow::Finite(vec![])
     }));
 
     let scalar = Pir {

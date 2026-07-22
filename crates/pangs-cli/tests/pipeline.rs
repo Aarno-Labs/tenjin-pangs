@@ -1818,8 +1818,9 @@ fn analyze_andersen_refines_spurious_external_store_address_modref() {
             && row["detail"] == "edge:store|omega:steens_external|pointee_count=1"
             && row["address_node"] == "val:driver:%gp"
             && row["pointee_globals"] == serde_json::json!(["@Table"])
-            && row["candidate_scope"] == "finite"
-            && row["pointee_global_count"] == 1
+            // The same Steensgaard class also contains an inttoptr source. Named pointees
+            // must not narrow that universal provenance; Andersen separates the fields below.
+            && row["candidate_scope"] == "module-wide"
     }));
 
     let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))

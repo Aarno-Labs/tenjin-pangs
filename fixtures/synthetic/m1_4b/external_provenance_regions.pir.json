@@ -1,0 +1,57 @@
+{
+  "module": "m1_4b.external_provenance_regions",
+  "functions": [
+    {
+      "key": "main",
+      "sig": {
+        "ret": { "class": "integer" },
+        "params": [
+          { "class": "integer" },
+          { "class": "integer" }
+        ],
+        "cc": "ccc"
+      },
+      "param_names": ["%argc", "%argv"],
+      "body": [
+        {
+          "kind": "call_direct",
+          "callee": "opaque",
+          "sig": {
+            "ret": { "class": "integer" },
+            "params": [
+              { "class": "integer" },
+              { "class": "integer" }
+            ],
+            "cc": "ccc"
+          },
+          "args": ["%argv", "@G"],
+          "dest": "%external_result"
+        },
+        { "kind": "load", "dest": "%path", "address": "%argv" },
+        {
+          "kind": "ptr_to_int",
+          "dest": "%path_bits",
+          "source": "%path",
+          "comparison_only": false
+        },
+        { "kind": "int_to_ptr", "dest": "%forged", "source": "%bits" }
+      ]
+    },
+    {
+      "key": "opaque",
+      "sig": {
+        "ret": { "class": "integer" },
+        "params": [
+          { "class": "integer" },
+          { "class": "integer" }
+        ],
+        "cc": "ccc"
+      },
+      "external": true,
+      "body": []
+    }
+  ],
+  "globals": [
+    { "key": "@G", "mutable": true, "exported": false }
+  ]
+}

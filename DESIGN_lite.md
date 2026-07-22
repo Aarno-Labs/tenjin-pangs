@@ -144,6 +144,17 @@ External calls remain Ω boundaries by default.  A small exact-name summary may 
 that boundary only when it encodes a documented, auditable pointer transfer; unlisted
 or shape-mismatched calls remain Ω.
 
+The inclusion solver represents Ω as provenance-separated abstract regions rather than
+one absorbing object. Executable entry arguments, generic external storage, values written
+through each client/external call boundary, external returns, unknown results, and
+integer-forged pointers have distinct identities. Each region initially denotes itself;
+ordinary copy/store/load/GEP constraints may add named allocations or other regions to its
+contents. Merely passing unrelated pointer arguments to the same external call does not
+equate those pointer values. This preserves every external origin while preventing argv,
+external returns, and unrelated client addresses from aliasing solely because all crossed an
+Ω boundary. Integer-forged pointers retain a separate universal marker and therefore never
+narrow module-wide mod/ref.
+
 ## 4. The residual risk, named
 
 The cut precision is tier-E context-sensitivity, which CORAL's finding III says

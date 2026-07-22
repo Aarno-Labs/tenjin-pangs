@@ -30,6 +30,16 @@ use crate::{IndirectCallResolution, SolveResult, SteensClasses};
 /// rounds in practice; this only guards against a pathological input.
 const MAX_ROUNDS: usize = 8;
 
+// The quadratic partition-cost proxy predates provenance-separated external regions and
+// rejects some sparse, medium-sized partitions that solve cheaply in practice.  Refine those
+// partitions when they contain no integer-forged (universal) source; retain the ordinary
+// fallback for larger or genuinely universal partitions.  This keeps the expensive YAPET/Vim
+// cases behind the existing budget while allowing external-origin separation to survive past
+// Steensgaard on cases such as JPEGOptim.
+const PROVENANCE_PROMOTION_MIN_BUDGET: u64 = 100_000;
+const PROVENANCE_PROMOTION_MAX_NODES: u64 = 4_096;
+const PROVENANCE_PROMOTION_MAX_EDGES: u64 = 4_096;
+
 /// Solve Andersen as a refinement of Steensgaard and fold the refined facts back into a
 /// `SolveResult` that is otherwise identical to the Steensgaard answer.
 pub fn solve_andersen(
@@ -166,8 +176,14 @@ fn finish_andersen(
     // Override only the refined facts; keep global escape/unknown-caller facts from
     // Steensgaard. Unrefined/oversize node partitions retain their Steensgaard node rows.
     base.indirect_calls = refined.indirect_calls;
-    for (label, reaches_function_pointer, external, pointee_globals, external_sources) in
-        refined.nodes
+    for (
+        label,
+        reaches_function_pointer,
+        external,
+        external_universal,
+        pointee_globals,
+        external_sources,
+    ) in refined.nodes
     {
         if let Some(node) = base.nodes.get_mut(&label) {
             // Andersen runs inside a self-contained Steensgaard partition, so its points-to
@@ -176,6 +192,7 @@ fn finish_andersen(
             // Steensgaard merged a sibling callback field into the same pointee class.
             node.reaches_function_pointer = reaches_function_pointer;
             node.external = external;
+            node.external_universal = external_universal;
             node.pointee_globals = pointee_globals.into();
             node.external_sources = external_sources;
         }
@@ -193,7 +210,7 @@ fn finish_andersen(
 
 struct RefinerOutput {
     indirect_calls: Vec<IndirectCallResolution>,
-    nodes: Vec<(String, bool, bool, Vec<String>, Vec<String>)>,
+    nodes: Vec<(String, bool, bool, bool, Vec<String>, Vec<String>)>,
     /// Refined global-object points-to (`obj:global:<name>` label → named allocations), only
     /// populated when `Refiner::materialize_global_points_to` is set.
     global_points_to: Vec<(String, BTreeSet<String>)>,
@@ -265,8 +282,41 @@ impl PartitionCut {
 }
 
 /// One abstract object that can appear in a points-to set: a PAG object node, a lazily
-/// materialized field of one, or the single Ω object.
+/// materialized field of one, or a provenance-specific external-memory region.
 type Cell = u32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ExternalRegion {
+    EntryArguments,
+    GenericStorage,
+    ClientBoundary(u32),
+    ExternalReturn(u32),
+    UnknownReturn(u32),
+    EscapedFunctionParam(u32),
+    ForgedPointer(u32),
+}
+
+impl ExternalRegion {
+    fn is_universal(self) -> bool {
+        matches!(self, Self::ForgedPointer(_))
+    }
+
+    fn may_contain_function_pointer(self) -> bool {
+        !matches!(self, Self::EntryArguments)
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::EntryArguments => "entry_arguments".to_string(),
+            Self::GenericStorage => "generic_external_storage".to_string(),
+            Self::ClientBoundary(id) => format!("client_boundary:{id}"),
+            Self::ExternalReturn(id) => format!("external_return:{id}"),
+            Self::UnknownReturn(id) => format!("unknown_return:{id}"),
+            Self::EscapedFunctionParam(id) => format!("escaped_function_param:{id}"),
+            Self::ForgedPointer(id) => format!("forged_pointer:{id}"),
+        }
+    }
+}
 
 struct Refiner<'a> {
     pir: &'a Pir,
@@ -279,8 +329,6 @@ struct Refiner<'a> {
     confined_targets: &'a BTreeSet<String>,
 
     n_base: usize,
-    omega: Cell,
-
     // PIR/PAG cross-reference tables.
     func_index: HashMap<String, usize>,
     /// PAG object node id for each address-taken function (membership target of `&f`).
@@ -314,8 +362,6 @@ impl<'a> Refiner<'a> {
         confined_targets: &'a BTreeSet<String>,
     ) -> Self {
         let n_base = pag.nodes.len();
-        let omega = n_base as Cell;
-
         let func_index: HashMap<String, usize> = pir
             .functions
             .iter()
@@ -377,7 +423,6 @@ impl<'a> Refiner<'a> {
             exact_targets,
             confined_targets,
             n_base,
-            omega,
             func_index,
             fn_cell_to_index,
             global_of_cell,
@@ -462,11 +507,22 @@ impl<'a> Refiner<'a> {
         }
 
         let mut oversize: HashSet<usize> = HashSet::new();
+        let forged_partitions = self
+            .pag
+            .omega_seeds
+            .iter()
+            .filter(|seed| seed.kind == OmegaSeedKind::IntToPtr)
+            .filter_map(|seed| self.omega_seed_partition(seed))
+            .collect::<HashSet<_>>();
         for &ap in &interesting {
             let n = nodes_in.get(&ap).copied().unwrap_or(0);
             let e = edges_in.get(&ap).copied().unwrap_or(0);
             let cost = n.saturating_mul(n.saturating_add(e));
-            if cost > self.budget {
+            let provenance_promoted = self.budget >= PROVENANCE_PROMOTION_MIN_BUDGET
+                && n <= PROVENANCE_PROMOTION_MAX_NODES
+                && e <= PROVENANCE_PROMOTION_MAX_EDGES
+                && !forged_partitions.contains(&ap);
+            if cost > self.budget && !provenance_promoted {
                 oversize.insert(ap);
             }
         }
@@ -928,7 +984,7 @@ impl<'a> Refiner<'a> {
     /// points-to set of every in-scope cell.
     fn solve_once(&mut self, target_map: &HashMap<usize, Vec<usize>>) -> Solve {
         let profile = andersen_profile_enabled();
-        let mut solve = Solve::new(self.n_base, self.omega, profile);
+        let mut solve = Solve::new(self.n_base, profile);
 
         // Base constraints from PAG edges (in-scope only; partitions are self-contained).
         for edge in &self.pag.edges {
@@ -1013,14 +1069,28 @@ impl<'a> Refiner<'a> {
     fn apply_boundary_omega_seeds(&self, solve: &mut Solve) {
         for seed in &self.pag.omega_seeds {
             match (seed.kind, seed.target) {
-                (
-                    OmegaSeedKind::IntToPtr | OmegaSeedKind::UnknownResultExternal,
-                    SeedTarget::Node(id),
-                ) => self.seed_points_to_omega(solve, id, omega_seed_source(seed.kind)),
+                (OmegaSeedKind::IntToPtr, SeedTarget::Node(id)) => self.seed_points_to_region(
+                    solve,
+                    id,
+                    ExternalRegion::ForgedPointer(id.0),
+                    omega_seed_source(seed.kind),
+                ),
+                (OmegaSeedKind::UnknownResultExternal, SeedTarget::Node(id)) => self
+                    .seed_points_to_region(
+                        solve,
+                        id,
+                        ExternalRegion::UnknownReturn(id.0),
+                        omega_seed_source(seed.kind),
+                    ),
                 (
                     OmegaSeedKind::PtrToInt | OmegaSeedKind::UnknownOperandEscape,
                     SeedTarget::Node(id),
-                ) => self.seed_unknown_store_through(solve, id, omega_seed_source(seed.kind)),
+                ) => self.seed_unknown_store_through(
+                    solve,
+                    id,
+                    ExternalRegion::GenericStorage,
+                    omega_seed_source(seed.kind),
+                ),
                 (
                     OmegaSeedKind::ExportedSymbol | OmegaSeedKind::ImportedSymbol,
                     SeedTarget::Node(id),
@@ -1032,7 +1102,12 @@ impl<'a> Refiner<'a> {
                             ..
                         })
                     ) {
-                        self.seed_points_to_omega(solve, id, omega_seed_source(seed.kind));
+                        self.seed_points_to_region(
+                            solve,
+                            id,
+                            ExternalRegion::GenericStorage,
+                            omega_seed_source(seed.kind),
+                        );
                     }
                 }
                 (OmegaSeedKind::ExternalCallBoundary, SeedTarget::Callsite(id)) => {
@@ -1060,7 +1135,12 @@ impl<'a> Refiner<'a> {
             "omega:external_call_arg".to_string()
         };
         for &arg in &callsite.args {
-            self.seed_unknown_store_through(solve, arg, &arg_source);
+            self.seed_unknown_store_through(
+                solve,
+                arg,
+                ExternalRegion::ClientBoundary(callsite.id.0),
+                &arg_source,
+            );
         }
         if let Some(result) = callsite.result {
             let result_source = if detailed {
@@ -1068,7 +1148,12 @@ impl<'a> Refiner<'a> {
             } else {
                 "omega:external_call_result".to_string()
             };
-            self.seed_points_to_omega(solve, result, &result_source);
+            self.seed_points_to_region(
+                solve,
+                result,
+                ExternalRegion::ExternalReturn(callsite.id.0),
+                &result_source,
+            );
         }
     }
 
@@ -1079,7 +1164,12 @@ impl<'a> Refiner<'a> {
             "omega:vararg_call_arg".to_string()
         };
         for &arg in callsite.args.iter().skip(callsite.sig.params.len()) {
-            self.seed_unknown_store_through(solve, arg, &source);
+            self.seed_unknown_store_through(
+                solve,
+                arg,
+                ExternalRegion::ClientBoundary(callsite.id.0),
+                &source,
+            );
         }
     }
 
@@ -1102,7 +1192,12 @@ impl<'a> Refiner<'a> {
             };
             for param_index in 0..self.pir.functions[func_index].sig.params.len() {
                 if let Some(&param) = self.param_nodes.get(&(func_index, param_index)) {
-                    self.seed_points_to_omega(solve, param, "omega:escaped_function_param");
+                    self.seed_points_to_region(
+                        solve,
+                        param,
+                        ExternalRegion::EscapedFunctionParam(param.0),
+                        "omega:escaped_function_param",
+                    );
                 }
             }
         }
@@ -1117,24 +1212,43 @@ impl<'a> Refiner<'a> {
         };
         for param_index in 1..self.pir.functions[main_index].sig.params.len() {
             if let Some(&param) = self.param_nodes.get(&(main_index, param_index)) {
-                self.seed_points_to_omega(solve, param, "omega:main_entry_param");
+                self.seed_points_to_region(
+                    solve,
+                    param,
+                    ExternalRegion::EntryArguments,
+                    "omega:main_entry_param",
+                );
             }
         }
     }
 
-    fn seed_points_to_omega(&self, solve: &mut Solve, node: NodeId, source: &str) {
+    fn seed_points_to_region(
+        &self,
+        solve: &mut Solve,
+        node: NodeId,
+        region: ExternalRegion,
+        source: &str,
+    ) {
         if self.in_scope.get(node.0 as usize).copied().unwrap_or(false) {
-            solve.add_pts_with_source(node.0, self.omega, Some(source));
+            let region = solve.region(region);
+            solve.add_pts_with_source(node.0, region, Some(source));
         }
     }
 
-    fn seed_unknown_store_through(&self, solve: &mut Solve, node: NodeId, source: &str) {
+    fn seed_unknown_store_through(
+        &self,
+        solve: &mut Solve,
+        node: NodeId,
+        region: ExternalRegion,
+        source: &str,
+    ) {
         if self.in_scope.get(node.0 as usize).copied().unwrap_or(false) {
+            let region = solve.region(region);
             solve
                 .stores
                 .entry(node.0)
                 .or_default()
-                .push((self.omega, Some(source.to_string())));
+                .push((region, Some(source.to_string())));
         }
     }
 
@@ -1271,7 +1385,7 @@ impl<'a> Refiner<'a> {
     fn emit_node_resolutions(
         &self,
         pts: &Solve,
-    ) -> Vec<(String, bool, bool, Vec<String>, Vec<String>)> {
+    ) -> Vec<(String, bool, bool, bool, Vec<String>, Vec<String>)> {
         let explain_label = std::env::var("PANGS_ANDERSEN_EXPLAIN_NODE").ok();
         let mut out = Vec::new();
         for node in &self.pag.nodes {
@@ -1280,12 +1394,16 @@ impl<'a> Refiner<'a> {
             }
             let set = pts.pts.get(&node.id.0);
             let external = set
-                .map(|set| set.iter().any(|cell| *cell == self.omega))
+                .map(|set| set.iter().any(|cell| pts.is_external(*cell)))
+                .unwrap_or(false);
+            let external_universal = set
+                .map(|set| set.iter().any(|cell| pts.is_universal_external(*cell)))
                 .unwrap_or(false);
             let reaches_function_pointer = set
                 .map(|set| {
                     set.iter().any(|cell| {
-                        *cell == self.omega
+                        pts.external_region(*cell)
+                            .is_some_and(ExternalRegion::may_contain_function_pointer)
                             || self
                                 .fn_cell_to_index
                                 .contains_key(pts.field_base.get(cell).unwrap_or(cell))
@@ -1304,7 +1422,7 @@ impl<'a> Refiner<'a> {
             globals.sort();
             globals.dedup();
             let external_sources = if external {
-                pts.omega_sources
+                pts.external_sources
                     .get(&node.id.0)
                     .map(|sources| sources.iter().cloned().collect())
                     .unwrap_or_else(|| vec!["omega:unknown".to_string()])
@@ -1316,8 +1434,8 @@ impl<'a> Refiner<'a> {
                     .into_iter()
                     .flat_map(|set| set.iter().copied())
                     .map(|cell| {
-                        if cell == self.omega {
-                            return "omega".to_string();
+                        if let Some(region) = pts.external_region(cell) {
+                            return format!("external:{}", region.label());
                         }
                         let root = *pts.field_base.get(&cell).unwrap_or(&cell);
                         if let Some(index) = self.fn_cell_to_index.get(&root) {
@@ -1343,10 +1461,11 @@ impl<'a> Refiner<'a> {
                     .cloned()
                     .collect::<Vec<_>>();
                 eprintln!(
-                    "pangs andersen explain node={} reaches_function_pointer={} external={} allocations={:?} omega_source_count={} omega_source_sample={:?}",
+                    "pangs andersen explain node={} reaches_function_pointer={} external={} external_universal={} allocations={:?} omega_source_count={} omega_source_sample={:?}",
                     node.label,
                     reaches_function_pointer,
                     external,
+                    external_universal,
                     allocations,
                     source_count,
                     source_sample
@@ -1356,6 +1475,7 @@ impl<'a> Refiner<'a> {
                 node.label.clone(),
                 reaches_function_pointer,
                 external,
+                external_universal,
                 globals,
                 external_sources,
             ));
@@ -1392,7 +1512,7 @@ impl<'a> Refiner<'a> {
                     continue;
                 };
                 for &o in set {
-                    if o == self.omega {
+                    if pts.is_external(o) {
                         continue;
                     }
                     let root = pts.field_base.get(&o).copied().unwrap_or(o);
@@ -1518,10 +1638,11 @@ fn edge_witness(kind: &str, edge: &pangs_pag::Edge) -> String {
 
 /// One stateless inclusion solve over a fixed constraint set.
 struct Solve {
-    omega: Cell,
     next_field: Cell,
     pts: HashMap<Cell, HashSet<Cell>>,
-    omega_sources: HashMap<Cell, BTreeSet<String>>,
+    external_sources: HashMap<Cell, BTreeSet<String>>,
+    regions: HashMap<ExternalRegion, Cell>,
+    region_of_cell: HashMap<Cell, ExternalRegion>,
     succ: HashMap<Cell, HashSet<Cell>>,
     loads: HashMap<Cell, Vec<Cell>>,
     stores: HashMap<Cell, Vec<(Cell, Option<String>)>>,
@@ -1554,12 +1675,13 @@ struct Solve {
 }
 
 impl Solve {
-    fn new(n_base: usize, omega: Cell, profile: bool) -> Self {
-        let mut solve = Self {
-            omega,
-            next_field: omega + 1,
+    fn new(n_base: usize, profile: bool) -> Self {
+        Self {
+            next_field: n_base as Cell,
             pts: HashMap::new(),
-            omega_sources: HashMap::new(),
+            external_sources: HashMap::new(),
+            regions: HashMap::new(),
+            region_of_cell: HashMap::new(),
             succ: HashMap::new(),
             loads: HashMap::new(),
             stores: HashMap::new(),
@@ -1577,11 +1699,34 @@ impl Solve {
             queued: HashSet::new(),
             profile,
             steps: 0,
-        };
-        let _ = n_base;
-        // Ω is absorbing: it points only to itself.
-        solve.pts.entry(omega).or_default().insert(omega);
-        solve
+        }
+    }
+
+    fn region(&mut self, region: ExternalRegion) -> Cell {
+        if let Some(&cell) = self.regions.get(&region) {
+            return cell;
+        }
+        let cell = self.next_field;
+        self.next_field += 1;
+        self.regions.insert(region, cell);
+        self.region_of_cell.insert(cell, region);
+        // Each region denotes its own foreign objects. Unlike the old absorbing Ω cell,
+        // its contents may gain named objects through real store/copy constraints.
+        self.pts.entry(cell).or_default().insert(cell);
+        cell
+    }
+
+    fn external_region(&self, cell: Cell) -> Option<ExternalRegion> {
+        self.region_of_cell.get(&cell).copied()
+    }
+
+    fn is_external(&self, cell: Cell) -> bool {
+        self.region_of_cell.contains_key(&cell)
+    }
+
+    fn is_universal_external(&self, cell: Cell) -> bool {
+        self.external_region(cell)
+            .is_some_and(ExternalRegion::is_universal)
     }
 
     fn enqueue(&mut self, cell: Cell) {
@@ -1595,17 +1740,18 @@ impl Solve {
     }
 
     fn add_pts_with_source(&mut self, cell: Cell, obj: Cell, source: Option<&str>) {
-        if cell == self.omega {
-            return; // Ω stays {Ω}
-        }
         let mut changed = self.pts.entry(cell).or_default().insert(obj);
-        if obj == self.omega {
+        if self.is_external(obj) {
             if let Some(source) = source {
+                let source = source.to_string();
                 changed |= self
-                    .omega_sources
+                    .external_sources
                     .entry(cell)
                     .or_default()
-                    .insert(source.to_string());
+                    .insert(source.clone());
+                // Loads from the region must retain the region's origin even when the
+                // pointer used to reach it is not copied into the loaded value.
+                self.external_sources.entry(obj).or_default().insert(source);
             }
         }
         if changed {
@@ -1614,7 +1760,7 @@ impl Solve {
     }
 
     fn add_copy(&mut self, from: Cell, to: Cell) {
-        if to == self.omega || from == to {
+        if from == to {
             return;
         }
         if self.succ.entry(from).or_default().insert(to) {
@@ -1625,7 +1771,7 @@ impl Solve {
                 for o in src {
                     changed |= dst.insert(o);
                 }
-                changed |= self.propagate_omega_sources(from, to);
+                changed |= self.propagate_external_sources(from, to);
                 if changed {
                     self.enqueue(to);
                 }
@@ -1633,17 +1779,14 @@ impl Solve {
         }
     }
 
-    fn propagate_omega_sources(&mut self, from: Cell, to: Cell) -> bool {
-        if from == self.omega || to == self.omega {
-            return false;
-        }
-        let Some(sources) = self.omega_sources.get(&from).cloned() else {
+    fn propagate_external_sources(&mut self, from: Cell, to: Cell) -> bool {
+        let Some(sources) = self.external_sources.get(&from).cloned() else {
             return false;
         };
         if sources.is_empty() {
             return false;
         }
-        let dst = self.omega_sources.entry(to).or_default();
+        let dst = self.external_sources.entry(to).or_default();
         let mut changed = false;
         for source in sources {
             changed |= dst.insert(source);
@@ -1660,8 +1803,8 @@ impl Solve {
     /// future fields through the whole-object cell. This keeps the M2.1 soundness property
     /// while reducing broad cross-field/root pollution.
     fn field_of(&mut self, base: Cell, off: Option<i64>) -> Cell {
-        if base == self.omega {
-            return self.omega;
+        if self.is_external(base) {
+            return base;
         }
         if self.unknown_field_base.contains_key(&base) {
             return base;
@@ -1729,7 +1872,7 @@ impl Solve {
     }
 
     fn note_direct_access(&mut self, base: Cell) {
-        if base == self.omega
+        if self.is_external(base)
             || self.field_base.contains_key(&base)
             || self.unknown_field_base.contains_key(&base)
         {
@@ -1818,8 +1961,8 @@ impl Solve {
                 for (q, omega_source) in qs {
                     for &o in &objs {
                         self.note_direct_access(o);
-                        if q == self.omega {
-                            self.add_pts_with_source(o, self.omega, omega_source.as_deref());
+                        if self.is_external(q) {
+                            self.add_pts_with_source(o, q, omega_source.as_deref());
                         } else {
                             self.add_copy(q, o);
                         }
@@ -1869,15 +2012,12 @@ impl Solve {
             if let Some(succs) = self.succ.get(&n).cloned() {
                 let src: HashSet<Cell> = self.pts.get(&n).cloned().unwrap_or_default();
                 for s in succs {
-                    if s == self.omega {
-                        continue;
-                    }
                     let mut changed = false;
                     let dst = self.pts.entry(s).or_default();
                     for &o in &src {
                         changed |= dst.insert(o);
                     }
-                    changed |= self.propagate_omega_sources(n, s);
+                    changed |= self.propagate_external_sources(n, s);
                     if changed {
                         self.enqueue(s);
                     }
@@ -1908,7 +2048,7 @@ mod tests {
     use pangs_pag::{BuildMode, Pag, PagOpts};
     use pangs_pir::Pir;
 
-    use super::{solve_andersen, solve_andersen_with_overrides};
+    use super::{solve_andersen, solve_andersen_with_overrides, ExternalRegion, Solve};
     use crate::solve_steensgaard;
 
     fn fixture(name: &str) -> std::path::PathBuf {
@@ -2082,6 +2222,50 @@ mod tests {
         let unknown_ptr = &andersen.nodes["val:driver:%unknown_ptr"];
         assert!(unknown_ptr.external);
         assert_eq!(unknown_ptr.external_sources, vec!["omega:inttoptr"]);
+    }
+
+    #[test]
+    fn external_origins_remain_separate_until_a_constraint_connects_them() {
+        let (pir, pag) = load("external_provenance_regions.pir.json");
+        let result = solve_andersen(&pir, &pag, BuildMode::Executable, 1_000_000);
+
+        // `opaque` observes both argv and @G, but observation is not pointer flow between
+        // them. Loading argv after the boundary therefore retains foreign provenance without
+        // acquiring @G. This is the distinction the former single Ω object could not express.
+        let path = &result.nodes["val:main:%path"];
+        assert!(path.external);
+        assert!(!path.external_universal);
+        assert!(path.pointee_globals.is_empty());
+
+        let external_result = &result.nodes["val:main:%external_result"];
+        assert!(external_result.external);
+        assert!(!external_result.external_universal);
+        assert!(external_result.pointee_globals.is_empty());
+
+        let forged = &result.nodes["val:main:%forged"];
+        assert!(forged.external);
+        assert!(forged.external_universal);
+    }
+
+    #[test]
+    fn external_region_contents_gain_named_objects_only_from_constraints() {
+        let mut solve = Solve::new(3, false);
+        let entry = solve.region(ExternalRegion::EntryArguments);
+        let returned = solve.region(ExternalRegion::ExternalReturn(7));
+        solve.add_pts_with_source(1, entry, Some("omega:main_entry_param"));
+        solve.add_pts_with_source(2, returned, Some("omega:external_call_result"));
+        solve.run();
+        assert!(!solve.pts[&1].contains(&0));
+        assert!(!solve.pts[&2].contains(&0));
+
+        // A real store of a pointer to base object 0 into entry-owned storage connects
+        // precisely that object. A subsequent load can then recover it.
+        solve.add_pts(0, 0);
+        solve.add_copy(0, entry);
+        solve.add_copy(entry, 1);
+        solve.run();
+        assert!(solve.pts[&1].contains(&0));
+        assert!(!solve.pts[&2].contains(&0));
     }
 
     #[test]
