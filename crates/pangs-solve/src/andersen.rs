@@ -24,7 +24,7 @@ use pangs_pag::{
 };
 use pangs_pir::{fsa_compatible, Pir};
 
-use crate::{IndirectCallResolution, SolveResult, SteensClasses};
+use crate::{debug_assert_narrows, IndirectCallResolution, SolveResult, SteensClasses};
 
 /// Hard cap on CG-refinement rounds. The loop converges by monotone shrinkage in 2–3
 /// rounds in practice; this only guards against a pathological input.
@@ -176,25 +176,18 @@ fn finish_andersen(
     // Override only the refined facts; keep global escape/unknown-caller facts from
     // Steensgaard. Unrefined/oversize node partitions retain their Steensgaard node rows.
     base.indirect_calls = refined.indirect_calls;
-    for (
-        label,
-        reaches_function_pointer,
-        external,
-        external_universal,
-        pointee_globals,
-        external_sources,
-    ) in refined.nodes
-    {
-        if let Some(node) = base.nodes.get_mut(&label) {
+    for resolution in refined.nodes {
+        if let Some(node) = base.nodes.get_mut(&resolution.label) {
             // Andersen runs inside a self-contained Steensgaard partition, so its points-to
             // set is a sound subset of the union-based answer. In particular, a data pointer
             // need not retain `reaches_function_pointer` merely because field-insensitive
             // Steensgaard merged a sibling callback field into the same pointee class.
-            node.reaches_function_pointer = reaches_function_pointer;
-            node.external = external;
-            node.external_universal = external_universal;
-            node.pointee_globals = pointee_globals.into();
-            node.external_sources = external_sources;
+            node.reaches_function_pointer = resolution.reaches_function_pointer;
+            node.external = resolution.external;
+            node.external_universal = resolution.external_universal;
+            node.pointee_globals = resolution.pointee_globals.into();
+            node.pointee_globals_unfiltered = resolution.pointee_globals_unfiltered.into();
+            node.external_sources = resolution.external_sources;
         }
     }
     // Refined in-scope globals replace their Steensgaard `node_points_to` entry; oversize and
@@ -210,13 +203,23 @@ fn finish_andersen(
 
 struct RefinerOutput {
     indirect_calls: Vec<IndirectCallResolution>,
-    nodes: Vec<(String, bool, bool, bool, Vec<String>, Vec<String>)>,
+    nodes: Vec<RefinedNodeResolution>,
     /// Refined global-object points-to (`obj:global:<name>` label → named allocations), only
     /// populated when `Refiner::materialize_global_points_to` is set.
     global_points_to: Vec<(String, BTreeSet<String>)>,
     rounds: usize,
     oversize_fallbacks: usize,
     oversize_fallback_max_size: usize,
+}
+
+struct RefinedNodeResolution {
+    label: String,
+    reaches_function_pointer: bool,
+    external: bool,
+    external_universal: bool,
+    pointee_globals: Vec<String>,
+    pointee_globals_unfiltered: Vec<String>,
+    external_sources: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1382,11 +1385,17 @@ impl<'a> Refiner<'a> {
         out
     }
 
-    fn emit_node_resolutions(
-        &self,
-        pts: &Solve,
-    ) -> Vec<(String, bool, bool, bool, Vec<String>, Vec<String>)> {
+    fn emit_node_resolutions(&self, pts: &Solve) -> Vec<RefinedNodeResolution> {
         let explain_label = std::env::var("PANGS_ANDERSEN_EXPLAIN_NODE").ok();
+        let address_exposed = &self.classes.global_address_exposed;
+        let violation_tainted = self.classes.module_violation_tainted;
+        let global_index_by_key = self
+            .pir
+            .globals
+            .iter()
+            .enumerate()
+            .map(|(index, global)| (global.key.as_str(), index))
+            .collect::<HashMap<_, _>>();
         let mut out = Vec::new();
         for node in &self.pag.nodes {
             if !node.kind.is_value_like_public() || !self.in_scope[node.id.0 as usize] {
@@ -1410,7 +1419,7 @@ impl<'a> Refiner<'a> {
                     })
                 })
                 .unwrap_or(false);
-            let mut globals: Vec<String> = set
+            let mut globals_unfiltered: Vec<String> = set
                 .into_iter()
                 .flat_map(|set| set.iter())
                 .filter_map(|cell| {
@@ -1419,8 +1428,34 @@ impl<'a> Refiner<'a> {
                 })
                 .map(|&idx| self.pir.globals[idx].key.clone())
                 .collect();
+            globals_unfiltered.sort();
+            globals_unfiltered.dedup();
+            let mut globals = if external_universal || violation_tainted {
+                globals_unfiltered.clone()
+            } else {
+                globals_unfiltered
+                    .iter()
+                    .filter(|key| {
+                        global_index_by_key
+                            .get(key.as_str())
+                            .is_some_and(|&index| address_exposed[index])
+                    })
+                    .cloned()
+                    .collect()
+            };
             globals.sort();
-            globals.dedup();
+            debug_assert_narrows(
+                &node.label,
+                "address-exposed-andersen",
+                &globals,
+                "andersen",
+                &globals_unfiltered,
+            );
+            let globals_unfiltered = if globals != globals_unfiltered {
+                globals_unfiltered
+            } else {
+                Vec::new()
+            };
             let external_sources = if external {
                 pts.external_sources
                     .get(&node.id.0)
@@ -1471,14 +1506,15 @@ impl<'a> Refiner<'a> {
                     source_sample
                 );
             }
-            out.push((
-                node.label.clone(),
+            out.push(RefinedNodeResolution {
+                label: node.label.clone(),
                 reaches_function_pointer,
                 external,
                 external_universal,
-                globals,
+                pointee_globals: globals,
+                pointee_globals_unfiltered: globals_unfiltered,
                 external_sources,
-            ));
+            });
         }
         out
     }

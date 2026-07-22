@@ -178,6 +178,16 @@ external returns, and unrelated client addresses from aliasing solely because al
 Ω boundary. Integer-forged pointers retain a separate universal marker and therefore never
 narrow module-wide mod/ref.
 
+Finite pointee-class enumeration is additionally filtered by a per-global address-exposure bit.
+A global is unexposed only when every modeled use of its symbol is the address operand of a direct
+load/store (including the load/store representation of `atomicrmw` and `cmpxchg`); GEPs, address
+copies, stores as a value, calls, returns, `ptrtoint`, initializer capture, export, and unknown
+operations all expose it. An unexposed object cannot be the target of another pointer because its
+address never exists as a program value, so class-unification side effects alone do not justify
+including it in a finite `pointee_globals` set. Universal external rows bypass the filter, as do
+modules containing inline assembly without a complete value-flow certificate. When candidates are
+removed, `pointee_globals_unfiltered` retains the original class envelope for differential checks.
+
 ## 4. The residual risk, named
 
 The cut precision is tier-E context-sensitivity, which CORAL's finding III says

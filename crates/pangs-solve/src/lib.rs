@@ -187,6 +187,11 @@ pub struct NodeResolution {
     pub external_universal: bool,
     #[serde(default)]
     pub pointee_globals: SharedStringList,
+    /// The pre-filter solver enumeration, emitted only when address-exposure
+    /// filtering removed at least one candidate.  Differential checks can reconstruct the
+    /// envelope as this list when non-empty, or `pointee_globals` otherwise.
+    #[serde(default, skip_serializing_if = "SharedStringList::is_empty")]
+    pub pointee_globals_unfiltered: SharedStringList,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_sources: Vec<String>,
 }
@@ -369,6 +374,12 @@ pub struct SteensClasses {
     pub universal: Vec<bool>,
     /// `esc[root]` — class members are reachable by external code (PIP `Ω ⊒ {x}`).
     pub esc: Vec<bool>,
+    /// One bit per PIR global. False proves that the global symbol is used only as the
+    /// address operand of direct memory accesses.
+    pub global_address_exposed: Vec<bool>,
+    /// Module-wide violations without a complete value-flow certificate disable exposure
+    /// filtering for every node resolution.
+    pub module_violation_tainted: bool,
 }
 
 impl SteensClasses {
@@ -689,6 +700,8 @@ struct Solver<'a> {
     function_object_nodes: Vec<Option<NodeId>>,
     global_keys: Vec<String>,
     global_object_nodes: Vec<Option<NodeId>>,
+    global_address_exposed: Vec<bool>,
+    module_violation_tainted: bool,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
     worklist: VecDeque<usize>,
     queued: Vec<bool>,
@@ -719,6 +732,110 @@ struct MaterializedPointsTo {
     direct: BTreeMap<String, BTreeSet<String>>,
     through_memory: BTreeMap<String, BTreeSet<String>>,
     through_memory_external: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Compute the negative-proof bit used when enumerating finite pointee classes.  A global is
+/// unexposed only when its symbol value is used exclusively as the address of a direct
+/// load/store.  Everything else is exposure: address propagation, GEP, storage as a value,
+/// calls/returns, ptr-to-int, unknown operations (including inline asm), initializer capture,
+/// or export.
+fn global_address_exposure(pir: &Pir, pag: &Pag) -> Vec<bool> {
+    let global_by_key = pir
+        .globals
+        .iter()
+        .enumerate()
+        .flat_map(|(index, global)| {
+            let bare = global.key.strip_prefix('@').unwrap_or(&global.key);
+            [(global.key.as_str(), index), (bare, index)]
+        })
+        .collect::<HashMap<_, _>>();
+    let mut object_global = HashMap::<NodeId, usize>::new();
+    for node in &pag.nodes {
+        if let NodeKind::Object {
+            object: ObjectKind::Global,
+            key,
+            ..
+        } = &node.kind
+        {
+            if let Some(&index) = global_by_key
+                .get(key.as_str())
+                .or_else(|| global_by_key.get(key.strip_prefix('@').unwrap_or(key)))
+            {
+                object_global.insert(node.id, index);
+            }
+        }
+    }
+
+    let mut symbol_global = HashMap::<NodeId, usize>::new();
+    for edge in &pag.edges {
+        if edge.kind == pangs_pag::EdgeKind::AddrOf {
+            if let Some(&index) = object_global.get(&edge.src) {
+                symbol_global.insert(edge.dst, index);
+            }
+        }
+    }
+
+    let mut exposed = vec![false; pir.globals.len()];
+    for edge in &pag.edges {
+        if edge.kind == pangs_pag::EdgeKind::AddrOf {
+            continue;
+        }
+        if let Some(&index) = symbol_global.get(&edge.src) {
+            let direct_address = matches!(edge.kind, pangs_pag::EdgeKind::Load);
+            if !direct_address {
+                exposed[index] = true;
+            }
+        }
+        if let Some(&index) = symbol_global.get(&edge.dst) {
+            let direct_address = matches!(edge.kind, pangs_pag::EdgeKind::Store);
+            if !direct_address {
+                exposed[index] = true;
+            }
+        }
+    }
+    for callsite in &pag.callsites {
+        for node in callsite.operand.iter().chain(&callsite.args) {
+            if let Some(&index) = symbol_global.get(node) {
+                exposed[index] = true;
+            }
+        }
+    }
+    for seed in &pag.omega_seeds {
+        let SeedTarget::Node(node) = seed.target else {
+            continue;
+        };
+        if let Some(&index) = symbol_global
+            .get(&node)
+            .or_else(|| object_global.get(&node))
+        {
+            exposed[index] = true;
+        }
+    }
+    for initializer in &pir.globals {
+        for referenced in &initializer.init_refs {
+            if let Some(&index) = global_by_key
+                .get(referenced.as_str())
+                .or_else(|| global_by_key.get(referenced.strip_prefix('@').unwrap_or(referenced)))
+            {
+                exposed[index] = true;
+            }
+        }
+    }
+    exposed
+}
+
+fn module_violation_tainted(pir: &Pir) -> bool {
+    // Match the existing module-wide violation discipline: inline assembly has no complete
+    // value-operand flow certificate and can name storage outside the modeled IR. Other
+    // lowered `Unknown` statements explicitly expose their operands/results to Ω, so the
+    // per-global exposure proof remains applicable to globals absent from those values.
+    pir.functions
+        .iter()
+        .flat_map(|func| &func.body)
+        .chain(&pir.global_init)
+        .any(|stmt| {
+            matches!(stmt, pangs_pir::Stmt::Unknown { reason, .. } if reason.starts_with("inline_asm"))
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -793,6 +910,8 @@ impl<'a> Solver<'a> {
             .map(|(idx, key)| (key.clone(), idx))
             .collect::<HashMap<_, _>>();
         let mut global_object_nodes = vec![None; global_keys.len()];
+        let global_address_exposed = global_address_exposure(pir, pag);
+        let module_violation_tainted = module_violation_tainted(pir);
 
         let mut classes = Vec::with_capacity(pag.nodes.len());
         for (index, node) in pag.nodes.iter().enumerate() {
@@ -853,6 +972,8 @@ impl<'a> Solver<'a> {
             function_object_nodes,
             global_keys,
             global_object_nodes,
+            global_address_exposed,
+            module_violation_tainted,
             callsites_by_index,
             worklist: VecDeque::new(),
             queued,
@@ -912,6 +1033,8 @@ impl<'a> Solver<'a> {
             ext,
             universal,
             esc,
+            global_address_exposed: self.global_address_exposed.clone(),
+            module_violation_tainted: self.module_violation_tainted,
         }
     }
 
@@ -1159,7 +1282,9 @@ impl<'a> Solver<'a> {
             );
         }
 
-        let mut pointee_globals_by_root: Vec<Option<SharedStringList>> =
+        let mut unfiltered_pointee_globals_by_root: Vec<Option<SharedStringList>> =
+            vec![None; self.classes.len()];
+        let mut exposed_pointee_globals_by_root: Vec<Option<SharedStringList>> =
             vec![None; self.classes.len()];
         let mut reaches_function_pointer_by_root: Vec<Option<bool>> =
             vec![None; self.classes.len()];
@@ -1200,22 +1325,54 @@ impl<'a> Solver<'a> {
                 node_summary_by_root[root] = Some(cached.clone());
                 cached
             };
-            let pointee_globals = summary
+            let (pointee_globals, pointee_globals_unfiltered) = summary
                 .pointee
                 .map(|pointee| {
-                    if let Some(globals) = &pointee_globals_by_root[pointee] {
+                    let unfiltered =
+                        if let Some(globals) = &unfiltered_pointee_globals_by_root[pointee] {
+                            globals.clone()
+                        } else {
+                            let mut globals = self.classes[pointee]
+                                .global_objs
+                                .iter()
+                                .map(|&global_index| self.global_keys[global_index].clone())
+                                .collect::<Vec<_>>();
+                            globals.sort();
+                            let globals = SharedStringList::from(globals);
+                            unfiltered_pointee_globals_by_root[pointee] = Some(globals.clone());
+                            globals
+                        };
+                    if self.module_violation_tainted || self.classes[root].universal {
+                        return (unfiltered, SharedStringList::default());
+                    }
+                    let filtered = if let Some(globals) = &exposed_pointee_globals_by_root[pointee]
+                    {
                         globals.clone()
                     } else {
                         let mut globals = self.classes[pointee]
                             .global_objs
                             .iter()
+                            .filter(|&&global_index| self.global_address_exposed[global_index])
                             .map(|&global_index| self.global_keys[global_index].clone())
                             .collect::<Vec<_>>();
                         globals.sort();
                         let globals = SharedStringList::from(globals);
-                        pointee_globals_by_root[pointee] = Some(globals.clone());
+                        exposed_pointee_globals_by_root[pointee] = Some(globals.clone());
                         globals
-                    }
+                    };
+                    debug_assert_narrows(
+                        &node.label,
+                        "address-exposed",
+                        &filtered,
+                        "steens-class",
+                        &unfiltered,
+                    );
+                    let envelope = if filtered != unfiltered {
+                        unfiltered
+                    } else {
+                        SharedStringList::default()
+                    };
+                    (filtered, envelope)
                 })
                 .unwrap_or_default();
             nodes.insert(
@@ -1225,6 +1382,7 @@ impl<'a> Solver<'a> {
                     external: summary.external,
                     external_universal: self.classes[root].universal,
                     pointee_globals,
+                    pointee_globals_unfiltered,
                     external_sources: if summary.external {
                         vec!["omega:steens_external".to_string()]
                     } else {
@@ -1811,7 +1969,7 @@ mod tests {
     use std::path::Path;
 
     use pangs_pag::{CallKind, Callsite, CallsiteId, Node, NodeId, NodeKind, Pag, PagOpts, Scope};
-    use pangs_pir::{AbiClass, Func};
+    use pangs_pir::{AbiClass, Func, Global};
 
     use super::*;
 
@@ -1884,6 +2042,148 @@ mod tests {
             sig: void_sig(),
             external_boundary: false,
             loc: None,
+        }
+    }
+
+    fn address_exposure_filter_fixture(tainted: bool, universal: bool) -> NodeResolution {
+        let pir = Pir {
+            module: "address_exposure".into(),
+            source: None,
+            lowering: Default::default(),
+            target: None,
+            functions: Vec::new(),
+            globals: vec![
+                Global {
+                    key: "closed".into(),
+                    ..Global::default()
+                },
+                Global {
+                    key: "exposed".into(),
+                    ..Global::default()
+                },
+            ],
+            global_init: tainted
+                .then(|| pangs_pir::Stmt::Unknown {
+                    op: "call".into(),
+                    operands: Vec::new(),
+                    results: Vec::new(),
+                    reason: "inline_asm".into(),
+                    loc: None,
+                })
+                .into_iter()
+                .collect(),
+        };
+        let nodes = vec![
+            Node {
+                id: NodeId(0),
+                label: "obj:global:closed".into(),
+                kind: NodeKind::Object {
+                    object: ObjectKind::Global,
+                    key: "closed".into(),
+                    owner: None,
+                },
+            },
+            Node {
+                id: NodeId(1),
+                label: "obj:global:exposed".into(),
+                kind: NodeKind::Object {
+                    object: ObjectKind::Global,
+                    key: "exposed".into(),
+                    owner: None,
+                },
+            },
+            Node {
+                id: NodeId(2),
+                label: "sym:global:@closed".into(),
+                kind: NodeKind::Value {
+                    scope: Scope::Module,
+                },
+            },
+            Node {
+                id: NodeId(3),
+                label: "sym:global:@exposed".into(),
+                kind: NodeKind::Value {
+                    scope: Scope::Module,
+                },
+            },
+            Node {
+                id: NodeId(4),
+                label: "val:query".into(),
+                kind: NodeKind::Value {
+                    scope: Scope::Module,
+                },
+            },
+            Node {
+                id: NodeId(5),
+                label: "val:gep".into(),
+                kind: NodeKind::Value {
+                    scope: Scope::Module,
+                },
+            },
+        ];
+        let edges = vec![
+            pangs_pag::Edge {
+                id: pangs_pag::EdgeId(0),
+                kind: pangs_pag::EdgeKind::AddrOf,
+                src: NodeId(0),
+                dst: NodeId(2),
+                owner: pangs_pag::Owner::Module,
+                loc: None,
+            },
+            pangs_pag::Edge {
+                id: pangs_pag::EdgeId(1),
+                kind: pangs_pag::EdgeKind::AddrOf,
+                src: NodeId(1),
+                dst: NodeId(3),
+                owner: pangs_pag::Owner::Module,
+                loc: None,
+            },
+            pangs_pag::Edge {
+                id: pangs_pag::EdgeId(2),
+                kind: pangs_pag::EdgeKind::Gep { byte_off: Some(0) },
+                src: NodeId(3),
+                dst: NodeId(5),
+                owner: pangs_pag::Owner::Module,
+                loc: None,
+            },
+        ];
+        let pag = Pag {
+            module: pir.module.clone(),
+            source: None,
+            metrics: Default::default(),
+            nodes,
+            edges,
+            callsites: Vec::new(),
+            omega_seeds: Vec::new(),
+        };
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+        let pointee = solver.join(0, 1);
+        solver.classes[4].pointee = Some(pointee);
+        solver.classes[4].universal = universal;
+        solver.finish().nodes.remove("val:query").unwrap()
+    }
+
+    #[test]
+    fn finite_class_enumeration_drops_globals_without_address_exposure() {
+        let resolution = address_exposure_filter_fixture(false, false);
+        assert_eq!(&*resolution.pointee_globals, &["exposed".to_string()]);
+        assert_eq!(
+            &*resolution.pointee_globals_unfiltered,
+            &["closed".to_string(), "exposed".to_string()]
+        );
+    }
+
+    #[test]
+    fn universal_or_violation_tainted_enumeration_keeps_unexposed_globals() {
+        for resolution in [
+            address_exposure_filter_fixture(false, true),
+            address_exposure_filter_fixture(true, false),
+        ] {
+            assert_eq!(
+                &*resolution.pointee_globals,
+                &["closed".to_string(), "exposed".to_string()]
+            );
+            assert!(resolution.pointee_globals_unfiltered.is_empty());
         }
     }
 

@@ -63,15 +63,18 @@ exclusion. In that case the access must remain module-wide unless a stronger, se
 validated proof applies. A global's address not escaping to an external boundary is not by
 itself sufficient: an entirely internal pointer may still alias the global.
 
-## Option 1: direct-address-only certificate
+## Option 1: address-exposure filtering at class enumeration
 
-The smallest refinement is a per-global certificate stating that every use of the global's
+The smallest refinement is a per-global bit stating that every use of the global's
 address is the address operand of an ordinary direct load or store. Any other use fails the
 certificate, including assignment to another pointer, GEP, storage of the address, passage to a
 call, return, static initializer capture, integer conversion, export, or unsupported operation.
 
-For a finite unknown-access row, a certified global can be removed unless the row's address
-node is the direct global symbol itself. Universal rows cannot use this exclusion.
+At the solver's finite pointee-class enumeration site, an unexposed global is removed from
+`pointee_globals`. This repairs ModRef, stationarity, escape diagnostics, and future clients at
+their common source instead of introducing a disposition-only certificate. Universal rows and
+modules with module-wide violation taint cannot use this exclusion. The raw class set remains
+available as `pointee_globals_unfiltered` whenever filtering changes an answer.
 
 ### Advantages
 
@@ -82,7 +85,7 @@ node is the direct global symbol itself. Universal rows cannot use this exclusio
 
 ### Limitations and risks
 
-- Helps only unusually closed globals.
+- Helps whenever false candidates are closed, even if the global being analyzed is not.
 - Rejects common, benign local aliases and helper-function access patterns.
 - A PIR-level string-use scan could miss constant expressions or lowering details; the proof
   should be based on exhaustive LLVM uses or explicit PAG edges.
@@ -90,8 +93,8 @@ node is the direct global symbol itself. Universal rows cannot use this exclusio
 
 ### Likely scope
 
-Small to medium. It needs a certificate producer, storage in the analysis API, candidate-set
-filtering before high-fanout collapse, diagnostics, and positive and negative tests.
+Small to medium. It needs one exposure bit per global, filtering at solver class enumeration,
+raw-envelope diagnostics, and positive and negative tests.
 
 ## Option 2: semantic pointer kinds and typed payload flow
 
@@ -337,7 +340,15 @@ integration point while a new analysis is being validated.
 
 ## Proposed sequence
 
-### Stage 1: diagnose and preserve provenance
+### Stage 1: filter finite class enumeration by address exposure
+
+Compute the per-global address-exposure bit and remove unexposed globals while enumerating
+finite, non-universal solver classes. Preserve the raw class envelope for differential checks,
+and bypass the filter for universal external provenance and module-wide violation taint. This
+is the first implementation step because corpus measurement shows that false candidates, not
+necessarily the globals being classified, are very often address-closed.
+
+### Stage 2: diagnose and preserve provenance
 
 Before changing eligibility, add diagnostics that explain why each candidate global reached a
 high-fanout access node. At minimum record whether the path involved:
@@ -354,7 +365,7 @@ Run this on `sym_count_xjtr_0` and representative corpus cases. This confirms wh
 type loss, aggregate binding, or memory merging is the dominant source and establishes A/B
 metrics for candidate-set sizes.
 
-### Stage 2: semantic pointer kinds and by-value aggregate correctness
+### Stage 3: semantic pointer kinds and by-value aggregate correctness
 
 Preserve pointer-versus-non-pointer semantics separately from ABI classes and stop emitting
 pointer-payload constraints for proven scalar values. Model pointer-bearing aggregate fields
@@ -365,7 +376,7 @@ This is the preferred foundational change because every later certificate or que
 from a cleaner graph. Measure changes in PAG size, solver time, ModRef fanout, and disposition
 coverage on Surprisetalk plus the established small-to-large profiling corpus.
 
-### Stage 3: general global-centric access-set certificate
+### Stage 4: general global-centric access-set certificate
 
 Implement a summary-based address-flow closure for disposition. Begin with SSA operations,
 constant GEPs, local pointer spills, direct calls, and returns. Fail closed at unresolved
@@ -376,20 +387,20 @@ Use a complete certificate to replace coarse unknown attribution for that global
 eligibility. Do not limit the implementation to direct-address-only globals, although those
 provide useful initial tests.
 
-### Stage 4: layout-aware refinement
+### Stage 5: layout-aware refinement
 
 Add allocation extent, access width, and GEP-offset validation to the global-centric analysis
 and to finite candidate construction. Preserve conservative behavior for unknown offsets,
 unions, byte casts, flexible layouts, and `container_of`-style negative paths.
 
-### Stage 5: demand-driven matched-path queries
+### Stage 6: demand-driven matched-path queries
 
 For globals whose address-flow certificate remains incomplete and whose disposition would
 otherwise be unhandled, run a bounded candidate-specific query with matched memory and
 interprocedural edges. Cache shared slices and expose truncation explicitly. Only complete
 negative answers remove candidates.
 
-### Stage 6: reconsider selective stronger solving
+### Stage 7: reconsider selective stronger solving
 
 Profile the remaining false positives. Introduce flow- or context-sensitive selective solving
 only if a material fraction of important globals remains blocked by genuine solver merges that
@@ -418,18 +429,19 @@ through valid aggregate paths, or reachable from universal forged pointers remai
 
 ## Recommendation
 
-Do not make the direct-address-only certificate the final architecture. It is a useful test and
-possibly a low-risk early optimization, but the general solution should be a cleaner typed PAG
-combined with an explicit, auditable access-set completeness proof.
+Do not treat address-exposure filtering as the final architecture. It is a high-payoff early
+refinement, but the general solution should be a cleaner typed PAG combined with an explicit,
+auditable access-set completeness proof.
 
 The recommended investment order is therefore:
 
-1. provenance diagnostics;
-2. semantic pointer kinds and precise by-value aggregate flow;
-3. global-centric address-flow closure;
-4. layout validation;
-5. demand-driven matched-path queries; and
-6. selective flow/context sensitivity only if corpus evidence justifies it.
+1. address-exposure filtering at finite class enumeration;
+2. provenance diagnostics;
+3. semantic pointer kinds and precise by-value aggregate flow;
+4. global-centric address-flow closure;
+5. layout validation;
+6. demand-driven matched-path queries; and
+7. selective flow/context sensitivity only if corpus evidence justifies it.
 
 This order improves the shared analysis foundation first, gives disposition a general
 certificate rather than an isolation special case, and reserves the highest-complexity solver
