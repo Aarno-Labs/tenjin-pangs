@@ -40,6 +40,12 @@ const PROVENANCE_PROMOTION_MIN_BUDGET: u64 = 100_000;
 const PROVENANCE_PROMOTION_MAX_NODES: u64 = 4_096;
 const PROVENANCE_PROMOTION_MAX_EDGES: u64 = 4_096;
 
+// SCC scans are linear in the current copy graph, so trigger them geometrically rather
+// than after every dynamic edge. A pass runs after at least this many new edges and after
+// those edges amount to at least half of the current graph. Once a dense cycle collapses,
+// edges internal to it canonicalize to self-edges and stop contributing to the trigger.
+const COPY_SCC_MIN_EDGES: usize = 4_096;
+
 /// Solve Andersen as a refinement of Steensgaard and fold the refined facts back into a
 /// `SolveResult` that is otherwise identical to the Steensgaard answer.
 pub fn solve_andersen(
@@ -1069,7 +1075,7 @@ impl<'a> Refiner<'a> {
 
         if profile {
             eprintln!(
-                "pangs andersen profile: solve start target_sites={} target_edges={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} loads={} stores={} geps={} memcpys={}",
+                "pangs andersen profile: solve start target_sites={} target_edges={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} loads={} stores={} geps={} memcpys={} copy_scc_enabled={} copy_scc_min_edges={}",
                 target_map.len(),
                 target_map.values().map(Vec::len).sum::<usize>(),
                 solve.pts.len(),
@@ -1079,13 +1085,15 @@ impl<'a> Refiner<'a> {
                 solve.loads.values().map(Vec::len).sum::<usize>(),
                 solve.stores.values().map(Vec::len).sum::<usize>(),
                 solve.geps.values().map(Vec::len).sum::<usize>(),
-                solve.memcpys.len()
+                solve.memcpys.len(),
+                solve.scc_enabled,
+                solve.scc_min_edges
             );
         }
         solve.run();
         if profile {
             eprintln!(
-                "pangs andersen profile: solve done steps={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={}",
+                "pangs andersen profile: solve done steps={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
                 solve.steps,
                 solve.pts.len(),
                 solve.pts_facts(),
@@ -1094,7 +1102,10 @@ impl<'a> Refiner<'a> {
                 solve.fields.len(),
                 solve.unknown_fields.len(),
                 solve.memcpy_pairs_processed,
-                solve.copy_fact_pairs_processed
+                solve.copy_fact_pairs_processed,
+                solve.scc_passes,
+                solve.scc_nodes_collapsed,
+                solve.scc_copy_edges_removed
             );
         }
         solve
@@ -1320,7 +1331,7 @@ impl<'a> Refiner<'a> {
             }
             let operand = cs.operand.unwrap();
             let mut funcs: Vec<usize> = Vec::new();
-            if let Some(set) = pts.pts.get(&operand.0) {
+            if let Some(set) = pts.points_to(operand.0) {
                 for &cell in set {
                     if let Some(&idx) = self.fn_cell_to_index.get(&cell) {
                         let f = &self.pir.functions[idx];
@@ -1435,7 +1446,7 @@ impl<'a> Refiner<'a> {
             if !node.kind.is_value_like_public() || !self.in_scope[node.id.0 as usize] {
                 continue;
             }
-            let set = pts.pts.get(&node.id.0);
+            let set = pts.points_to(node.id.0);
             let external = set
                 .map(|set| set.iter().any(|cell| pts.is_external(*cell)))
                 .unwrap_or(false);
@@ -1491,8 +1502,7 @@ impl<'a> Refiner<'a> {
                 Vec::new()
             };
             let external_sources = if external {
-                pts.external_sources
-                    .get(&node.id.0)
+                pts.external_sources_for(node.id.0)
                     .map(|sources| sources.iter().cloned().collect())
                     .unwrap_or_else(|| vec!["omega:unknown".to_string()])
             } else {
@@ -1578,7 +1588,7 @@ impl<'a> Refiner<'a> {
             }
             let mut allocs = BTreeSet::new();
             for cell in content_cells {
-                let Some(set) = pts.pts.get(&cell) else {
+                let Some(set) = pts.points_to(cell) else {
                     continue;
                 };
                 for &o in set {
@@ -1622,6 +1632,14 @@ fn maps_equal(a: &HashMap<usize, Vec<usize>>, b: &HashMap<usize, Vec<usize>>) ->
 
 fn andersen_profile_enabled() -> bool {
     std::env::var_os("PANGS_ANDERSEN_PROFILE").is_some()
+}
+
+fn copy_scc_min_edges() -> usize {
+    std::env::var("PANGS_ANDERSEN_COPY_SCC_MIN_EDGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(COPY_SCC_MIN_EDGES)
 }
 
 fn partition_profile_enabled() -> bool {
@@ -1729,6 +1747,10 @@ struct MemcpyDelta {
 
 struct Solve {
     next_field: Cell,
+    /// Constraint-graph node representative. This canonicalizes where pointer contents are
+    /// stored and propagated; cells appearing *inside* points-to sets remain allocation
+    /// identities and are deliberately never canonicalized.
+    representative: Vec<Cell>,
     pts: HashMap<Cell, HashSet<Cell>>,
     /// Points-to facts not yet propagated over the source's established copy edges.
     pending_pts: HashMap<Cell, Vec<Cell>>,
@@ -1773,12 +1795,19 @@ struct Solve {
     steps: usize,
     memcpy_pairs_processed: usize,
     copy_fact_pairs_processed: usize,
+    new_copy_edges_since_scc: usize,
+    scc_enabled: bool,
+    scc_min_edges: usize,
+    scc_passes: usize,
+    scc_nodes_collapsed: usize,
+    scc_copy_edges_removed: usize,
 }
 
 impl Solve {
     fn new(n_base: usize, profile: bool) -> Self {
         Self {
             next_field: n_base as Cell,
+            representative: (0..n_base as Cell).collect(),
             pts: HashMap::new(),
             pending_pts: HashMap::new(),
             external_sources: HashMap::new(),
@@ -1806,15 +1835,39 @@ impl Solve {
             steps: 0,
             memcpy_pairs_processed: 0,
             copy_fact_pairs_processed: 0,
+            new_copy_edges_since_scc: 0,
+            scc_enabled: std::env::var_os("PANGS_ANDERSEN_DISABLE_COPY_SCC").is_none(),
+            scc_min_edges: copy_scc_min_edges(),
+            scc_passes: 0,
+            scc_nodes_collapsed: 0,
+            scc_copy_edges_removed: 0,
         }
+    }
+
+    fn allocate_cell(&mut self) -> Cell {
+        let cell = self.next_field;
+        self.next_field += 1;
+        self.representative.push(cell);
+        cell
+    }
+
+    fn canonical(&self, cell: Cell) -> Cell {
+        self.representative[cell as usize]
+    }
+
+    fn points_to(&self, cell: Cell) -> Option<&HashSet<Cell>> {
+        self.pts.get(&self.canonical(cell))
+    }
+
+    fn external_sources_for(&self, cell: Cell) -> Option<&BTreeSet<String>> {
+        self.external_sources.get(&self.canonical(cell))
     }
 
     fn region(&mut self, region: ExternalRegion) -> Cell {
         if let Some(&cell) = self.regions.get(&region) {
             return cell;
         }
-        let cell = self.next_field;
-        self.next_field += 1;
+        let cell = self.allocate_cell();
         self.regions.insert(region, cell);
         self.region_of_cell.insert(cell, region);
         // Each region denotes its own foreign objects. Unlike the old absorbing Ω cell,
@@ -1837,6 +1890,7 @@ impl Solve {
     }
 
     fn enqueue(&mut self, cell: Cell) {
+        let cell = self.canonical(cell);
         if self.queued.insert(cell) {
             self.worklist.push(cell);
         }
@@ -1863,6 +1917,7 @@ impl Solve {
         if objects.is_empty() {
             return;
         }
+        let cell = self.canonical(cell);
         let dst = self.pts.entry(cell).or_default();
         let mut added = Vec::new();
         for &object in objects {
@@ -1880,6 +1935,7 @@ impl Solve {
         if sources.is_empty() {
             return;
         }
+        let cell = self.canonical(cell);
         let dst = self.external_sources.entry(cell).or_default();
         let mut added = Vec::new();
         for source in sources {
@@ -1897,6 +1953,8 @@ impl Solve {
     }
 
     fn add_copy(&mut self, from: Cell, to: Cell) {
+        let from = self.canonical(from);
+        let to = self.canonical(to);
         if from == to {
             return;
         }
@@ -1912,6 +1970,7 @@ impl Solve {
             return;
         }
         self.pending_succ.entry(from).or_default().insert(to);
+        self.new_copy_edges_since_scc = self.new_copy_edges_since_scc.saturating_add(1);
         // Even an empty source must run once so the edge becomes established before later
         // source facts are propagated as deltas.
         self.enqueue(from);
@@ -1933,9 +1992,11 @@ impl Solve {
 
     fn memcpy_delta(&mut self, index: usize) -> MemcpyDelta {
         let join = &self.memcpys[index];
+        let destination = self.canonical(join.dst);
+        let source = self.canonical(join.src);
         let new_destinations = self
             .pts
-            .get(&join.dst)
+            .get(&destination)
             .map(|set| {
                 set.iter()
                     .copied()
@@ -1945,7 +2006,7 @@ impl Solve {
             .unwrap_or_default();
         let new_sources = self
             .pts
-            .get(&join.src)
+            .get(&source)
             .map(|set| {
                 set.iter()
                     .copied()
@@ -1957,7 +2018,7 @@ impl Solve {
             Vec::new()
         } else {
             self.pts
-                .get(&join.src)
+                .get(&source)
                 .map(|set| set.iter().copied().collect())
                 .unwrap_or_default()
         };
@@ -2016,8 +2077,7 @@ impl Solve {
                 if let Some(&cell) = self.fields.get(&(base, off)) {
                     return cell;
                 }
-                let cell = self.next_field;
-                self.next_field += 1;
+                let cell = self.allocate_cell();
                 self.fields.insert((base, off), cell);
                 self.field_base.insert(cell, base);
                 self.field_offset.insert(cell, off);
@@ -2035,8 +2095,7 @@ impl Solve {
         if let Some(&cell) = self.unknown_fields.get(&base) {
             return cell;
         }
-        let cell = self.next_field;
-        self.next_field += 1;
+        let cell = self.allocate_cell();
         self.unknown_fields.insert(base, cell);
         self.unknown_field_base.insert(cell, base);
         self.field_base.insert(cell, base);
@@ -2073,6 +2132,245 @@ impl Solve {
         }
     }
 
+    fn should_collapse_copy_sccs(&self) -> bool {
+        let edges = self.copy_edges();
+        self.scc_enabled
+            && edges >= self.scc_min_edges
+            && self.new_copy_edges_since_scc >= self.scc_min_edges.max(edges / 2)
+    }
+
+    /// Collapse every non-trivial SCC in the current copy graph.
+    ///
+    /// Mutual inclusion makes the members' pointer contents equal at the least fixed point,
+    /// so eagerly replacing them with one shared variable is exact. Allocation identities
+    /// stored in the points-to relation are not rewritten: two globals whose *contents* are
+    /// mutually included do not thereby become the same concrete object.
+    fn collapse_copy_sccs(&mut self) {
+        self.scc_passes = self.scc_passes.saturating_add(1);
+        self.new_copy_edges_since_scc = 0;
+
+        let cell_count = self.next_field as usize;
+        let mut adjacency = vec![Vec::<Cell>::new(); cell_count];
+        for (&source, successors) in self.succ.iter().chain(&self.pending_succ) {
+            adjacency[source as usize].extend(successors.iter().copied());
+        }
+        for successors in &mut adjacency {
+            successors.sort_unstable();
+            successors.dedup();
+        }
+        let old_edge_count = adjacency.iter().map(Vec::len).sum::<usize>();
+
+        // Iterative Kosaraju keeps stack usage independent of corpus size. Cells are dense
+        // integer IDs, so vector-indexed graph state is substantially cheaper than hashing.
+        let mut reverse = vec![Vec::<Cell>::new(); cell_count];
+        let mut active = vec![false; cell_count];
+        for (source, successors) in adjacency.iter().enumerate() {
+            if !successors.is_empty() {
+                active[source] = true;
+            }
+            for &destination in successors {
+                active[destination as usize] = true;
+                reverse[destination as usize].push(source as Cell);
+            }
+        }
+        let mut seen = vec![false; cell_count];
+        let mut finish_order = Vec::new();
+        for root in 0..cell_count {
+            if !active[root] || seen[root] {
+                continue;
+            }
+            seen[root] = true;
+            let mut dfs = vec![(root as Cell, 0usize)];
+            while let Some((node, next_successor)) = dfs.last_mut() {
+                if *next_successor < adjacency[*node as usize].len() {
+                    let successor = adjacency[*node as usize][*next_successor];
+                    *next_successor += 1;
+                    if !seen[successor as usize] {
+                        seen[successor as usize] = true;
+                        dfs.push((successor, 0));
+                    }
+                } else {
+                    let (node, _) = dfs.pop().expect("non-empty SCC DFS stack");
+                    finish_order.push(node);
+                }
+            }
+        }
+
+        let mut component_of = vec![usize::MAX; cell_count];
+        let mut components = Vec::<Vec<Cell>>::new();
+        while let Some(root) = finish_order.pop() {
+            if component_of[root as usize] != usize::MAX {
+                continue;
+            }
+            let component = components.len();
+            component_of[root as usize] = component;
+            let mut pending = vec![root];
+            let mut members = Vec::new();
+            while let Some(node) = pending.pop() {
+                members.push(node);
+                for &predecessor in &reverse[node as usize] {
+                    if component_of[predecessor as usize] == usize::MAX {
+                        component_of[predecessor as usize] = component;
+                        pending.push(predecessor);
+                    }
+                }
+            }
+            components.push(members);
+        }
+
+        let mut collapsed_to: Vec<Cell> = (0..cell_count as Cell).collect();
+        let mut collapsed_nodes = 0usize;
+        let mut largest_scc = 0usize;
+        for members in &components {
+            if members.len() <= 1 {
+                continue;
+            }
+            let representative = *members.iter().min().expect("non-empty SCC");
+            for &member in members {
+                collapsed_to[member as usize] = representative;
+            }
+            collapsed_nodes = collapsed_nodes.saturating_add(members.len() - 1);
+            largest_scc = largest_scc.max(members.len());
+        }
+        if collapsed_nodes == 0 {
+            if self.profile {
+                eprintln!(
+                    "pangs andersen profile: scc pass={} copy_edges={} collapsed_nodes=0",
+                    self.scc_passes, old_edge_count
+                );
+            }
+            return;
+        }
+
+        for representative in &mut self.representative {
+            *representative = collapsed_to[*representative as usize];
+        }
+        let representatives = self.representative.clone();
+
+        let mut merged_pts = HashMap::<Cell, HashSet<Cell>>::new();
+        for (cell, objects) in std::mem::take(&mut self.pts) {
+            merged_pts
+                .entry(representatives[cell as usize])
+                .or_default()
+                .extend(objects);
+        }
+        self.pts = merged_pts;
+
+        let mut merged_external = HashMap::<Cell, BTreeSet<String>>::new();
+        for (cell, sources) in std::mem::take(&mut self.external_sources) {
+            merged_external
+                .entry(representatives[cell as usize])
+                .or_default()
+                .extend(sources);
+        }
+        self.external_sources = merged_external;
+
+        let mut condensed_succ = HashMap::<Cell, HashSet<Cell>>::new();
+        for (source, successors) in adjacency.into_iter().enumerate() {
+            let source = representatives[source];
+            for destination in successors {
+                let destination = representatives[destination as usize];
+                if source != destination {
+                    condensed_succ
+                        .entry(source)
+                        .or_default()
+                        .insert(destination);
+                }
+            }
+        }
+        let new_edge_count = condensed_succ.values().map(HashSet::len).sum::<usize>();
+        self.succ = condensed_succ;
+        self.pending_succ.clear();
+
+        let mut merged_loads = HashMap::<Cell, Vec<Cell>>::new();
+        for (cell, loads) in std::mem::take(&mut self.loads) {
+            merged_loads
+                .entry(representatives[cell as usize])
+                .or_default()
+                .extend(loads);
+        }
+        for loads in merged_loads.values_mut() {
+            loads.sort_unstable();
+            loads.dedup();
+        }
+        self.loads = merged_loads;
+
+        let mut merged_stores = HashMap::<Cell, Vec<(Cell, Option<String>)>>::new();
+        for (cell, stores) in std::mem::take(&mut self.stores) {
+            merged_stores
+                .entry(representatives[cell as usize])
+                .or_default()
+                .extend(stores);
+        }
+        for stores in merged_stores.values_mut() {
+            stores.sort_unstable();
+            stores.dedup();
+        }
+        self.stores = merged_stores;
+
+        let mut merged_geps = HashMap::<Cell, Vec<(Option<i64>, Cell)>>::new();
+        for (cell, geps) in std::mem::take(&mut self.geps) {
+            merged_geps
+                .entry(representatives[cell as usize])
+                .or_default()
+                .extend(geps);
+        }
+        for geps in merged_geps.values_mut() {
+            geps.sort_unstable();
+            geps.dedup();
+        }
+        self.geps = merged_geps;
+
+        let mut merged_memcpy_endpoints = HashMap::<Cell, Vec<usize>>::new();
+        for (cell, joins) in std::mem::take(&mut self.memcpy_by_endpoint) {
+            merged_memcpy_endpoints
+                .entry(representatives[cell as usize])
+                .or_default()
+                .extend(joins);
+        }
+        for joins in merged_memcpy_endpoints.values_mut() {
+            joins.sort_unstable();
+            joins.dedup();
+        }
+        self.memcpy_by_endpoint = merged_memcpy_endpoints;
+
+        // Re-seed every condensed variable from its complete state. This costs one
+        // propagation over the much smaller condensation graph and also re-evaluates
+        // complex constraints whose members just gained facts from one another.
+        self.pending_pts = self
+            .pts
+            .iter()
+            .map(|(&cell, objects)| (cell, objects.iter().copied().collect()))
+            .collect();
+        self.pending_external_sources = self
+            .external_sources
+            .iter()
+            .map(|(&cell, sources)| (cell, sources.iter().cloned().collect()))
+            .collect();
+        self.worklist.clear();
+        self.queued.clear();
+        let mut reseed = self.pending_pts.keys().copied().collect::<HashSet<_>>();
+        reseed.extend(self.pending_external_sources.keys().copied());
+        for cell in reseed {
+            self.enqueue(cell);
+        }
+
+        self.scc_nodes_collapsed = self.scc_nodes_collapsed.saturating_add(collapsed_nodes);
+        let removed_edges = old_edge_count.saturating_sub(new_edge_count);
+        self.scc_copy_edges_removed = self.scc_copy_edges_removed.saturating_add(removed_edges);
+        if self.profile {
+            eprintln!(
+                "pangs andersen profile: scc pass={} copy_edges_before={} copy_edges_after={} collapsed_nodes={} largest_scc={} removed_edges={}",
+                self.scc_passes,
+                old_edge_count,
+                new_edge_count,
+                collapsed_nodes,
+                largest_scc,
+                removed_edges
+            );
+        }
+    }
+
     fn pts_facts(&self) -> usize {
         self.pts.values().map(HashSet::len).sum()
     }
@@ -2094,7 +2392,7 @@ impl Solve {
     fn maybe_report_progress(&self) {
         if self.profile && self.steps % 10_000 == 0 {
             eprintln!(
-                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={}",
+                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} new_copy_edges_since_scc={}",
                 self.steps,
                 self.worklist.len(),
                 self.queued.len(),
@@ -2105,7 +2403,11 @@ impl Solve {
                 self.fields.len(),
                 self.unknown_fields.len(),
                 self.memcpy_pairs_processed,
-                self.copy_fact_pairs_processed
+                self.copy_fact_pairs_processed,
+                self.scc_passes,
+                self.scc_nodes_collapsed,
+                self.scc_copy_edges_removed,
+                self.new_copy_edges_since_scc
             );
         }
     }
@@ -2252,6 +2554,9 @@ impl Solve {
                         }
                     }
                 }
+            }
+            if self.should_collapse_copy_sccs() {
+                self.collapse_copy_sccs();
             }
         }
     }
@@ -2583,6 +2888,51 @@ mod tests {
         assert_eq!(solve.copy_fact_pairs_processed, 8);
         solve.run();
         assert_eq!(solve.copy_fact_pairs_processed, 8);
+    }
+
+    #[test]
+    fn copy_scc_collapse_preserves_object_identity_and_dynamic_growth() {
+        let mut solve = Solve::new(10, false);
+        solve.add_pts(0, 1); // Object identity 1 must not canonicalize with variable 1.
+        solve.add_pts(0, 6);
+        solve.add_pts(1, 7);
+        solve.add_pts(6, 8);
+        solve.add_external_sources(1, &["test-origin".to_string()]);
+        solve.loads.entry(1).or_default().push(5);
+        solve.add_copy(0, 1);
+        solve.add_copy(1, 2);
+        solve.add_copy(2, 0);
+        solve.add_copy(2, 3);
+
+        solve.collapse_copy_sccs();
+        let representative = solve.canonical(0);
+        assert_eq!(solve.canonical(1), representative);
+        assert_eq!(solve.canonical(2), representative);
+        assert_eq!(solve.points_to(0).unwrap(), &HashSet::from([1, 6, 7]));
+        assert!(solve.points_to(0).unwrap().contains(&1));
+        assert!(solve
+            .external_sources_for(2)
+            .unwrap()
+            .contains("test-origin"));
+        assert_eq!(solve.scc_nodes_collapsed, 2);
+        assert_eq!(solve.scc_copy_edges_removed, 3);
+
+        // Re-seeding propagates the union through the condensed edge and re-evaluates the
+        // load owned by member 1. The latter discovers contents of object 6 at destination 5;
+        // other possible pointee objects conservatively contribute their contents as well.
+        solve.run();
+        assert_eq!(solve.points_to(3).unwrap(), &HashSet::from([1, 6, 7]));
+        assert!(solve.points_to(5).unwrap().contains(&8));
+
+        // Facts and edges added through an old member ID resolve through the representative.
+        solve.add_pts(2, 9);
+        solve.add_copy(4, 1);
+        solve.add_pts(4, 8);
+        solve.run();
+        assert!(solve.points_to(0).unwrap().contains(&8));
+        assert!(solve.points_to(0).unwrap().contains(&9));
+        assert!(solve.points_to(3).unwrap().contains(&8));
+        assert!(solve.points_to(3).unwrap().contains(&9));
     }
 
     #[test]
