@@ -1074,7 +1074,7 @@ impl<'a> Refiner<'a> {
                 target_map.values().map(Vec::len).sum::<usize>(),
                 solve.pts.len(),
                 solve.pts_facts(),
-                solve.succ.len(),
+                solve.copy_sources(),
                 solve.copy_edges(),
                 solve.loads.values().map(Vec::len).sum::<usize>(),
                 solve.stores.values().map(Vec::len).sum::<usize>(),
@@ -1085,15 +1085,16 @@ impl<'a> Refiner<'a> {
         solve.run();
         if profile {
             eprintln!(
-                "pangs andersen profile: solve done steps={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={}",
+                "pangs andersen profile: solve done steps={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={}",
                 solve.steps,
                 solve.pts.len(),
                 solve.pts_facts(),
-                solve.succ.len(),
+                solve.copy_sources(),
                 solve.copy_edges(),
                 solve.fields.len(),
                 solve.unknown_fields.len(),
-                solve.memcpy_pairs_processed
+                solve.memcpy_pairs_processed,
+                solve.copy_fact_pairs_processed
             );
         }
         solve
@@ -1729,10 +1730,18 @@ struct MemcpyDelta {
 struct Solve {
     next_field: Cell,
     pts: HashMap<Cell, HashSet<Cell>>,
+    /// Points-to facts not yet propagated over the source's established copy edges.
+    pending_pts: HashMap<Cell, Vec<Cell>>,
     external_sources: HashMap<Cell, BTreeSet<String>>,
+    /// External-origin facts not yet propagated over established copy edges.
+    pending_external_sources: HashMap<Cell, Vec<String>>,
     regions: HashMap<ExternalRegion, Cell>,
     region_of_cell: HashMap<Cell, ExternalRegion>,
+    /// Copy edges which have already received their source's complete points-to set.
     succ: HashMap<Cell, HashSet<Cell>>,
+    /// Newly inserted copy edges awaiting one full-set seed. Keeping these separate from
+    /// `succ` lets established edges consume only deltas without missing old source facts.
+    pending_succ: HashMap<Cell, HashSet<Cell>>,
     loads: HashMap<Cell, Vec<Cell>>,
     stores: HashMap<Cell, Vec<(Cell, Option<String>)>>,
     geps: HashMap<Cell, Vec<(Option<i64>, Cell)>>,
@@ -1763,6 +1772,7 @@ struct Solve {
     profile: bool,
     steps: usize,
     memcpy_pairs_processed: usize,
+    copy_fact_pairs_processed: usize,
 }
 
 impl Solve {
@@ -1770,10 +1780,13 @@ impl Solve {
         Self {
             next_field: n_base as Cell,
             pts: HashMap::new(),
+            pending_pts: HashMap::new(),
             external_sources: HashMap::new(),
+            pending_external_sources: HashMap::new(),
             regions: HashMap::new(),
             region_of_cell: HashMap::new(),
             succ: HashMap::new(),
+            pending_succ: HashMap::new(),
             loads: HashMap::new(),
             stores: HashMap::new(),
             geps: HashMap::new(),
@@ -1792,6 +1805,7 @@ impl Solve {
             profile,
             steps: 0,
             memcpy_pairs_processed: 0,
+            copy_fact_pairs_processed: 0,
         }
     }
 
@@ -1805,7 +1819,7 @@ impl Solve {
         self.region_of_cell.insert(cell, region);
         // Each region denotes its own foreign objects. Unlike the old absorbing Ω cell,
         // its contents may gain named objects through real store/copy constraints.
-        self.pts.entry(cell).or_default().insert(cell);
+        self.add_pts(cell, cell);
         cell
     }
 
@@ -1833,21 +1847,51 @@ impl Solve {
     }
 
     fn add_pts_with_source(&mut self, cell: Cell, obj: Cell, source: Option<&str>) {
-        let mut changed = self.pts.entry(cell).or_default().insert(obj);
+        self.add_pts_batch(cell, std::slice::from_ref(&obj));
         if self.is_external(obj) {
             if let Some(source) = source {
                 let source = source.to_string();
-                changed |= self
-                    .external_sources
-                    .entry(cell)
-                    .or_default()
-                    .insert(source.clone());
+                self.add_external_sources(cell, std::slice::from_ref(&source));
                 // Loads from the region must retain the region's origin even when the
                 // pointer used to reach it is not copied into the loaded value.
-                self.external_sources.entry(obj).or_default().insert(source);
+                self.add_external_sources(obj, std::slice::from_ref(&source));
             }
         }
-        if changed {
+    }
+
+    fn add_pts_batch(&mut self, cell: Cell, objects: &[Cell]) {
+        if objects.is_empty() {
+            return;
+        }
+        let dst = self.pts.entry(cell).or_default();
+        let mut added = Vec::new();
+        for &object in objects {
+            if dst.insert(object) {
+                added.push(object);
+            }
+        }
+        if !added.is_empty() {
+            self.pending_pts.entry(cell).or_default().extend(added);
+            self.enqueue(cell);
+        }
+    }
+
+    fn add_external_sources(&mut self, cell: Cell, sources: &[String]) {
+        if sources.is_empty() {
+            return;
+        }
+        let dst = self.external_sources.entry(cell).or_default();
+        let mut added = Vec::new();
+        for source in sources {
+            if dst.insert(source.clone()) {
+                added.push(source.clone());
+            }
+        }
+        if !added.is_empty() {
+            self.pending_external_sources
+                .entry(cell)
+                .or_default()
+                .extend(added);
             self.enqueue(cell);
         }
     }
@@ -1856,20 +1900,21 @@ impl Solve {
         if from == to {
             return;
         }
-        if self.succ.entry(from).or_default().insert(to) {
-            // Push current pts(from) into pts(to) immediately.
-            if let Some(src) = self.pts.get(&from).cloned() {
-                let mut changed = false;
-                let dst = self.pts.entry(to).or_default();
-                for o in src {
-                    changed |= dst.insert(o);
-                }
-                changed |= self.propagate_external_sources(from, to);
-                if changed {
-                    self.enqueue(to);
-                }
-            }
+        if self
+            .succ
+            .get(&from)
+            .is_some_and(|successors| successors.contains(&to))
+            || self
+                .pending_succ
+                .get(&from)
+                .is_some_and(|successors| successors.contains(&to))
+        {
+            return;
         }
+        self.pending_succ.entry(from).or_default().insert(to);
+        // Even an empty source must run once so the edge becomes established before later
+        // source facts are propagated as deltas.
+        self.enqueue(from);
     }
 
     fn add_memcpy(&mut self, dst: Cell, src: Cell) {
@@ -1933,21 +1978,6 @@ impl Solve {
             all_sources,
             new_sources,
         }
-    }
-
-    fn propagate_external_sources(&mut self, from: Cell, to: Cell) -> bool {
-        let Some(sources) = self.external_sources.get(&from).cloned() else {
-            return false;
-        };
-        if sources.is_empty() {
-            return false;
-        }
-        let dst = self.external_sources.entry(to).or_default();
-        let mut changed = false;
-        for source in sources {
-            changed |= dst.insert(source);
-        }
-        changed
     }
 
     /// Field/subobject identity for `base + off` (M2.1, `PLAN-M2_lite_delta.md` §1 M2.1).
@@ -2048,23 +2078,34 @@ impl Solve {
     }
 
     fn copy_edges(&self) -> usize {
-        self.succ.values().map(HashSet::len).sum()
+        self.succ.values().map(HashSet::len).sum::<usize>()
+            + self.pending_succ.values().map(HashSet::len).sum::<usize>()
+    }
+
+    fn copy_sources(&self) -> usize {
+        self.succ.len()
+            + self
+                .pending_succ
+                .keys()
+                .filter(|source| !self.succ.contains_key(source))
+                .count()
     }
 
     fn maybe_report_progress(&self) {
         if self.profile && self.steps % 10_000 == 0 {
             eprintln!(
-                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={}",
+                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={}",
                 self.steps,
                 self.worklist.len(),
                 self.queued.len(),
                 self.pts.len(),
                 self.pts_facts(),
-                self.succ.len(),
+                self.copy_sources(),
                 self.copy_edges(),
                 self.fields.len(),
                 self.unknown_fields.len(),
-                self.memcpy_pairs_processed
+                self.memcpy_pairs_processed,
+                self.copy_fact_pairs_processed
             );
         }
     }
@@ -2086,16 +2127,48 @@ impl Solve {
     }
 
     fn run(&mut self) {
-        // Prime the worklist with every cell that already has points-to facts.
-        let seeded: Vec<Cell> = self.pts.keys().copied().collect();
-        for c in seeded {
-            self.enqueue(c);
-        }
-
         while let Some(n) = self.worklist.pop() {
             self.steps += 1;
             self.maybe_report_progress();
             self.queued.remove(&n);
+            let pts_delta = self.pending_pts.remove(&n).unwrap_or_default();
+            let external_delta = self.pending_external_sources.remove(&n).unwrap_or_default();
+            let new_successors = self.pending_succ.remove(&n).unwrap_or_default();
+
+            // Established copy edges consume only facts discovered since `n` last ran.
+            if let Some(successors) = self.succ.get(&n).cloned() {
+                self.copy_fact_pairs_processed = self
+                    .copy_fact_pairs_processed
+                    .saturating_add(pts_delta.len().saturating_mul(successors.len()));
+                for successor in successors {
+                    self.add_pts_batch(successor, &pts_delta);
+                    self.add_external_sources(successor, &external_delta);
+                }
+            }
+
+            // A new edge predates none of the source's facts, so seed it from the complete
+            // set once and only then promote it to the established successor relation.
+            if !new_successors.is_empty() {
+                let all_pts = self
+                    .pts
+                    .get(&n)
+                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let all_external_sources = self
+                    .external_sources
+                    .get(&n)
+                    .map(|set| set.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                self.copy_fact_pairs_processed = self
+                    .copy_fact_pairs_processed
+                    .saturating_add(all_pts.len().saturating_mul(new_successors.len()));
+                for &successor in &new_successors {
+                    self.add_pts_batch(successor, &all_pts);
+                    self.add_external_sources(successor, &all_external_sources);
+                }
+                self.succ.entry(n).or_default().extend(new_successors);
+            }
+
             let objs: Vec<Cell> = self
                 .pts
                 .get(&n)
@@ -2177,21 +2250,6 @@ impl Solve {
                             self.note_direct_access(os);
                             self.add_copy(os, od);
                         }
-                    }
-                }
-            }
-            // Propagate along copy edges.
-            if let Some(succs) = self.succ.get(&n).cloned() {
-                let src: HashSet<Cell> = self.pts.get(&n).cloned().unwrap_or_default();
-                for s in succs {
-                    let mut changed = false;
-                    let dst = self.pts.entry(s).or_default();
-                    for &o in &src {
-                        changed |= dst.insert(o);
-                    }
-                    changed |= self.propagate_external_sources(n, s);
-                    if changed {
-                        self.enqueue(s);
                     }
                 }
             }
@@ -2466,8 +2524,8 @@ mod tests {
         assert_eq!(solve.pts[&2], HashSet::from([6, 7]));
         assert_eq!(solve.pts[&4], HashSet::from([6, 7]));
 
-        // A later payload fact follows the established copy edge. Re-running the solver,
-        // including its worklist priming, must not revisit any memcpy object pair.
+        // A later payload fact follows the established copy edge. Re-running an idle solver
+        // must not revisit any memcpy object pair.
         solve.add_pts(3, 8);
         solve.run();
         assert_eq!(solve.memcpy_pairs_processed, 4);
@@ -2493,6 +2551,38 @@ mod tests {
         assert_eq!(solve.memcpy_pairs_processed, 9);
         solve.run();
         assert_eq!(solve.memcpy_pairs_processed, 9);
+    }
+
+    #[test]
+    fn copy_edges_propagate_only_new_points_to_facts() {
+        let mut solve = Solve::new(8, false);
+        solve.add_pts(0, 1);
+        solve.add_pts(0, 2);
+        solve.add_copy(0, 4);
+        solve.run();
+        assert_eq!(solve.pts[&4], HashSet::from([1, 2]));
+        assert_eq!(solve.copy_fact_pairs_processed, 2);
+
+        // An established edge receives only the newly discovered fact.
+        solve.add_pts(0, 3);
+        solve.run();
+        assert_eq!(solve.pts[&4], HashSet::from([1, 2, 3]));
+        assert_eq!(solve.copy_fact_pairs_processed, 3);
+
+        // A dynamically added edge receives the complete current source set once.
+        solve.add_copy(0, 5);
+        solve.run();
+        assert_eq!(solve.pts[&5], HashSet::from([1, 2, 3]));
+        assert_eq!(solve.copy_fact_pairs_processed, 6);
+
+        // Later facts fan out once per established edge; an idle rerun does no work.
+        solve.add_pts(0, 6);
+        solve.run();
+        assert_eq!(solve.pts[&4], HashSet::from([1, 2, 3, 6]));
+        assert_eq!(solve.pts[&5], HashSet::from([1, 2, 3, 6]));
+        assert_eq!(solve.copy_fact_pairs_processed, 8);
+        solve.run();
+        assert_eq!(solve.copy_fact_pairs_processed, 8);
     }
 
     #[test]
