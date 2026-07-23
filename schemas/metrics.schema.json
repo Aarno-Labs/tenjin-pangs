@@ -210,6 +210,28 @@
       "type": "integer",
       "minimum": 0
     },
+    "andersen_complete": {
+      "type": "boolean"
+    },
+    "andersen_exhaustion_reason": {
+      "type": "string"
+    },
+    "andersen_steps": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "andersen_resume_rounds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "andersen_activated_targets": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "andersen_known_unbound_targets": {
+      "type": "integer",
+      "minimum": 0
+    },
     "steens_worklist_pops": {
       "type": "integer",
       "minimum": 0

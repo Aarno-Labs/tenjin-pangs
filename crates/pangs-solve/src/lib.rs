@@ -68,6 +68,21 @@ pub struct SolveMetrics {
     pub oversize_fallbacks: usize,
     pub oversize_fallback_max_size: usize,
     pub rounds: usize,
+    /// Whether the partition-scoped Andersen tier reached its joint points-to/call-graph
+    /// fixed point. A false value means every non-exact Andersen output was discarded and
+    /// the result retains its complete Steensgaard fallback.
+    #[serde(default = "default_true")]
+    pub andersen_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub andersen_exhaustion_reason: Option<String>,
+    #[serde(default)]
+    pub andersen_steps: usize,
+    #[serde(default)]
+    pub andersen_resume_rounds: usize,
+    #[serde(default)]
+    pub andersen_activated_targets: usize,
+    #[serde(default)]
+    pub andersen_known_unbound_targets: usize,
     #[serde(default)]
     pub steens_worklist_pops: u64,
     #[serde(default)]
@@ -102,6 +117,10 @@ pub struct SolveMetrics {
     pub steens_max_class_fn_objs: usize,
     #[serde(default)]
     pub steens_max_class_candidate_pairs: u64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1146,8 +1165,8 @@ impl<'a> Solver<'a> {
         let n_nodes = self.pag.nodes.len();
         let total = self.classes.len();
         let mut node_class = vec![0usize; n_nodes];
-        for i in 0..n_nodes {
-            node_class[i] = self.find(i);
+        for (i, class) in node_class.iter_mut().enumerate() {
+            *class = self.find(i);
         }
         let mut pointee = vec![None; total];
         let mut ext = vec![false; total];

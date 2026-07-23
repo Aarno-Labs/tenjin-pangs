@@ -22,13 +22,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use pangs_pag::{
     BuildMode, CallKind, EdgeKind, NodeId, NodeKind, ObjectKind, OmegaSeedKind, Pag, SeedTarget,
 };
-use pangs_pir::{fsa_compatible, Pir};
+use pangs_pir::Pir;
 
 use crate::{debug_assert_narrows, IndirectCallResolution, SolveResult, SteensClasses};
 
-/// Hard cap on CG-refinement rounds. The loop converges by monotone shrinkage in 2–3
-/// rounds in practice; this only guards against a pathological input.
-const MAX_ROUNDS: usize = 8;
+/// Hard cap on points-to/discovery resume phases. Hitting it abandons the whole Andersen
+/// tier: a partial ascending solve is an under-approximation and must never be emitted.
+const MAX_RESUME_ROUNDS: usize = 64;
 
 // The quadratic partition-cost proxy predates provenance-separated external regions and
 // rejects some sparse, medium-sized partitions that solve cheaply in practice.  Refine those
@@ -159,12 +159,62 @@ fn finish_andersen(
     pir: &Pir,
     pag: &Pag,
     classes: &SteensClasses,
+    base: SolveResult,
+    build_mode: BuildMode,
+    partition_budget: u64,
+    exact_targets: &BTreeMap<String, Vec<String>>,
+    confined_targets: &BTreeSet<String>,
+    materialize_global_points_to: bool,
+) -> SolveResult {
+    finish_andersen_controlled(
+        pir,
+        pag,
+        classes,
+        base,
+        build_mode,
+        partition_budget,
+        exact_targets,
+        confined_targets,
+        materialize_global_points_to,
+        AndersenControls::from_environment(),
+    )
+}
+
+#[derive(Clone, Default)]
+struct AndersenControls {
+    max_steps: Option<usize>,
+    max_resumes: Option<usize>,
+    inject_exhaustion: Option<String>,
+    disable_eager_unknown: bool,
+    subtractive_differential: bool,
+}
+
+impl AndersenControls {
+    fn from_environment() -> Self {
+        Self {
+            max_steps: andersen_max_steps(),
+            max_resumes: Some(andersen_max_resumes()),
+            inject_exhaustion: std::env::var("PANGS_ANDERSEN_INJECT_EXHAUSTION").ok(),
+            disable_eager_unknown: std::env::var_os("PANGS_ANDERSEN_DISABLE_EAGER_UNKNOWN")
+                .is_some(),
+            subtractive_differential: std::env::var_os("PANGS_ANDERSEN_DIFFERENTIAL_SUBTRACTIVE")
+                .is_some(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_andersen_controlled(
+    pir: &Pir,
+    pag: &Pag,
+    classes: &SteensClasses,
     mut base: SolveResult,
     build_mode: BuildMode,
     partition_budget: u64,
     exact_targets: &BTreeMap<String, Vec<String>>,
     confined_targets: &BTreeSet<String>,
     materialize_global_points_to: bool,
+    controls: AndersenControls,
 ) -> SolveResult {
     let mut refiner = Refiner::new(
         pir,
@@ -177,37 +227,82 @@ fn finish_andersen(
         confined_targets,
     );
     refiner.materialize_global_points_to = materialize_global_points_to;
-    let refined = refiner.run();
+    let outcome = refiner.run(controls);
 
-    // Override only the refined facts; keep global escape/unknown-caller facts from
-    // Steensgaard. Unrefined/oversize node partitions retain their Steensgaard node rows.
-    base.indirect_calls = refined.indirect_calls;
-    for resolution in refined.nodes {
-        if let Some(node) = base.nodes.get_mut(&resolution.label) {
-            // Andersen runs inside a self-contained Steensgaard partition, so its points-to
-            // set is a sound subset of the union-based answer. In particular, a data pointer
-            // need not retain `reaches_function_pointer` merely because field-insensitive
-            // Steensgaard merged a sibling callback field into the same pointee class.
-            node.reaches_function_pointer = resolution.reaches_function_pointer;
-            node.external = resolution.external;
-            node.external_universal = resolution.external_universal;
-            node.pointee_globals = resolution.pointee_globals.into();
-            node.pointee_globals_unfiltered = resolution.pointee_globals_unfiltered.into();
-            if node.pointee_globals.is_empty() {
-                node.pointee_provenance = Default::default();
+    match outcome {
+        RefinerOutcome::Complete(refined) => {
+            // Override only complete refined facts; keep global escape/unknown-caller facts
+            // from Steensgaard. Unrefined/oversize node partitions retain their base rows.
+            base.indirect_calls = refined.indirect_calls;
+            patch_exact_overrides(pir, &mut base.indirect_calls, exact_targets);
+            for resolution in refined.nodes {
+                if let Some(node) = base.nodes.get_mut(&resolution.label) {
+                    node.reaches_function_pointer = resolution.reaches_function_pointer;
+                    node.external = resolution.external;
+                    node.external_universal = resolution.external_universal;
+                    node.pointee_globals = resolution.pointee_globals.into();
+                    node.pointee_globals_unfiltered = resolution.pointee_globals_unfiltered.into();
+                    if node.pointee_globals.is_empty() {
+                        node.pointee_provenance = Default::default();
+                    }
+                    node.external_sources = resolution.external_sources;
+                }
             }
-            node.external_sources = resolution.external_sources;
+            for (label, allocs) in refined.global_points_to {
+                base.node_points_to.insert(label, allocs);
+            }
+            base.metrics.rounds = refined.resume_rounds;
+            base.metrics.andersen_complete = true;
+            base.metrics.andersen_steps = refined.steps;
+            base.metrics.andersen_resume_rounds = refined.resume_rounds;
+            base.metrics.andersen_activated_targets = refined.activated_targets;
+            base.metrics.andersen_known_unbound_targets = 0;
+            base.metrics.oversize_fallbacks = refined.oversize_fallbacks;
+            base.metrics.oversize_fallback_max_size = refined.oversize_fallback_max_size;
+        }
+        RefinerOutcome::Exhausted(exhausted) => {
+            // The ascending solve is incomplete. Preserve only independently proven exact
+            // callsite answers; every other output family remains byte-for-byte Steensgaard.
+            patch_exact_overrides(pir, &mut base.indirect_calls, exact_targets);
+            for row in &mut base.indirect_calls {
+                if !exact_targets.contains_key(&row.callsite_key) {
+                    row.fallback = true;
+                }
+            }
+            base.metrics.andersen_complete = false;
+            base.metrics.andersen_exhaustion_reason = Some(exhausted.reason.clone());
+            base.metrics.andersen_steps = exhausted.steps;
+            base.metrics.andersen_resume_rounds = exhausted.resume_rounds;
+            base.metrics.andersen_activated_targets = exhausted.activated_targets;
+            base.metrics.andersen_known_unbound_targets = exhausted.known_unbound_targets;
+            base.metrics.rounds = exhausted.resume_rounds;
+            base.metrics.oversize_fallbacks = exhausted.oversize_fallbacks;
+            base.metrics.oversize_fallback_max_size = exhausted.oversize_fallback_max_size;
+            eprintln!(
+                "pangs andersen exhausted: reason={} steps={} resume_rounds={} worklist={} queued={} pending_copy_seeds={} pending_pts_deltas={} known_unbound_targets={} activated_targets={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} memcpy_pairs_processed={} copy_fact_pairs_processed={}",
+                exhausted.reason,
+                exhausted.steps,
+                exhausted.resume_rounds,
+                exhausted.worklist,
+                exhausted.queued,
+                exhausted.pending_copy_seeds,
+                exhausted.pending_pts_deltas,
+                exhausted.known_unbound_targets,
+                exhausted.activated_targets,
+                exhausted.scc_passes,
+                exhausted.scc_nodes_collapsed,
+                exhausted.scc_copy_edges_removed,
+                exhausted.memcpy_pairs_processed,
+                exhausted.copy_fact_pairs_processed,
+            );
         }
     }
-    // Refined in-scope globals replace their Steensgaard `node_points_to` entry; oversize and
-    // uninteresting globals keep the Steensgaard fallback already seeded into `base`.
-    for (label, allocs) in refined.global_points_to {
-        base.node_points_to.insert(label, allocs);
-    }
-    base.metrics.rounds = refined.rounds;
-    base.metrics.oversize_fallbacks = refined.oversize_fallbacks;
-    base.metrics.oversize_fallback_max_size = refined.oversize_fallback_max_size;
     base
+}
+
+enum RefinerOutcome {
+    Complete(RefinerOutput),
+    Exhausted(ExhaustionDiagnostic),
 }
 
 struct RefinerOutput {
@@ -216,9 +311,53 @@ struct RefinerOutput {
     /// Refined global-object points-to (`obj:global:<name>` label → named allocations), only
     /// populated when `Refiner::materialize_global_points_to` is set.
     global_points_to: Vec<(String, BTreeSet<String>)>,
-    rounds: usize,
+    resume_rounds: usize,
+    steps: usize,
+    activated_targets: usize,
     oversize_fallbacks: usize,
     oversize_fallback_max_size: usize,
+}
+
+struct ExhaustionDiagnostic {
+    reason: String,
+    steps: usize,
+    resume_rounds: usize,
+    worklist: usize,
+    queued: usize,
+    pending_copy_seeds: usize,
+    pending_pts_deltas: usize,
+    known_unbound_targets: usize,
+    activated_targets: usize,
+    scc_passes: usize,
+    scc_nodes_collapsed: usize,
+    scc_copy_edges_removed: usize,
+    memcpy_pairs_processed: usize,
+    copy_fact_pairs_processed: usize,
+    oversize_fallbacks: usize,
+    oversize_fallback_max_size: usize,
+}
+
+fn patch_exact_overrides(
+    pir: &Pir,
+    rows: &mut [IndirectCallResolution],
+    exact_targets: &BTreeMap<String, Vec<String>>,
+) {
+    let functions: HashSet<&str> = pir.functions.iter().map(|f| f.key.as_str()).collect();
+    for row in rows {
+        let Some(targets) = exact_targets.get(&row.callsite_key) else {
+            continue;
+        };
+        let mut targets = targets
+            .iter()
+            .filter(|target| functions.contains(target.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        debug_assert_narrows(&row.callsite_key, "exact", &targets, "steens", &row.targets);
+        row.targets = targets;
+        row.fallback = false;
+    }
 }
 
 struct RefinedNodeResolution {
@@ -229,6 +368,12 @@ struct RefinedNodeResolution {
     pointee_globals: Vec<String>,
     pointee_globals_unfiltered: Vec<String>,
     external_sources: Vec<String>,
+}
+
+#[derive(Default)]
+struct TargetDiscovery {
+    targets: Vec<(usize, usize)>,
+    eager_sites: Vec<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -906,9 +1051,9 @@ impl<'a> Refiner<'a> {
         labels
     }
 
-    // ----- CG-refinement outer loop -----------------------------------------------------
+    // ----- monotone on-the-fly call-graph refinement -----------------------------------
 
-    fn run(mut self) -> RefinerOutput {
+    fn run(mut self, controls: AndersenControls) -> RefinerOutcome {
         // Indirect callsites we will refine (in-scope), with their PAG indices.
         let in_scope_sites: Vec<usize> = (0..self.pag.callsites.len())
             .filter(|&i| {
@@ -936,75 +1081,255 @@ impl<'a> Refiner<'a> {
             );
         }
 
-        // Round-0 seed: exact overrides for proven sites, otherwise FSA ∩ Steensgaard
-        // targets with confined targets removed from candidate callsites.
+        // Store each non-exact site's sound target envelope. Exact sites are pinned
+        // independently and never participate in discovery.
         let steens_by_key: HashMap<&str, &IndirectCallResolution> = self
             .base
             .indirect_calls
             .iter()
             .map(|r| (r.callsite_key.as_str(), r))
             .collect();
-        let mut target_map: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut envelopes: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut exact_map: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut eager_sites = HashSet::new();
         for &site in &in_scope_sites {
             let key = self.pag.callsites[site].key.as_str();
-            let funcs = if let Some(funcs) = self.exact_target_indices(key) {
-                funcs
+            if let Some(funcs) = self.exact_target_indices(key) {
+                exact_map.insert(site, funcs);
             } else {
-                steens_by_key
+                let envelope = steens_by_key
                     .get(key)
                     .map(|r| self.non_confined_target_indices(&r.targets))
-                    .unwrap_or_default()
-            };
-            target_map.insert(site, funcs);
+                    .unwrap_or_default();
+                envelopes.insert(site, envelope);
+                // A Steensgaard unknown-callee verdict means named address flow is not a
+                // complete account of possible internal callbacks. Activate the envelope
+                // eagerly and retain fallback provenance for this site.
+                if !controls.disable_eager_unknown
+                    && steens_by_key.get(key).is_some_and(|row| row.unknown_callee)
+                {
+                    eager_sites.insert(site);
+                }
+            }
         }
 
-        let mut rounds = 0usize;
-        let mut pts = self.solve_once(&target_map);
-        loop {
-            rounds += 1;
-            let new_map = self.recompute_targets(&in_scope_sites, &pts);
-            // Monotone shrinkage: round k+1 ⊆ round k. A growth is a soundness bug.
-            for (&site, funcs) in &new_map {
-                let prev: HashSet<usize> = target_map[&site].iter().copied().collect();
-                debug_assert!(
-                    funcs.iter().all(|f| prev.contains(f)),
-                    "Andersen CG-refinement grew an icall target set (soundness bug)"
-                );
+        let mut solve = self.build_base_solve();
+        let mut activated: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+        let mut external_summaries = HashSet::new();
+        let mut initial = exact_map
+            .iter()
+            .flat_map(|(&site, funcs)| funcs.iter().map(move |&func| (site, func)))
+            .collect::<Vec<_>>();
+        for &site in &eager_sites {
+            if let Some(functions) = envelopes.get(&site) {
+                initial.extend(functions.iter().map(|&function| (site, function)));
             }
-            if maps_equal(&new_map, &target_map) || rounds >= MAX_ROUNDS {
+        }
+        initial.sort_unstable();
+        initial.dedup();
+        for (site, func) in initial {
+            self.activate_target(
+                &mut solve,
+                &mut activated,
+                &mut external_summaries,
+                site,
+                func,
+            );
+        }
+
+        let max_steps = controls.max_steps;
+        let max_resumes = controls.max_resumes.unwrap_or(MAX_RESUME_ROUNDS);
+        let injection = controls.inject_exhaustion;
+        let mut resume_rounds = 0usize;
+        let mut known_unbound = Vec::new();
+        loop {
+            resume_rounds += 1;
+            if injection.as_deref() == Some("propagation") {
+                return RefinerOutcome::Exhausted(self.exhaustion(
+                    &solve,
+                    "injected_during_propagation",
+                    resume_rounds,
+                    known_unbound.len(),
+                    activated.values().map(BTreeSet::len).sum(),
+                ));
+            }
+            if !solve.run_with_limit(max_steps) {
+                return RefinerOutcome::Exhausted(self.exhaustion(
+                    &solve,
+                    "propagation_step_budget",
+                    resume_rounds,
+                    known_unbound.len(),
+                    activated.values().map(BTreeSet::len).sum(),
+                ));
+            }
+
+            let discovery =
+                self.discover_targets(&in_scope_sites, &envelopes, &exact_map, &activated, &solve);
+            known_unbound = discovery.targets;
+            if !controls.disable_eager_unknown {
+                for site in discovery.eager_sites {
+                    if eager_sites.insert(site) {
+                        known_unbound.extend(
+                            envelopes
+                                .get(&site)
+                                .into_iter()
+                                .flat_map(|funcs| funcs.iter().map(|&func| (site, func))),
+                        );
+                    }
+                }
+            }
+            known_unbound.sort_unstable();
+            known_unbound.dedup();
+            known_unbound.retain(|(site, func)| {
+                !activated
+                    .get(site)
+                    .is_some_and(|targets| targets.contains(func))
+            });
+
+            if known_unbound.is_empty() {
                 break;
+            }
+            if injection.as_deref() == Some("discovery") {
+                return RefinerOutcome::Exhausted(self.exhaustion(
+                    &solve,
+                    "injected_after_discovery",
+                    resume_rounds,
+                    known_unbound.len(),
+                    activated.values().map(BTreeSet::len).sum(),
+                ));
+            }
+            if resume_rounds >= max_resumes {
+                return RefinerOutcome::Exhausted(self.exhaustion(
+                    &solve,
+                    "resume_round_cap",
+                    resume_rounds,
+                    known_unbound.len(),
+                    activated.values().map(BTreeSet::len).sum(),
+                ));
             }
             if andersen_profile_enabled() {
                 eprintln!(
-                    "pangs andersen profile: round {rounds} target map changed; rerunning fixed-graph solve"
+                    "pangs andersen profile: resume {resume_rounds} discovered {} new call bindings",
+                    known_unbound.len()
                 );
             }
-            target_map = new_map;
-            pts = self.solve_once(&target_map);
+            for &(site, func) in &known_unbound {
+                self.activate_target(
+                    &mut solve,
+                    &mut activated,
+                    &mut external_summaries,
+                    site,
+                    func,
+                );
+            }
+            if injection.as_deref() == Some("activation") {
+                return RefinerOutcome::Exhausted(self.exhaustion(
+                    &solve,
+                    "injected_after_activation",
+                    resume_rounds,
+                    0,
+                    activated.values().map(BTreeSet::len).sum(),
+                ));
+            }
         }
 
-        let indirect_calls = self.emit_indirect_calls(&in_scope_sites, &pts);
-        let nodes = self.emit_node_resolutions(&pts);
+        if controls.subtractive_differential {
+            assert!(
+                controls.disable_eager_unknown,
+                "subtractive differential requires pure-LFP mode \
+                 (set PANGS_ANDERSEN_DISABLE_EAGER_UNKNOWN)"
+            );
+            let oracle = self.subtractive_oracle(&in_scope_sites, &envelopes, &exact_map);
+            for &site in &in_scope_sites {
+                let additive = activated.get(&site).cloned().unwrap_or_default();
+                let descending = oracle.get(&site).cloned().unwrap_or_default();
+                assert!(
+                    additive.is_subset(&descending),
+                    "monotone OTF target set is not a subset of subtractive oracle at {}: \
+                     additive={additive:?} subtractive={descending:?}",
+                    self.pag.callsites[site].key
+                );
+                if exact_map.contains_key(&site) {
+                    assert_eq!(
+                        additive, descending,
+                        "exact target changed across Andersen constructions"
+                    );
+                }
+            }
+        }
+
+        let activated_targets = activated.values().map(BTreeSet::len).sum();
+        if andersen_profile_enabled() {
+            eprintln!(
+                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
+                solve.steps,
+                resume_rounds,
+                activated_targets,
+                eager_sites.len(),
+                solve.pts.len(),
+                solve.pts_facts(),
+                solve.copy_sources(),
+                solve.copy_edges(),
+                solve.fields.len(),
+                solve.unknown_fields.len(),
+                solve.memcpy_pairs_processed,
+                solve.copy_fact_pairs_processed,
+                solve.scc_passes,
+                solve.scc_nodes_collapsed,
+                solve.scc_copy_edges_removed,
+            );
+        }
+        let indirect_calls =
+            self.emit_indirect_calls(&in_scope_sites, &activated, &eager_sites, &solve);
+        let nodes = self.emit_node_resolutions(&solve);
         let global_points_to = if self.materialize_global_points_to {
-            self.emit_global_points_to(&pts)
+            self.emit_global_points_to(&solve)
         } else {
             Vec::new()
         };
-        RefinerOutput {
+        RefinerOutcome::Complete(RefinerOutput {
             indirect_calls,
             nodes,
             global_points_to,
-            rounds,
+            resume_rounds,
+            steps: solve.steps,
+            activated_targets,
+            oversize_fallbacks: self.oversize_fallbacks,
+            oversize_fallback_max_size: self.oversize_fallback_max_size,
+        })
+    }
+
+    fn exhaustion(
+        &self,
+        solve: &Solve,
+        reason: &str,
+        resume_rounds: usize,
+        known_unbound_targets: usize,
+        activated_targets: usize,
+    ) -> ExhaustionDiagnostic {
+        ExhaustionDiagnostic {
+            reason: reason.to_string(),
+            steps: solve.steps,
+            resume_rounds,
+            worklist: solve.worklist.len(),
+            queued: solve.queued.len(),
+            pending_copy_seeds: solve.pending_succ.values().map(HashSet::len).sum(),
+            pending_pts_deltas: solve.pending_pts.values().map(Vec::len).sum(),
+            known_unbound_targets,
+            activated_targets,
+            scc_passes: solve.scc_passes,
+            scc_nodes_collapsed: solve.scc_nodes_collapsed,
+            scc_copy_edges_removed: solve.scc_copy_edges_removed,
+            memcpy_pairs_processed: solve.memcpy_pairs_processed,
+            copy_fact_pairs_processed: solve.copy_fact_pairs_processed,
             oversize_fallbacks: self.oversize_fallbacks,
             oversize_fallback_max_size: self.oversize_fallback_max_size,
         }
     }
 
-    // ----- the inclusion solve (stateless per round) ------------------------------------
+    // ----- the persistent inclusion solve -----------------------------------------------
 
-    /// Solve one fixed call graph from scratch (no caches across rounds). Returns the
-    /// points-to set of every in-scope cell.
-    fn solve_once(&mut self, target_map: &HashMap<usize, Vec<usize>>) -> Solve {
+    fn build_base_solve(&mut self) -> Solve {
         let profile = andersen_profile_enabled();
         let mut solve = Solve::new(self.n_base, profile);
 
@@ -1022,27 +1347,19 @@ impl<'a> Refiner<'a> {
                 }
                 EdgeKind::Load => {
                     if self.node_may_carry_pointer(edge.dst) {
-                        solve.loads.entry(edge.src.0).or_default().push(edge.dst.0);
+                        solve.add_load(edge.src.0, edge.dst.0);
                     }
                 }
                 EdgeKind::Store => {
                     if self.node_may_carry_pointer(edge.src) {
-                        solve
-                            .stores
-                            .entry(edge.dst.0)
-                            .or_default()
-                            .push((edge.src.0, None));
+                        solve.add_store(edge.dst.0, edge.src.0, None);
                     }
                 }
                 EdgeKind::Gep { byte_off } => {
                     if let Some(byte_off) = byte_off {
                         solve.known_offsets.insert(byte_off);
                     }
-                    solve
-                        .geps
-                        .entry(edge.src.0)
-                        .or_default()
-                        .push((byte_off, edge.dst.0));
+                    solve.add_gep(edge.src.0, byte_off, edge.dst.0);
                 }
                 EdgeKind::Memcpy { .. } => solve.add_memcpy(edge.dst.0, edge.src.0),
             }
@@ -1050,34 +1367,9 @@ impl<'a> Refiner<'a> {
 
         self.apply_boundary_omega_seeds(&mut solve);
 
-        // Indirect-call bindings for the fixed call graph (direct calls are already PAG
-        // Assign edges; only icalls are bound dynamically).
-        for (&site, funcs) in target_map {
-            let cs = &self.pag.callsites[site];
-            for &f in funcs {
-                if self.pir.functions[f].external {
-                    self.apply_external_call_effects(&mut solve, cs);
-                }
-                for (i, &arg) in cs.args.iter().enumerate() {
-                    if let Some(&param) = self.param_nodes.get(&(f, i)) {
-                        if self.pointer_transfer(arg, param) {
-                            solve.add_copy(arg.0, param.0);
-                        }
-                    }
-                }
-                if let (Some(result), Some(&ret)) = (cs.result, self.ret_nodes.get(&f)) {
-                    if self.pointer_transfer(ret, result) {
-                        solve.add_copy(ret.0, result.0);
-                    }
-                }
-            }
-        }
-
         if profile {
             eprintln!(
-                "pangs andersen profile: solve start target_sites={} target_edges={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} loads={} stores={} geps={} memcpys={} copy_scc_enabled={} copy_scc_min_edges={}",
-                target_map.len(),
-                target_map.values().map(Vec::len).sum::<usize>(),
+                "pangs andersen profile: solve start target_sites=0 target_edges=0 pts_entries={} pts_facts={} copy_sources={} copy_edges={} loads={} stores={} geps={} memcpys={} copy_scc_enabled={} copy_scc_min_edges={}",
                 solve.pts.len(),
                 solve.pts_facts(),
                 solve.copy_sources(),
@@ -1090,25 +1382,164 @@ impl<'a> Refiner<'a> {
                 solve.scc_min_edges
             );
         }
-        solve.run();
-        if profile {
-            eprintln!(
-                "pangs andersen profile: solve done steps={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
-                solve.steps,
-                solve.pts.len(),
-                solve.pts_facts(),
-                solve.copy_sources(),
-                solve.copy_edges(),
-                solve.fields.len(),
-                solve.unknown_fields.len(),
-                solve.memcpy_pairs_processed,
-                solve.copy_fact_pairs_processed,
-                solve.scc_passes,
-                solve.scc_nodes_collapsed,
-                solve.scc_copy_edges_removed
-            );
-        }
         solve
+    }
+
+    fn activate_target(
+        &self,
+        solve: &mut Solve,
+        activated: &mut HashMap<usize, BTreeSet<usize>>,
+        external_summaries: &mut HashSet<usize>,
+        site: usize,
+        function: usize,
+    ) {
+        if !activated.entry(site).or_default().insert(function) {
+            return;
+        }
+        let callsite = &self.pag.callsites[site];
+        if self.pir.functions[function].external && external_summaries.insert(site) {
+            self.apply_external_call_effects(solve, callsite);
+        }
+        for (index, &argument) in callsite.args.iter().enumerate() {
+            if let Some(&parameter) = self.param_nodes.get(&(function, index)) {
+                if self.pointer_transfer(argument, parameter) {
+                    solve.add_copy(argument.0, parameter.0);
+                }
+            }
+        }
+        if let (Some(result), Some(&ret)) = (callsite.result, self.ret_nodes.get(&function)) {
+            if self.pointer_transfer(ret, result) {
+                solve.add_copy(ret.0, result.0);
+            }
+        }
+    }
+
+    /// Temporary migration oracle: solve the old descending target construction to
+    /// convergence. It is enabled only by an explicit diagnostic switch and intentionally
+    /// shares base construction and target activation with the additive path so differences
+    /// isolate fixed-point direction rather than constraint generation.
+    fn subtractive_oracle(
+        &mut self,
+        sites: &[usize],
+        envelopes: &HashMap<usize, Vec<usize>>,
+        exact: &HashMap<usize, Vec<usize>>,
+    ) -> HashMap<usize, BTreeSet<usize>> {
+        let mut targets = sites
+            .iter()
+            .map(|&site| {
+                let functions = exact
+                    .get(&site)
+                    .or_else(|| envelopes.get(&site))
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                (site, functions)
+            })
+            .collect::<HashMap<_, BTreeSet<_>>>();
+        let max_rounds = targets.values().map(BTreeSet::len).sum::<usize>() + 1;
+
+        for _ in 0..max_rounds {
+            let mut solve = self.build_base_solve();
+            let mut installed = HashMap::new();
+            let mut summaries = HashSet::new();
+            for (&site, functions) in &targets {
+                for &function in functions {
+                    self.activate_target(
+                        &mut solve,
+                        &mut installed,
+                        &mut summaries,
+                        site,
+                        function,
+                    );
+                }
+            }
+            solve.run();
+
+            let mut next = HashMap::new();
+            for &site in sites {
+                if let Some(functions) = exact.get(&site) {
+                    next.insert(site, functions.iter().copied().collect());
+                    continue;
+                }
+                let envelope = envelopes
+                    .get(&site)
+                    .map(|functions| functions.iter().copied().collect::<HashSet<_>>())
+                    .unwrap_or_default();
+                let functions = self.pag.callsites[site]
+                    .operand
+                    .and_then(|operand| solve.points_to(operand.0))
+                    .into_iter()
+                    .flat_map(|points_to| points_to.iter())
+                    .filter_map(|cell| {
+                        let root = solve.field_base.get(cell).copied().unwrap_or(*cell);
+                        self.fn_cell_to_index.get(&root).copied()
+                    })
+                    .filter(|function| envelope.contains(function))
+                    .collect::<BTreeSet<_>>();
+                next.insert(site, functions);
+            }
+            for (&site, functions) in &next {
+                debug_assert!(
+                    functions.is_subset(&targets[&site]),
+                    "subtractive Andersen oracle grew a target set"
+                );
+            }
+            if next == targets {
+                return next;
+            }
+            targets = next;
+        }
+        panic!("subtractive Andersen differential oracle failed to converge")
+    }
+
+    fn discover_targets(
+        &self,
+        sites: &[usize],
+        envelopes: &HashMap<usize, Vec<usize>>,
+        exact: &HashMap<usize, Vec<usize>>,
+        activated: &HashMap<usize, BTreeSet<usize>>,
+        solve: &Solve,
+    ) -> TargetDiscovery {
+        let mut discovery = TargetDiscovery::default();
+        for &site in sites {
+            if exact.contains_key(&site) {
+                continue;
+            }
+            let Some(operand) = self.pag.callsites[site].operand else {
+                continue;
+            };
+            let Some(points_to) = solve.points_to(operand.0) else {
+                continue;
+            };
+            let envelope = envelopes
+                .get(&site)
+                .map(|targets| targets.iter().copied().collect::<HashSet<_>>())
+                .unwrap_or_default();
+            for &cell in points_to {
+                if solve
+                    .external_region(cell)
+                    .is_some_and(ExternalRegion::may_contain_function_pointer)
+                {
+                    discovery.eager_sites.push(site);
+                }
+                let root = solve.field_base.get(&cell).copied().unwrap_or(cell);
+                if let Some(&function) = self.fn_cell_to_index.get(&root) {
+                    if envelope.contains(&function)
+                        && !activated
+                            .get(&site)
+                            .is_some_and(|targets| targets.contains(&function))
+                    {
+                        discovery.targets.push((site, function));
+                    }
+                }
+            }
+        }
+        discovery.targets.sort_unstable();
+        discovery.targets.dedup();
+        discovery.eager_sites.sort_unstable();
+        discovery.eager_sites.dedup();
+        discovery
     }
 
     fn apply_boundary_omega_seeds(&self, solve: &mut Solve) {
@@ -1292,17 +1723,15 @@ impl<'a> Refiner<'a> {
     ) {
         if self.in_scope.get(node.0 as usize).copied().unwrap_or(false) {
             let region = solve.region(region);
-            solve
-                .stores
-                .entry(node.0)
-                .or_default()
-                .push((region, Some(source.to_string())));
+            solve.add_store(node.0, region, Some(source.to_string()));
         }
     }
 
     fn scope_profile(&self) -> ScopeProfile {
-        let mut profile = ScopeProfile::default();
-        profile.in_scope_nodes = self.in_scope.iter().filter(|&&in_scope| in_scope).count();
+        let mut profile = ScopeProfile {
+            in_scope_nodes: self.in_scope.iter().filter(|&&in_scope| in_scope).count(),
+            ..ScopeProfile::default()
+        };
         for edge in &self.pag.edges {
             if !self.in_scope[edge.dst.0 as usize] && !self.in_scope[edge.src.0 as usize] {
                 continue;
@@ -1317,38 +1746,6 @@ impl<'a> Refiner<'a> {
             }
         }
         profile
-    }
-
-    /// Recompute each in-scope site's targets = FSA ∩ {address-taken functions in
-    /// pts(operand)} from the solved points-to.
-    fn recompute_targets(&self, sites: &[usize], pts: &Solve) -> HashMap<usize, Vec<usize>> {
-        let mut map = HashMap::new();
-        for &site in sites {
-            let cs = &self.pag.callsites[site];
-            if let Some(funcs) = self.exact_target_indices(&cs.key) {
-                map.insert(site, funcs);
-                continue;
-            }
-            let operand = cs.operand.unwrap();
-            let mut funcs: Vec<usize> = Vec::new();
-            if let Some(set) = pts.points_to(operand.0) {
-                for &cell in set {
-                    if let Some(&idx) = self.fn_cell_to_index.get(&cell) {
-                        let f = &self.pir.functions[idx];
-                        if f.address_taken
-                            && !self.confined_targets.contains(&f.key)
-                            && fsa_compatible(&cs.sig, &f.sig)
-                        {
-                            funcs.push(idx);
-                        }
-                    }
-                }
-            }
-            funcs.sort_unstable();
-            funcs.dedup();
-            map.insert(site, funcs);
-        }
-        map
     }
 
     fn exact_target_indices(&self, callsite_key: &str) -> Option<Vec<usize>> {
@@ -1377,10 +1774,11 @@ impl<'a> Refiner<'a> {
     fn emit_indirect_calls(
         &self,
         in_scope_sites: &[usize],
+        activated: &HashMap<usize, BTreeSet<usize>>,
+        eager_sites: &HashSet<usize>,
         pts: &Solve,
     ) -> Vec<IndirectCallResolution> {
         let in_scope: HashSet<usize> = in_scope_sites.iter().copied().collect();
-        let final_map = self.recompute_targets(in_scope_sites, pts);
         let mut out = Vec::new();
         for (idx, cs) in self.pag.callsites.iter().enumerate() {
             if cs.kind != CallKind::Indirect {
@@ -1392,7 +1790,7 @@ impl<'a> Refiner<'a> {
                 .iter()
                 .find(|r| r.callsite_key == cs.key);
             if in_scope.contains(&idx) {
-                let mut targets: Vec<String> = final_map
+                let mut targets: Vec<String> = activated
                     .get(&idx)
                     .map(|fs| {
                         fs.iter()
@@ -1412,12 +1810,24 @@ impl<'a> Refiner<'a> {
                         &steens.targets,
                     );
                 }
+                let operand_unknown = cs
+                    .operand
+                    .and_then(|operand| pts.points_to(operand.0))
+                    .is_some_and(|set| {
+                        set.iter().any(|&cell| {
+                            pts.external_region(cell)
+                                .is_some_and(ExternalRegion::may_contain_function_pointer)
+                        })
+                    });
+                let exact = self.exact_targets.contains_key(&cs.key);
+                let fallback = !exact && eager_sites.contains(&idx);
+                let unknown_callee =
+                    steens.map(|r| r.unknown_callee).unwrap_or(false) || operand_unknown;
                 out.push(IndirectCallResolution {
                     callsite_key: cs.key.clone(),
                     targets,
-                    // Ω/unknown-callee is a Steensgaard escape verdict, kept verbatim.
-                    unknown_callee: steens.map(|r| r.unknown_callee).unwrap_or(false),
-                    fallback: false,
+                    unknown_callee,
+                    fallback,
                 });
             } else if let Some(steens) = steens {
                 // Uninteresting or oversize partition: keep Steensgaard, tag as fallback.
@@ -1624,12 +2034,6 @@ fn omega_seed_source(kind: OmegaSeedKind) -> &'static str {
     }
 }
 
-fn maps_equal(a: &HashMap<usize, Vec<usize>>, b: &HashMap<usize, Vec<usize>>) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .all(|(k, v)| b.get(k).map(|w| w == v).unwrap_or(false))
-}
-
 fn andersen_profile_enabled() -> bool {
     std::env::var_os("PANGS_ANDERSEN_PROFILE").is_some()
 }
@@ -1640,6 +2044,20 @@ fn copy_scc_min_edges() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(COPY_SCC_MIN_EDGES)
+}
+
+fn andersen_max_steps() -> Option<usize> {
+    std::env::var("PANGS_ANDERSEN_MAX_STEPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn andersen_max_resumes() -> usize {
+    std::env::var("PANGS_ANDERSEN_MAX_RESUMES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(MAX_RESUME_ROUNDS)
 }
 
 fn partition_profile_enabled() -> bool {
@@ -1976,7 +2394,47 @@ impl Solve {
         self.enqueue(from);
     }
 
+    fn add_load(&mut self, base: Cell, destination: Cell) {
+        let base = self.canonical(base);
+        let loads = self.loads.entry(base).or_default();
+        if !loads.contains(&destination) {
+            loads.push(destination);
+            self.enqueue(base);
+        }
+    }
+
+    fn add_store(&mut self, base: Cell, value: Cell, source: Option<String>) {
+        let base = self.canonical(base);
+        let store = (value, source);
+        let stores = self.stores.entry(base).or_default();
+        if !stores.contains(&store) {
+            stores.push(store);
+            // Complex constraints consume the owner's complete current points-to set, so
+            // late registration must run even when the owner has no pending delta.
+            self.enqueue(base);
+        }
+    }
+
+    fn add_gep(&mut self, base: Cell, offset: Option<i64>, destination: Cell) {
+        let base = self.canonical(base);
+        let gep = (offset, destination);
+        let geps = self.geps.entry(base).or_default();
+        if !geps.contains(&gep) {
+            geps.push(gep);
+            self.enqueue(base);
+        }
+    }
+
     fn add_memcpy(&mut self, dst: Cell, src: Cell) {
+        let dst = self.canonical(dst);
+        let src = self.canonical(src);
+        if self
+            .memcpys
+            .iter()
+            .any(|join| self.canonical(join.dst) == dst && self.canonical(join.src) == src)
+        {
+            return;
+        }
         let index = self.memcpys.len();
         self.memcpys.push(MemcpyJoin {
             dst,
@@ -1988,6 +2446,8 @@ impl Solve {
         if src != dst {
             self.memcpy_by_endpoint.entry(src).or_default().push(index);
         }
+        self.enqueue(dst);
+        self.enqueue(src);
     }
 
     fn memcpy_delta(&mut self, index: usize) -> MemcpyDelta {
@@ -2429,7 +2889,17 @@ impl Solve {
     }
 
     fn run(&mut self) {
+        assert!(self.run_with_limit(None));
+    }
+
+    /// Resume propagation. The cumulative limit is checked against `steps`, so repeated
+    /// resumes share one budget rather than resetting it at each discovery boundary.
+    fn run_with_limit(&mut self, max_steps: Option<usize>) -> bool {
         while let Some(n) = self.worklist.pop() {
+            if max_steps.is_some_and(|limit| self.steps >= limit) {
+                self.worklist.push(n);
+                return false;
+            }
             self.steps += 1;
             self.maybe_report_progress();
             self.queued.remove(&n);
@@ -2559,6 +3029,7 @@ impl Solve {
                 self.collapse_copy_sccs();
             }
         }
+        true
     }
 }
 
@@ -2583,8 +3054,11 @@ mod tests {
     use pangs_pag::{BuildMode, Pag, PagOpts};
     use pangs_pir::Pir;
 
-    use super::{solve_andersen, solve_andersen_with_overrides, ExternalRegion, Solve};
-    use crate::solve_steensgaard;
+    use super::{
+        finish_andersen_controlled, solve_andersen, solve_andersen_with_overrides,
+        AndersenControls, ExternalRegion, Solve,
+    };
+    use crate::{solve_steensgaard, PointsToMaterialization};
 
     fn fixture(name: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2594,6 +3068,15 @@ mod tests {
 
     fn load(name: &str) -> (Pir, Pag) {
         let pir = Pir::from_path(fixture(name)).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        (pir, pag)
+    }
+
+    fn load_m1_4(name: &str) -> (Pir, Pag) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/m1_4")
+            .join(name);
+        let pir = Pir::from_path(path).unwrap();
         let pag = Pag::from_pir(&pir, &PagOpts::default());
         (pir, pag)
     }
@@ -2691,6 +3174,106 @@ mod tests {
             .find(|r| r.callsite_key == "driver@!noloc#1")
             .unwrap();
         assert_eq!(candidate_site.targets, vec!["other".to_string()]);
+    }
+
+    #[test]
+    fn exhaustion_at_every_joint_phase_reverts_every_output_but_exact_calls() {
+        let (pir, pag) = load_m2_3("confined_subtraction.pir.json");
+        let mut exact = BTreeMap::new();
+        exact.insert("driver@!noloc#0".to_string(), vec!["cb".to_string()]);
+        let confined = BTreeSet::from(["cb".to_string()]);
+        let (base, classes) = crate::solve_steensgaard_classes_materialized(
+            &pir,
+            &pag,
+            BuildMode::Library,
+            PointsToMaterialization::GlobalObjects,
+        );
+        let base_nodes = format!("{:?}", base.nodes);
+        let base_points_to = base.node_points_to.clone();
+
+        for (injection, reason) in [
+            ("propagation", "injected_during_propagation"),
+            ("discovery", "injected_after_discovery"),
+            ("activation", "injected_after_activation"),
+        ] {
+            let result = finish_andersen_controlled(
+                &pir,
+                &pag,
+                &classes,
+                base.clone(),
+                BuildMode::Library,
+                1_000_000,
+                &exact,
+                &confined,
+                true,
+                AndersenControls {
+                    inject_exhaustion: Some(injection.to_string()),
+                    ..AndersenControls::default()
+                },
+            );
+
+            assert!(!result.metrics.andersen_complete);
+            assert_eq!(
+                result.metrics.andersen_exhaustion_reason.as_deref(),
+                Some(reason)
+            );
+            assert_eq!(format!("{:?}", result.nodes), base_nodes);
+            assert_eq!(result.node_points_to, base_points_to);
+            let exact_site = result
+                .indirect_calls
+                .iter()
+                .find(|row| row.callsite_key == "driver@!noloc#0")
+                .unwrap();
+            assert_eq!(exact_site.targets, vec!["cb".to_string()]);
+            assert!(!exact_site.fallback);
+            assert!(result
+                .indirect_calls
+                .iter()
+                .filter(|row| row.callsite_key != "driver@!noloc#0")
+                .all(|row| row.fallback));
+        }
+    }
+
+    #[test]
+    fn a_late_store_replays_the_owner_complete_points_to_set() {
+        let mut solve = Solve::new(4, false);
+        solve.add_pts(0, 1);
+        solve.run();
+
+        let external = solve.region(ExternalRegion::ClientBoundary(7));
+        solve.add_store(0, external, Some("late-boundary".to_string()));
+        solve.run();
+
+        assert!(solve.points_to(1).unwrap().contains(&external));
+        assert!(solve
+            .external_sources_for(1)
+            .unwrap()
+            .contains("late-boundary"));
+    }
+
+    #[test]
+    fn forged_indirect_operand_retains_unknown_fallback_provenance() {
+        let (pir, pag) = load_m1_4("inttoptr_unknown_call.pir.json");
+        let result = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
+        let call = &result.indirect_calls[0];
+        assert!(call.targets.is_empty());
+        assert!(call.unknown_callee);
+        assert!(call.fallback);
+        assert!(result.metrics.andersen_complete);
+    }
+
+    #[test]
+    fn propagation_step_budget_is_cumulative_across_resumes() {
+        let mut solve = Solve::new(4, false);
+        solve.add_pts(0, 1);
+        assert!(solve.run_with_limit(Some(1)));
+        assert_eq!(solve.steps, 1);
+
+        solve.add_copy(0, 2);
+        assert!(!solve.run_with_limit(Some(1)));
+        assert_eq!(solve.steps, 1);
+        assert!(solve.run_with_limit(Some(3)));
+        assert_eq!(solve.steps, 3);
     }
 
     #[test]
@@ -2933,6 +3516,17 @@ mod tests {
         assert!(solve.points_to(0).unwrap().contains(&9));
         assert!(solve.points_to(3).unwrap().contains(&8));
         assert!(solve.points_to(3).unwrap().contains(&9));
+
+        // A complex constraint installed through an old SCC member also resolves through
+        // the representative and replays its complete pointee set.
+        let external = solve.region(ExternalRegion::ClientBoundary(99));
+        solve.add_store(2, external, Some("late-after-scc".to_string()));
+        solve.run();
+        assert!(solve.points_to(6).unwrap().contains(&external));
+        assert!(solve
+            .external_sources_for(6)
+            .unwrap()
+            .contains("late-after-scc"));
     }
 
     #[test]
@@ -3077,7 +3671,7 @@ mod tests {
                 r.targets
             );
             // Soundness: a resolved site must never be empty-without-unknown_callee.
-            assert!(!(r.targets.is_empty() && !r.unknown_callee));
+            assert!(!r.targets.is_empty() || r.unknown_callee);
         }
         let steens_targets: Vec<&str> = steens
             .indirect_calls

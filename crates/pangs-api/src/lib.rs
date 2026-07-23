@@ -528,6 +528,18 @@ pub struct Metrics {
     pub oversize_fallbacks: usize,
     pub oversize_fallback_max_size: usize,
     pub rounds: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub andersen_complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub andersen_exhaustion_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub andersen_steps: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub andersen_resume_rounds: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub andersen_activated_targets: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub andersen_known_unbound_targets: Option<usize>,
     #[serde(default)]
     pub steens_worklist_pops: u64,
     #[serde(default)]
@@ -1268,8 +1280,8 @@ impl Analysis {
                 let pag_started = Instant::now();
                 let indirect_vararg_keys = indirect_callsites
                     .iter()
-                    .filter(|&(cs, _, sig)| sig.vararg)
-                    .map(|(cs, _, sig)| callsites[cs.0 as usize].key.clone())
+                    .filter(|&(_, _, sig)| sig.vararg)
+                    .map(|(cs, _, _)| callsites[cs.0 as usize].key.clone())
                     .collect::<BTreeSet<_>>();
                 let mut pag = Pag::from_pir(
                     module,
@@ -1775,6 +1787,12 @@ impl Analysis {
             oversize_fallbacks: 0,
             oversize_fallback_max_size: 0,
             rounds: 0,
+            andersen_complete: None,
+            andersen_exhaustion_reason: None,
+            andersen_steps: None,
+            andersen_resume_rounds: None,
+            andersen_activated_targets: None,
+            andersen_known_unbound_targets: None,
             steens_worklist_pops: 0,
             steens_process_class_calls: 0,
             steens_candidate_pairs: 0,
@@ -1849,6 +1867,18 @@ impl Analysis {
                 oversize_fallbacks: solved.oversize_fallbacks,
                 oversize_fallback_max_size: solved.oversize_fallback_max_size,
                 rounds: solved.rounds,
+                andersen_complete: (opts.stage == Stage::Andersen)
+                    .then_some(solved.andersen_complete),
+                andersen_exhaustion_reason: (opts.stage == Stage::Andersen)
+                    .then(|| solved.andersen_exhaustion_reason.clone())
+                    .flatten(),
+                andersen_steps: (opts.stage == Stage::Andersen).then_some(solved.andersen_steps),
+                andersen_resume_rounds: (opts.stage == Stage::Andersen)
+                    .then_some(solved.andersen_resume_rounds),
+                andersen_activated_targets: (opts.stage == Stage::Andersen)
+                    .then_some(solved.andersen_activated_targets),
+                andersen_known_unbound_targets: (opts.stage == Stage::Andersen)
+                    .then_some(solved.andersen_known_unbound_targets),
                 steens_worklist_pops: solved.steens_worklist_pops,
                 steens_process_class_calls: solved.steens_process_class_calls,
                 steens_candidate_pairs: solved.steens_candidate_pairs,
@@ -2422,10 +2452,10 @@ fn stationarity_verdicts_from_modrefs(
         let absence_only_initval = initval_is_absence_only(&initval_diagnostics);
         let mut writers = StationarityWriters::default();
         let reason = if !complete_initval
-            && !(absence_only_initval
-                && !external_storage_globals.contains(&global.key)
-                && unknown_writers.is_empty()
-                && !runtime_writers.contains_key(&global.key))
+            && (!absence_only_initval
+                || external_storage_globals.contains(&global.key)
+                || !unknown_writers.is_empty()
+                || runtime_writers.contains_key(&global.key))
         {
             StationarityReason::IncompleteInitval
         } else if !unknown_writers.is_empty() {
@@ -6191,8 +6221,8 @@ fn compute_transitive_modrefs(
         total_closure_rows,
         max_closure_rows,
     );
-    for scc in 0..scc_members.len() {
-        let rows = memo[scc].take().unwrap_or_default().rows;
+    for entry in memo.iter_mut().take(scc_members.len()) {
+        let rows = entry.take().unwrap_or_default().rows;
         max_fanout_by_scc.push(max_modref_payload_fanout_by_rank(
             &rows,
             &payload_fanout_ranks,
@@ -6211,8 +6241,7 @@ fn compute_transitive_modrefs(
 
     let mut row_set_by_func = Vec::with_capacity(func_count);
     profile.print_closure("closure-start", &metrics, 0, payloads.len());
-    for root_idx in 0..func_count {
-        let scc = scc_of_func[root_idx];
+    for (root_idx, &scc) in scc_of_func.iter().enumerate().take(func_count) {
         let rows = &row_sets[scc];
         metrics.attempted += rows.len() as u64;
         metrics.unique += rows.len() as u64;

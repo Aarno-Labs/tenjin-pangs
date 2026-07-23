@@ -108,24 +108,26 @@ pointers: icall operands, mutable globals and what they reach, escape-relevant
 objects), not on a residue. Partitions solve independently across the core pool;
 sequential cache-friendly worklist within.
 
-**Call graph via outer-loop refinement** (replaces KallGraph's on-the-fly fixpoint with
-dependency-driven re-analysis):
+**Call graph via monotone on-the-fly discovery:**
 
-1. **Round 0 seed:** direct calls + (FSA ∩ Steensgaard) for icalls, minus B2-resolved
-   icalls (exact) and B3-confined functions. Sound over-approximation by construction.
-2. Solve all interesting partitions in parallel against this *fixed* call graph.
-3. Recompute icall targets from solved fn-ptr pts; intersect with FSA. The graph
-   shrinks monotonically and stays sound (round k's graph over-approximates ⇒ round
-   k's pts over-approximate ⇒ round k+1's graph still over-approximates reality).
-4. Re-solve; stop when the call graph stops shrinking. Expect 2–3 rounds.
+1. Build one persistent solve from base PAG constraints, Ω seeds, and pinned B1/B2
+   exact bindings.
+2. Propagate to quiescence, then discover function objects reaching each non-exact
+   icall operand within its `FSA ∩ Steensgaard` envelope.
+3. Install each newly grounded argument/parameter and return/result binding once, using
+   copy-edge delta propagation to seed the edge from the source's existing facts.
+4. Resume the same solve until both propagation and target discovery are quiescent.
 
-Each round is **stateless** — no dependency tracking, no query re-analysis bookkeeping,
-no memo caches. At ≤1 MLoC, re-running a parallel partition solve twice costs minutes.
-That trade (redundant work for statelessness) is the heart of the lite design.
+Unknown-origin operands retain conservative Steensgaard fallback provenance and activate
+the remaining envelope when the origin may denote client code. A resource limit cannot
+emit a partial ascending solve: the entire Andersen tier falls back to the complete
+Steensgaard result, while independently proven exact callsite answers survive. The old
+stateless descending construction remains only as a temporary differential oracle during
+the migration (`20260723_MONOTONE_OTF_CG_PLAN.md`).
 
 ### F. Clients as post-passes
 With an exhaustive materialized solution, every client is a scan, not a query engine:
-- **Call graph:** final round's edges; each icall edge tagged `B2-exact` or
+- **Call graph:** joint fixed-point edges; each icall edge tagged `B2-exact` or
   `Andersen∩FSA` (two provenance tags instead of five tiers').
 - **writers(o):** scan stores whose pointer pts includes `o` — the demand query becomes
   a table lookup. Mutability lattice (`never-written` → `stationary` (B1) →

@@ -346,12 +346,14 @@ Build a reusable exact-override patcher for `base.indirect_calls`:
 Use the same patcher in both successful and exhausted assembly so exact precedence cannot
 drift between paths.
 
-Both assembly paths also enforce a production emit-time invariant: every in-scope
-indirect site must satisfy `targets ≠ ∅ ∨ unknown_callee ∨ fallback`. Under additive
-construction, empty-and-known-and-not-fallback is precisely the signature of a missing
-grounding seed, so this promotes the existing fixture-only assertion to the production
-path: force `unknown_callee: true` and emit a loud diagnostic rather than a silently
-false-negative row.
+Do not treat `targets = ∅ ∧ !unknown_callee ∧ !fallback` as a production error by itself.
+The Andersen tier does not carry a callsite-reachability predicate, and a reachable
+function can contain an unreachable indirect call whose operand has no grounded
+points-to facts. The `mismatched_offsets_do_not_match` fixture also legitimately refines
+a broad Steensgaard candidate to an empty set. Missing-grounding detection therefore
+belongs in the seed audit and additive/subtractive differential, where reachability and
+the source of the strict subset can be examined, rather than in an unconditional emitter
+fallback.
 
 For successful runs:
 
@@ -474,8 +476,7 @@ that makes later incomplete ascending states impossible to emit.
 - Activate exact targets and statically detectable eager-unknown sites; implement the
   dynamic region-triggered eager activation inside the discovery loop.
 - Alternate budgeted propagation and batched target discovery until joint quiescence.
-- Implement the hardened `unknown_callee` OR rule and the emit-time
-  `targets ≠ ∅ ∨ unknown_callee ∨ fallback` invariant (§3.2, §6).
+- Implement the hardened `unknown_callee` OR rule (§3.2, §6).
 - Add a test/diagnostic switch that disables eager unknown-origin activation (pure-LFP
   mode) for the §7 differential.
 - Remove the monotone-shrinkage assertion.
@@ -544,8 +545,8 @@ Stage 4 is a release gate even if its code lands alongside Stage 3.
   envelope activation exactly once, with fallback provenance on the emitted answer.
 - `unknown_callee` is emitted true when the Andersen operand reaches a
   function-pointer-capable region, even where the Steensgaard verdict alone was false.
-- No in-scope site emits empty targets with `unknown_callee: false` and
-  `fallback: false`.
+- Empty known target sets are covered by differential/seed-audit fixtures so they can be
+  distinguished from missing grounding without conflating them with unreachable sites.
 
 ### SCC and delta interaction
 
