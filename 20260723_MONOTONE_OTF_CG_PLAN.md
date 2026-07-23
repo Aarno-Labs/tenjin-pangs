@@ -68,10 +68,14 @@ P += base PAG constraints and Ω seeds
 T += X(site)                                      for exact sites
 P += bind(site, f)                                for (site, f) in T
 T += (site, f) when f ∈ E(site) and &f ∈ P[operand(site)]
+T += (site, f) for all f ∈ E(site) when P[operand(site)] contains a
+                                                  fn-ptr-capable external region (§3.2)
 ```
 
 All rules only add facts. Starting from grounded address-of, direct-call, entry, boundary,
-and exact-override facts computes the least fixed point of this positive system.
+and exact-override facts computes the least fixed point of this positive system. Region
+reachability is itself monotone, so the eager unknown-origin rule preserves the positive
+character of the system and its termination bound.
 
 The current descending implementation instead starts from `E` and repeatedly applies the
 points-to-derived target filter. It can retain a mutually supporting target cycle with no
@@ -102,9 +106,34 @@ The conservative version-1 rule is:
 - for a non-exact site whose origin can denote an internal function without an explicit
   named-object flow, eagerly activate its remaining Steensgaard envelope.
 
+The eager trigger has two detection times:
+
+- **static**: categories identifiable at construction (an operand seeded directly by a
+  forged-pointer or boundary region) register their eager bindings in
+  `build_base_solve()`;
+- **dynamic**: most unknown origins emerge mid-solve, when a function-pointer-capable
+  external region cell first appears in `P[operand(site)]`. Target discovery must
+  therefore also report region-reachability events, and the outer loop must activate the
+  affected site's remaining envelope at the same batch boundary — idempotently, once per
+  site.
+
 Such a site gains no additive-callgraph precision and should retain Steensgaard fallback
 provenance for its target answer. This is preferable to silently omitting effects of an
-internal callback. The audit may prove that some `unknown_callee` categories denote only
+internal callback. Note that it is also deliberately *more* conservative than the current
+descending path, whose final converged solve equally omits the narrowed-away bindings'
+flows and relies on the `unknown_callee` flag alone; the eager bindings additionally
+model caller-side argument/return flows of a possible internal callback. Two
+consequences:
+
+- eager sites — and facts transitively derived from their bindings, which can reach
+  otherwise-unrelated sites — cannot participate in a naive `additive ⊆ subtractive`
+  check; §7 splits the differential into two modes for exactly this reason;
+- the emitted `unknown_callee` flag becomes load-bearing under additive construction and
+  is hardened to the OR of the Steensgaard escape verdict and the Andersen-side
+  observation that `P[operand(site)]` contains a function-pointer-capable or universal
+  external region.
+
+The audit may prove that some `unknown_callee` categories denote only
 foreign code; those may use the external summary without eager internal bindings, but the
 proof and category must be recorded in code and tests.
 
@@ -211,7 +240,8 @@ Refactor `solve_once` into:
    - allocate one `Solve`;
    - add in-scope PAG constraints;
    - apply Ω/boundary seeds;
-   - register exact and conservatively eager unknown-origin bindings;
+   - register exact bindings and statically detectable eager unknown-origin bindings
+     (§3.2); dynamically detected unknown origins are activated from the discovery loop;
 2. `activate_target(&mut Solve, site, function)`:
    - idempotently record `(site, function)`;
    - add argument-to-parameter copies;
@@ -226,7 +256,9 @@ Refactor `solve_once` into:
    - canonicalize the operand through `points_to`;
    - map function-object cells to PIR function indices;
    - intersect explicitly with the site's stored `E(site)`;
-   - return only target pairs not previously activated.
+   - report sites whose operand set newly contains a function-pointer-capable external
+     region (§3.2 dynamic eager trigger);
+   - return only target pairs and eager sites not previously activated.
 
 The outer loop becomes:
 
@@ -235,10 +267,10 @@ build base solve
 activate exact/eager targets
 loop:
     run to points-to quiescence, or exhaust
-    discover all new target pairs
-    if none: joint LFP is complete
+    discover new target pairs and newly unknown-origin sites
+    if neither: joint LFP is complete
     if resume cap would fire: exhaust
-    activate all new pairs
+    activate all new pairs and eager envelopes
 ```
 
 Batch activation makes the result independent of target enumeration order. Sort target
@@ -314,6 +346,13 @@ Build a reusable exact-override patcher for `base.indirect_calls`:
 Use the same patcher in both successful and exhausted assembly so exact precedence cannot
 drift between paths.
 
+Both assembly paths also enforce a production emit-time invariant: every in-scope
+indirect site must satisfy `targets ≠ ∅ ∨ unknown_callee ∨ fallback`. Under additive
+construction, empty-and-known-and-not-fallback is precisely the signature of a missing
+grounding seed, so this promotes the existing fixture-only assertion to the production
+path: force `unknown_callee: true` and emit a loud diagnostic rather than a silently
+false-negative row.
+
 For successful runs:
 
 - exact sites emit the pinned exact list;
@@ -334,20 +373,39 @@ For exhausted runs:
 Keep the current descending path behind a test/diagnostic-only switch during migration.
 Do not expose it as a permanent client choice.
 
-For each completed additive run, compare against a completed descending run built from the
-same PIR/PAG, exact overrides, confined targets, budget, and Steensgaard base:
+Eager unknown-origin activation (§3.2) deliberately installs bindings the descending
+final solve lacks, so a single-mode comparison would report spurious non-subsets both at
+eager sites (envelope answer vs. narrowed answer) and at innocent sites reached by an
+eager binding's flows. Run the differential in two modes.
 
-- additive non-exact targets must be a subset of descending targets per site;
+**Mode 1 — pure-LFP oracle comparison** (eager unknown-origin activation disabled).
+Compare against a descending run built from the same PIR/PAG, exact overrides, confined
+targets, budget, and Steensgaard base, using only descending runs that converged rather
+than hitting the round cap. Both paths are then fixed points of the same target-derivation
+operator and the additive result is the least one, so these checks are exact, not
+heuristic:
+
+- pure-additive non-exact targets must be a subset of descending targets per site — a
+  strict subset is a removed ungrounded cycle, a missing seed/summary, or a
+  constraint-generation asymmetry between the paths, never noise;
 - both must remain subsets of the Steensgaard envelope;
 - exact sites must be identical;
-- additive node/global allocation sets should narrow the descending semantic sets where
-  their representations are directly comparable;
+- pure-additive node/global allocation sets should narrow the descending semantic sets
+  where their representations are directly comparable;
 - additive external/unknown flags must not become less conservative without an audited
   provenance reason;
 - downstream callgraph, mod/ref, escape, stationarity, disposition, and localization
   artifacts receive subset/soundness-oriented differential checks.
 
-Every strict target subset is triaged as one of:
+**Mode 2 — default (eager) mode self-checks:**
+
+- per non-exact site, default-mode targets ⊇ pure-mode targets and ⊆ the Steensgaard
+  envelope;
+- every default-mode fact absent from the pure-mode run traces to an eager activation;
+- every eager site carries fallback provenance and the hardened `unknown_callee`
+  observation (§3.2).
+
+Every Mode-1 strict target subset is triaged as one of:
 
 1. an ungrounded self-supporting cycle removed by the least fixed point;
 2. a missing seed, summary, or activation rule;
@@ -413,8 +471,13 @@ that makes later incomplete ascending states impossible to emit.
 - Precompute and store `E(site)` for every in-scope non-exact callsite.
 - Maintain separate pinned exact and activated non-exact target sets.
 - Build one `Solve`.
-- Activate exact and audited eager-unknown targets.
+- Activate exact targets and statically detectable eager-unknown sites; implement the
+  dynamic region-triggered eager activation inside the discovery loop.
 - Alternate budgeted propagation and batched target discovery until joint quiescence.
+- Implement the hardened `unknown_callee` OR rule and the emit-time
+  `targets ≠ ∅ ∨ unknown_callee ∨ fallback` invariant (§3.2, §6).
+- Add a test/diagnostic switch that disables eager unknown-origin activation (pure-LFP
+  mode) for the §7 differential.
 - Remove the monotone-shrinkage assertion.
 - Add monotone-growth assertions and retain the M2.0 Steensgaard subset tripwire.
 - Redefine/report `rounds` as resume phases, or add `resume_rounds` and migrate consumers.
@@ -477,6 +540,12 @@ Stage 4 is a release gate even if its code lands alongside Stage 3.
 - A late-discovered external target installs argument stores and result provenance after
   quiescence.
 - Duplicate external targets do not duplicate the call-boundary summary.
+- A function-pointer-capable region reaching an operand only mid-solve triggers eager
+  envelope activation exactly once, with fallback provenance on the emitted answer.
+- `unknown_callee` is emitted true when the Andersen operand reaches a
+  function-pointer-capable region, even where the Steensgaard verdict alone was false.
+- No in-scope site emits empty targets with `unknown_callee: false` and
+  `fallback: false`.
 
 ### SCC and delta interaction
 
@@ -499,8 +568,11 @@ Stage 4 is a release gate even if its code lands alongside Stage 3.
 
 ### Differential
 
-- Additive targets are subsets of subtractive targets on every fixture and corpus site.
-- Exact sites are equal across paths.
+- Pure-mode additive targets are subsets of subtractive targets on every fixture and
+  corpus site (comparing only converged descending runs).
+- Default-mode targets are supersets of pure-mode targets, remain within the Steensgaard
+  envelope, and every difference traces to an eager activation.
+- Exact sites are equal across paths and modes.
 - All observed dynamic indirect-call pairs remain in the additive result.
 - Downstream disposition artifacts contain no unexplained loss of conservative facts.
 
@@ -514,7 +586,9 @@ The change is ready to become the default when:
 3. Unknown-origin function-pointer categories have explicit, tested conservative
    handling.
 4. The joint solver reaches quiescence without a normal-corpus exhaustion.
-5. Additive results satisfy `additive ⊆ subtractive ⊆ Steensgaard` per non-exact site.
+5. Pure-mode results satisfy `additive ⊆ subtractive ⊆ Steensgaard` per non-exact site,
+   and default-mode results satisfy `pure ⊆ default ⊆ Steensgaard` with every difference
+   from pure mode attributed to an audited eager activation.
 6. Every strict subset on the validation corpus is triaged.
 7. Dynamic traces contain no call edge absent from the additive result.
 8. SCC collapse and late external-effect tests pass.
