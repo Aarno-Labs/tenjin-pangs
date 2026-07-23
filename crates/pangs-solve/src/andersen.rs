@@ -1038,7 +1038,7 @@ impl<'a> Refiner<'a> {
                         .or_default()
                         .push((byte_off, edge.dst.0));
                 }
-                EdgeKind::Memcpy { .. } => solve.memcpys.push((edge.dst.0, edge.src.0)),
+                EdgeKind::Memcpy { .. } => solve.add_memcpy(edge.dst.0, edge.src.0),
             }
         }
 
@@ -1085,14 +1085,15 @@ impl<'a> Refiner<'a> {
         solve.run();
         if profile {
             eprintln!(
-                "pangs andersen profile: solve done steps={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={}",
+                "pangs andersen profile: solve done steps={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={}",
                 solve.steps,
                 solve.pts.len(),
                 solve.pts_facts(),
                 solve.succ.len(),
                 solve.copy_edges(),
                 solve.fields.len(),
-                solve.unknown_fields.len()
+                solve.unknown_fields.len(),
+                solve.memcpy_pairs_processed
             );
         }
         solve
@@ -1705,6 +1706,26 @@ fn edge_witness(kind: &str, edge: &pangs_pag::Edge) -> String {
 }
 
 /// One stateless inclusion solve over a fixed constraint set.
+///
+/// A memcpy constraint adds `source_object -> destination_object` copy edges for the
+/// Cartesian product of its operands' points-to sets. Remember both frontiers so later
+/// growth visits only pairs with at least one newly discovered endpoint.
+struct MemcpyJoin {
+    dst: Cell,
+    src: Cell,
+    seen_destinations: HashSet<Cell>,
+    seen_sources: HashSet<Cell>,
+}
+
+struct MemcpyDelta {
+    // These two rectangles partition the newly required pairs without overlapping:
+    // `new_destinations × all_sources` and `old_destinations × new_sources`.
+    new_destinations: Vec<Cell>,
+    old_destinations: Vec<Cell>,
+    all_sources: Vec<Cell>,
+    new_sources: Vec<Cell>,
+}
+
 struct Solve {
     next_field: Cell,
     pts: HashMap<Cell, HashSet<Cell>>,
@@ -1715,7 +1736,8 @@ struct Solve {
     loads: HashMap<Cell, Vec<Cell>>,
     stores: HashMap<Cell, Vec<(Cell, Option<String>)>>,
     geps: HashMap<Cell, Vec<(Option<i64>, Cell)>>,
-    memcpys: Vec<(Cell, Cell)>,
+    memcpys: Vec<MemcpyJoin>,
+    memcpy_by_endpoint: HashMap<Cell, Vec<usize>>,
     fields: HashMap<(Cell, i64), Cell>,
     /// field cell -> base object cell, so a refined field resolves back to its global.
     field_base: HashMap<Cell, Cell>,
@@ -1740,6 +1762,7 @@ struct Solve {
     queued: HashSet<Cell>,
     profile: bool,
     steps: usize,
+    memcpy_pairs_processed: usize,
 }
 
 impl Solve {
@@ -1755,6 +1778,7 @@ impl Solve {
             stores: HashMap::new(),
             geps: HashMap::new(),
             memcpys: Vec::new(),
+            memcpy_by_endpoint: HashMap::new(),
             fields: HashMap::new(),
             field_base: HashMap::new(),
             field_offset: HashMap::new(),
@@ -1767,6 +1791,7 @@ impl Solve {
             queued: HashSet::new(),
             profile,
             steps: 0,
+            memcpy_pairs_processed: 0,
         }
     }
 
@@ -1844,6 +1869,69 @@ impl Solve {
                     self.enqueue(to);
                 }
             }
+        }
+    }
+
+    fn add_memcpy(&mut self, dst: Cell, src: Cell) {
+        let index = self.memcpys.len();
+        self.memcpys.push(MemcpyJoin {
+            dst,
+            src,
+            seen_destinations: HashSet::new(),
+            seen_sources: HashSet::new(),
+        });
+        self.memcpy_by_endpoint.entry(dst).or_default().push(index);
+        if src != dst {
+            self.memcpy_by_endpoint.entry(src).or_default().push(index);
+        }
+    }
+
+    fn memcpy_delta(&mut self, index: usize) -> MemcpyDelta {
+        let join = &self.memcpys[index];
+        let new_destinations = self
+            .pts
+            .get(&join.dst)
+            .map(|set| {
+                set.iter()
+                    .copied()
+                    .filter(|object| !join.seen_destinations.contains(object))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let new_sources = self
+            .pts
+            .get(&join.src)
+            .map(|set| {
+                set.iter()
+                    .copied()
+                    .filter(|object| !join.seen_sources.contains(object))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let all_sources = if new_destinations.is_empty() {
+            Vec::new()
+        } else {
+            self.pts
+                .get(&join.src)
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default()
+        };
+
+        let join = &mut self.memcpys[index];
+        let old_destinations = if new_sources.is_empty() {
+            Vec::new()
+        } else {
+            join.seen_destinations.iter().copied().collect()
+        };
+        join.seen_destinations
+            .extend(new_destinations.iter().copied());
+        join.seen_sources.extend(new_sources.iter().copied());
+
+        MemcpyDelta {
+            new_destinations,
+            old_destinations,
+            all_sources,
+            new_sources,
         }
     }
 
@@ -1966,7 +2054,7 @@ impl Solve {
     fn maybe_report_progress(&self) {
         if self.profile && self.steps % 10_000 == 0 {
             eprintln!(
-                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={}",
+                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={}",
                 self.steps,
                 self.worklist.len(),
                 self.queued.len(),
@@ -1975,7 +2063,8 @@ impl Solve {
                 self.succ.len(),
                 self.copy_edges(),
                 self.fields.len(),
-                self.unknown_fields.len()
+                self.unknown_fields.len(),
+                self.memcpy_pairs_processed
             );
         }
     }
@@ -2048,28 +2137,43 @@ impl Solve {
                 }
             }
             // n in a memcpy: contents-copy between pointed-to objects (field-insensitive).
-            if !self.memcpys.is_empty() {
-                let relevant: Vec<(Cell, Cell)> = self
-                    .memcpys
-                    .iter()
-                    .copied()
-                    .filter(|&(d, s)| d == n || s == n)
-                    .collect();
-                for (d, s) in relevant {
-                    let dobjs: Vec<Cell> = self
-                        .pts
-                        .get(&d)
-                        .map(|s| s.iter().copied().collect())
-                        .unwrap_or_default();
-                    let sobjs: Vec<Cell> = self
-                        .pts
-                        .get(&s)
-                        .map(|s| s.iter().copied().collect())
-                        .unwrap_or_default();
-                    self.report_large_product("memcpy", n, dobjs.len(), sobjs.len());
-                    for &od in &dobjs {
+            if let Some(relevant) = self.memcpy_by_endpoint.get(&n).cloned() {
+                for index in relevant {
+                    let delta = self.memcpy_delta(index);
+                    self.report_large_product(
+                        "memcpy",
+                        n,
+                        delta.new_destinations.len(),
+                        delta.all_sources.len(),
+                    );
+                    self.memcpy_pairs_processed = self.memcpy_pairs_processed.saturating_add(
+                        delta
+                            .new_destinations
+                            .len()
+                            .saturating_mul(delta.all_sources.len()),
+                    );
+                    for &od in &delta.new_destinations {
                         self.note_direct_access(od);
-                        for &os in &sobjs {
+                        for &os in &delta.all_sources {
+                            self.note_direct_access(os);
+                            self.add_copy(os, od);
+                        }
+                    }
+                    self.report_large_product(
+                        "memcpy",
+                        n,
+                        delta.old_destinations.len(),
+                        delta.new_sources.len(),
+                    );
+                    self.memcpy_pairs_processed = self.memcpy_pairs_processed.saturating_add(
+                        delta
+                            .old_destinations
+                            .len()
+                            .saturating_mul(delta.new_sources.len()),
+                    );
+                    for &od in &delta.old_destinations {
+                        self.note_direct_access(od);
+                        for &os in &delta.new_sources {
                             self.note_direct_access(os);
                             self.add_copy(os, od);
                         }
@@ -2110,7 +2214,7 @@ impl ValueLike for NodeKind {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::path::Path;
 
     use pangs_pag::{BuildMode, Pag, PagOpts};
@@ -2334,6 +2438,61 @@ mod tests {
         solve.run();
         assert!(solve.pts[&1].contains(&0));
         assert!(!solve.pts[&2].contains(&0));
+    }
+
+    #[test]
+    fn memcpy_joins_only_new_pointee_pairs() {
+        let mut solve = Solve::new(10, false);
+        solve.add_memcpy(0, 1);
+
+        solve.add_pts(0, 2);
+        solve.add_pts(1, 3);
+        solve.add_pts(3, 6);
+        solve.run();
+        assert_eq!(solve.memcpy_pairs_processed, 1);
+        assert!(solve.succ[&3].contains(&2));
+        assert!(solve.pts[&2].contains(&6));
+
+        // Growing both endpoints adds the three missing quadrants:
+        // (new dst 4 × old/new src 3,5) plus (old dst 2 × new src 5).
+        solve.add_pts(0, 4);
+        solve.add_pts(1, 5);
+        solve.add_pts(5, 7);
+        solve.run();
+        assert_eq!(solve.memcpy_pairs_processed, 4);
+        for (src, dst) in [(3, 2), (3, 4), (5, 2), (5, 4)] {
+            assert!(solve.succ[&src].contains(&dst), "missing {src} -> {dst}");
+        }
+        assert_eq!(solve.pts[&2], HashSet::from([6, 7]));
+        assert_eq!(solve.pts[&4], HashSet::from([6, 7]));
+
+        // A later payload fact follows the established copy edge. Re-running the solver,
+        // including its worklist priming, must not revisit any memcpy object pair.
+        solve.add_pts(3, 8);
+        solve.run();
+        assert_eq!(solve.memcpy_pairs_processed, 4);
+        assert!(solve.pts[&2].contains(&8));
+        assert!(solve.pts[&4].contains(&8));
+        solve.run();
+        assert_eq!(solve.memcpy_pairs_processed, 4);
+    }
+
+    #[test]
+    fn memcpy_with_same_endpoint_avoids_new_new_overlap() {
+        let mut solve = Solve::new(6, false);
+        solve.add_memcpy(0, 0);
+        solve.add_pts(0, 1);
+        solve.add_pts(0, 2);
+        solve.run();
+        assert_eq!(solve.memcpy_pairs_processed, 4);
+
+        // The new object participates in five new ordered pairs, not six: the new/new
+        // pair belongs only to the new-destination rectangle.
+        solve.add_pts(0, 3);
+        solve.run();
+        assert_eq!(solve.memcpy_pairs_processed, 9);
+        solve.run();
+        assert_eq!(solve.memcpy_pairs_processed, 9);
     }
 
     #[test]
