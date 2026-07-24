@@ -867,6 +867,30 @@ impl<'a> Refiner<'a> {
                     hubs.join("; ")
                 );
             }
+            let offset_collisions = self.partition_offset_collisions(profile.root, 8);
+            if !offset_collisions.is_empty() {
+                eprintln!(
+                    "pangs partition profile: root={} offset_collisions={}",
+                    profile.root,
+                    offset_collisions.join("; ")
+                );
+            }
+            let mixed_classes = self.partition_function_data_cohabitation(profile.root, 8);
+            if !mixed_classes.is_empty() {
+                eprintln!(
+                    "pangs partition profile: root={} function_data_cohabitation={}",
+                    profile.root,
+                    mixed_classes.join("; ")
+                );
+            }
+            let copy_bridges = self.partition_aggregate_copy_bridges(profile.root, 8);
+            if !copy_bridges.is_empty() {
+                eprintln!(
+                    "pangs partition profile: root={} aggregate_copy_bridges={}",
+                    profile.root,
+                    copy_bridges.join("; ")
+                );
+            }
             let cuts = [
                 PartitionCut::None,
                 PartitionCut::WithoutLoad,
@@ -986,6 +1010,201 @@ impl<'a> Refiner<'a> {
                     witnesses.remove(&root).unwrap_or_default()
                 )
             })
+            .collect()
+    }
+
+    /// Report final Steensgaard object classes into which multiple source-level GEP
+    /// offsets were folded. This does not claim that the GEPs alone caused the complete
+    /// class merge; it records the exact field distinctions a field-sensitive fallback
+    /// could have retained.
+    fn partition_offset_collisions(&self, ap: usize, limit: usize) -> Vec<String> {
+        #[derive(Default)]
+        struct Collision {
+            offsets: BTreeSet<Option<i64>>,
+            edges: usize,
+            witnesses: Vec<String>,
+        }
+
+        let mut by_class = HashMap::<usize, Collision>::new();
+        for edge in &self.pag.edges {
+            let EdgeKind::Gep { byte_off } = edge.kind else {
+                continue;
+            };
+            let Some((left, right, _)) = self.diagnostic_join_edge(edge) else {
+                continue;
+            };
+            if ap_find_const(&self.ap_parent, left) != ap
+                || ap_find_const(&self.ap_parent, right) != ap
+            {
+                continue;
+            }
+            let class = left;
+            let collision = by_class.entry(class).or_default();
+            collision.offsets.insert(byte_off);
+            collision.edges += 1;
+            if collision.witnesses.len() < 3 {
+                collision.witnesses.push(format!(
+                    "off={}:{}",
+                    byte_off
+                        .map(|offset| offset.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    edge_witness("gep", edge)
+                ));
+            }
+        }
+
+        let mut collisions = by_class
+            .into_iter()
+            .filter(|(_, collision)| collision.offsets.len() > 1)
+            .collect::<Vec<_>>();
+        collisions.sort_by(|(left_class, left), (right_class, right)| {
+            right
+                .offsets
+                .len()
+                .cmp(&left.offsets.len())
+                .then_with(|| right.edges.cmp(&left.edges))
+                .then_with(|| left_class.cmp(right_class))
+        });
+        collisions
+            .into_iter()
+            .take(limit)
+            .map(|(class, collision)| {
+                let offset_count = collision.offsets.len();
+                let offsets = collision
+                    .offsets
+                    .iter()
+                    .take(16)
+                    .map(|offset| {
+                        offset
+                            .map(|offset| offset.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    })
+                    .collect::<Vec<_>>();
+                format!(
+                    "class={} offset_count={} offset_sample={:?} edges={} labels={:?} witnesses={:?}",
+                    class,
+                    offset_count,
+                    offsets,
+                    collision.edges,
+                    self.class_label_sample(class, 4),
+                    collision.witnesses
+                )
+            })
+            .collect()
+    }
+
+    /// Report Steensgaard classes that simultaneously contain function allocations and
+    /// data allocations. These are the concrete mixed-domain classes that pointer lanes
+    /// are intended to split.
+    fn partition_function_data_cohabitation(&self, ap: usize, limit: usize) -> Vec<String> {
+        #[derive(Default)]
+        struct Occupants {
+            functions: Vec<String>,
+            data: Vec<String>,
+        }
+
+        let mut by_class = HashMap::<usize, Occupants>::new();
+        for node in &self.pag.nodes {
+            let NodeKind::Object { object, key, .. } = &node.kind else {
+                continue;
+            };
+            let class = self.classes.class_of(node.id);
+            if ap_find_const(&self.ap_parent, class) != ap {
+                continue;
+            }
+            let occupants = by_class.entry(class).or_default();
+            match object {
+                ObjectKind::Function => occupants.functions.push(key.clone()),
+                ObjectKind::Alloca | ObjectKind::Global | ObjectKind::ExternalReadonly => {
+                    occupants.data.push(key.clone());
+                }
+            }
+        }
+        let mut mixed = by_class
+            .into_iter()
+            .filter(|(_, occupants)| !occupants.functions.is_empty() && !occupants.data.is_empty())
+            .collect::<Vec<_>>();
+        for (_, occupants) in &mut mixed {
+            occupants.functions.sort();
+            occupants.functions.dedup();
+            occupants.data.sort();
+            occupants.data.dedup();
+        }
+        mixed.sort_by(|(left_class, left), (right_class, right)| {
+            right
+                .functions
+                .len()
+                .saturating_mul(right.data.len())
+                .cmp(&left.functions.len().saturating_mul(left.data.len()))
+                .then_with(|| left_class.cmp(right_class))
+        });
+        mixed
+            .into_iter()
+            .take(limit)
+            .map(|(class, occupants)| {
+                format!(
+                    "class={} functions={} data={} function_sample={:?} data_sample={:?}",
+                    class,
+                    occupants.functions.len(),
+                    occupants.data.len(),
+                    sample_strings(&occupants.functions, 6),
+                    sample_strings(&occupants.data, 6)
+                )
+            })
+            .collect()
+    }
+
+    /// Report aggregate-copy constraints whose field-insensitive content join lands in a
+    /// function/data mixed class. They are potential layout-erasing bridges, not causal
+    /// proofs: another constraint may already have merged the same content class.
+    fn partition_aggregate_copy_bridges(&self, ap: usize, limit: usize) -> Vec<String> {
+        let mut object_kinds = HashMap::<usize, (bool, bool)>::new();
+        for node in &self.pag.nodes {
+            let NodeKind::Object { object, .. } = &node.kind else {
+                continue;
+            };
+            let entry = object_kinds
+                .entry(self.classes.class_of(node.id))
+                .or_default();
+            match object {
+                ObjectKind::Function => entry.0 = true,
+                ObjectKind::Alloca | ObjectKind::Global | ObjectKind::ExternalReadonly => {
+                    entry.1 = true;
+                }
+            }
+        }
+
+        self.pag
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let EdgeKind::Memcpy { bytes } = edge.kind else {
+                    return None;
+                };
+                let (left, right, _) = self.diagnostic_join_edge(edge)?;
+                if ap_find_const(&self.ap_parent, left) != ap
+                    || ap_find_const(&self.ap_parent, right) != ap
+                {
+                    return None;
+                }
+                let left_kinds = object_kinds.get(&left).copied().unwrap_or_default();
+                let right_kinds = object_kinds.get(&right).copied().unwrap_or_default();
+                let mixed = (left_kinds.0 || right_kinds.0) && (left_kinds.1 || right_kinds.1);
+                mixed.then(|| {
+                    format!(
+                        "content_classes={}->{} bytes={} src={} dst={} witness={}",
+                        right,
+                        left,
+                        bytes
+                            .map(|bytes| bytes.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        self.pag.nodes[edge.src.0 as usize].label,
+                        self.pag.nodes[edge.dst.0 as usize].label,
+                        edge_witness("memcpy", edge)
+                    )
+                })
+            })
+            .take(limit)
             .collect()
     }
 
