@@ -100,13 +100,14 @@ Andersen doesn't OOM — CORAL's baselines did, at 128 GB, on OpenSSL-sized inpu
 ~200 lines.
 
 ### D'. The one real solver
-Partition-scoped, inclusion-based, PIP internals (implicit-Ω constraint forms, sparse
-bitmaps, no classic-optimization zoo — PIP measured that the representation wins beat
-all of OVS/cycle-detection/difference-propagation at this granularity). Run **by
-default on every interesting partition** (those reachable from client-relevant
-pointers: icall operands, mutable globals and what they reach, escape-relevant
-objects), not on a residue. Partitions solve independently across the core pool;
-sequential cache-friendly worklist within.
+Partition-scoped, inclusion-based, PIP internals (implicit-Ω constraint forms and
+per-variable points-to sets). Run **by default on every interesting partition** (those
+reachable from client-relevant pointers: icall operands, mutable globals and what they
+reach, escape-relevant objects), not on a residue. Partitions solve independently
+across the core pool; each uses a sequential cache-friendly worklist. The implementation
+keeps the optimization surface narrow, but profiles of dense promoted partitions
+justified two general mechanisms: semi-naive constraint joins and threshold-triggered
+collapse of strongly connected copy variables.
 
 **Call graph via monotone on-the-fly discovery:**
 
@@ -124,6 +125,47 @@ emit a partial ascending solve: the entire Andersen tier falls back to the compl
 Steensgaard result, while independently proven exact callsite answers survive. The old
 stateless descending construction remains only as a temporary differential oracle during
 the migration (`20260723_MONOTONE_OTF_CG_PLAN.md`).
+
+**Semi-naive constraint processing:**
+
+For each canonical pointer variable `n`, the solver retains both its complete points-to
+set `pts(n)` and the unpropagated addition `Δpts(n)`. Constraints likewise distinguish
+established relations from newly installed relations:
+
+- An established copy edge `n → p` consumes only `Δpts(n)`. A new copy edge is seeded
+  once from the complete `pts(n)` before becoming established.
+- Established loads, stores, and GEPs join only with `Δpts(n)`. A newly installed
+  load/store/GEP joins once with the complete `pts(n)` and then becomes established.
+  This full-set seed is required because on-the-fly call-target activation can add a
+  constraint after `n` has otherwise reached quiescence.
+- A `memcpy(dst, src)` remembers the destination and source objects it has already
+  joined. Growth is processed as the two disjoint rectangles
+  `new_dst × all_src` and `old_dst × new_src`, so each required object pair is visited
+  once.
+
+This changes scheduling, not the least fixed point. Every constraint/pointee pair that
+the ordinary full-rescan worklist would evaluate is still evaluated: either when the
+pointee first enters the owner's delta, or during the new-constraint full-set seed.
+Facts and constraints are monotone, and deduplication can therefore discard repeated
+evaluations without discarding a possible result.
+
+Copy-SCC collapse needs one deliberate exception to the normal delta rule. Mutual copy
+inclusion makes every member of a copy SCC have equal contents at the fixed point, so
+the members can be represented by one canonical variable. The merge can, however,
+place a constraint formerly owned by one member beside a pointee formerly known only
+to another member. Those are new semantic join pairs even though neither input is
+globally new. After a non-trivial collapse, the solver therefore:
+
+1. unions the members' points-to facts and condenses the copy graph;
+2. merges and deduplicates both established and pending load/store/GEP constraints;
+3. marks all merged complex constraints pending and reseeds each affected
+   representative from its complete state once; and
+4. resumes ordinary delta propagation after that replay.
+
+The conservative replay is what makes SCC collapse compatible with incremental joins;
+replaying only the pre-collapse deltas would be an under-approximation. Profiling
+counters separately record copy-fact, memcpy, load, store, and GEP pairs so a reduction
+in Cartesian work can be distinguished from changes elsewhere in the pipeline.
 
 ### F. Clients as post-passes
 With an exhaustive materialized solution, every client is a scan, not a query engine:

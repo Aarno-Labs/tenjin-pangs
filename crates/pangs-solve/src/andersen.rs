@@ -1261,7 +1261,7 @@ impl<'a> Refiner<'a> {
         let activated_targets = activated.values().map(BTreeSet::len).sum();
         if andersen_profile_enabled() {
             eprintln!(
-                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
+                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
                 solve.steps,
                 resume_rounds,
                 activated_targets,
@@ -1274,6 +1274,9 @@ impl<'a> Refiner<'a> {
                 solve.unknown_fields.len(),
                 solve.memcpy_pairs_processed,
                 solve.copy_fact_pairs_processed,
+                solve.load_pairs_processed,
+                solve.store_pairs_processed,
+                solve.gep_pairs_processed,
                 solve.scc_passes,
                 solve.scc_nodes_collapsed,
                 solve.scc_copy_edges_removed,
@@ -1374,9 +1377,12 @@ impl<'a> Refiner<'a> {
                 solve.pts_facts(),
                 solve.copy_sources(),
                 solve.copy_edges(),
-                solve.loads.values().map(Vec::len).sum::<usize>(),
-                solve.stores.values().map(Vec::len).sum::<usize>(),
-                solve.geps.values().map(Vec::len).sum::<usize>(),
+                solve.loads.values().map(Vec::len).sum::<usize>()
+                    + solve.pending_loads.values().map(Vec::len).sum::<usize>(),
+                solve.stores.values().map(Vec::len).sum::<usize>()
+                    + solve.pending_stores.values().map(Vec::len).sum::<usize>(),
+                solve.geps.values().map(Vec::len).sum::<usize>()
+                    + solve.pending_geps.values().map(Vec::len).sum::<usize>(),
                 solve.memcpys.len(),
                 solve.scc_enabled,
                 solve.scc_min_edges
@@ -2182,9 +2188,17 @@ struct Solve {
     /// Newly inserted copy edges awaiting one full-set seed. Keeping these separate from
     /// `succ` lets established edges consume only deltas without missing old source facts.
     pending_succ: HashMap<Cell, HashSet<Cell>>,
+    /// Complex constraints which have already consumed their owner's complete points-to
+    /// set. Established constraints consume only later points-to deltas.
     loads: HashMap<Cell, Vec<Cell>>,
     stores: HashMap<Cell, Vec<(Cell, Option<String>)>>,
     geps: HashMap<Cell, Vec<(Option<i64>, Cell)>>,
+    /// Newly inserted complex constraints awaiting one join with their owner's complete
+    /// points-to set. Keeping these separate makes the joins semi-naive without losing
+    /// constraints registered after propagation has otherwise reached quiescence.
+    pending_loads: HashMap<Cell, Vec<Cell>>,
+    pending_stores: HashMap<Cell, Vec<(Cell, Option<String>)>>,
+    pending_geps: HashMap<Cell, Vec<(Option<i64>, Cell)>>,
     memcpys: Vec<MemcpyJoin>,
     memcpy_by_endpoint: HashMap<Cell, Vec<usize>>,
     fields: HashMap<(Cell, i64), Cell>,
@@ -2213,6 +2227,9 @@ struct Solve {
     steps: usize,
     memcpy_pairs_processed: usize,
     copy_fact_pairs_processed: usize,
+    load_pairs_processed: usize,
+    store_pairs_processed: usize,
+    gep_pairs_processed: usize,
     new_copy_edges_since_scc: usize,
     scc_enabled: bool,
     scc_min_edges: usize,
@@ -2237,6 +2254,9 @@ impl Solve {
             loads: HashMap::new(),
             stores: HashMap::new(),
             geps: HashMap::new(),
+            pending_loads: HashMap::new(),
+            pending_stores: HashMap::new(),
+            pending_geps: HashMap::new(),
             memcpys: Vec::new(),
             memcpy_by_endpoint: HashMap::new(),
             fields: HashMap::new(),
@@ -2253,6 +2273,9 @@ impl Solve {
             steps: 0,
             memcpy_pairs_processed: 0,
             copy_fact_pairs_processed: 0,
+            load_pairs_processed: 0,
+            store_pairs_processed: 0,
+            gep_pairs_processed: 0,
             new_copy_edges_since_scc: 0,
             scc_enabled: std::env::var_os("PANGS_ANDERSEN_DISABLE_COPY_SCC").is_none(),
             scc_min_edges: copy_scc_min_edges(),
@@ -2396,9 +2419,19 @@ impl Solve {
 
     fn add_load(&mut self, base: Cell, destination: Cell) {
         let base = self.canonical(base);
-        let loads = self.loads.entry(base).or_default();
-        if !loads.contains(&destination) {
-            loads.push(destination);
+        let established = self
+            .loads
+            .get(&base)
+            .is_some_and(|loads| loads.contains(&destination));
+        let pending = self
+            .pending_loads
+            .get(&base)
+            .is_some_and(|loads| loads.contains(&destination));
+        if !established && !pending {
+            self.pending_loads
+                .entry(base)
+                .or_default()
+                .push(destination);
             self.enqueue(base);
         }
     }
@@ -2406,11 +2439,17 @@ impl Solve {
     fn add_store(&mut self, base: Cell, value: Cell, source: Option<String>) {
         let base = self.canonical(base);
         let store = (value, source);
-        let stores = self.stores.entry(base).or_default();
-        if !stores.contains(&store) {
-            stores.push(store);
-            // Complex constraints consume the owner's complete current points-to set, so
-            // late registration must run even when the owner has no pending delta.
+        let established = self
+            .stores
+            .get(&base)
+            .is_some_and(|stores| stores.contains(&store));
+        let pending = self
+            .pending_stores
+            .get(&base)
+            .is_some_and(|stores| stores.contains(&store));
+        if !established && !pending {
+            self.pending_stores.entry(base).or_default().push(store);
+            // A late constraint must run even when the owner has no pending points-to delta.
             self.enqueue(base);
         }
     }
@@ -2418,9 +2457,13 @@ impl Solve {
     fn add_gep(&mut self, base: Cell, offset: Option<i64>, destination: Cell) {
         let base = self.canonical(base);
         let gep = (offset, destination);
-        let geps = self.geps.entry(base).or_default();
-        if !geps.contains(&gep) {
-            geps.push(gep);
+        let established = self.geps.get(&base).is_some_and(|geps| geps.contains(&gep));
+        let pending = self
+            .pending_geps
+            .get(&base)
+            .is_some_and(|geps| geps.contains(&gep));
+        if !established && !pending {
+            self.pending_geps.entry(base).or_default().push(gep);
             self.enqueue(base);
         }
     }
@@ -2742,44 +2785,57 @@ impl Solve {
         self.succ = condensed_succ;
         self.pending_succ.clear();
 
-        let mut merged_loads = HashMap::<Cell, Vec<Cell>>::new();
-        for (cell, loads) in std::mem::take(&mut self.loads) {
-            merged_loads
+        // Collapsing variables can combine constraints from one old member with pointees
+        // from another. Treat every merged complex constraint as new so the complete
+        // representative points-to set is joined once; subsequent growth returns to delta
+        // propagation.
+        let mut replay_loads = HashMap::<Cell, Vec<Cell>>::new();
+        for (cell, loads) in std::mem::take(&mut self.loads)
+            .into_iter()
+            .chain(std::mem::take(&mut self.pending_loads))
+        {
+            replay_loads
                 .entry(representatives[cell as usize])
                 .or_default()
                 .extend(loads);
         }
-        for loads in merged_loads.values_mut() {
+        for loads in replay_loads.values_mut() {
             loads.sort_unstable();
             loads.dedup();
         }
-        self.loads = merged_loads;
+        self.pending_loads = replay_loads;
 
-        let mut merged_stores = HashMap::<Cell, Vec<(Cell, Option<String>)>>::new();
-        for (cell, stores) in std::mem::take(&mut self.stores) {
-            merged_stores
+        let mut replay_stores = HashMap::<Cell, Vec<(Cell, Option<String>)>>::new();
+        for (cell, stores) in std::mem::take(&mut self.stores)
+            .into_iter()
+            .chain(std::mem::take(&mut self.pending_stores))
+        {
+            replay_stores
                 .entry(representatives[cell as usize])
                 .or_default()
                 .extend(stores);
         }
-        for stores in merged_stores.values_mut() {
+        for stores in replay_stores.values_mut() {
             stores.sort_unstable();
             stores.dedup();
         }
-        self.stores = merged_stores;
+        self.pending_stores = replay_stores;
 
-        let mut merged_geps = HashMap::<Cell, Vec<(Option<i64>, Cell)>>::new();
-        for (cell, geps) in std::mem::take(&mut self.geps) {
-            merged_geps
+        let mut replay_geps = HashMap::<Cell, Vec<(Option<i64>, Cell)>>::new();
+        for (cell, geps) in std::mem::take(&mut self.geps)
+            .into_iter()
+            .chain(std::mem::take(&mut self.pending_geps))
+        {
+            replay_geps
                 .entry(representatives[cell as usize])
                 .or_default()
                 .extend(geps);
         }
-        for geps in merged_geps.values_mut() {
+        for geps in replay_geps.values_mut() {
             geps.sort_unstable();
             geps.dedup();
         }
-        self.geps = merged_geps;
+        self.pending_geps = replay_geps;
 
         let mut merged_memcpy_endpoints = HashMap::<Cell, Vec<usize>>::new();
         for (cell, joins) in std::mem::take(&mut self.memcpy_by_endpoint) {
@@ -2811,6 +2867,9 @@ impl Solve {
         self.queued.clear();
         let mut reseed = self.pending_pts.keys().copied().collect::<HashSet<_>>();
         reseed.extend(self.pending_external_sources.keys().copied());
+        reseed.extend(self.pending_loads.keys().copied());
+        reseed.extend(self.pending_stores.keys().copied());
+        reseed.extend(self.pending_geps.keys().copied());
         for cell in reseed {
             self.enqueue(cell);
         }
@@ -2852,7 +2911,7 @@ impl Solve {
     fn maybe_report_progress(&self) {
         if self.profile && self.steps % 10_000 == 0 {
             eprintln!(
-                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} new_copy_edges_since_scc={}",
+                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} new_copy_edges_since_scc={}",
                 self.steps,
                 self.worklist.len(),
                 self.queued.len(),
@@ -2864,6 +2923,9 @@ impl Solve {
                 self.unknown_fields.len(),
                 self.memcpy_pairs_processed,
                 self.copy_fact_pairs_processed,
+                self.load_pairs_processed,
+                self.store_pairs_processed,
+                self.gep_pairs_processed,
                 self.scc_passes,
                 self.scc_nodes_collapsed,
                 self.scc_copy_edges_removed,
@@ -2941,27 +3003,45 @@ impl Solve {
                 self.succ.entry(n).or_default().extend(new_successors);
             }
 
-            let objs: Vec<Cell> = self
-                .pts
-                .get(&n)
-                .map(|s| s.iter().copied().collect())
-                .unwrap_or_default();
-
             // n as a load base: p = *n  ⇒  pts(o) ⊆ pts(p)  for o ∈ pts(n)
             if let Some(ps) = self.loads.get(&n).cloned() {
-                self.report_large_product("load", n, ps.len(), objs.len());
+                self.report_large_product("load", n, ps.len(), pts_delta.len());
+                self.load_pairs_processed = self
+                    .load_pairs_processed
+                    .saturating_add(ps.len().saturating_mul(pts_delta.len()));
                 for p in ps {
-                    for &o in &objs {
+                    for &o in &pts_delta {
                         self.note_direct_access(o);
                         self.add_copy(o, p);
                     }
                 }
             }
+            if let Some(ps) = self.pending_loads.remove(&n) {
+                let all_pts = self
+                    .pts
+                    .get(&n)
+                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                self.report_large_product("new-load", n, ps.len(), all_pts.len());
+                self.load_pairs_processed = self
+                    .load_pairs_processed
+                    .saturating_add(ps.len().saturating_mul(all_pts.len()));
+                for &p in &ps {
+                    for &o in &all_pts {
+                        self.note_direct_access(o);
+                        self.add_copy(o, p);
+                    }
+                }
+                self.loads.entry(n).or_default().extend(ps);
+            }
             // n as a store base: *n = q  ⇒  pts(q) ⊆ pts(o)  for o ∈ pts(n)
             if let Some(qs) = self.stores.get(&n).cloned() {
-                self.report_large_product("store", n, qs.len(), objs.len());
+                self.report_large_product("store", n, qs.len(), pts_delta.len());
+                self.store_pairs_processed = self
+                    .store_pairs_processed
+                    .saturating_add(qs.len().saturating_mul(pts_delta.len()));
                 for (q, omega_source) in qs {
-                    for &o in &objs {
+                    for &o in &pts_delta {
                         self.note_direct_access(o);
                         if self.is_external(q) {
                             self.add_pts_with_source(o, q, omega_source.as_deref());
@@ -2971,15 +3051,58 @@ impl Solve {
                     }
                 }
             }
+            if let Some(qs) = self.pending_stores.remove(&n) {
+                let all_pts = self
+                    .pts
+                    .get(&n)
+                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                self.report_large_product("new-store", n, qs.len(), all_pts.len());
+                self.store_pairs_processed = self
+                    .store_pairs_processed
+                    .saturating_add(qs.len().saturating_mul(all_pts.len()));
+                for (q, omega_source) in &qs {
+                    for &o in &all_pts {
+                        self.note_direct_access(o);
+                        if self.is_external(*q) {
+                            self.add_pts_with_source(o, *q, omega_source.as_deref());
+                        } else {
+                            self.add_copy(*q, o);
+                        }
+                    }
+                }
+                self.stores.entry(n).or_default().extend(qs);
+            }
             // n as a gep base: p = n + off  ⇒  field(o, off) ∈ pts(p)  for o ∈ pts(n)
             if let Some(gs) = self.geps.get(&n).cloned() {
-                self.report_large_product("gep", n, gs.len(), objs.len());
+                self.report_large_product("gep", n, gs.len(), pts_delta.len());
+                self.gep_pairs_processed = self
+                    .gep_pairs_processed
+                    .saturating_add(gs.len().saturating_mul(pts_delta.len()));
                 for (off, p) in gs {
-                    for &o in &objs {
+                    for &o in &pts_delta {
                         let f = self.field_of(o, off);
                         self.add_pts(p, f);
                     }
                 }
+            }
+            if let Some(gs) = self.pending_geps.remove(&n) {
+                let all_pts = self
+                    .pts
+                    .get(&n)
+                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                self.report_large_product("new-gep", n, gs.len(), all_pts.len());
+                self.gep_pairs_processed = self
+                    .gep_pairs_processed
+                    .saturating_add(gs.len().saturating_mul(all_pts.len()));
+                for &(off, p) in &gs {
+                    for &o in &all_pts {
+                        let f = self.field_of(o, off);
+                        self.add_pts(p, f);
+                    }
+                }
+                self.geps.entry(n).or_default().extend(gs);
             }
             // n in a memcpy: contents-copy between pointed-to objects (field-insensitive).
             if let Some(relevant) = self.memcpy_by_endpoint.get(&n).cloned() {
@@ -3249,6 +3372,74 @@ mod tests {
             .external_sources_for(1)
             .unwrap()
             .contains("late-boundary"));
+    }
+
+    #[test]
+    fn complex_constraints_join_only_new_pointees_and_replay_late_constraints() {
+        let mut loads = Solve::new(12, false);
+        loads.add_pts(1, 7);
+        loads.add_pts(2, 8);
+        loads.add_pts(3, 9);
+        loads.add_pts(0, 1);
+        loads.add_pts(0, 2);
+        loads.add_load(0, 5);
+        loads.run();
+        assert_eq!(loads.load_pairs_processed, 2);
+        assert_eq!(loads.points_to(5).unwrap(), &HashSet::from([7, 8]));
+
+        loads.add_pts(0, 3);
+        loads.run();
+        assert_eq!(loads.load_pairs_processed, 3);
+        assert_eq!(loads.points_to(5).unwrap(), &HashSet::from([7, 8, 9]));
+        loads.run();
+        assert_eq!(loads.load_pairs_processed, 3);
+
+        loads.add_load(0, 6);
+        loads.run();
+        assert_eq!(loads.load_pairs_processed, 6);
+        assert_eq!(loads.points_to(6).unwrap(), &HashSet::from([7, 8, 9]));
+
+        let mut stores = Solve::new(12, false);
+        stores.add_pts(4, 10);
+        stores.add_pts(0, 1);
+        stores.add_pts(0, 2);
+        stores.add_store(0, 4, None);
+        stores.run();
+        assert_eq!(stores.store_pairs_processed, 2);
+        assert!(stores.points_to(1).unwrap().contains(&10));
+        assert!(stores.points_to(2).unwrap().contains(&10));
+
+        stores.add_pts(0, 3);
+        stores.run();
+        assert_eq!(stores.store_pairs_processed, 3);
+        assert!(stores.points_to(3).unwrap().contains(&10));
+        stores.run();
+        assert_eq!(stores.store_pairs_processed, 3);
+
+        stores.add_store(0, 5, None);
+        stores.run();
+        assert_eq!(stores.store_pairs_processed, 6);
+
+        let mut geps = Solve::new(12, false);
+        geps.known_offsets.insert(4);
+        geps.add_pts(0, 1);
+        geps.add_pts(0, 2);
+        geps.add_gep(0, Some(4), 5);
+        geps.run();
+        assert_eq!(geps.gep_pairs_processed, 2);
+        assert_eq!(geps.points_to(5).unwrap().len(), 2);
+
+        geps.add_pts(0, 3);
+        geps.run();
+        assert_eq!(geps.gep_pairs_processed, 3);
+        assert_eq!(geps.points_to(5).unwrap().len(), 3);
+        geps.run();
+        assert_eq!(geps.gep_pairs_processed, 3);
+
+        geps.add_gep(0, Some(4), 6);
+        geps.run();
+        assert_eq!(geps.gep_pairs_processed, 6);
+        assert_eq!(geps.points_to(6).unwrap().len(), 3);
     }
 
     #[test]
@@ -3527,6 +3718,43 @@ mod tests {
             .external_sources_for(6)
             .unwrap()
             .contains("late-after-scc"));
+    }
+
+    #[test]
+    fn copy_scc_collapse_replays_every_complex_join_across_merged_members() {
+        let mut solve = Solve::new(16, false);
+        solve.known_offsets.insert(4);
+        solve.add_pts(0, 6);
+        solve.add_pts(1, 7);
+        solve.add_pts(6, 8);
+        solve.add_pts(7, 9);
+        solve.add_pts(4, 10);
+        solve.add_load(1, 11);
+        solve.add_store(1, 4, None);
+        solve.add_gep(1, Some(4), 12);
+        solve.run();
+
+        assert_eq!(solve.points_to(11).unwrap(), &HashSet::from([9, 10]));
+        assert!(!solve.points_to(6).is_some_and(|pts| pts.contains(&10)));
+        assert_eq!(solve.points_to(12).unwrap().len(), 1);
+        assert_eq!(solve.load_pairs_processed, 1);
+        assert_eq!(solve.store_pairs_processed, 1);
+        assert_eq!(solve.gep_pairs_processed, 1);
+
+        solve.add_copy(0, 1);
+        solve.add_copy(1, 0);
+        solve.collapse_copy_sccs();
+        solve.run();
+
+        // The merged representative combines object 6 from member 0 with constraints
+        // formerly owned by member 1. Full replay after collapse must process that new
+        // cross-product for all three complex-constraint kinds.
+        assert_eq!(solve.points_to(11).unwrap(), &HashSet::from([8, 9, 10]));
+        assert!(solve.points_to(6).unwrap().contains(&10));
+        assert_eq!(solve.points_to(12).unwrap().len(), 2);
+        assert_eq!(solve.load_pairs_processed, 3);
+        assert_eq!(solve.store_pairs_processed, 3);
+        assert_eq!(solve.gep_pairs_processed, 3);
     }
 
     #[test]
