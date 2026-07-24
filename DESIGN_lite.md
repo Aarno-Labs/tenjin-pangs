@@ -42,16 +42,18 @@ recoverable later behind a stable interface (§6 below).
                                 ▼
                  ┌────────────────────────────────────────────────────────────┐
                  │  D'. Partition-scoped Andersen (PIP internals), exhaustive │
-                 │      over interesting partitions; outer CG-refinement loop │
+                 │      over admitted interesting partitions; joint CG LFP    │
                  └──────────────┬─────────────────────────────────────────────┘
                                 ▼
                  ┌────────────────────────────────────────────────────────────┐
-                 │  F. Clients: post-passes over the materialized solution    │
+                 │  F. Clients + disposition over the materialized solution   │
                  └────────────────────────────────────────────────────────────┘
 ```
 
-No tier E. No certificate checks between phases: B2's exact answers take precedence,
-everything else reads D's solution, and FSA intersection is applied once as a final
+No authoritative tier E. Experimental CFL query prototypes exist behind the query CLI,
+but they do not feed analysis, disposition, or transformation artifacts. No certificate
+checks run between production phases: B2's exact answers take precedence, everything
+else reads D's solution, and FSA intersection is applied once as a final
 soundness-preserving filter on icall results.
 
 ## 2. Phase details (deltas from `DESIGN.md` §4)
@@ -74,6 +76,15 @@ Each wrapper call is then safe only when its actual format is a decodable consta
 supported, `%n`-free conversion sequence. Unknown formats, `va_copy`, other consumers,
 escaping list aliases, and unfamiliar dataflow retain the ordinary Ω boundary and audit.
 
+The exact-name external summary registry is deliberately small and shape checked. In
+addition to safe format consumers, it can classify an external as pure/constant-returning,
+read-only over client state, or returning an interior alias of a particular argument.
+Implemented examples include `__ctype_get_*` accessors, the glibc ctype tables, and standard
+byte/string search routines such as `strchr`. A name match with the wrong call shape is not
+a proof: unlisted or mismatched calls retain the normal Ω effects. Known positional
+variadic bindings are modeled only when the callee's consumption is visible; otherwise
+function-pointer actuals and other pointer-bearing tail arguments fail closed.
+
 **Cut:**
 - **Typed heap clones** (cclyzer use-based back-propagation). v1 uses plain
   allocation-site objects. This deletes the back-propagation pass, the clone/site-object
@@ -89,25 +100,48 @@ escaping list aliases, and unfamiliar dataflow retain the ordinary Ω boundary a
 - **B2 simple pointers (KELP).** ~⅓ of icalls resolved exactly, for free, with regional
   SSA walks. Safe fallback discipline unchanged.
 
-**Conditional:** B3 (confined functions) falls out of B2 nearly for free; keep it iff it
-remains a one-evening delta on B2's bookkeeping. Drop without regret otherwise.
+**Kept:** B3 confined-function subtraction falls out of B2's bookkeeping. Functions whose
+every address flow was consumed by an exact simple chain are removed from non-exact
+candidate envelopes, while an exact B2 binding to such a function remains pinned.
+
+B1 now emits more than an initializer target set. Its production certificate records the
+publication boundary, initialization subtree and writers, readers/observations, and
+decisive failure evidence. Static initializer stores are not runtime writers. Absence-only
+initialization may therefore be stationary, while thread writers, signal reachability,
+recursion, `atexit`, unresolved effects, or a post-publication write fail closed. This
+certificate is fact input to disposition, not a terminal strategy decision.
 
 ### C'. Steensgaard, demoted to partitioner
-Same lock-free union-find with type/signature compatibility filtering, but its *only*
-jobs are (a) **Kahlon partitions** to scope D' (the reason exhaustive field-sensitive
-Andersen doesn't OOM — CORAL's baselines did, at 128 GB, on OpenSSL-sized inputs), and
-(b) the first wave of escape bits. It settles no queries and produces no certificates.
-~200 lines.
+A sequential numeric-ID union-find with type/signature compatibility filtering. Its
+*only* jobs are (a) **Kahlon partitions** to scope D' (the reason exhaustive
+field-sensitive Andersen doesn't OOM — CORAL's baselines did, at 128 GB, on
+OpenSSL-sized inputs), (b) the first wave of escape bits, and (c) the complete base-tier
+answer used wherever D' cannot refine. It settles no query by certificate.
 
 ### D'. The one real solver
 Partition-scoped, inclusion-based, PIP internals (implicit-Ω constraint forms and
-per-variable points-to sets). Run **by default on every interesting partition** (those
-reachable from client-relevant pointers: icall operands, mutable globals and what they
-reach, escape-relevant objects), not on a residue. Partitions solve independently
-across the core pool; each uses a sequential cache-friendly worklist. The implementation
-keeps the optimization surface narrow, but profiles of dense promoted partitions
+per-variable points-to sets). Every interesting partition (one reachable from
+client-relevant pointers: icall operands, mutable globals and what they reach, or
+escape-relevant objects) is considered without certificate-residue routing; the admission
+policy below decides whether Andersen or the Steensgaard fallback supplies its answer.
+The current implementation runs admitted partitions in one sequential solve;
+partition-level parallelism remains a clean future seam because Kahlon partitions are
+flow-closed. The implementation keeps the optimization surface narrow, but profiles of
+dense promoted partitions
 justified two general mechanisms: semi-naive constraint joins and threshold-triggered
 collapse of strongly connected copy variables.
+
+**Partition admission and fallback:**
+
+Steensgaard supplies the complete base-tier answer for every partition. An interesting
+partition is admitted to Andersen when its quadratic cost proxy fits the configured
+budget. An oversize partition remains at its Steensgaard answer, and the result records
+the number and largest size of such fallbacks. Provenance separation also permits a
+bounded promotion: a sparse, medium-sized partition that exceeds the old cost proxy may
+still be admitted when its node and edge counts fit fixed caps and it contains no
+integer-forged/universal external source. Larger or forged partitions retain the ordinary
+fallback. Complete Andersen facts overwrite only admitted partitions, so omission by the
+refiner is conservative.
 
 **Call graph via monotone on-the-fly discovery:**
 
@@ -125,6 +159,18 @@ emit a partial ascending solve: the entire Andersen tier falls back to the compl
 Steensgaard result, while independently proven exact callsite answers survive. The old
 stateless descending construction remains only as a temporary differential oracle during
 the migration (`20260723_MONOTONE_OTF_CG_PLAN.md`).
+
+**Finite field domain:**
+
+A constant-offset GEP lazily materializes `(root_object, byte_offset)`. Each root also has
+at most one unknown-offset summary. A dynamic offset aliases that summary with every
+materialized constant field of the root, in both directions; a direct whole-object access
+is likewise bridged to the summary. Nested constant GEPs canonicalize to
+`root + combined_offset` only when the combined offset occurs in the fixed PAG's finite
+offset vocabulary. Other nested or recursive offsets route to the root's unknown summary
+rather than creating an unbounded field-of-field chain. Thus dynamic indexing remains
+sound with respect to constant-field accesses while recursive GEP cycles terminate in a
+finite abstract domain.
 
 **Semi-naive constraint processing:**
 
@@ -169,20 +215,64 @@ in Cartesian work can be distinguished from changes elsewhere in the pipeline.
 
 ### F. Clients as post-passes
 With an exhaustive materialized solution, every client is a scan, not a query engine:
+
 - **Call graph:** joint fixed-point edges; each icall edge tagged `B2-exact` or
   `Andersen∩FSA` (two provenance tags instead of five tiers').
-- **writers(o):** scan stores whose pointer pts includes `o` — the demand query becomes
-  a table lookup. Mutability lattice (`never-written` → `stationary` (B1) →
-  `thread-confined` → `shared`) computed in one pass.
-- **Escape:** Ω bits from C'/D', narrowed per allocation by an independent address-flow proof
-  when Steensgaard has merged unrelated storage. Address isolation and write isolation are
-  separate certificates: a known runtime write does not by itself make the allocation's address
-  externally reachable.
-- **Globals localization:** unchanged from `DESIGN.md` §7 — transitive mod/ref over the
-  final call graph, Ω-derived unknown-caller/callee taint, component verdicts.
+- **Mod/ref and writers:** direct accesses are syntactic; pointer-aware load/store,
+  `memcpy`, and `memset` accesses expand through the materialized points-to relation.
+  Rows distinguish direct, aliased, finite-unknown, and universal-unknown provenance.
+  Transitive mod/ref closes over the final direct and indirect call graph. When a local
+  or transitive expansion exceeds its configured high-fanout bound, the concrete rows
+  collapse to an explicit conservative unknown row rather than being truncated.
+  Aggregate-memory and other audit findings retain finite global-flow candidates when
+  the solver proves them; violation relevance is then attributed to those candidates
+  instead of poisoning unrelated globals. Universal or assumption-tainted flow remains
+  module-wide.
+- **Escape and immutability:** Ω bits from C'/D' are narrowed per allocation by an
+  independent address-flow proof when Steensgaard has merged unrelated storage.
+  Address isolation and write isolation are separate facts: a known runtime write does
+  not by itself make the allocation's address externally reachable. Certified
+  initializer/callback-table aggregate copies and allocation provenance may establish
+  immutable contents without treating arbitrary runtime aggregate memory as precise.
+- **Globals localization:** the one-`Context` rewrite graph from `DESIGN.md` §7 closes
+  backward over internal callers of accessors and records the exact rewritten functions
+  and call sites. Ordinary outbound external calls do not connect or freeze the slice.
+  Unknown incoming callers and unresolved alternative callees block only when they
+  intersect a required signature rewrite. A global whose address is captured in a
+  static aggregate initializer also blocks until source-level aggregate-initializer
+  rewriting exists, because localization would replace its link-time-stable address
+  with a runtime local address. Components remain diagnostics, not the eligibility gate.
+- **Disposition:** the fact vector is routed by the policy stage in `DISPOSITION.md`.
+  The default cascade selects the first independently applicable strategy among
+  `immutable`, `once-lock`, `atomic`, `mutex`, and application-only `localize`, falling
+  back to `unhandled` with accumulated witnesses. Coupling-group support, overrides,
+  accepted-risk records, source-materialization recipes, and the marker inventory are
+  emitted in the shared manifest. Violation taint gates every strategy unless an
+  explicit accepted-risk override is recorded. Localization consumes only globals assigned
+  `localize`; the older mutability lattice is a reporting summary, not the strategy
+  decision procedure.
 
 Post-passes over one materialized result are also far easier to test than interleaved
 demand queries: golden-file the whole solution on small inputs, diff across changes.
+
+### Validation invariants
+
+The transformation-facing result is guarded by checks at several independent levels:
+
+- Debug subset tripwires require `Andersen ⊆ Steensgaard ⊆ FSA` at every narrowed
+  indirect-call site; exact B2 answers are checked against their envelopes separately.
+- The temporary subtractive construction can run as a differential oracle for the
+  monotone additive call-graph fixed point. Any additive target outside the descending
+  result is a defect.
+- Injected exhaustion tests abandon propagation, discovery, and activation at their
+  quiet boundaries and require indirect calls, node resolutions, and global points-to
+  facts to revert together. Independently proven exact sites remain exact.
+- The `differential` command compares conservative, Steensgaard, and Andersen artifacts;
+  emitted schemas are validated; LLVM callsite instrumentation plus `check-traces`
+  detects dynamically observed callees absent from the static envelope.
+
+These checks are not precision certificates between production tiers. They are
+soundness-regression tripwires around the one authoritative lite pipeline.
 
 ## 3. What is cut, and what each cut costs
 
@@ -191,7 +281,7 @@ demand queries: golden-file the whole solution on small inputs, diff across chan
 | Tier E (CFL engine: grammar, MHS offset stacks, shortcuts, CastMap, memo caches, dependency-driven CG fixpoint) | The single largest component — KallGraph's core is 2.1K SLOC *on top of* SVF, and our version generalized it to a query algebra. Estimated ⅓–½ of total system complexity. | The ~20% icall residue that needed context-sensitivity stays at Andersen∩FSA precision. See §4 for why the coverage hit is likely small. |
 | Per-tier certificate cascade | Settled/unsettled routing, certificate checks ×4, downward query flow | Some work D' does was provably unnecessary (already settled). At this scale, wasted solver-seconds; the routing logic cost more in complexity than it saved in compute. |
 | Typed heap clones + conservatism dial | Back-propagation pass, clone⁄site duality, per-client mode switch | Heap objects coarser by type. Hurts heap-heavy alias precision; mutable-*globals* client is the least heap-dependent client we have. |
-| KallGraph per-query parallelism | Read-only query pool, shared caches | None at this scale — `DESIGN.md` §1 already called it "overkill insurance" below 1 MLoC. Partition-level parallelism in D' remains. |
+| KallGraph per-query parallelism | Read-only query pool, shared caches | None at this scale — `DESIGN.md` §1 already called it "overkill insurance" below 1 MLoC. Kahlon partitions leave a clean parallelization seam, but the current D' solve is sequential. |
 
 **Not cut, anywhere:** Ω boundary model, int↔ptr provenance rules, violation
 detection → Ω-taint, FSA envelope, KELP safe-fallback discipline, byte-offset field
@@ -221,6 +311,11 @@ equate those pointer values. This preserves every external origin while preventi
 external returns, and unrelated client addresses from aliasing solely because all crossed an
 Ω boundary. Integer-forged pointers retain a separate universal marker and therefore never
 narrow module-wide mod/ref.
+
+Boundary seeding is build-mode aware. Executable mode treats `main` and its entry arguments
+as the program boundary while retaining callbacks whose addresses flow to external code.
+Library mode additionally treats exported functions as unknown-caller entries and exported
+global addresses as externally reachable; an explicit export set overrides the defaults.
 
 Finite pointee-class enumeration is additionally filtered by a per-global address-exposure bit.
 A global is unexposed only when every modeled use of its symbol is the address operand of a direct
@@ -269,17 +364,21 @@ parameter-passed function pointers need. Two reasons to expect a small coverage 
 
 The genuine exposure is `DESIGN.md` §11.4's mega-component risk: if the imprecise
 residue merges load-bearing components, coverage collapses. This is empirical and cheap
-to measure — M1 on Vim answers it in days (see §6 gates).
+to measure through corpus coverage, component/rewrite-slice size, and the provenance of
+the false edges that are load-bearing.
 
-## 5. Milestones
+## 5. Historical milestones and current status
 
-1. **M1 — sound end-to-end:** A' + C' + D' with the CG-refinement loop, Ω taint,
+1. **M1 — sound end-to-end (landed):** A' + C' + D' with joint CG discovery, Ω taint,
    violation detection, FSA filter. Correct (coarse) input for the localization client.
    Metric from day one: fraction of mutable globals localizable, plus the
    component-size distribution and which unknowns are load-bearing.
-2. **M2 — the precision jump:** B1 + B2 (+B3 if trivial). Per KELP/CORAL this is the
-   largest precision gain per engineering hour in either design.
-3. **M3 — measure and decide:** coverage on Vim and PHP against the M3 gates below.
+2. **M2 — the precision jump (landed):** B1 + B2 + B3, including stationarity,
+   exact/simple bindings, confined subtraction, finite field summaries, and the
+   narrowing ledgers.
+3. **M3 — measure and decide (lite selected):** corpus measurements kept Andersen as
+   the authoritative final tier. CFL/MHS query kernels were implemented as experimental
+   diagnostics and then deliberately left disconnected from production results.
 
 ## 6. Upgrade path (why the simplification is reversible)
 
@@ -287,6 +386,12 @@ Nothing in lite forecloses the full design:
 
 - The frozen PAG **is** the graph tier E would traverse; A' omits only the CastMap,
   which can be built in a later pass without touching A'.
+- Experimental field-insensitive and MHS field-sensitive callee-query kernels,
+  dependency-tracked call-graph discovery, signature filtering, and bounded/truncated
+  fallback already exist behind `pangs query`. They are prototypes, not soundness
+  authorities. Promoting them would require production fallback assembly, validation
+  against the Andersen/FSA envelopes, and integration with every downstream fact—not
+  merely switching the call-graph exporter.
 - B2-exact-first + FSA-filter-last is already the interface shape a demand tier slots
   behind: "refine this set of residual facts" — residual icalls, residual
   `writers()` targets — with lite's answers as the sound default when a query is not
@@ -294,7 +399,7 @@ Nothing in lite forecloses the full design:
 - Typed heap clones are an additive object-domain change: clones join the PAG alongside
   site objects (the full design's conservative mode), invisible to the solver loop.
 
-**Decision gates at M3:**
+**Future upgrade gates:**
 - Localization coverage on Vim/PHP acceptable to the client → ship lite, stop.
 - Coverage limited by *heap object conflation* (diagnosable: imprecise facts trace to
   multi-type allocation sites) → add typed clones, not tier E.
