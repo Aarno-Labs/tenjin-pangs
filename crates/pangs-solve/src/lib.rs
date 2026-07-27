@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 mod andersen;
 mod cfl;
+mod knobs;
 pub use andersen::{
     solve_andersen, solve_andersen_with_global_points_to, solve_andersen_with_overrides,
     solve_andersen_with_overrides_and_target_points_to,
@@ -2434,15 +2435,15 @@ impl<'a> Solver<'a> {
 }
 
 fn steens_profile_enabled() -> bool {
-    std::env::var_os("PANGS_STEENS_PROFILE").is_some()
+    std::env::var_os(knobs::ENV_STEENS_PROFILE).is_some()
 }
 
 fn steens_profile_interval_candidate_pairs() -> u64 {
-    std::env::var("PANGS_STEENS_PROFILE_INTERVAL")
+    std::env::var(knobs::ENV_STEENS_PROFILE_INTERVAL)
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(10_000_000)
+        .unwrap_or(knobs::STEENS_PROFILE_INTERVAL_CANDIDATE_PAIRS)
 }
 
 fn percentile(sorted: &[usize], pct: usize) -> usize {

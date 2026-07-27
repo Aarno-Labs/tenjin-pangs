@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod knobs;
 mod llvm_sys;
 
 /// Exact-name external functions whose nullable pointer result is derived from one pointer

@@ -6,6 +6,8 @@ use pangs_pir::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod knobs;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PagOpts {
     pub build_mode: BuildMode,
@@ -15,12 +17,17 @@ pub struct PagOpts {
     pub safe_indirect_vararg_callsites: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildMode {
-    #[default]
     Library,
     Executable,
+}
+
+impl Default for BuildMode {
+    fn default() -> Self {
+        knobs::DEFAULT_BUILD_MODE
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

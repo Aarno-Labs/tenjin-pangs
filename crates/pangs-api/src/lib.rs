@@ -24,12 +24,13 @@ use thiserror::Error;
 
 mod differential;
 mod initval;
+pub mod knobs;
 mod simple;
 pub use differential::{run_differential, DifferentialReport};
 use initval::resolve_initval_icalls;
-use simple::{
-    resolve_simple_icalls, SimpleIcallQuery, SimpleIcallResolution, DEFAULT_CONTEXT_DEPTH,
-};
+use knobs::DEFAULT_B2_CONTEXT_DEPTH;
+pub use knobs::DEFAULT_PARTITION_BUDGET;
+use simple::{resolve_simple_icalls, SimpleIcallQuery, SimpleIcallResolution};
 
 #[derive(Debug, Error)]
 pub enum AnalysisError {
@@ -51,8 +52,6 @@ pub struct CallsiteId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ComponentId(pub u32);
 
-pub const DEFAULT_PARTITION_BUDGET: u64 = 200_000;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Opts {
     pub stage: Stage,
@@ -70,14 +69,14 @@ pub struct Opts {
 impl Default for Opts {
     fn default() -> Self {
         Self {
-            stage: Stage::Conservative,
-            build_mode: BuildMode::Library,
+            stage: knobs::DEFAULT_STAGE,
+            build_mode: knobs::DEFAULT_BUILD_MODE,
             exports: BTreeSet::new(),
             partition_budget: DEFAULT_PARTITION_BUDGET,
-            enable_b1_initval: true,
-            enable_b2_simple: true,
-            enable_b3_confined: true,
-            b2_context_depth: DEFAULT_CONTEXT_DEPTH,
+            enable_b1_initval: knobs::DEFAULT_ENABLE_B1_INITVAL,
+            enable_b2_simple: knobs::DEFAULT_ENABLE_B2_SIMPLE,
+            enable_b3_confined: knobs::DEFAULT_ENABLE_B3_CONFINED,
+            b2_context_depth: DEFAULT_B2_CONTEXT_DEPTH,
             disposition_registries: Vec::new(),
         }
     }
@@ -4101,42 +4100,42 @@ impl PointerModRefProfile {
 }
 
 fn pointer_modref_profile_enabled() -> bool {
-    std::env::var_os("PANGS_POINTER_MODREF_PROFILE").is_some()
+    std::env::var_os(knobs::ENV_POINTER_MODREF_PROFILE).is_some()
 }
 
 fn pointer_modref_profile_interval_attempts() -> u64 {
-    std::env::var("PANGS_POINTER_MODREF_PROFILE_INTERVAL")
+    std::env::var(knobs::ENV_POINTER_MODREF_PROFILE_INTERVAL)
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(10_000_000)
+        .unwrap_or(knobs::POINTER_MODREF_PROFILE_INTERVAL_ATTEMPTS)
 }
 
 fn pointer_modref_profile_top_emitters() -> usize {
-    std::env::var("PANGS_POINTER_MODREF_PROFILE_TOP")
+    std::env::var(knobs::ENV_POINTER_MODREF_PROFILE_TOP)
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(20)
+        .unwrap_or(knobs::POINTER_MODREF_PROFILE_TOP_EMITTERS)
 }
 
 fn pointer_modref_profile_global() -> Option<String> {
-    std::env::var("PANGS_POINTER_MODREF_PROFILE_GLOBAL")
+    std::env::var(knobs::ENV_POINTER_MODREF_PROFILE_GLOBAL)
         .ok()
         .filter(|value| !value.is_empty())
 }
 
 fn pointer_modref_high_fanout_limit() -> usize {
-    std::env::var("PANGS_POINTER_MODREF_HIGH_FANOUT_LIMIT")
+    std::env::var(knobs::ENV_POINTER_MODREF_HIGH_FANOUT_LIMIT)
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(16)
+        .unwrap_or(knobs::POINTER_MODREF_HIGH_FANOUT_LIMIT)
 }
 
 fn transitive_modref_high_fanout_limit() -> usize {
-    std::env::var("PANGS_TRANSITIVE_MODREF_HIGH_FANOUT_LIMIT")
+    std::env::var(knobs::ENV_TRANSITIVE_MODREF_HIGH_FANOUT_LIMIT)
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(16_384)
+        .unwrap_or(knobs::TRANSITIVE_MODREF_HIGH_FANOUT_LIMIT)
 }
 
 fn effective_registry_apis(extensions: &[RegistryApi]) -> Vec<RegistryApi> {
@@ -4820,7 +4819,7 @@ fn build_modref_node_summary_data(
         resolution
             .pointee_globals
             .iter()
-            .take(16)
+            .take(knobs::MODREF_POINTEE_GLOBAL_SAMPLE_LIMIT)
             .cloned()
             .collect::<Vec<_>>(),
     );

@@ -19,7 +19,7 @@ const KILL_CODE_ORDER: [&str; 4] = [
 ];
 
 fn trace_timing(label: &str, started: Instant) {
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+    if std::env::var_os(crate::knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing {label}={}ms",
             started.elapsed().as_millis()
@@ -1653,7 +1653,7 @@ fn build_payload(
         .collect::<Vec<_>>();
     let post_sample = post_functions
         .iter()
-        .take(16)
+        .take(crate::knobs::PHASE_FUNCTION_SAMPLE_LIMIT)
         .map(|function| analysis.functions()[*function].key.clone())
         .collect::<Vec<_>>();
     let init_functions = init_subtree_functions(&reachability, &pre_functions, &spine_functions);

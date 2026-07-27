@@ -13,7 +13,10 @@ use pangs_pag::{
 };
 use pangs_pir::{fsa_compatible, Signature};
 
-const QUERY_STATE_BUDGET: usize = 25_000;
+use crate::knobs::{
+    CFL_FIXPOINT_MAX_ROUNDS, CFL_QUERY_STATE_BUDGET, CFL_VISIT_HISTOGRAM_LARGE_MAX,
+    CFL_VISIT_HISTOGRAM_MEDIUM_MAX, CFL_VISIT_HISTOGRAM_SMALL_MAX,
+};
 
 /// Experimental tier-E prototype: M3.1 field-insensitive CFL query kernel for callees.
 ///
@@ -160,7 +163,7 @@ fn query_all_callees_field_sensitive_fixpoint_report_inner(
     let mut deps_by_return_func: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut rounds = Vec::new();
 
-    for round_index in 0..32 {
+    for round_index in 0..CFL_FIXPOINT_MAX_ROUNDS {
         if pending.is_empty() {
             break;
         }
@@ -542,7 +545,7 @@ impl<'a> QueryGraph<'a> {
             }
             out.metrics.visited_states = visited.len();
             out.metrics.max_worklist = out.metrics.max_worklist.max(worklist.len() + 1);
-            if visited.len() >= QUERY_STATE_BUDGET || worklist.len() >= QUERY_STATE_BUDGET {
+            if visited.len() >= CFL_QUERY_STATE_BUDGET || worklist.len() >= CFL_QUERY_STATE_BUDGET {
                 out.metrics.truncated = true;
                 break;
             }
@@ -591,7 +594,7 @@ impl<'a> QueryGraph<'a> {
             }
             out.metrics.visited_states = visited.len();
             out.metrics.max_worklist = out.metrics.max_worklist.max(worklist.len() + 1);
-            if visited.len() >= QUERY_STATE_BUDGET || worklist.len() >= QUERY_STATE_BUDGET {
+            if visited.len() >= CFL_QUERY_STATE_BUDGET || worklist.len() >= CFL_QUERY_STATE_BUDGET {
                 out.metrics.truncated = true;
                 break;
             }
@@ -946,9 +949,9 @@ fn visit_histogram(queries: &[CflCalleeQuery]) -> CflVisitHistogram {
     let mut histogram = CflVisitHistogram::default();
     for query in queries {
         match query.metrics.visited_states {
-            0..=10 => histogram.le_10 += 1,
-            11..=100 => histogram.le_100 += 1,
-            101..=1_000 => histogram.le_1000 += 1,
+            value if value <= CFL_VISIT_HISTOGRAM_SMALL_MAX => histogram.le_10 += 1,
+            value if value <= CFL_VISIT_HISTOGRAM_MEDIUM_MAX => histogram.le_100 += 1,
+            value if value <= CFL_VISIT_HISTOGRAM_LARGE_MAX => histogram.le_1000 += 1,
             _ => histogram.gt_1000 += 1,
         }
     }

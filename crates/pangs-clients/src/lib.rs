@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use jsonschema::JSONSchema;
 
 mod cc2json;
+mod knobs;
 mod phase_stationarity;
 pub use cc2json::{run_cc2json, Cc2jsonOpts};
 
@@ -124,7 +125,7 @@ pub fn assemble_disposition_artifacts(
     let disposition_started = Instant::now();
     let registry_started = Instant::now();
     let registry_facts = registry_access_facts(analysis, module);
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+    if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing registry-facts={}ms",
             registry_started.elapsed().as_millis()
@@ -132,7 +133,7 @@ pub fn assemble_disposition_artifacts(
     }
     let fact_indexes_started = Instant::now();
     let fact_rows = DispositionFactRows::new(analysis);
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+    if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing fact-row-indexes={}ms",
             fact_indexes_started.elapsed().as_millis()
@@ -148,7 +149,7 @@ pub fn assemble_disposition_artifacts(
         &registry_facts.thread_writers,
         &fact_rows.violation,
     );
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+    if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing through-phase-certificates={}ms",
             disposition_started.elapsed().as_millis()
@@ -255,7 +256,7 @@ pub fn assemble_disposition_artifacts(
             extra: Extra::new(),
         });
     }
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+    if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing global-fact-assembly={}ms keyed={} unkeyed={}",
             global_facts_started.elapsed().as_millis(),
@@ -278,7 +279,7 @@ pub fn assemble_disposition_artifacts(
     let mut coupling_groups = assemble_coupling_groups(analysis, &mut globals);
     let atomic_started = Instant::now();
     assemble_atomic_eligibility(analysis, target, &mut globals);
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+    if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing atomic-eligibility={}ms certified={}",
             atomic_started.elapsed().as_millis(),
@@ -301,7 +302,7 @@ pub fn assemble_disposition_artifacts(
         &globals,
         &mut coupling_groups,
     );
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+    if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing mutex-eligibility={}ms certified={}",
             mutex_started.elapsed().as_millis(),
@@ -315,7 +316,7 @@ pub fn assemble_disposition_artifacts(
                 .count()
         );
     }
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+    if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing coupling-groups={}ms groups={} evidence-edges={}",
             coupling_started.elapsed().as_millis(),
@@ -627,7 +628,7 @@ fn registry_access_facts(analysis: &Analysis, module: &pangs_pir::Pir) -> Regist
             }
         }
     }
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+    if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition registry detail calls={} specs={} unresolved={} distinct-entries={} cached-accesses={}",
             registry_calls,
@@ -734,7 +735,7 @@ fn assemble_coupling_groups(
             }
         }
     }
-    if std::env::var_os("PANGS_DISPOSITION_TIMINGS").is_some() {
+    if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing coupling-once-lock={}ms certified-globals={} evidence-edges={}",
             once_lock_started.elapsed().as_millis(),

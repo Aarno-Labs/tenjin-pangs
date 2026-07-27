@@ -4,8 +4,6 @@ use pangs_pir::{fsa_compatible, Pir, Signature, Stmt};
 
 use crate::CallsiteId;
 
-pub(crate) const DEFAULT_CONTEXT_DEPTH: usize = 8;
-
 #[derive(Debug, Clone)]
 pub(crate) struct SimpleIcallQuery {
     pub callsite: CallsiteId,

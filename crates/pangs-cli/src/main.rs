@@ -5,12 +5,14 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use pangs_api::{Analysis, BuildMode, Opts, RegistryApi, Stage, DEFAULT_PARTITION_BUDGET};
+use pangs_api::{Analysis, BuildMode, Opts, RegistryApi, Stage};
 use pangs_dispose::{apply_policy, config_with_overrides, parse_overrides, write_artifact_pair};
 use pangs_manifest::DisposeMode;
 use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
 use pangs_pir::Pir;
 use sha2::{Digest, Sha256};
+
+mod knobs;
 
 #[derive(Debug, Parser)]
 #[command(name = "pangs")]
@@ -28,13 +30,13 @@ enum Command {
         out: PathBuf,
         // Andersen is the M1 shipping answer (M1.4b); `conservative` and `steens` remain
         // runnable regression floors.
-        #[arg(long, default_value = "andersen")]
+        #[arg(long, default_value = knobs::DEFAULT_ANALYSIS_STAGE)]
         stage: StageArg,
-        #[arg(long, default_value = "library")]
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = DEFAULT_PARTITION_BUDGET, hide = true)]
+        #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
         #[arg(long)]
         validate: bool,
@@ -58,13 +60,13 @@ enum Command {
     /// Run analysis and print mod/ref row counts without writing exports.
     ModrefSummary {
         module: PathBuf,
-        #[arg(long, default_value = "andersen")]
+        #[arg(long, default_value = knobs::DEFAULT_ANALYSIS_STAGE)]
         stage: StageArg,
-        #[arg(long, default_value = "library")]
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = DEFAULT_PARTITION_BUDGET, hide = true)]
+        #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
     },
     DumpPir {
@@ -76,14 +78,14 @@ enum Command {
         module: PathBuf,
         #[arg(long)]
         func: Option<String>,
-        #[arg(long, default_value = "library")]
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
     },
     CheckPag {
         module: PathBuf,
-        #[arg(long, default_value = "library")]
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
@@ -101,23 +103,23 @@ enum Command {
     /// Run conservative→steens→andersen and check the narrowing/monotonicity ledger.
     Differential {
         module: PathBuf,
-        #[arg(long, default_value = "library")]
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = DEFAULT_PARTITION_BUDGET, hide = true)]
+        #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
     },
     /// Run the M2.7 pre-analysis ablation: M1 baseline, B2 only, B1 only, and both.
     M2Ablation {
         module: PathBuf,
-        #[arg(long, default_value = "andersen")]
+        #[arg(long, default_value = knobs::DEFAULT_ANALYSIS_STAGE)]
         stage: StageArg,
-        #[arg(long, default_value = "library")]
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = DEFAULT_PARTITION_BUDGET, hide = true)]
+        #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
     },
     /// Instrument every indirect call in a module, writing an instrumented `.bc`.
@@ -137,17 +139,17 @@ enum Command {
         module: PathBuf,
         #[arg(long)]
         json_out: PathBuf,
-        #[arg(long, default_value = "andersen")]
+        #[arg(long, default_value = knobs::DEFAULT_ANALYSIS_STAGE)]
         stage: StageArg,
         /// pangs reachability mode: `library` (all functions reachable) or `executable`
         /// (reachable from `main`). Mirrors cc2json's `--entrypoints`.
-        #[arg(long, default_value = "library")]
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
         entrypoints: BuildModeArg,
         /// Treat all globals as module-internal for escape analysis (cclyzer's
         /// `--internalize-globals`). Off by default, matching how the goldens were produced.
         #[arg(long)]
         internalize_globals: bool,
-        #[arg(long, default_value_t = DEFAULT_PARTITION_BUDGET, hide = true)]
+        #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
     },
 }
@@ -157,11 +159,11 @@ enum QueryCommand {
     /// Run the experimental tier-E M3 callee query prototype.
     Callees {
         module: PathBuf,
-        #[arg(long, default_value = "library")]
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value = "field-sensitive")]
+        #[arg(long, default_value = knobs::DEFAULT_QUERY_MODE)]
         mode: QueryModeArg,
     },
 }
@@ -531,9 +533,9 @@ fn run() -> Result<()> {
                 let mut histogram = [0usize; 4];
                 for query in &run.queries {
                     match query.metrics.visited_states {
-                        0..=10 => histogram[0] += 1,
-                        11..=100 => histogram[1] += 1,
-                        101..=1_000 => histogram[2] += 1,
+                        value if value <= knobs::QUERY_HISTOGRAM_SMALL_MAX => histogram[0] += 1,
+                        value if value <= knobs::QUERY_HISTOGRAM_MEDIUM_MAX => histogram[1] += 1,
+                        value if value <= knobs::QUERY_HISTOGRAM_LARGE_MAX => histogram[2] += 1,
                         _ => histogram[3] += 1,
                     }
                 }

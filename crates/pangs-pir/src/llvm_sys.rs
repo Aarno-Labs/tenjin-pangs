@@ -18,6 +18,7 @@ use llvm_sys::{
     LLVMAtomicOrdering, LLVMDLLStorageClass, LLVMLinkage, LLVMOpcode, LLVMTypeKind, LLVMVisibility,
 };
 
+use crate::knobs::{CONSTANT_EXPR_RECURSION_LIMIT, DEBUG_TYPE_RECURSION_LIMIT};
 use crate::{
     AbiClass, Access, Func, GepLane, Global, Loc, LoweringStats, Param, Pir, PirError,
     ScalarTypeClass, Signature, StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo,
@@ -27,8 +28,6 @@ use crate::{
 mod ptrint;
 
 type AliasMap = BTreeMap<String, AliasTarget>;
-
-const MAX_CONSTANT_EXPR_LOWER_DEPTH: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AliasTarget {
@@ -544,7 +543,7 @@ unsafe fn di_type_class(
     metadata: LLVMMetadataRef,
     depth: usize,
 ) -> (Option<ScalarTypeClass>, Option<bool>) {
-    if depth >= 32 {
+    if depth >= DEBUG_TYPE_RECURSION_LIMIT {
         return (None, None);
     }
     let printed = value_string(LLVMMetadataAsValue(context, metadata));
@@ -2304,7 +2303,7 @@ unsafe fn lower_constant_expr_value_inner(
         let name = value_name(constant);
         return format!("@{}", resolve_symbol_name(ctx, &name).unwrap_or(name));
     }
-    if depth >= MAX_CONSTANT_EXPR_LOWER_DEPTH || !path.insert(constant as usize) {
+    if depth >= CONSTANT_EXPR_RECURSION_LIMIT || !path.insert(constant as usize) {
         let dest = global_init_temp(temp_ordinal);
         lowering.bump_tainted("global_initializer_constant_traversal_limit");
         push_unknown(

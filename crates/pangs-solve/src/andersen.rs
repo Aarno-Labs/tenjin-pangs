@@ -24,30 +24,11 @@ use pangs_pag::{
 };
 use pangs_pir::Pir;
 
+use crate::knobs;
 use crate::{
     debug_assert_narrows, exact_allocation_addresses, ExactAddress, FieldLocation,
     IndirectCallResolution, SolveResult, SteensClasses,
 };
-
-/// Hard cap on points-to/discovery resume phases. Hitting it abandons the whole Andersen
-/// tier: a partial ascending solve is an under-approximation and must never be emitted.
-const MAX_RESUME_ROUNDS: usize = 64;
-
-// The quadratic partition-cost proxy predates provenance-separated external regions and
-// rejects some sparse, medium-sized partitions that solve cheaply in practice.  Refine those
-// partitions when they contain no integer-forged (universal) source; retain the ordinary
-// fallback for larger or genuinely universal partitions.  This keeps the expensive YAPET/Vim
-// cases behind the existing budget while allowing external-origin separation to survive past
-// Steensgaard on cases such as JPEGOptim.
-const PROVENANCE_PROMOTION_MIN_BUDGET: u64 = 100_000;
-const PROVENANCE_PROMOTION_MAX_NODES: u64 = 4_096;
-const PROVENANCE_PROMOTION_MAX_EDGES: u64 = 4_096;
-
-// SCC scans are linear in the current copy graph, so trigger them geometrically rather
-// than after every dynamic edge. A pass runs after at least this many new edges and after
-// those edges amount to at least half of the current graph. Once a dense cycle collapses,
-// edges internal to it canonicalize to self-edges and stop contributing to the trigger.
-const COPY_SCC_MIN_EDGES: usize = 4_096;
 
 /// Solve Andersen as a refinement of Steensgaard and fold the refined facts back into a
 /// `SolveResult` that is otherwise identical to the Steensgaard answer.
@@ -197,11 +178,13 @@ impl AndersenControls {
         Self {
             max_steps: andersen_max_steps(),
             max_resumes: Some(andersen_max_resumes()),
-            inject_exhaustion: std::env::var("PANGS_ANDERSEN_INJECT_EXHAUSTION").ok(),
-            disable_eager_unknown: std::env::var_os("PANGS_ANDERSEN_DISABLE_EAGER_UNKNOWN")
+            inject_exhaustion: std::env::var(knobs::ENV_ANDERSEN_INJECT_EXHAUSTION).ok(),
+            disable_eager_unknown: std::env::var_os(knobs::ENV_ANDERSEN_DISABLE_EAGER_UNKNOWN)
                 .is_some(),
-            subtractive_differential: std::env::var_os("PANGS_ANDERSEN_DIFFERENTIAL_SUBTRACTIVE")
-                .is_some(),
+            subtractive_differential: std::env::var_os(
+                knobs::ENV_ANDERSEN_DIFFERENTIAL_SUBTRACTIVE,
+            )
+            .is_some(),
         }
     }
 }
@@ -698,9 +681,10 @@ impl<'a> Refiner<'a> {
             let n = nodes_in.get(&ap).copied().unwrap_or(0);
             let e = edges_in.get(&ap).copied().unwrap_or(0);
             let cost = n.saturating_mul(n.saturating_add(e));
-            let provenance_promoted = self.budget >= PROVENANCE_PROMOTION_MIN_BUDGET
-                && n <= PROVENANCE_PROMOTION_MAX_NODES
-                && e <= PROVENANCE_PROMOTION_MAX_EDGES
+            let provenance_promoted = self.budget
+                >= knobs::ANDERSEN_PROVENANCE_PROMOTION_MIN_BUDGET
+                && n <= knobs::ANDERSEN_PROVENANCE_PROMOTION_MAX_NODES
+                && e <= knobs::ANDERSEN_PROVENANCE_PROMOTION_MAX_EDGES
                 && !forged_partitions.contains(&ap);
             if cost > self.budget && !provenance_promoted {
                 oversize.insert(ap);
@@ -868,10 +852,16 @@ impl<'a> Refiner<'a> {
             eprintln!(
                 "pangs partition profile: root={} global_sample={:?} function_sample={:?}",
                 profile.root,
-                sample_strings(&profile.globals, 12),
-                sample_strings(&profile.functions, 12)
+                sample_strings(
+                    &profile.globals,
+                    knobs::PARTITION_PROFILE_SYMBOL_SAMPLE_LIMIT
+                ),
+                sample_strings(
+                    &profile.functions,
+                    knobs::PARTITION_PROFILE_SYMBOL_SAMPLE_LIMIT
+                )
             );
-            let hubs = self.partition_hubs(profile.root, 5);
+            let hubs = self.partition_hubs(profile.root, knobs::PARTITION_PROFILE_HUB_LIMIT);
             if !hubs.is_empty() {
                 eprintln!(
                     "pangs partition profile: root={} top_load_store_hubs={}",
@@ -879,7 +869,8 @@ impl<'a> Refiner<'a> {
                     hubs.join("; ")
                 );
             }
-            let offset_collisions = self.partition_offset_collisions(profile.root, 8);
+            let offset_collisions = self
+                .partition_offset_collisions(profile.root, knobs::PARTITION_PROFILE_DETAIL_LIMIT);
             if !offset_collisions.is_empty() {
                 eprintln!(
                     "pangs partition profile: root={} offset_collisions={}",
@@ -887,7 +878,10 @@ impl<'a> Refiner<'a> {
                     offset_collisions.join("; ")
                 );
             }
-            let mixed_classes = self.partition_function_data_cohabitation(profile.root, 8);
+            let mixed_classes = self.partition_function_data_cohabitation(
+                profile.root,
+                knobs::PARTITION_PROFILE_DETAIL_LIMIT,
+            );
             if !mixed_classes.is_empty() {
                 eprintln!(
                     "pangs partition profile: root={} function_data_cohabitation={}",
@@ -895,7 +889,10 @@ impl<'a> Refiner<'a> {
                     mixed_classes.join("; ")
                 );
             }
-            let copy_bridges = self.partition_aggregate_copy_bridges(profile.root, 8);
+            let copy_bridges = self.partition_aggregate_copy_bridges(
+                profile.root,
+                knobs::PARTITION_PROFILE_DETAIL_LIMIT,
+            );
             if !copy_bridges.is_empty() {
                 eprintln!(
                     "pangs partition profile: root={} aggregate_copy_bridges={}",
@@ -917,7 +914,11 @@ impl<'a> Refiner<'a> {
                     "pangs partition profile: root={} cut={} largest_node_components={:?}",
                     profile.root,
                     cut.label(),
-                    self.partition_cut_components(profile.root, cut, 8)
+                    self.partition_cut_components(
+                        profile.root,
+                        cut,
+                        knobs::PARTITION_PROFILE_DETAIL_LIMIT
+                    )
                 );
             }
             eprintln!(
@@ -1018,7 +1019,10 @@ impl<'a> Refiner<'a> {
                     root,
                     loads,
                     stores,
-                    self.class_label_sample(root, 4),
+                    self.class_label_sample(
+                        root,
+                        knobs::PARTITION_PROFILE_CLASS_LABEL_SAMPLE_LIMIT,
+                    ),
                     witnesses.remove(&root).unwrap_or_default()
                 )
             })
@@ -1055,7 +1059,7 @@ impl<'a> Refiner<'a> {
             let location = FieldLocation::from_gep(byte_off, lane);
             collision.offsets.insert(location);
             collision.edges += 1;
-            if collision.witnesses.len() < 3 {
+            if collision.witnesses.len() < knobs::PARTITION_PROFILE_COLLISION_WITNESS_LIMIT {
                 collision
                     .witnesses
                     .push(format!("off={location:?}:{}", edge_witness("gep", edge)));
@@ -1082,7 +1086,7 @@ impl<'a> Refiner<'a> {
                 let offsets = collision
                     .offsets
                     .iter()
-                    .take(16)
+                    .take(knobs::PARTITION_PROFILE_COLLISION_OFFSET_SAMPLE_LIMIT)
                     .map(|offset| format!("{offset:?}"))
                     .collect::<Vec<_>>();
                 format!(
@@ -1091,7 +1095,10 @@ impl<'a> Refiner<'a> {
                     offset_count,
                     offsets,
                     collision.edges,
-                    self.class_label_sample(class, 4),
+                    self.class_label_sample(
+                        class,
+                        knobs::PARTITION_PROFILE_CLASS_LABEL_SAMPLE_LIMIT,
+                    ),
                     collision.witnesses
                 )
             })
@@ -1152,8 +1159,14 @@ impl<'a> Refiner<'a> {
                     class,
                     occupants.functions.len(),
                     occupants.data.len(),
-                    sample_strings(&occupants.functions, 6),
-                    sample_strings(&occupants.data, 6)
+                    sample_strings(
+                        &occupants.functions,
+                        knobs::PARTITION_PROFILE_OCCUPANT_SAMPLE_LIMIT
+                    ),
+                    sample_strings(
+                        &occupants.data,
+                        knobs::PARTITION_PROFILE_OCCUPANT_SAMPLE_LIMIT
+                    )
                 )
             })
             .collect()
@@ -1362,7 +1375,9 @@ impl<'a> Refiner<'a> {
         }
 
         let max_steps = controls.max_steps;
-        let max_resumes = controls.max_resumes.unwrap_or(MAX_RESUME_ROUNDS);
+        let max_resumes = controls
+            .max_resumes
+            .unwrap_or(knobs::ANDERSEN_MAX_RESUME_ROUNDS);
         let injection = controls.inject_exhaustion;
         let mut resume_rounds = 0usize;
         let mut known_unbound = Vec::new();
@@ -1460,8 +1475,8 @@ impl<'a> Refiner<'a> {
         if controls.subtractive_differential {
             assert!(
                 controls.disable_eager_unknown,
-                "subtractive differential requires pure-LFP mode \
-                 (set PANGS_ANDERSEN_DISABLE_EAGER_UNKNOWN)"
+                "subtractive differential requires pure-LFP mode (set {})",
+                knobs::ENV_ANDERSEN_DISABLE_EAGER_UNKNOWN
             );
             let oracle = self.subtractive_oracle(&in_scope_sites, &envelopes, &exact_map);
             for &site in &in_scope_sites {
@@ -1844,7 +1859,7 @@ impl<'a> Refiner<'a> {
     }
 
     fn apply_external_call_effects(&self, solve: &mut Solve, callsite: &pangs_pag::Callsite) {
-        let detailed = std::env::var_os("PANGS_ANDERSEN_EXPLAIN_NODE").is_some();
+        let detailed = std::env::var_os(knobs::ENV_ANDERSEN_EXPLAIN_NODE).is_some();
         let arg_source = if detailed {
             format!("omega:external_call_arg:{}", callsite.key)
         } else {
@@ -1874,7 +1889,7 @@ impl<'a> Refiner<'a> {
     }
 
     fn apply_vararg_call_effects(&self, solve: &mut Solve, callsite: &pangs_pag::Callsite) {
-        let source = if std::env::var_os("PANGS_ANDERSEN_EXPLAIN_NODE").is_some() {
+        let source = if std::env::var_os(knobs::ENV_ANDERSEN_EXPLAIN_NODE).is_some() {
             format!("omega:vararg_call_arg:{}", callsite.key)
         } else {
             "omega:vararg_call_arg".to_string()
@@ -2081,7 +2096,7 @@ impl<'a> Refiner<'a> {
     }
 
     fn emit_node_resolutions(&self, pts: &Solve) -> Vec<RefinedNodeResolution> {
-        let explain_label = std::env::var("PANGS_ANDERSEN_EXPLAIN_NODE").ok();
+        let explain_label = std::env::var(knobs::ENV_ANDERSEN_EXPLAIN_NODE).ok();
         let address_exposed = &self.classes.global_address_exposed;
         let violation_tainted = self.classes.module_violation_tainted;
         let global_index_by_key = self
@@ -2182,11 +2197,10 @@ impl<'a> Refiner<'a> {
                     .collect::<Vec<_>>();
                 allocations.sort();
                 allocations.dedup();
-                const SOURCE_LIMIT: usize = 32;
                 let source_count = external_sources.len();
                 let source_sample = external_sources
                     .iter()
-                    .take(SOURCE_LIMIT)
+                    .take(knobs::ANDERSEN_EXTERNAL_SOURCE_LIMIT)
                     .cloned()
                     .collect::<Vec<_>>();
                 eprintln!(
@@ -2275,41 +2289,41 @@ fn omega_seed_source(kind: OmegaSeedKind) -> &'static str {
 }
 
 fn andersen_profile_enabled() -> bool {
-    std::env::var_os("PANGS_ANDERSEN_PROFILE").is_some()
+    std::env::var_os(knobs::ENV_ANDERSEN_PROFILE).is_some()
 }
 
 fn copy_scc_min_edges() -> usize {
-    std::env::var("PANGS_ANDERSEN_COPY_SCC_MIN_EDGES")
+    std::env::var(knobs::ENV_ANDERSEN_COPY_SCC_MIN_EDGES)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(COPY_SCC_MIN_EDGES)
+        .unwrap_or(knobs::ANDERSEN_COPY_SCC_MIN_EDGES)
 }
 
 fn andersen_max_steps() -> Option<usize> {
-    std::env::var("PANGS_ANDERSEN_MAX_STEPS")
+    std::env::var(knobs::ENV_ANDERSEN_MAX_STEPS)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
 }
 
 fn andersen_max_resumes() -> usize {
-    std::env::var("PANGS_ANDERSEN_MAX_RESUMES")
+    std::env::var(knobs::ENV_ANDERSEN_MAX_RESUMES)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(MAX_RESUME_ROUNDS)
+        .unwrap_or(knobs::ANDERSEN_MAX_RESUME_ROUNDS)
 }
 
 fn partition_profile_enabled() -> bool {
-    std::env::var_os("PANGS_PARTITION_PROFILE").is_some()
+    std::env::var_os(knobs::ENV_PARTITION_PROFILE).is_some()
 }
 
 fn partition_profile_top() -> usize {
-    std::env::var("PANGS_PARTITION_PROFILE_TOP")
+    std::env::var(knobs::ENV_PARTITION_PROFILE_TOP)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(20)
+        .unwrap_or(knobs::PARTITION_PROFILE_TOP)
 }
 
 fn ap_find_const(parent: &[usize], mut x: usize) -> usize {
@@ -2517,7 +2531,7 @@ impl Solve {
             store_pairs_processed: 0,
             gep_pairs_processed: 0,
             new_copy_edges_since_scc: 0,
-            scc_enabled: std::env::var_os("PANGS_ANDERSEN_DISABLE_COPY_SCC").is_none(),
+            scc_enabled: std::env::var_os(knobs::ENV_ANDERSEN_DISABLE_COPY_SCC).is_none(),
             scc_min_edges: copy_scc_min_edges(),
             scc_passes: 0,
             scc_nodes_collapsed: 0,
@@ -3146,7 +3160,7 @@ impl Solve {
     }
 
     fn maybe_report_progress(&self) {
-        if self.profile && self.steps % 10_000 == 0 {
+        if self.profile && self.steps % knobs::ANDERSEN_PROFILE_STEP_INTERVAL == 0 {
             eprintln!(
                 "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} new_copy_edges_since_scc={}",
                 self.steps,
@@ -3172,7 +3186,7 @@ impl Solve {
     }
 
     fn report_large_product(&self, kind: &str, base: Cell, lhs: usize, rhs: usize) {
-        if self.profile && lhs.saturating_mul(rhs) >= 50_000 {
+        if self.profile && lhs.saturating_mul(rhs) >= knobs::ANDERSEN_PROFILE_LARGE_PRODUCT {
             eprintln!(
                 "pangs andersen profile: large {} expansion base={} lhs={} rhs={} product={} steps={} pts_facts={} copy_edges={}",
                 kind,
