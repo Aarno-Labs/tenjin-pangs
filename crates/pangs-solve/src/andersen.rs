@@ -30,6 +30,32 @@ use crate::{
     IndirectCallResolution, SolveResult, SteensClasses,
 };
 
+/// Return the cheap, Steensgaard-derived structural census used to calibrate
+/// Andersen partition admission. This stops before the inclusion solve and
+/// does not construct any API client rows.
+pub fn andersen_admission_census(
+    pir: &Pir,
+    pag: &Pag,
+    build_mode: BuildMode,
+) -> Vec<AdmissionStructureProfile> {
+    let labels = BTreeSet::new();
+    let (base, classes) = crate::solve_steensgaard_classes_targeted(pir, pag, build_mode, &labels);
+    let exact_targets = BTreeMap::new();
+    let confined_targets = BTreeSet::new();
+    let refiner = Refiner::new(
+        pir,
+        pag,
+        &classes,
+        &base,
+        build_mode,
+        0,
+        &exact_targets,
+        &confined_targets,
+        true,
+    );
+    refiner.admission_structures
+}
+
 /// Solve Andersen as a refinement of Steensgaard and fold the refined facts back into a
 /// `SolveResult` that is otherwise identical to the Steensgaard answer.
 pub fn solve_andersen(
@@ -211,6 +237,7 @@ fn finish_andersen_controlled(
         partition_budget,
         exact_targets,
         confined_targets,
+        admission_profile_enabled(),
     );
     refiner.materialize_global_points_to = materialize_global_points_to;
     let outcome = refiner.run(controls);
@@ -388,22 +415,22 @@ struct PartitionProfile {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct AdmissionStructureProfile {
-    kind: &'static str,
-    root: usize,
-    nodes: u64,
-    edges: u64,
-    quadratic_proxy: u64,
-    forged: bool,
-    values: usize,
-    allocas: usize,
-    globals: usize,
-    functions: usize,
-    icalls: usize,
-    ext_classes: usize,
-    esc_classes: usize,
-    edge_counts: BTreeMap<&'static str, usize>,
-    omega_seed_counts: BTreeMap<&'static str, usize>,
+pub struct AdmissionStructureProfile {
+    pub kind: &'static str,
+    pub root: usize,
+    pub nodes: u64,
+    pub edges: u64,
+    pub quadratic_proxy: u64,
+    pub forged: bool,
+    pub values: usize,
+    pub allocas: usize,
+    pub globals: usize,
+    pub functions: usize,
+    pub icalls: usize,
+    pub ext_classes: usize,
+    pub esc_classes: usize,
+    pub edge_counts: BTreeMap<&'static str, usize>,
+    pub omega_seed_counts: BTreeMap<&'static str, usize>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -533,6 +560,8 @@ struct Refiner<'a> {
     /// Diagnostic-only root selection used by the admission profiler. A selected
     /// interesting partition is forcibly admitted in isolation.
     admission_profile_root: Option<usize>,
+    collect_admission_structures: bool,
+    admission_structures: Vec<AdmissionStructureProfile>,
     /// When set, `run` also emits refined points-to for in-scope global memory objects.
     materialize_global_points_to: bool,
 }
@@ -548,6 +577,7 @@ impl<'a> Refiner<'a> {
         budget: u64,
         exact_targets: &'a BTreeMap<String, Vec<String>>,
         confined_targets: &'a BTreeSet<String>,
+        collect_admission_structures: bool,
     ) -> Self {
         let n_base = pag.nodes.len();
         let func_index: HashMap<String, usize> = pir
@@ -622,6 +652,8 @@ impl<'a> Refiner<'a> {
             oversize_fallbacks: 0,
             oversize_fallback_max_size: 0,
             admission_profile_root: admission_profile_root(),
+            collect_admission_structures,
+            admission_structures: Vec::new(),
             materialize_global_points_to: false,
         };
         refiner.build_scope();
@@ -732,13 +764,22 @@ impl<'a> Refiner<'a> {
                 oversize.insert(ap);
             }
         }
-        if admission_profile_enabled() && self.admission_profile_root.is_none() {
-            self.print_admission_structure_profile(
+        if self.collect_admission_structures && self.admission_profile_root.is_none() {
+            self.admission_structures = self.collect_admission_structure_profiles(
                 &interesting,
                 &forged_partitions,
                 &nodes_in,
                 &edges_in,
             );
+            if admission_profile_enabled() {
+                for record in &self.admission_structures {
+                    eprintln!(
+                        "pangs andersen admission profile: {}",
+                        serde_json::to_string(record)
+                            .expect("serialize admission structure profile")
+                    );
+                }
+            }
         }
         if let Some(selected) = self.admission_profile_root {
             assert!(
@@ -770,43 +811,42 @@ impl<'a> Refiner<'a> {
         }
     }
 
-    fn print_admission_structure_profile(
+    fn collect_admission_structure_profiles(
         &self,
         interesting: &HashSet<usize>,
         forged_partitions: &HashSet<usize>,
         nodes_in: &HashMap<usize, u64>,
         edges_in: &HashMap<usize, u64>,
-    ) {
+    ) -> Vec<AdmissionStructureProfile> {
         let mut profiles = self.collect_partition_profiles();
         profiles.retain(|root, _| interesting.contains(root));
         let mut roots = profiles.keys().copied().collect::<Vec<_>>();
         roots.sort_unstable();
-        for root in roots {
-            let profile = &profiles[&root];
-            let nodes = nodes_in.get(&root).copied().unwrap_or(0);
-            let edges = edges_in.get(&root).copied().unwrap_or(0);
-            let record = AdmissionStructureProfile {
-                kind: "structure",
-                root,
-                nodes,
-                edges,
-                quadratic_proxy: nodes.saturating_mul(nodes.saturating_add(edges)),
-                forged: forged_partitions.contains(&root),
-                values: profile.values,
-                allocas: profile.allocas,
-                globals: profile.globals.len(),
-                functions: profile.functions.len(),
-                icalls: profile.icalls,
-                ext_classes: profile.ext_classes,
-                esc_classes: profile.esc_classes,
-                edge_counts: profile.edge_counts.clone(),
-                omega_seed_counts: profile.omega_seed_counts.clone(),
-            };
-            eprintln!(
-                "pangs andersen admission profile: {}",
-                serde_json::to_string(&record).expect("serialize admission structure profile")
-            );
-        }
+        roots
+            .into_iter()
+            .map(|root| {
+                let profile = &profiles[&root];
+                let nodes = nodes_in.get(&root).copied().unwrap_or(0);
+                let edges = edges_in.get(&root).copied().unwrap_or(0);
+                AdmissionStructureProfile {
+                    kind: "structure",
+                    root,
+                    nodes,
+                    edges,
+                    quadratic_proxy: nodes.saturating_mul(nodes.saturating_add(edges)),
+                    forged: forged_partitions.contains(&root),
+                    values: profile.values,
+                    allocas: profile.allocas,
+                    globals: profile.globals.len(),
+                    functions: profile.functions.len(),
+                    icalls: profile.icalls,
+                    ext_classes: profile.ext_classes,
+                    esc_classes: profile.esc_classes,
+                    edge_counts: profile.edge_counts.clone(),
+                    omega_seed_counts: profile.omega_seed_counts.clone(),
+                }
+            })
+            .collect()
     }
 
     fn collect_partition_profiles(&self) -> HashMap<usize, PartitionProfile> {

@@ -90,6 +90,14 @@ enum Command {
         #[arg(long)]
         exports: Option<PathBuf>,
     },
+    /// Emit the cheap Steensgaard-derived Andersen admission census as JSONL.
+    AndersenAdmissionCensus {
+        module: PathBuf,
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
+        build_mode: BuildModeArg,
+        #[arg(long)]
+        exports: Option<PathBuf>,
+    },
     Report {
         dir: PathBuf,
     },
@@ -434,6 +442,25 @@ fn run() -> Result<()> {
                 pag.callsites.len(),
                 pag.omega_seeds.len()
             );
+        }
+        Command::AndersenAdmissionCensus {
+            module,
+            build_mode,
+            exports,
+        } => {
+            let pir = Pir::from_path(&module)?;
+            let build_mode = build_mode.into();
+            let pag = Pag::from_pir(
+                &pir,
+                &PagOpts {
+                    build_mode,
+                    exports: read_exports(exports)?,
+                    ..PagOpts::default()
+                },
+            );
+            for record in pangs_solve::andersen_admission_census(&pir, &pag, build_mode) {
+                println!("{}", serde_json::to_string(&record)?);
+            }
         }
         Command::Report { dir } => {
             print!("{}", pangs_clients::report(&dir)?);

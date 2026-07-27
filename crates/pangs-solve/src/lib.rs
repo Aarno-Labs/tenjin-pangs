@@ -13,8 +13,9 @@ mod andersen;
 mod cfl;
 mod knobs;
 pub use andersen::{
-    solve_andersen, solve_andersen_with_global_points_to, solve_andersen_with_overrides,
-    solve_andersen_with_overrides_and_target_points_to,
+    andersen_admission_census, solve_andersen, solve_andersen_with_global_points_to,
+    solve_andersen_with_overrides, solve_andersen_with_overrides_and_target_points_to,
+    AdmissionStructureProfile,
 };
 
 // Experimental tier-E prototype APIs. These are intentionally kept out of the

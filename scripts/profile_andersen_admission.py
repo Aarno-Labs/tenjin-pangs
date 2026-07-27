@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument(
+        "--census-only",
+        action="store_true",
+        help="write the structural census without isolated client-row trials",
+    )
+    parser.add_argument(
         "--min-quadratic-proxy",
         type=int,
         default=0,
@@ -113,6 +118,28 @@ def run_analysis(
     return completed.stderr
 
 
+def run_census(
+    pangs: pathlib.Path,
+    module: pathlib.Path,
+) -> list[dict[str, Any]]:
+    completed = subprocess.run(
+        [
+            str(pangs),
+            "andersen-admission-census",
+            str(module),
+            "--build-mode",
+            module_mode(module),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode:
+        raise RuntimeError(f"{module.name} census failed:\n{completed.stderr}")
+    return [json.loads(line) for line in completed.stdout.splitlines()]
+
+
 def profile_records(stderr: str, kind: str) -> list[dict[str, Any]]:
     records = []
     for line in stderr.splitlines():
@@ -160,16 +187,11 @@ def profile_module(
     sample_below: int,
     max_nodes: int | None,
     max_edges: int | None,
+    census_only: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     with tempfile.TemporaryDirectory(prefix=f"pangs-admission-{module.stem}-") as tmp:
         root_dir = pathlib.Path(tmp)
-        baseline = root_dir / "steens"
-        run_analysis(pangs, module, baseline, "steens")
-
-        census_out = root_dir / "census"
-        census_stderr = run_analysis(pangs, module, census_out, "andersen")
-        structures = profile_records(census_stderr, "structure")
-        shutil.rmtree(census_out)
+        structures = run_census(pangs, module)
         for structure in structures:
             structure["module"] = module.name
             structure["build_mode"] = module_mode(module)
@@ -195,7 +217,11 @@ def profile_module(
             reverse=True,
         )
         selected.extend(below[:sample_below])
+        if census_only or not selected:
+            return structures, []
 
+        baseline = root_dir / "steens"
+        run_analysis(pangs, module, baseline, "steens")
         records = []
         for structure in selected:
             root = structure["root"]
@@ -247,6 +273,7 @@ def main() -> None:
                         args.sample_below,
                         args.max_nodes,
                         args.max_edges,
+                        args.census_only,
                     ): module
                     for module in selected
                 }
