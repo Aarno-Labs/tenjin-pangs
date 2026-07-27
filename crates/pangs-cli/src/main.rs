@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use pangs_api::{Analysis, BuildMode, Opts, RegistryApi, Stage};
+use pangs_api::{Analysis, BuildMode, Opts, RegistryApi, Stage, DEFAULT_PARTITION_BUDGET};
 use pangs_dispose::{apply_policy, config_with_overrides, parse_overrides, write_artifact_pair};
 use pangs_manifest::DisposeMode;
 use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
@@ -34,7 +34,7 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = 100_000, hide = true)]
+        #[arg(long, default_value_t = DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
         #[arg(long)]
         validate: bool,
@@ -64,7 +64,7 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = 100_000, hide = true)]
+        #[arg(long, default_value_t = DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
     },
     DumpPir {
@@ -105,7 +105,7 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = 100_000, hide = true)]
+        #[arg(long, default_value_t = DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
     },
     /// Run the M2.7 pre-analysis ablation: M1 baseline, B2 only, B1 only, and both.
@@ -117,7 +117,7 @@ enum Command {
         build_mode: BuildModeArg,
         #[arg(long)]
         exports: Option<PathBuf>,
-        #[arg(long, default_value_t = 100_000, hide = true)]
+        #[arg(long, default_value_t = DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
     },
     /// Instrument every indirect call in a module, writing an instrumented `.bc`.
@@ -147,7 +147,7 @@ enum Command {
         /// `--internalize-globals`). Off by default, matching how the goldens were produced.
         #[arg(long)]
         internalize_globals: bool,
-        #[arg(long, default_value_t = 100_000, hide = true)]
+        #[arg(long, default_value_t = DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
     },
 }
