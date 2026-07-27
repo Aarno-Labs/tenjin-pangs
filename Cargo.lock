@@ -990,6 +990,7 @@ dependencies = [
  "pangs-pag",
  "pangs-pir",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

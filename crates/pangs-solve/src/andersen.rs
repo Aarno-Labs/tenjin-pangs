@@ -387,6 +387,44 @@ struct PartitionProfile {
     omega_seed_counts: BTreeMap<&'static str, usize>,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct AdmissionStructureProfile {
+    kind: &'static str,
+    root: usize,
+    nodes: u64,
+    edges: u64,
+    quadratic_proxy: u64,
+    forged: bool,
+    values: usize,
+    allocas: usize,
+    globals: usize,
+    functions: usize,
+    icalls: usize,
+    ext_classes: usize,
+    esc_classes: usize,
+    edge_counts: BTreeMap<&'static str, usize>,
+    omega_seed_counts: BTreeMap<&'static str, usize>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AdmissionWorkProfile {
+    kind: &'static str,
+    root: usize,
+    actual_work: usize,
+    worklist_pops: usize,
+    points_to_facts_inserted: usize,
+    copy_edges_inserted: usize,
+    copy_fact_pairs_processed: usize,
+    load_pairs_processed: usize,
+    store_pairs_processed: usize,
+    gep_pairs_processed: usize,
+    memcpy_pairs_processed: usize,
+    field_cells_allocated: usize,
+    scc_nodes_scanned: usize,
+    scc_edges_scanned: usize,
+    scc_passes: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PartitionCut {
     None,
@@ -492,6 +530,9 @@ struct Refiner<'a> {
     in_scope: Vec<bool>,
     oversize_fallbacks: usize,
     oversize_fallback_max_size: usize,
+    /// Diagnostic-only root selection used by the admission profiler. A selected
+    /// interesting partition is forcibly admitted in isolation.
+    admission_profile_root: Option<usize>,
     /// When set, `run` also emits refined points-to for in-scope global memory objects.
     materialize_global_points_to: bool,
 }
@@ -580,6 +621,7 @@ impl<'a> Refiner<'a> {
             in_scope: vec![false; n_base],
             oversize_fallbacks: 0,
             oversize_fallback_max_size: 0,
+            admission_profile_root: admission_profile_root(),
             materialize_global_points_to: false,
         };
         refiner.build_scope();
@@ -690,6 +732,27 @@ impl<'a> Refiner<'a> {
                 oversize.insert(ap);
             }
         }
+        if admission_profile_enabled() && self.admission_profile_root.is_none() {
+            self.print_admission_structure_profile(
+                &interesting,
+                &forged_partitions,
+                &nodes_in,
+                &edges_in,
+            );
+        }
+        if let Some(selected) = self.admission_profile_root {
+            assert!(
+                interesting.contains(&selected),
+                "{}={} is not an interesting partition root",
+                knobs::ENV_ANDERSEN_ADMISSION_PROFILE_ROOT,
+                selected
+            );
+            oversize = interesting
+                .iter()
+                .copied()
+                .filter(|&partition| partition != selected)
+                .collect();
+        }
         self.oversize_fallbacks = oversize.len();
         self.oversize_fallback_max_size = oversize
             .iter()
@@ -705,6 +768,124 @@ impl<'a> Refiner<'a> {
             let ap = self.ap_find(self.classes.class_of(NodeId(i as u32)));
             self.in_scope[i] = interesting.contains(&ap) && !oversize.contains(&ap);
         }
+    }
+
+    fn print_admission_structure_profile(
+        &self,
+        interesting: &HashSet<usize>,
+        forged_partitions: &HashSet<usize>,
+        nodes_in: &HashMap<usize, u64>,
+        edges_in: &HashMap<usize, u64>,
+    ) {
+        let mut profiles = self.collect_partition_profiles();
+        profiles.retain(|root, _| interesting.contains(root));
+        let mut roots = profiles.keys().copied().collect::<Vec<_>>();
+        roots.sort_unstable();
+        for root in roots {
+            let profile = &profiles[&root];
+            let nodes = nodes_in.get(&root).copied().unwrap_or(0);
+            let edges = edges_in.get(&root).copied().unwrap_or(0);
+            let record = AdmissionStructureProfile {
+                kind: "structure",
+                root,
+                nodes,
+                edges,
+                quadratic_proxy: nodes.saturating_mul(nodes.saturating_add(edges)),
+                forged: forged_partitions.contains(&root),
+                values: profile.values,
+                allocas: profile.allocas,
+                globals: profile.globals.len(),
+                functions: profile.functions.len(),
+                icalls: profile.icalls,
+                ext_classes: profile.ext_classes,
+                esc_classes: profile.esc_classes,
+                edge_counts: profile.edge_counts.clone(),
+                omega_seed_counts: profile.omega_seed_counts.clone(),
+            };
+            eprintln!(
+                "pangs andersen admission profile: {}",
+                serde_json::to_string(&record).expect("serialize admission structure profile")
+            );
+        }
+    }
+
+    fn collect_partition_profiles(&self) -> HashMap<usize, PartitionProfile> {
+        let mut profiles: HashMap<usize, PartitionProfile> = HashMap::new();
+        for node in &self.pag.nodes {
+            let class = self.classes.class_of(node.id);
+            let root = ap_find_const(&self.ap_parent, class);
+            let profile = profiles.entry(root).or_insert_with(|| PartitionProfile {
+                root,
+                ..PartitionProfile::default()
+            });
+            profile.nodes += 1;
+            if self.classes.ext.get(class).copied().unwrap_or(false) {
+                profile.ext_classes += 1;
+            }
+            if self.classes.esc.get(class).copied().unwrap_or(false) {
+                profile.esc_classes += 1;
+            }
+            match &node.kind {
+                NodeKind::Value { .. } | NodeKind::Param { .. } | NodeKind::Return { .. } => {
+                    profile.values += 1;
+                }
+                NodeKind::Object { object, key, .. } => match object {
+                    ObjectKind::Alloca => profile.allocas += 1,
+                    ObjectKind::Global => profile.globals.push(key.clone()),
+                    ObjectKind::Function => profile.functions.push(key.clone()),
+                    ObjectKind::ExternalReadonly => {}
+                },
+            }
+        }
+        for callsite in &self.pag.callsites {
+            if callsite.kind != CallKind::Indirect {
+                continue;
+            }
+            let Some(operand) = callsite.operand else {
+                continue;
+            };
+            let root = ap_find_const(&self.ap_parent, self.classes.class_of(operand));
+            profiles
+                .entry(root)
+                .or_insert_with(|| PartitionProfile {
+                    root,
+                    ..PartitionProfile::default()
+                })
+                .icalls += 1;
+        }
+        for edge in &self.pag.edges {
+            let root = ap_find_const(&self.ap_parent, self.classes.class_of(edge.dst));
+            *profiles
+                .entry(root)
+                .or_insert_with(|| PartitionProfile {
+                    root,
+                    ..PartitionProfile::default()
+                })
+                .edge_counts
+                .entry(edge_family(edge.kind))
+                .or_insert(0) += 1;
+        }
+        for seed in &self.pag.omega_seeds {
+            let Some(root) = self.omega_seed_partition(seed) else {
+                continue;
+            };
+            *profiles
+                .entry(root)
+                .or_insert_with(|| PartitionProfile {
+                    root,
+                    ..PartitionProfile::default()
+                })
+                .omega_seed_counts
+                .entry(omega_seed_kind_label(seed.kind))
+                .or_insert(0) += 1;
+        }
+        for profile in profiles.values_mut() {
+            profile.globals.sort();
+            profile.globals.dedup();
+            profile.functions.sort();
+            profile.functions.dedup();
+        }
+        profiles
     }
 
     fn print_partition_profile(
@@ -1529,6 +1710,41 @@ impl<'a> Refiner<'a> {
         } else {
             Vec::new()
         };
+        if let Some(root) = self.admission_profile_root {
+            let actual_work = solve
+                .steps
+                .saturating_add(solve.points_to_facts_inserted)
+                .saturating_add(solve.copy_edges_inserted)
+                .saturating_add(solve.copy_fact_pairs_processed)
+                .saturating_add(solve.load_pairs_processed)
+                .saturating_add(solve.store_pairs_processed)
+                .saturating_add(solve.gep_pairs_processed)
+                .saturating_add(solve.memcpy_pairs_processed)
+                .saturating_add(solve.field_cells_allocated)
+                .saturating_add(solve.scc_nodes_scanned)
+                .saturating_add(solve.scc_edges_scanned);
+            let record = AdmissionWorkProfile {
+                kind: "work",
+                root,
+                actual_work,
+                worklist_pops: solve.steps,
+                points_to_facts_inserted: solve.points_to_facts_inserted,
+                copy_edges_inserted: solve.copy_edges_inserted,
+                copy_fact_pairs_processed: solve.copy_fact_pairs_processed,
+                load_pairs_processed: solve.load_pairs_processed,
+                store_pairs_processed: solve.store_pairs_processed,
+                gep_pairs_processed: solve.gep_pairs_processed,
+                memcpy_pairs_processed: solve.memcpy_pairs_processed,
+                field_cells_allocated: solve.field_cells_allocated,
+                scc_nodes_scanned: solve.scc_nodes_scanned,
+                scc_edges_scanned: solve.scc_edges_scanned,
+                scc_passes: solve.scc_passes,
+            };
+            eprintln!(
+                "pangs andersen admission profile: {}",
+                serde_json::to_string(&record).expect("serialize admission work profile")
+            );
+        }
         RefinerOutcome::Complete(RefinerOutput {
             indirect_calls,
             nodes,
@@ -2326,6 +2542,19 @@ fn partition_profile_top() -> usize {
         .unwrap_or(knobs::PARTITION_PROFILE_TOP)
 }
 
+fn admission_profile_enabled() -> bool {
+    std::env::var_os(knobs::ENV_ANDERSEN_ADMISSION_PROFILE).is_some()
+}
+
+fn admission_profile_root() -> Option<usize> {
+    if !admission_profile_enabled() {
+        return None;
+    }
+    std::env::var(knobs::ENV_ANDERSEN_ADMISSION_PROFILE_ROOT)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
 fn ap_find_const(parent: &[usize], mut x: usize) -> usize {
     while parent[x] != x {
         x = parent[x];
@@ -2484,6 +2713,11 @@ struct Solve {
     load_pairs_processed: usize,
     store_pairs_processed: usize,
     gep_pairs_processed: usize,
+    points_to_facts_inserted: usize,
+    copy_edges_inserted: usize,
+    field_cells_allocated: usize,
+    scc_nodes_scanned: usize,
+    scc_edges_scanned: usize,
     new_copy_edges_since_scc: usize,
     scc_enabled: bool,
     scc_min_edges: usize,
@@ -2530,6 +2764,11 @@ impl Solve {
             load_pairs_processed: 0,
             store_pairs_processed: 0,
             gep_pairs_processed: 0,
+            points_to_facts_inserted: 0,
+            copy_edges_inserted: 0,
+            field_cells_allocated: 0,
+            scc_nodes_scanned: 0,
+            scc_edges_scanned: 0,
             new_copy_edges_since_scc: 0,
             scc_enabled: std::env::var_os(knobs::ENV_ANDERSEN_DISABLE_COPY_SCC).is_none(),
             scc_min_edges: copy_scc_min_edges(),
@@ -2621,6 +2860,8 @@ impl Solve {
             }
         }
         if !added.is_empty() {
+            self.points_to_facts_inserted =
+                self.points_to_facts_inserted.saturating_add(added.len());
             self.pending_pts.entry(cell).or_default().extend(added);
             self.enqueue(cell);
         }
@@ -2665,6 +2906,7 @@ impl Solve {
             return;
         }
         self.pending_succ.entry(from).or_default().insert(to);
+        self.copy_edges_inserted = self.copy_edges_inserted.saturating_add(1);
         self.new_copy_edges_since_scc = self.new_copy_edges_since_scc.saturating_add(1);
         // Even an empty source must run once so the edge becomes established before later
         // source facts are propagated as deltas.
@@ -2836,6 +3078,7 @@ impl Solve {
             return cell;
         }
         let cell = self.allocate_cell();
+        self.field_cells_allocated = self.field_cells_allocated.saturating_add(1);
         self.fields.insert((base, location), cell);
         self.field_base.insert(cell, base);
         self.field_location.insert(cell, location);
@@ -2913,6 +3156,10 @@ impl Solve {
             successors.dedup();
         }
         let old_edge_count = adjacency.iter().map(Vec::len).sum::<usize>();
+        self.scc_nodes_scanned = self.scc_nodes_scanned.saturating_add(cell_count);
+        self.scc_edges_scanned = self
+            .scc_edges_scanned
+            .saturating_add(old_edge_count.saturating_mul(2));
 
         // Iterative Kosaraju keeps stack usage independent of corpus size. Cells are dense
         // integer IDs, so vector-indexed graph state is substantially cheaper than hashing.

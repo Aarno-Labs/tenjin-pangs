@@ -110,6 +110,16 @@ pub(crate) const ENV_PARTITION_PROFILE: &str = "PANGS_PARTITION_PROFILE";
 /// Overrides the number of partitions printed by partition profiling.
 pub(crate) const ENV_PARTITION_PROFILE_TOP: &str = "PANGS_PARTITION_PROFILE_TOP";
 
+/// Emits machine-readable structural and actual-work records used to
+/// calibrate Andersen partition admission.
+pub(crate) const ENV_ANDERSEN_ADMISSION_PROFILE: &str = "PANGS_ANDERSEN_ADMISSION_PROFILE";
+
+/// Diagnostic-only partition root selector. When set together with admission
+/// profiling, the selected interesting partition is forcibly admitted and all
+/// other partitions retain their Steensgaard answer.
+pub(crate) const ENV_ANDERSEN_ADMISSION_PROFILE_ROOT: &str =
+    "PANGS_ANDERSEN_ADMISSION_PROFILE_ROOT";
+
 /// Enables Steensgaard candidate-pair profiling when present.
 pub(crate) const ENV_STEENS_PROFILE: &str = "PANGS_STEENS_PROFILE";
 
