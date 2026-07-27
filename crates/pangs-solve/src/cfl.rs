@@ -651,7 +651,7 @@ impl<'a> QueryGraph<'a> {
                 EdgeKind::AddrOf | EdgeKind::Assign | EdgeKind::Memcpy { .. } => {
                     worklist.push_back(state.clone().next(edge.dst, Phase::Forward));
                 }
-                EdgeKind::Gep { byte_off } => {
+                EdgeKind::Gep { byte_off, .. } => {
                     worklist.push_back(state.clone().adjust(
                         edge.dst,
                         Phase::Forward,
@@ -681,7 +681,7 @@ impl<'a> QueryGraph<'a> {
                 EdgeKind::AddrOf | EdgeKind::Assign | EdgeKind::Memcpy { .. } => {
                     worklist.push_back(state.clone().next(edge.src, Phase::Backward));
                 }
-                EdgeKind::Gep { byte_off } => {
+                EdgeKind::Gep { byte_off, .. } => {
                     worklist.push_back(state.clone().adjust(
                         edge.src,
                         Phase::Backward,

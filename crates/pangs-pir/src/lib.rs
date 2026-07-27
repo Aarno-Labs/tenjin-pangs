@@ -300,6 +300,14 @@ pub enum Stmt {
         base: String,
         #[serde(default)]
         byte_off: Option<i64>,
+        /// A normalized affine lane for GEPs containing dynamic sequential indices.
+        ///
+        /// The denoted byte offsets are `residue + k * modulus`. This preserves a
+        /// statically known struct-field lane across an unknown array index without
+        /// materializing individual array elements. `None` together with a `None`
+        /// `byte_off` is the fully unknown byte-offset case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lane: Option<GepLane>,
         #[serde(default)]
         loc: Option<Loc>,
     },
@@ -393,6 +401,38 @@ pub enum Stmt {
         #[serde(default)]
         loc: Option<Loc>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct GepLane {
+    pub modulus: u64,
+    pub residue: i64,
+}
+
+impl GepLane {
+    pub fn new(modulus: u64, residue: i64) -> Option<Self> {
+        let modulus_i64 = i64::try_from(modulus).ok()?;
+        (modulus_i64 > 0).then(|| Self {
+            modulus,
+            residue: residue.rem_euclid(modulus_i64),
+        })
+    }
+
+    pub fn shifted(self, byte_off: i64) -> Option<Self> {
+        Self::new(self.modulus, self.residue.checked_add(byte_off)?)
+    }
+
+    pub fn combined(self, other: Self) -> Option<Self> {
+        let modulus = gcd_u64(self.modulus, other.modulus);
+        Self::new(modulus, self.residue.checked_add(other.residue)?)
+    }
+}
+
+fn gcd_u64(mut lhs: u64, mut rhs: u64) -> u64 {
+    while rhs != 0 {
+        (lhs, rhs) = (rhs, lhs % rhs);
+    }
+    lhs
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

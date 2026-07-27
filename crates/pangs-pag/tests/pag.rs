@@ -85,10 +85,13 @@ fn builds_core_nodes_edges_callsites_and_seeds() {
         .edges
         .iter()
         .any(|edge| matches!(edge.kind, pangs_pag::EdgeKind::Store)));
-    assert!(pag
-        .edges
-        .iter()
-        .any(|edge| matches!(edge.kind, pangs_pag::EdgeKind::Gep { byte_off: Some(8) })));
+    assert!(pag.edges.iter().any(|edge| matches!(
+        edge.kind,
+        pangs_pag::EdgeKind::Gep {
+            byte_off: Some(8),
+            ..
+        }
+    )));
     let bits = pag
         .nodes
         .iter()

@@ -1458,6 +1458,7 @@ mod tests {
                 dest: "%c".to_string(),
                 base: "@G".to_string(),
                 byte_off: Some(8),
+                lane: None,
                 loc: None,
             },
         ]);

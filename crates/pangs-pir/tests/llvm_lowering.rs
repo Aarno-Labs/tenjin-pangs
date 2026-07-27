@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use pangs_pir::{Param, Pir, ScalarTypeClass, Stmt, ValueKind, VarArgPosition};
+use pangs_pir::{GepLane, Param, Pir, ScalarTypeClass, Stmt, ValueKind, VarArgPosition};
 use tempfile::TempDir;
 
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
@@ -1905,6 +1905,7 @@ fn computes_gep_byte_offsets_from_ll() {
 %S = type { i8, i32, i8* }
 %Inner = type { i16, i8* }
 %Outer = type { i8, [3 x %Inner] }
+@table = internal global [512 x %S] zeroinitializer
 
 define void @gep_offsets(i32* %arr, %S* %s, %Outer* %o, i64 %idx) {
 entry:
@@ -1912,6 +1913,7 @@ entry:
   %struct_gep = getelementptr %S, %S* %s, i64 0, i32 1
   %nested_gep = getelementptr %Outer, %Outer* %o, i64 0, i32 1, i64 2, i32 1
   %dynamic_gep = getelementptr i32, i32* %arr, i64 %idx
+  %dynamic_field = getelementptr [512 x %S], [512 x %S]* @table, i64 0, i64 %idx, i32 2
   ret void
 }
 "#,
@@ -1953,11 +1955,35 @@ entry:
         Stmt::Gep {
             dest,
             byte_off: None,
+            lane: Some(GepLane {
+                modulus: 4,
+                residue: 0
+            }),
             ..
         } if dest.ends_with("::dynamic_gep")
     )));
+    assert!(func.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Gep {
+            dest,
+            byte_off: None,
+            lane: Some(GepLane {
+                modulus: 16,
+                residue: 8
+            }),
+            ..
+        } if dest.ends_with("::dynamic_field")
+    )));
     assert_eq!(pir.lowering.modeled_counts["gep_byte_offset"], 3);
-    assert_eq!(pir.lowering.skipped_counts["gep_dynamic_index"], 1);
+    assert_eq!(pir.lowering.modeled_counts["gep_array_lane"], 2);
+    assert_eq!(
+        pir.lowering
+            .skipped_counts
+            .get("gep_dynamic_index")
+            .copied()
+            .unwrap_or(0),
+        0
+    );
 }
 
 #[test]

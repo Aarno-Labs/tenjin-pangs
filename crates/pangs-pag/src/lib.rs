@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use pangs_pir::{external_return_alias_arg, Loc, Pir, Signature, Stmt, ValueKind, VarArgPosition};
+use pangs_pir::{
+    external_return_alias_arg, GepLane, Loc, Pir, Signature, Stmt, ValueKind, VarArgPosition,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -537,8 +539,14 @@ pub enum EdgeKind {
     Assign,
     Load,
     Store,
-    Gep { byte_off: Option<i64> },
-    Memcpy { bytes: Option<u64> },
+    Gep {
+        byte_off: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lane: Option<GepLane>,
+    },
+    Memcpy {
+        bytes: Option<u64>,
+    },
 }
 
 impl EdgeKind {
@@ -898,6 +906,7 @@ impl<'a> Builder<'a> {
                 dest,
                 base,
                 byte_off,
+                lane,
                 loc,
             } => {
                 let src = self.operand_node(func_index, owner_scope(&owner), base);
@@ -905,6 +914,7 @@ impl<'a> Builder<'a> {
                 self.add_edge(
                     EdgeKind::Gep {
                         byte_off: *byte_off,
+                        lane: *lane,
                     },
                     src,
                     dst,

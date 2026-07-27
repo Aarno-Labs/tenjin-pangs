@@ -19,9 +19,9 @@ use llvm_sys::{
 };
 
 use crate::{
-    AbiClass, Access, Func, Global, Loc, LoweringStats, Param, Pir, PirError, ScalarTypeClass,
-    Signature, StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo, ValueKind,
-    VarArgPosition,
+    AbiClass, Access, Func, GepLane, Global, Loc, LoweringStats, Param, Pir, PirError,
+    ScalarTypeClass, Signature, StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo,
+    ValueKind, VarArgPosition,
 };
 
 mod ptrint;
@@ -1272,10 +1272,12 @@ unsafe fn lower_instruction(
         }
         LLVMOpcode::LLVMGetElementPtr => {
             let base = LLVMGetOperand(inst, 0);
+            let (byte_off, lane) = gep_displacement(ctx, inst, lowering, false);
             body.push(Stmt::Gep {
                 dest: fctx.local_key(inst),
                 base: fctx.operand_key(base),
-                byte_off: gep_byte_offset(ctx, inst, lowering),
+                byte_off,
+                lane,
                 loc: loc(inst),
             });
             lowering.bump_modeled("gep");
@@ -2348,10 +2350,12 @@ unsafe fn lower_constant_expr_value_inner(
                     depth + 1,
                 );
                 let dest = global_init_temp(temp_ordinal);
+                let (byte_off, lane) = gep_displacement(ctx, constant, lowering, true);
                 body.push(Stmt::Gep {
                     dest: dest.clone(),
                     base,
-                    byte_off: constant_gep_byte_offset(ctx, constant, lowering),
+                    byte_off,
+                    lane,
                     loc: None,
                 });
                 lowering.bump_modeled("global_init_gep");
@@ -2813,56 +2817,145 @@ unsafe fn type_size_key(data_layout: LLVMTargetDataRef, ty: LLVMTypeRef) -> u64 
     }
 }
 
-unsafe fn gep_byte_offset(
+unsafe fn gep_displacement(
     ctx: &ModuleCtx,
-    inst: LLVMValueRef,
+    gep: LLVMValueRef,
     lowering: &mut LoweringStats,
-) -> Option<i64> {
-    let operand_count = LLVMGetNumOperands(inst);
-    let mut indices = Vec::new();
-    for index in 1..operand_count {
-        let operand = LLVMGetOperand(inst, index as u32);
-        let Some(value) = constant_i64(operand) else {
-            lowering.bump_skipped("gep_dynamic_index");
-            return None;
-        };
-        indices.push(value);
+    global_init: bool,
+) -> (Option<i64>, Option<GepLane>) {
+    let operand_count = LLVMGetNumOperands(gep);
+    if operand_count == 0 {
+        lowering.bump_skipped(if global_init {
+            "constant_gep_non_pointer_base"
+        } else {
+            "gep_non_pointer_base"
+        });
+        return (None, None);
     }
-    let result = gep_offset_from_indices(ctx, LLVMGetGEPSourceElementType(inst), &indices);
-    if result.is_some() {
-        lowering.bump_modeled("gep_byte_offset");
+
+    let source_type = LLVMGetGEPSourceElementType(gep);
+    let mut current = source_type;
+    let mut constant_part = 0_i128;
+    let mut dynamic_modulus = 0_u64;
+
+    for ordinal in 1..operand_count {
+        let operand = LLVMGetOperand(gep, ordinal as u32);
+        let first = ordinal == 1;
+        let (stride, next_type) =
+            if first {
+                (type_size_key(ctx.data_layout, source_type), source_type)
+            } else {
+                match LLVMGetTypeKind(current) {
+                    LLVMTypeKind::LLVMStructTypeKind => {
+                        let Some(index) =
+                            constant_i64(operand).and_then(|index| u32::try_from(index).ok())
+                        else {
+                            lowering.bump_skipped(if global_init {
+                                "constant_gep_unsupported_offset"
+                            } else {
+                                "gep_unsupported_offset"
+                            });
+                            return (None, None);
+                        };
+                        let Some(element_type) = struct_element_type(current, index) else {
+                            lowering.bump_skipped(if global_init {
+                                "constant_gep_unsupported_offset"
+                            } else {
+                                "gep_unsupported_offset"
+                            });
+                            return (None, None);
+                        };
+                        let Some(next) = constant_part.checked_add(i128::from(
+                            LLVMOffsetOfElement(ctx.data_layout, current, index),
+                        )) else {
+                            return (None, None);
+                        };
+                        constant_part = next;
+                        current = element_type;
+                        continue;
+                    }
+                    LLVMTypeKind::LLVMArrayTypeKind
+                    | LLVMTypeKind::LLVMPointerTypeKind
+                    | LLVMTypeKind::LLVMVectorTypeKind => {
+                        let element_type = LLVMGetElementType(current);
+                        (type_size_key(ctx.data_layout, element_type), element_type)
+                    }
+                    _ => {
+                        lowering.bump_skipped(if global_init {
+                            "constant_gep_unsupported_offset"
+                        } else {
+                            "gep_unsupported_offset"
+                        });
+                        return (None, None);
+                    }
+                }
+            };
+
+        current = next_type;
+        if let Some(index) = constant_i64(operand) {
+            let Some(delta) = i128::from(index).checked_mul(i128::from(stride)) else {
+                return (None, None);
+            };
+            let Some(next) = constant_part.checked_add(delta) else {
+                return (None, None);
+            };
+            constant_part = next;
+        } else if stride == 0 {
+            lowering.bump_skipped(if global_init {
+                "constant_gep_dynamic_index"
+            } else {
+                "gep_dynamic_zero_stride"
+            });
+            return (None, None);
+        } else {
+            dynamic_modulus = if dynamic_modulus == 0 {
+                stride
+            } else {
+                gcd_u64(dynamic_modulus, stride)
+            };
+        }
+    }
+
+    let Ok(constant_part) = i64::try_from(constant_part) else {
+        lowering.bump_skipped(if global_init {
+            "constant_gep_unsupported_offset"
+        } else {
+            "gep_unsupported_offset"
+        });
+        return (None, None);
+    };
+
+    if dynamic_modulus == 0 {
+        lowering.bump_modeled(if global_init {
+            "global_init_gep_byte_offset"
+        } else {
+            "gep_byte_offset"
+        });
+        (Some(constant_part), None)
     } else {
-        lowering.bump_skipped("gep_unsupported_offset");
+        let lane = GepLane::new(dynamic_modulus, constant_part);
+        if lane.is_some() {
+            lowering.bump_modeled(if global_init {
+                "global_init_gep_array_lane"
+            } else {
+                "gep_array_lane"
+            });
+        } else {
+            lowering.bump_skipped(if global_init {
+                "constant_gep_unsupported_offset"
+            } else {
+                "gep_unsupported_offset"
+            });
+        }
+        (None, lane)
     }
-    result
 }
 
-unsafe fn constant_gep_byte_offset(
-    ctx: &ModuleCtx,
-    constant: LLVMValueRef,
-    lowering: &mut LoweringStats,
-) -> Option<i64> {
-    let operand_count = LLVMGetNumOperands(constant);
-    if operand_count == 0 {
-        lowering.bump_skipped("constant_gep_non_pointer_base");
-        return None;
+fn gcd_u64(mut lhs: u64, mut rhs: u64) -> u64 {
+    while rhs != 0 {
+        (lhs, rhs) = (rhs, lhs % rhs);
     }
-    let mut indices = Vec::new();
-    for index in 1..operand_count {
-        let operand = LLVMGetOperand(constant, index as u32);
-        let Some(value) = constant_i64(operand) else {
-            lowering.bump_skipped("constant_gep_dynamic_index");
-            return None;
-        };
-        indices.push(value);
-    }
-    let result = gep_offset_from_indices(ctx, LLVMGetGEPSourceElementType(constant), &indices);
-    if result.is_some() {
-        lowering.bump_modeled("global_init_gep_byte_offset");
-    } else {
-        lowering.bump_skipped("constant_gep_unsupported_offset");
-    }
-    result
+    lhs
 }
 
 unsafe fn gep_offset_from_indices(
@@ -2951,6 +3044,7 @@ fn global_init_element_address(
                 dest: dest.clone(),
                 base: base.to_string(),
                 byte_off: Some(byte_off),
+                lane: None,
                 loc: None,
             });
             lowering.bump_modeled("global_init_field_gep");

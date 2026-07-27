@@ -59,7 +59,8 @@ soundness-preserving filter on icall results.
 ## 2. Phase details (deltas from `DESIGN.md` §4)
 
 ### A'. PAG construction
-**Kept:** byte-offset Geps with lazy `(object, byte_off)` field materialization; the
+**Kept:** byte-offset Geps with lazy `(object, byte_off)` field materialization, extended
+with normalized affine lanes for dynamic sequential indices; the
 constant-indexed fn-ptr-array carve-out (dispatch tables); the PIP Ω boundary model with
 implicit bits; **assumption-violation detection → Ω-taint** (non-negotiable — it is what
 makes per-component soundness auditable); the TeaDSA call/return-site filter
@@ -119,9 +120,13 @@ OpenSSL-sized inputs), (b) the first wave of escape bits, and (c) the complete b
 answer used wherever D' cannot refine. It settles no query by certificate.
 
 Its partition boundary is allocation-field aware when the fixed PAG independently proves
-an address root. Constant GEP offsets get distinct synthetic storage classes; a dynamic
-offset gets one summary joined only to the materialized fields of that same allocation.
-Unknown-root GEPs retain ordinary field-insensitive unification. Synthetic global-field
+an address root. Constant GEP offsets get distinct synthetic storage classes. LLVM
+lowering preserves a dynamic sequential index as an affine byte lane
+`residue + k * modulus`, so an unknown element of an array of structs retains its known
+member offset. Lanes join only locations whose congruences may overlap. A genuinely
+unstructured dynamic byte offset gets one summary joined only to the materialized fields
+of that same allocation. Unknown-root GEPs retain ordinary field-insensitive unification.
+Synthetic global-field
 classes carry their owning-global membership so they seed interesting partitions and
 contribute to aggregate escape/write facts. Andersen consumes the same root-relative
 address proof to seed a field directly at a partition boundary instead of requiring the
@@ -171,17 +176,20 @@ the migration (`20260723_MONOTONE_OTF_CG_PLAN.md`).
 
 **Finite field domain:**
 
-A constant-offset GEP lazily materializes `(root_object, byte_offset)`. Each root also has
-at most one unknown-offset summary. A dynamic offset aliases that summary with every
-materialized constant field of the root, in both directions; a direct whole-object access
-is likewise bridged to the summary. Nested constant GEPs canonicalize to
-`root + combined_offset` only when the combined offset occurs in the fixed PAG's finite
-offset vocabulary. Other nested or recursive offsets route to the root's unknown summary
-rather than creating an unbounded field-of-field chain. Thus dynamic indexing remains
-sound with respect to constant-field accesses while recursive GEP cycles terminate in a
-finite abstract domain.
+A constant-offset GEP lazily materializes `(root_object, Exact(byte_offset))`. A GEP with
+dynamic sequential indices materializes
+`(root_object, Lane { modulus, residue })`, denoting offsets congruent to `residue` modulo
+`modulus`; multiple dynamic strides compose with their greatest common divisor. Thus
+`table[*].fn` and `table[*].used` remain separate when their member offsets occupy
+disjoint lanes, while a constant element address aliases the appropriate lane. Each root
+also has at most one fully unknown-offset summary, which aliases every materialized
+location for that root; a direct whole-object access is likewise bridged to that summary.
+Nested GEPs canonicalize to a root-relative exact offset or lane only when that location
+occurs in the fixed PAG's finite location vocabulary. Other nested or recursive locations
+route to the root's unknown summary rather than creating an unbounded field-of-field
+chain.
 
-C' uses the same constant/unknown distinction for independently rooted GEPs. Its classes
+C' uses the same exact/lane/unknown distinction for independently rooted GEPs. Its classes
 are intentionally coarser than D's inclusion sets, but field contents no longer merge
 their complete aggregate containers merely because corresponding fields exchange a value.
 

@@ -1,0 +1,58 @@
+{
+  "module": "m1_4b.array_lane_fnptr",
+  "functions": [
+    {
+      "key": "setup",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%table", "ty": "[512 x struct.Entry]" },
+        {
+          "kind": "gep",
+          "dest": "%element.fn",
+          "base": "%table",
+          "byte_off": null,
+          "lane": { "modulus": 24, "residue": 0 }
+        },
+        { "kind": "gep", "dest": "%fn.addr", "base": "%element.fn", "byte_off": 8 },
+        { "kind": "store", "address": "%fn.addr", "value": "f0" },
+        {
+          "kind": "gep",
+          "dest": "%element.used",
+          "base": "%table",
+          "byte_off": null,
+          "lane": { "modulus": 24, "residue": 0 }
+        },
+        { "kind": "gep", "dest": "%used.addr", "base": "%element.used", "byte_off": 16 },
+        { "kind": "store", "address": "%used.addr", "value": "f1" },
+        {
+          "kind": "gep",
+          "dest": "%element.lookup",
+          "base": "%table",
+          "byte_off": null,
+          "lane": { "modulus": 24, "residue": 0 }
+        },
+        { "kind": "gep", "dest": "%lookup.addr", "base": "%element.lookup", "byte_off": 8 },
+        { "kind": "load", "dest": "%fp", "address": "%lookup.addr" },
+        {
+          "kind": "call_indirect",
+          "operand": "%fp",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "f0",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    },
+    {
+      "key": "f1",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": []
+}

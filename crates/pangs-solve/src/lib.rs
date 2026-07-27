@@ -860,7 +860,7 @@ struct Solver<'a> {
     global_address_exposed: Vec<bool>,
     module_violation_tainted: bool,
     exact_addresses: Vec<Option<ExactAddress>>,
-    field_classes: HashMap<(NodeId, Option<i64>), usize>,
+    field_classes: HashMap<(NodeId, FieldLocation), usize>,
     fields_by_root: HashMap<NodeId, Vec<usize>>,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
     worklist: VecDeque<usize>,
@@ -890,8 +890,65 @@ pub(crate) enum PointsToMaterialization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExactAddress {
     root: NodeId,
-    /// `None` is the per-root unknown-offset summary, not an unknown allocation root.
-    byte_off: Option<i64>,
+    location: FieldLocation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum FieldLocation {
+    Exact(i64),
+    Lane(pangs_pir::GepLane),
+    Unknown,
+}
+
+impl FieldLocation {
+    fn from_gep(byte_off: Option<i64>, lane: Option<pangs_pir::GepLane>) -> Self {
+        byte_off
+            .map(Self::Exact)
+            .or_else(|| {
+                lane.and_then(|lane| pangs_pir::GepLane::new(lane.modulus, lane.residue))
+                    .map(Self::Lane)
+            })
+            .unwrap_or(Self::Unknown)
+    }
+
+    fn add(self, delta: Self) -> Self {
+        match (self, delta) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Exact(lhs), Self::Exact(rhs)) => lhs
+                .checked_add(rhs)
+                .map(Self::Exact)
+                .unwrap_or(Self::Unknown),
+            (Self::Lane(lane), Self::Exact(off)) | (Self::Exact(off), Self::Lane(lane)) => {
+                lane.shifted(off).map(Self::Lane).unwrap_or(Self::Unknown)
+            }
+            (Self::Lane(lhs), Self::Lane(rhs)) => {
+                lhs.combined(rhs).map(Self::Lane).unwrap_or(Self::Unknown)
+            }
+        }
+    }
+
+    fn may_alias(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => true,
+            (Self::Exact(lhs), Self::Exact(rhs)) => lhs == rhs,
+            (Self::Exact(exact), Self::Lane(lane)) | (Self::Lane(lane), Self::Exact(exact)) => {
+                let modulus = i64::try_from(lane.modulus).expect("normalized GEP lane modulus");
+                exact.rem_euclid(modulus) == lane.residue
+            }
+            (Self::Lane(lhs), Self::Lane(rhs)) => {
+                let modulus = gcd_u64(lhs.modulus, rhs.modulus);
+                let modulus = i64::try_from(modulus).expect("normalized GEP lane modulus");
+                lhs.residue.rem_euclid(modulus) == rhs.residue.rem_euclid(modulus)
+            }
+        }
+    }
+}
+
+fn gcd_u64(mut lhs: u64, mut rhs: u64) -> u64 {
+    while rhs != 0 {
+        (lhs, rhs) = (rhs, lhs % rhs);
+    }
+    lhs
 }
 
 /// Independently derive allocation-relative addresses from the fixed PAG. This is deliberately
@@ -914,7 +971,7 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
         if edge.kind == pangs_pag::EdgeKind::AddrOf {
             addresses[edge.dst.0 as usize] = Some(ExactAddress {
                 root: edge.src,
-                byte_off: Some(0),
+                location: FieldLocation::Exact(0),
             });
         }
     }
@@ -927,13 +984,10 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
                 continue;
             }
             let candidate = match incoming[0].kind {
-                pangs_pag::EdgeKind::Gep { byte_off } if incoming.len() == 1 => {
+                pangs_pag::EdgeKind::Gep { byte_off, lane } if incoming.len() == 1 => {
                     addresses[incoming[0].src.0 as usize].map(|base| ExactAddress {
                         root: base.root,
-                        byte_off: base
-                            .byte_off
-                            .zip(byte_off)
-                            .and_then(|(base, delta)| base.checked_add(delta)),
+                        location: base.location.add(FieldLocation::from_gep(byte_off, lane)),
                     })
                 }
                 pangs_pag::EdgeKind::Assign
@@ -952,11 +1006,11 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
                             .all(|address| address.root == first.root)
                             .then(|| ExactAddress {
                                 root: first.root,
-                                byte_off: alternatives
+                                location: alternatives
                                     .iter()
-                                    .all(|address| address.byte_off == first.byte_off)
-                                    .then_some(first.byte_off)
-                                    .flatten(),
+                                    .all(|address| address.location == first.location)
+                                    .then_some(first.location)
+                                    .unwrap_or(FieldLocation::Unknown),
                             })
                     })
                 }
@@ -1336,7 +1390,7 @@ impl<'a> Solver<'a> {
                     let dst = self.class_of(edge.dst);
                     let dst_p = self.pointee_of(dst);
                     if let Some(address) = self.exact_addresses[edge.dst.0 as usize] {
-                        let field = self.field_class(address.root, address.byte_off);
+                        let field = self.field_class(address.root, address.location);
                         self.join(dst_p, field, PROV_DIRECT_ADDRESS);
                     } else {
                         let src = self.class_of(edge.src);
@@ -2183,8 +2237,8 @@ impl<'a> Solver<'a> {
     /// Steensgaard field identity used by both its fallback answer and the Kahlon partition
     /// boundary. Constant offsets remain distinct. A dynamic or otherwise non-composable offset
     /// uses one summary per allocation root and joins only the fields of that same root.
-    fn field_class(&mut self, root: NodeId, byte_off: Option<i64>) -> usize {
-        if let Some(&class) = self.field_classes.get(&(root, byte_off)) {
+    fn field_class(&mut self, root: NodeId, location: FieldLocation) -> usize {
+        if let Some(&class) = self.field_classes.get(&(root, location)) {
             return self.find(class);
         }
 
@@ -2199,23 +2253,24 @@ impl<'a> Solver<'a> {
             .extend(self.classes[root_class].global_objs.iter().copied());
         self.classes.push(data);
         self.queued.push(false);
-        self.field_classes.insert((root, byte_off), id);
+        self.field_classes.insert((root, location), id);
 
-        let existing = self.fields_by_root.entry(root).or_default().clone();
         self.fields_by_root.entry(root).or_default().push(id);
-        let summary = self.field_classes.get(&(root, None)).copied();
-        match byte_off {
-            None => {
-                let mut class = id;
-                for field in existing {
-                    class = self.join(class, field, PROV_DIRECT_ADDRESS);
-                }
-                class
-            }
-            Some(_) => summary
-                .map(|summary| self.join(id, summary, PROV_DIRECT_ADDRESS))
-                .unwrap_or(id),
+        let aliasing = self
+            .field_classes
+            .iter()
+            .filter_map(|(&(candidate_root, candidate_location), &class)| {
+                (candidate_root == root
+                    && candidate_location != location
+                    && location.may_alias(candidate_location))
+                .then_some(class)
+            })
+            .collect::<Vec<_>>();
+        let mut class = id;
+        for alias in aliasing {
+            class = self.join(class, alias, PROV_DIRECT_ADDRESS);
         }
+        class
     }
 
     fn set_ext(&mut self, class: usize) {
@@ -2442,6 +2497,7 @@ mod tests {
                         dest: "%f::scalar.addr".into(),
                         base: "@aggregate".into(),
                         byte_off: Some(0),
+                        lane: None,
                         loc: None,
                     },
                     Stmt::Store {
@@ -2453,6 +2509,7 @@ mod tests {
                         dest: "%f::pointer.addr".into(),
                         base: "@aggregate".into(),
                         byte_off: Some(8),
+                        lane: None,
                         loc: None,
                     },
                     Stmt::Store {
@@ -2502,6 +2559,33 @@ mod tests {
             let pointer = solved.nodes.get("val:f:%f::pointer").unwrap();
             assert!(pointer.pointee_globals.iter().any(|key| key == "target"));
         }
+    }
+
+    #[test]
+    fn affine_gep_lanes_alias_only_matching_residue_classes() {
+        let fn_lane = FieldLocation::Lane(pangs_pir::GepLane::new(24, 8).unwrap());
+        let used_lane = FieldLocation::Lane(pangs_pir::GepLane::new(24, 16).unwrap());
+        let wider_fn_lane = FieldLocation::Lane(pangs_pir::GepLane::new(48, 32).unwrap());
+
+        assert!(fn_lane.may_alias(FieldLocation::Exact(8)));
+        assert!(fn_lane.may_alias(FieldLocation::Exact(32)));
+        assert!(fn_lane.may_alias(wider_fn_lane));
+        assert!(!fn_lane.may_alias(FieldLocation::Exact(0)));
+        assert!(!fn_lane.may_alias(used_lane));
+        assert_eq!(
+            fn_lane.add(FieldLocation::Exact(8)),
+            FieldLocation::Lane(pangs_pir::GepLane::new(24, 16).unwrap())
+        );
+        assert_eq!(
+            FieldLocation::from_gep(
+                None,
+                Some(pangs_pir::GepLane {
+                    modulus: 0,
+                    residue: 8,
+                }),
+            ),
+            FieldLocation::Unknown
+        );
     }
 
     #[test]
@@ -2671,7 +2755,10 @@ mod tests {
             },
             pangs_pag::Edge {
                 id: pangs_pag::EdgeId(2),
-                kind: pangs_pag::EdgeKind::Gep { byte_off: Some(0) },
+                kind: pangs_pag::EdgeKind::Gep {
+                    byte_off: Some(0),
+                    lane: None,
+                },
                 src: NodeId(3),
                 dst: NodeId(5),
                 owner: pangs_pag::Owner::Module,

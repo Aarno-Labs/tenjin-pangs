@@ -6976,6 +6976,7 @@ mod component_tests {
                     dest: "@__global_init::0".into(),
                     base: "@array".into(),
                     byte_off: Some(1),
+                    lane: None,
                     loc: None,
                 },
                 Stmt::Store {

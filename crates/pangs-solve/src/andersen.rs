@@ -25,8 +25,8 @@ use pangs_pag::{
 use pangs_pir::Pir;
 
 use crate::{
-    debug_assert_narrows, exact_allocation_addresses, ExactAddress, IndirectCallResolution,
-    SolveResult, SteensClasses,
+    debug_assert_narrows, exact_allocation_addresses, ExactAddress, FieldLocation,
+    IndirectCallResolution, SolveResult, SteensClasses,
 };
 
 /// Hard cap on points-to/discovery resume phases. Hitting it abandons the whole Andersen
@@ -953,10 +953,10 @@ impl<'a> Refiner<'a> {
             EdgeKind::Assign => Some((src, dst, "assign")),
             EdgeKind::Load => Some((dst, self.classes.pointee[src]?, "load")),
             EdgeKind::Store => Some((self.classes.pointee[dst]?, src, "store")),
-            EdgeKind::Gep { byte_off } => Some((
+            EdgeKind::Gep { byte_off, lane } => Some((
                 self.classes.pointee[dst]?,
                 self.classes.pointee[src]?,
-                if byte_off.is_some() {
+                if byte_off.is_some() || lane.is_some() {
                     "gep_const"
                 } else {
                     "gep_unknown"
@@ -1032,14 +1032,14 @@ impl<'a> Refiner<'a> {
     fn partition_offset_collisions(&self, ap: usize, limit: usize) -> Vec<String> {
         #[derive(Default)]
         struct Collision {
-            offsets: BTreeSet<Option<i64>>,
+            offsets: BTreeSet<FieldLocation>,
             edges: usize,
             witnesses: Vec<String>,
         }
 
         let mut by_class = HashMap::<usize, Collision>::new();
         for edge in &self.pag.edges {
-            let EdgeKind::Gep { byte_off } = edge.kind else {
+            let EdgeKind::Gep { byte_off, lane } = edge.kind else {
                 continue;
             };
             let Some((left, right, _)) = self.diagnostic_join_edge(edge) else {
@@ -1052,16 +1052,13 @@ impl<'a> Refiner<'a> {
             }
             let class = left;
             let collision = by_class.entry(class).or_default();
-            collision.offsets.insert(byte_off);
+            let location = FieldLocation::from_gep(byte_off, lane);
+            collision.offsets.insert(location);
             collision.edges += 1;
             if collision.witnesses.len() < 3 {
-                collision.witnesses.push(format!(
-                    "off={}:{}",
-                    byte_off
-                        .map(|offset| offset.to_string())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    edge_witness("gep", edge)
-                ));
+                collision
+                    .witnesses
+                    .push(format!("off={location:?}:{}", edge_witness("gep", edge)));
             }
         }
 
@@ -1086,11 +1083,7 @@ impl<'a> Refiner<'a> {
                     .offsets
                     .iter()
                     .take(16)
-                    .map(|offset| {
-                        offset
-                            .map(|offset| offset.to_string())
-                            .unwrap_or_else(|| "unknown".to_string())
-                    })
+                    .map(|offset| format!("{offset:?}"))
                     .collect::<Vec<_>>();
                 format!(
                     "class={} offset_count={} offset_sample={:?} edges={} labels={:?} witnesses={:?}",
@@ -1566,6 +1559,12 @@ impl<'a> Refiner<'a> {
     fn build_base_solve(&mut self) -> Solve {
         let profile = andersen_profile_enabled();
         let mut solve = Solve::new(self.n_base, profile);
+        solve.known_locations.extend(
+            self.exact_addresses
+                .iter()
+                .flatten()
+                .map(|address| address.location),
+        );
 
         // Base constraints from PAG edges (in-scope only; partitions are self-contained).
         for edge in &self.pag.edges {
@@ -1589,15 +1588,14 @@ impl<'a> Refiner<'a> {
                         solve.add_store(edge.dst.0, edge.src.0, None);
                     }
                 }
-                EdgeKind::Gep { byte_off } => {
-                    if let Some(byte_off) = byte_off {
-                        solve.known_offsets.insert(byte_off);
-                    }
+                EdgeKind::Gep { byte_off, lane } => {
+                    let location = FieldLocation::from_gep(byte_off, lane);
+                    solve.known_locations.insert(location);
                     if let Some(address) = self.exact_addresses[edge.dst.0 as usize] {
-                        let field = solve.field_of(address.root.0, address.byte_off);
+                        let field = solve.field_of(address.root.0, address.location);
                         solve.add_pts(edge.dst.0, field);
                     } else {
-                        solve.add_gep(edge.src.0, byte_off, edge.dst.0);
+                        solve.add_gep(edge.src.0, location, edge.dst.0);
                     }
                 }
                 EdgeKind::Memcpy { .. } => solve.add_memcpy(edge.dst.0, edge.src.0),
@@ -2327,8 +2325,14 @@ fn edge_family(kind: EdgeKind) -> &'static str {
         EdgeKind::Assign => "assign",
         EdgeKind::Load => "load",
         EdgeKind::Store => "store",
-        EdgeKind::Gep { byte_off: Some(_) } => "gep_const",
-        EdgeKind::Gep { byte_off: None } => "gep_unknown",
+        EdgeKind::Gep {
+            byte_off: Some(_), ..
+        }
+        | EdgeKind::Gep { lane: Some(_), .. } => "gep_const",
+        EdgeKind::Gep {
+            byte_off: None,
+            lane: None,
+        } => "gep_unknown",
         EdgeKind::Memcpy { .. } => "memcpy",
     }
 }
@@ -2428,23 +2432,23 @@ struct Solve {
     /// set. Established constraints consume only later points-to deltas.
     loads: HashMap<Cell, Vec<Cell>>,
     stores: HashMap<Cell, Vec<(Cell, Option<String>)>>,
-    geps: HashMap<Cell, Vec<(Option<i64>, Cell)>>,
+    geps: HashMap<Cell, Vec<(FieldLocation, Cell)>>,
     /// Newly inserted complex constraints awaiting one join with their owner's complete
     /// points-to set. Keeping these separate makes the joins semi-naive without losing
     /// constraints registered after propagation has otherwise reached quiescence.
     pending_loads: HashMap<Cell, Vec<Cell>>,
     pending_stores: HashMap<Cell, Vec<(Cell, Option<String>)>>,
-    pending_geps: HashMap<Cell, Vec<(Option<i64>, Cell)>>,
+    pending_geps: HashMap<Cell, Vec<(FieldLocation, Cell)>>,
     memcpys: Vec<MemcpyJoin>,
     memcpy_by_endpoint: HashMap<Cell, Vec<usize>>,
-    fields: HashMap<(Cell, i64), Cell>,
+    fields: HashMap<(Cell, FieldLocation), Cell>,
     /// field cell -> base object cell, so a refined field resolves back to its global.
     field_base: HashMap<Cell, Cell>,
-    /// field cell -> byte offset from its root object.
-    field_offset: HashMap<Cell, i64>,
-    /// Constant offsets that occur in the fixed constraint graph. Nested GEPs are
-    /// canonicalized only into this finite vocabulary.
-    known_offsets: HashSet<i64>,
+    /// field cell -> normalized location from its root object.
+    field_location: HashMap<Cell, FieldLocation>,
+    /// Locations certified in the fixed constraint graph. Nested GEPs are canonicalized
+    /// only into this finite vocabulary.
+    known_locations: HashSet<FieldLocation>,
     /// base object cell -> its materialized constant-offset field cells. Needed to
     /// retroactively connect them when the base later receives a non-constant access (M2.1).
     obj_fields: HashMap<Cell, Vec<Cell>>,
@@ -2497,8 +2501,8 @@ impl Solve {
             memcpy_by_endpoint: HashMap::new(),
             fields: HashMap::new(),
             field_base: HashMap::new(),
-            field_offset: HashMap::new(),
-            known_offsets: HashSet::new(),
+            field_location: HashMap::new(),
+            known_locations: HashSet::new(),
             obj_fields: HashMap::new(),
             unknown_fields: HashMap::new(),
             unknown_field_base: HashMap::new(),
@@ -2690,9 +2694,9 @@ impl Solve {
         }
     }
 
-    fn add_gep(&mut self, base: Cell, offset: Option<i64>, destination: Cell) {
+    fn add_gep(&mut self, base: Cell, location: FieldLocation, destination: Cell) {
         let base = self.canonical(base);
-        let gep = (offset, destination);
+        let gep = (location, destination);
         let established = self.geps.get(&base).is_some_and(|geps| geps.contains(&gep));
         let pending = self
             .pending_geps
@@ -2780,7 +2784,7 @@ impl Solve {
         }
     }
 
-    /// Field/subobject identity for `base + off` (M2.1, `PLAN-M2_lite_delta.md` §1 M2.1).
+    /// Field/subobject identity for `base + location`.
     ///
     /// A **constant** offset gets its own subobject cell, giving field sensitivity. A
     /// **non-constant** offset (`None`) uses a per-root unknown-offset summary cell. The
@@ -2788,7 +2792,7 @@ impl Solve {
     /// store is visible to constant-field loads (and vice versa), but we avoid routing all
     /// future fields through the whole-object cell. This keeps the M2.1 soundness property
     /// while reducing broad cross-field/root pollution.
-    fn field_of(&mut self, base: Cell, off: Option<i64>) -> Cell {
+    fn field_of(&mut self, base: Cell, location: FieldLocation) -> Cell {
         if self.is_external(base) {
             return base;
         }
@@ -2796,63 +2800,60 @@ impl Solve {
             return base;
         }
         if let Some(&root) = self.field_base.get(&base) {
-            // Keep nested constant GEPs finite by canonicalizing them back to root+offset
+            // Keep nested GEPs finite by canonicalizing them back to a root-relative location
             // rather than creating field-of-field chains. We only materialize combined
-            // offsets that occur in the fixed graph's finite offset vocabulary; other nested
-            // constants route to the root's unknown-offset summary. Unknown nested offsets
-            // also route to the root summary because they may alias any root field.
-            let base_off = self.field_offset.get(&base).copied().unwrap_or(0);
-            return match off.and_then(|delta| base_off.checked_add(delta)) {
-                Some(combined) if combined == base_off => base,
-                Some(combined) if self.known_offsets.contains(&combined) => {
-                    self.field_of(root, Some(combined))
-                }
-                Some(_) | None => self.unknown_field_of(root),
+            // locations that occur in the fixed graph's finite vocabulary.
+            let base_location = self
+                .field_location
+                .get(&base)
+                .copied()
+                .unwrap_or(FieldLocation::Unknown);
+            let combined = base_location.add(location);
+            if combined == base_location {
+                return base;
+            }
+            return if self.known_locations.contains(&combined) {
+                self.field_of(root, combined)
+            } else {
+                self.unknown_field_of(root)
             };
         }
-        match off {
-            None => self.unknown_field_of(base),
-            Some(off) => {
-                if let Some(&cell) = self.fields.get(&(base, off)) {
-                    return cell;
-                }
-                let cell = self.allocate_cell();
-                self.fields.insert((base, off), cell);
-                self.field_base.insert(cell, base);
-                self.field_offset.insert(cell, off);
-                self.obj_fields.entry(base).or_default().push(cell);
-                if let Some(&summary) = self.unknown_fields.get(&base) {
-                    self.add_copy(cell, summary);
-                    self.add_copy(summary, cell);
-                }
-                cell
+        if let Some(&cell) = self.fields.get(&(base, location)) {
+            return cell;
+        }
+        let cell = self.allocate_cell();
+        self.fields.insert((base, location), cell);
+        self.field_base.insert(cell, base);
+        self.field_location.insert(cell, location);
+        let existing = self.obj_fields.entry(base).or_default().clone();
+        self.obj_fields.entry(base).or_default().push(cell);
+        if location == FieldLocation::Unknown {
+            self.unknown_fields.insert(base, cell);
+            self.unknown_field_base.insert(cell, base);
+        }
+        for field in existing {
+            let candidate = self
+                .field_location
+                .get(&field)
+                .copied()
+                .unwrap_or(FieldLocation::Unknown);
+            if location.may_alias(candidate) {
+                self.add_copy(cell, field);
+                self.add_copy(field, cell);
             }
         }
+        if location == FieldLocation::Unknown && self.direct_accessed.contains(&base) {
+            self.add_copy(base, cell);
+            self.add_copy(cell, base);
+        }
+        cell
     }
 
     fn unknown_field_of(&mut self, base: Cell) -> Cell {
         if let Some(&cell) = self.unknown_fields.get(&base) {
             return cell;
         }
-        let cell = self.allocate_cell();
-        self.unknown_fields.insert(base, cell);
-        self.unknown_field_base.insert(cell, base);
-        self.field_base.insert(cell, base);
-        self.obj_fields.entry(base).or_default().push(cell);
-        if let Some(fields) = self.obj_fields.get(&base).cloned() {
-            for field in fields {
-                if field == cell {
-                    continue;
-                }
-                self.add_copy(field, cell);
-                self.add_copy(cell, field);
-            }
-        }
-        if self.direct_accessed.contains(&base) {
-            self.add_copy(base, cell);
-            self.add_copy(cell, base);
-        }
-        cell
+        self.field_of(base, FieldLocation::Unknown)
     }
 
     fn note_direct_access(&mut self, base: Cell) {
@@ -3057,7 +3058,7 @@ impl Solve {
         }
         self.pending_stores = replay_stores;
 
-        let mut replay_geps = HashMap::<Cell, Vec<(Option<i64>, Cell)>>::new();
+        let mut replay_geps = HashMap::<Cell, Vec<(FieldLocation, Cell)>>::new();
         for (cell, geps) in std::mem::take(&mut self.geps)
             .into_iter()
             .chain(std::mem::take(&mut self.pending_geps))
@@ -3417,7 +3418,7 @@ mod tests {
         finish_andersen_controlled, solve_andersen, solve_andersen_with_overrides,
         AndersenControls, ExternalRegion, Solve,
     };
-    use crate::{solve_steensgaard, PointsToMaterialization};
+    use crate::{solve_steensgaard, FieldLocation, PointsToMaterialization};
 
     fn fixture(name: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3657,10 +3658,10 @@ mod tests {
         assert_eq!(stores.store_pairs_processed, 6);
 
         let mut geps = Solve::new(12, false);
-        geps.known_offsets.insert(4);
+        geps.known_locations.insert(FieldLocation::Exact(4));
         geps.add_pts(0, 1);
         geps.add_pts(0, 2);
-        geps.add_gep(0, Some(4), 5);
+        geps.add_gep(0, FieldLocation::Exact(4), 5);
         geps.run();
         assert_eq!(geps.gep_pairs_processed, 2);
         assert_eq!(geps.points_to(5).unwrap().len(), 2);
@@ -3672,7 +3673,7 @@ mod tests {
         geps.run();
         assert_eq!(geps.gep_pairs_processed, 3);
 
-        geps.add_gep(0, Some(4), 6);
+        geps.add_gep(0, FieldLocation::Exact(4), 6);
         geps.run();
         assert_eq!(geps.gep_pairs_processed, 6);
         assert_eq!(geps.points_to(6).unwrap().len(), 3);
@@ -3723,6 +3724,20 @@ mod tests {
             .iter()
             .all(|t| steens.indirect_calls[0].targets.contains(t)));
         assert!(andersen.metrics.rounds >= 1);
+    }
+
+    #[test]
+    fn dynamic_array_indices_preserve_struct_field_lanes() {
+        let (pir, pag) = load("array_lane_fnptr.pir.json");
+
+        let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        assert_eq!(steens.indirect_calls.len(), 1);
+        assert_eq!(steens.indirect_calls[0].targets, vec!["f0".to_string()]);
+
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
+        assert_eq!(andersen.indirect_calls.len(), 1);
+        assert_eq!(andersen.indirect_calls[0].targets, vec!["f0".to_string()]);
+        assert!(!andersen.indirect_calls[0].fallback);
     }
 
     #[test]
@@ -3954,7 +3969,7 @@ mod tests {
     #[test]
     fn copy_scc_collapse_replays_every_complex_join_across_merged_members() {
         let mut solve = Solve::new(16, false);
-        solve.known_offsets.insert(4);
+        solve.known_locations.insert(FieldLocation::Exact(4));
         solve.add_pts(0, 6);
         solve.add_pts(1, 7);
         solve.add_pts(6, 8);
@@ -3962,7 +3977,7 @@ mod tests {
         solve.add_pts(4, 10);
         solve.add_load(1, 11);
         solve.add_store(1, 4, None);
-        solve.add_gep(1, Some(4), 12);
+        solve.add_gep(1, FieldLocation::Exact(4), 12);
         solve.run();
 
         assert_eq!(solve.points_to(11).unwrap(), &HashSet::from([9, 10]));
