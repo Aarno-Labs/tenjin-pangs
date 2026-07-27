@@ -4977,7 +4977,7 @@ fn push_pointer_modrefs_from_pag(
             };
             if phase == ModRefSourcePhase::PagPointer {
                 if precise_storage_addresses
-                    .local_allocas
+                    .local_roots
                     .contains(&pointer_access.address_node)
                 {
                     continue;
@@ -5435,8 +5435,14 @@ fn modref_detail_with_external_sources(base: &str, sources: &[String]) -> String
     modref_detail_with_external_suffix(base, modref_external_source_suffix(sources).as_deref())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreciseStorageRoot {
+    LocalAlloca,
+    Global(GlobalId),
+}
+
 struct PreciseStorageAddresses {
-    local_allocas: BTreeSet<pangs_pag::NodeId>,
+    local_roots: BTreeSet<pangs_pag::NodeId>,
     direct_global_symbols: BTreeSet<pangs_pag::NodeId>,
     global_bases: BTreeMap<pangs_pag::NodeId, GlobalId>,
 }
@@ -5445,9 +5451,8 @@ fn precise_storage_addresses(
     pag: &Pag,
     global_lookup: &HashMap<String, GlobalId>,
 ) -> PreciseStorageAddresses {
-    let mut local_allocas = BTreeSet::new();
+    let mut roots = BTreeMap::<pangs_pag::NodeId, PreciseStorageRoot>::new();
     let mut direct_global_symbols = BTreeSet::new();
-    let mut global_bases = BTreeMap::new();
     for node in &pag.nodes {
         if let Some(global) = node
             .label
@@ -5455,9 +5460,9 @@ fn precise_storage_addresses(
             .and_then(|global_key| global_lookup.get(global_key).copied())
         {
             direct_global_symbols.insert(node.id);
-            global_bases.insert(node.id, global);
+            roots.insert(node.id, PreciseStorageRoot::Global(global));
         } else if let Some(global) = label_known_global(&node.label, global_lookup) {
-            global_bases.insert(node.id, global);
+            roots.insert(node.id, PreciseStorageRoot::Global(global));
         }
     }
     for edge in &pag.edges {
@@ -5472,7 +5477,7 @@ fn precise_storage_addresses(
                 object: pangs_pag::ObjectKind::Alloca,
                 ..
             } => {
-                local_allocas.insert(edge.dst);
+                roots.insert(edge.dst, PreciseStorageRoot::LocalAlloca);
             }
             pangs_pag::NodeKind::Object {
                 object: pangs_pag::ObjectKind::Global,
@@ -5481,27 +5486,67 @@ fn precise_storage_addresses(
             } => {
                 if let Some(&global) = global_lookup.get(key) {
                     direct_global_symbols.insert(edge.dst);
-                    global_bases.insert(edge.dst, global);
+                    roots.insert(edge.dst, PreciseStorageRoot::Global(global));
                 }
             }
             _ => {}
         }
     }
+
+    // This is an allocation-root certificate, not a points-to result. GEPs preserve their
+    // allocation root even when the byte offset is dynamic. Assign joins preserve a root only
+    // when every incoming pointer alternative has independently proved the same root. Loads,
+    // calls, integer casts, and mixed-root joins intentionally have no rule here.
+    let mut producers = BTreeMap::<pangs_pag::NodeId, Vec<&Edge>>::new();
+    for edge in &pag.edges {
+        if matches!(
+            edge.kind,
+            EdgeKind::AddrOf | EdgeKind::Assign | EdgeKind::Load | EdgeKind::Gep { .. }
+        ) {
+            producers.entry(edge.dst).or_default().push(edge);
+        }
+    }
     let mut changed = true;
     while changed {
         changed = false;
-        for edge in &pag.edges {
-            let Some(&global) = global_bases.get(&edge.src) else {
-                continue;
-            };
-            if !matches!(edge.kind, EdgeKind::Gep { byte_off: Some(_) }) {
+        for (&dst, incoming) in &producers {
+            if roots.contains_key(&dst) || incoming.is_empty() {
                 continue;
             }
-            changed |= global_bases.insert(edge.dst, global).is_none();
+            let candidate = match incoming[0].kind {
+                EdgeKind::Gep { .. } if incoming.len() == 1 => roots.get(&incoming[0].src).copied(),
+                EdgeKind::Assign
+                    if incoming
+                        .iter()
+                        .all(|edge| matches!(edge.kind, EdgeKind::Assign)) =>
+                {
+                    let mut incoming_roots =
+                        incoming.iter().map(|edge| roots.get(&edge.src).copied());
+                    let first = incoming_roots.next().flatten();
+                    first.filter(|root| incoming_roots.all(|candidate| candidate == Some(*root)))
+                }
+                _ => None,
+            };
+            let Some(root) = candidate else {
+                continue;
+            };
+            roots.insert(dst, root);
+            changed = true;
         }
     }
+    let local_roots = roots
+        .iter()
+        .filter_map(|(&node, root)| (*root == PreciseStorageRoot::LocalAlloca).then_some(node))
+        .collect();
+    let global_bases = roots
+        .into_iter()
+        .filter_map(|(node, root)| match root {
+            PreciseStorageRoot::Global(global) => Some((node, global)),
+            PreciseStorageRoot::LocalAlloca => None,
+        })
+        .collect();
     PreciseStorageAddresses {
-        local_allocas,
+        local_roots,
         direct_global_symbols,
         global_bases,
     }

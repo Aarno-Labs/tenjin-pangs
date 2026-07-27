@@ -3557,6 +3557,54 @@ fn steens_memset_modref_exports_direct_aliased_and_unknown_store_rows() {
 }
 
 #[test]
+fn exact_root_certificate_handles_dynamic_geps_and_same_root_assigns() {
+    let fixture = m1_6_fixture("exact_root_modref.pir.json");
+    let analysis = Analysis::run(
+        &Pir::from_path(&fixture).unwrap(),
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let main = analysis.lookup_func("main").unwrap();
+    let a = analysis.lookup_global("@A").unwrap();
+    let b = analysis.lookup_global("@B").unwrap();
+    let sites = analysis
+        .access_sites()
+        .iter()
+        .filter(|site| site.func == main && site.access == Access::Mod)
+        .collect::<Vec<_>>();
+    for line in [1, 2] {
+        let site = sites.iter().find(|site| {
+            site.loc.as_ref().is_some_and(|loc| {
+                loc.file == "m1_6_exact_root.c" && loc.line == line && loc.col == 1
+            })
+        });
+        assert!(site.is_some_and(|site| {
+            site.affects(a)
+                && !site.affects(b)
+                && site.target_count() == 1
+                && site.via == pangs_api::Via::Aliased
+        }));
+    }
+
+    let mixed = sites.iter().find(|site| {
+        site.loc
+            .as_ref()
+            .is_some_and(|loc| loc.file == "m1_6_exact_root.c" && loc.line == 3 && loc.col == 1)
+    });
+    assert!(mixed.is_some_and(|site| {
+        site.affects(a)
+            && site.affects(b)
+            && site.target_count() == 2
+            && site.via == pangs_api::Via::Aliased
+    }));
+}
+
+#[test]
 fn andersen_refines_spurious_external_store_address_modref() {
     let fixture = m5_fixture("andersen_refines_store_external.pir.json");
     let steens = Analysis::run(

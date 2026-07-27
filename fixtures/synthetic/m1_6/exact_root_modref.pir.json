@@ -1,0 +1,80 @@
+{
+  "module": "m1_6_exact_root_modref",
+  "functions": [
+    {
+      "key": "main",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [],
+        "cc": "ccc"
+      },
+      "body": [
+        {
+          "kind": "gep",
+          "dest": "%a0",
+          "base": "@A",
+          "byte_off": null,
+          "loc": null
+        },
+        {
+          "kind": "gep",
+          "dest": "%a1",
+          "base": "@A",
+          "byte_off": 8,
+          "loc": null
+        },
+        {
+          "kind": "gep",
+          "dest": "%b0",
+          "base": "@B",
+          "byte_off": null,
+          "loc": null
+        },
+        {
+          "kind": "assign",
+          "dest": "%same_root",
+          "sources": ["%a0", "%a1"],
+          "loc": null
+        },
+        {
+          "kind": "assign",
+          "dest": "%mixed_root",
+          "sources": ["%a0", "%b0"],
+          "loc": null
+        },
+        {
+          "kind": "store",
+          "address": "%a0",
+          "value": "@Payload",
+          "loc": { "file": "m1_6_exact_root.c", "line": 1, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%same_root",
+          "value": "@Payload",
+          "loc": { "file": "m1_6_exact_root.c", "line": 2, "col": 1 }
+        },
+        {
+          "kind": "store",
+          "address": "%mixed_root",
+          "value": "@Payload",
+          "loc": { "file": "m1_6_exact_root.c", "line": 3, "col": 1 }
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "@A",
+      "mutable": true
+    },
+    {
+      "key": "@B",
+      "mutable": true
+    },
+    {
+      "key": "@Payload",
+      "mutable": true
+    }
+  ]
+}

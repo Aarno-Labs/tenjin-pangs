@@ -220,6 +220,11 @@ With an exhaustive materialized solution, every client is a scan, not a query en
   `Andersen∩FSA` (two provenance tags instead of five tiers').
 - **Mod/ref and writers:** direct accesses are syntactic; pointer-aware load/store,
   `memcpy`, and `memset` accesses expand through the materialized points-to relation.
+  Before consulting that relation, an independent allocation-root certificate recognizes
+  addresses derived from one global or local alloca through arbitrary-offset GEPs and
+  same-root assignments. It settles only the storage root of that access: mixed-root
+  joins, loads, calls, and integer conversions remain solver queries, and field contents
+  still participate in pointer, escape, and indirect-call analysis.
   Rows distinguish direct, aliased, finite-unknown, and universal-unknown provenance.
   Transitive mod/ref closes over the final direct and indirect call graph. When a local
   or transitive expansion exceeds its configured high-fanout bound, the concrete rows
