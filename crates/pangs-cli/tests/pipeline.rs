@@ -1797,7 +1797,7 @@ fn analyze_steens_collapses_high_fanout_pointer_modref_to_unknown() {
 }
 
 #[test]
-fn analyze_andersen_refines_spurious_external_store_address_modref() {
+fn analyze_field_aware_steens_separates_external_store_address_modref() {
     let fixture = m5_fixture("andersen_refines_store_external.pir.json");
     let tmp = TempDir::new().unwrap();
     let out_steens = tmp.path().join("steens");
@@ -1813,17 +1813,13 @@ fn analyze_andersen_refines_spurious_external_store_address_modref() {
         .collect();
     assert!(steens_modref.iter().any(|row| {
         row["func"] == "driver"
-            && row["global"]["unknown"] == "omega_store"
+            && row["global"]["name"] == "@Table"
             && row["access"] == "mod"
-            && row["via"] == "unknown"
+            && row["via"] == "aliased"
             && row["witness"] == "driver@m5_store.c:8:1#0"
-            && row["detail"]
-                == "edge:store|omega:steens_external|pointee_count=1:provenance=direct_address_flow,scalar_or_unknown_payload,memory_merging,universal_origin"
-            && row["address_node"] == "val:driver:%gp"
-            && row["pointee_globals"] == serde_json::json!(["@Table"])
-            // The same Steensgaard class also contains an inttoptr source. Named pointees
-            // must not narrow that universal provenance; Andersen separates the fields below.
-            && row["candidate_scope"] == "module-wide"
+    }));
+    assert!(!steens_modref.iter().any(|row| {
+        row["global"]["unknown"] == "omega_store" && row["witness"] == "driver@m5_store.c:8:1#0"
     }));
 
     let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))

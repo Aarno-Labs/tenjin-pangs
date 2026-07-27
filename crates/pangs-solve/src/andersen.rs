@@ -24,7 +24,10 @@ use pangs_pag::{
 };
 use pangs_pir::Pir;
 
-use crate::{debug_assert_narrows, IndirectCallResolution, SolveResult, SteensClasses};
+use crate::{
+    debug_assert_narrows, exact_allocation_addresses, ExactAddress, IndirectCallResolution,
+    SolveResult, SteensClasses,
+};
 
 /// Hard cap on points-to/discovery resume phases. Hitting it abandons the whole Andersen
 /// tier: a partial ascending solve is an under-approximation and must never be emitted.
@@ -496,6 +499,9 @@ struct Refiner<'a> {
     param_nodes: HashMap<(usize, usize), NodeId>,
     /// func_index -> PAG return node id.
     ret_nodes: HashMap<usize, NodeId>,
+    /// Independently certified allocation-relative addresses used to cut GEP dependencies at
+    /// field-aware partition boundaries.
+    exact_addresses: Vec<Option<ExactAddress>>,
 
     /// Andersen partition root for each Steensgaard class root (class ∪ pointee folded).
     ap_parent: Vec<usize>,
@@ -586,6 +592,7 @@ impl<'a> Refiner<'a> {
             global_of_cell,
             param_nodes,
             ret_nodes,
+            exact_addresses: exact_allocation_addresses(pag),
             ap_parent: Vec::new(),
             in_scope: vec![false; n_base],
             oversize_fallbacks: 0,
@@ -658,6 +665,11 @@ impl<'a> Refiner<'a> {
             );
             if escape || is_global {
                 interesting.insert(ap);
+            }
+        }
+        for class in 0..total {
+            if self.classes.global_storage[class] {
+                interesting.insert(self.ap_find(class));
             }
         }
 
@@ -1581,7 +1593,12 @@ impl<'a> Refiner<'a> {
                     if let Some(byte_off) = byte_off {
                         solve.known_offsets.insert(byte_off);
                     }
-                    solve.add_gep(edge.src.0, byte_off, edge.dst.0);
+                    if let Some(address) = self.exact_addresses[edge.dst.0 as usize] {
+                        let field = solve.field_of(address.root.0, address.byte_off);
+                        solve.add_pts(edge.dst.0, field);
+                    } else {
+                        solve.add_gep(edge.src.0, byte_off, edge.dst.0);
+                    }
                 }
                 EdgeKind::Memcpy { .. } => solve.add_memcpy(edge.dst.0, edge.src.0),
             }
@@ -3690,15 +3707,12 @@ mod tests {
     fn andersen_distinguishes_struct_fn_ptr_fields() {
         let (pir, pag) = load("field_sensitive_fnptr.pir.json");
 
-        // Steensgaard conflates the two struct fields → both targets.
+        // Field-aware Steensgaard already keeps independently rooted struct fields apart.
         let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
         assert_eq!(steens.indirect_calls.len(), 1);
-        assert_eq!(
-            steens.indirect_calls[0].targets,
-            vec!["f0".to_string(), "f1".to_string()]
-        );
+        assert_eq!(steens.indirect_calls[0].targets, vec!["f0".to_string()]);
 
-        // Andersen's field sensitivity keeps only the field actually loaded.
+        // Andersen agrees while retaining its distinct refinement provenance.
         let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
         assert_eq!(andersen.indirect_calls.len(), 1);
         assert_eq!(andersen.indirect_calls[0].targets, vec!["f0".to_string()]);
@@ -3715,18 +3729,16 @@ mod tests {
     fn andersen_refines_function_pointer_reachability_for_data_fields() {
         let (pir, pag) = load("field_sensitive_data_vs_fnptr.pir.json");
 
-        // Steensgaard merges the aggregate's callback and data fields, so the loaded data
-        // pointer inherits the callback function object.
+        // Field-aware Steensgaard keeps the aggregate's callback and data fields separate.
         let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
         let data = "val:setup:%data";
-        assert!(steens.nodes[data].reaches_function_pointer);
+        assert!(!steens.nodes[data].reaches_function_pointer);
         assert_eq!(
             steens.nodes[data].pointee_globals,
             vec!["@Data".to_string()]
         );
 
-        // Andersen keeps the constant-offset fields separate. Its allocation set contains
-        // only @Data, so the refined function-pointer bit must narrow with it.
+        // Andersen retains the same precise allocation and function-pointer facts.
         let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
         assert!(!andersen.nodes[data].reaches_function_pointer);
         assert_eq!(
@@ -3740,7 +3752,7 @@ mod tests {
         let (pir, pag) = load_m5("andersen_refines_store_external.pir.json");
 
         let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
-        assert!(steens.nodes["val:driver:%gp"].external);
+        assert!(!steens.nodes["val:driver:%gp"].external);
 
         let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
         let gp = &andersen.nodes["val:driver:%gp"];
@@ -4008,8 +4020,9 @@ mod tests {
             .iter()
             .find(|r| r.callsite_key == "dispatchB@!noloc#0")
             .unwrap();
-        // Round-0 (Steensgaard) call graph routes g into dispatchB's parameter.
-        assert_eq!(steens_b.targets, vec!["g".to_string()]);
+        // Field-aware round 0 already excludes dispatchB from the outer field load, so its
+        // parameter receives no binding from that callsite.
+        assert!(steens_b.targets.is_empty());
 
         let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
         // Outer site narrows to dispatchA only…
@@ -4037,12 +4050,7 @@ mod tests {
             .find(|r| r.callsite_key == "dispatchA@!noloc#0")
             .unwrap();
         assert_eq!(andersen_a.targets, vec!["g".to_string()]);
-        // The drop only happens because the loop ran a second round.
-        assert!(
-            andersen.metrics.rounds >= 2,
-            "rounds={}",
-            andersen.metrics.rounds
-        );
+        assert!(andersen.metrics.rounds >= 1);
     }
 
     #[test]
@@ -4148,10 +4156,7 @@ mod tests {
         let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 0);
         assert_eq!(andersen.indirect_calls.len(), 1);
         assert!(andersen.indirect_calls[0].fallback);
-        assert_eq!(
-            andersen.indirect_calls[0].targets,
-            vec!["f0".to_string(), "f1".to_string()]
-        );
+        assert_eq!(andersen.indirect_calls[0].targets, vec!["f0".to_string()]);
         assert!(andersen.metrics.oversize_fallbacks >= 1);
         assert!(andersen.metrics.oversize_fallback_max_size >= 1);
     }

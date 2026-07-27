@@ -118,6 +118,15 @@ field-sensitive Andersen doesn't OOM — CORAL's baselines did, at 128 GB, on
 OpenSSL-sized inputs), (b) the first wave of escape bits, and (c) the complete base-tier
 answer used wherever D' cannot refine. It settles no query by certificate.
 
+Its partition boundary is allocation-field aware when the fixed PAG independently proves
+an address root. Constant GEP offsets get distinct synthetic storage classes; a dynamic
+offset gets one summary joined only to the materialized fields of that same allocation.
+Unknown-root GEPs retain ordinary field-insensitive unification. Synthetic global-field
+classes carry their owning-global membership so they seed interesting partitions and
+contribute to aggregate escape/write facts. Andersen consumes the same root-relative
+address proof to seed a field directly at a partition boundary instead of requiring the
+base-address partition to be co-admitted.
+
 ### D'. The one real solver
 Partition-scoped, inclusion-based, PIP internals (implicit-Ω constraint forms and
 per-variable points-to sets). Every interesting partition (one reachable from
@@ -171,6 +180,10 @@ offset vocabulary. Other nested or recursive offsets route to the root's unknown
 rather than creating an unbounded field-of-field chain. Thus dynamic indexing remains
 sound with respect to constant-field accesses while recursive GEP cycles terminate in a
 finite abstract domain.
+
+C' uses the same constant/unknown distinction for independently rooted GEPs. Its classes
+are intentionally coarser than D's inclusion sets, but field contents no longer merge
+their complete aggregate containers merely because corresponding fields exchange a value.
 
 **Semi-naive constraint processing:**
 

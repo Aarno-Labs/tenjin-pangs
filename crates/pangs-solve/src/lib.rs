@@ -471,6 +471,9 @@ pub struct SteensClasses {
     pub universal: Vec<bool>,
     /// `esc[root]` — class members are reachable by external code (PIP `Ω ⊒ {x}`).
     pub esc: Vec<bool>,
+    /// The class contains a global allocation or one of its allocation-relative fields.
+    /// Field-aware partitioning uses this to keep synthetic global-field partitions interesting.
+    pub global_storage: Vec<bool>,
     /// One bit per PIR global. False proves that the global symbol is used only as the
     /// address operand of direct memory accesses.
     pub global_address_exposed: Vec<bool>,
@@ -856,6 +859,9 @@ struct Solver<'a> {
     global_object_nodes: Vec<Option<NodeId>>,
     global_address_exposed: Vec<bool>,
     module_violation_tainted: bool,
+    exact_addresses: Vec<Option<ExactAddress>>,
+    field_classes: HashMap<(NodeId, Option<i64>), usize>,
+    fields_by_root: HashMap<NodeId, Vec<usize>>,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
     worklist: VecDeque<usize>,
     queued: Vec<bool>,
@@ -879,6 +885,90 @@ pub(crate) enum PointsToMaterialization {
     AllNodes,
     GlobalObjects,
     Targeted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactAddress {
+    root: NodeId,
+    /// `None` is the per-root unknown-offset summary, not an unknown allocation root.
+    byte_off: Option<i64>,
+}
+
+/// Independently derive allocation-relative addresses from the fixed PAG. This is deliberately
+/// weaker than points-to analysis: address-of seeds a root, GEP preserves it, and an Assign join
+/// is retained only when every incoming alternative names the same root. A differing offset
+/// becomes the root's unknown-offset summary; loads and all other producers stop the proof.
+fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
+    let mut addresses = vec![None; pag.nodes.len()];
+    let mut producers = BTreeMap::<NodeId, Vec<&pangs_pag::Edge>>::new();
+    for edge in &pag.edges {
+        if matches!(
+            edge.kind,
+            pangs_pag::EdgeKind::AddrOf
+                | pangs_pag::EdgeKind::Assign
+                | pangs_pag::EdgeKind::Load
+                | pangs_pag::EdgeKind::Gep { .. }
+        ) {
+            producers.entry(edge.dst).or_default().push(edge);
+        }
+        if edge.kind == pangs_pag::EdgeKind::AddrOf {
+            addresses[edge.dst.0 as usize] = Some(ExactAddress {
+                root: edge.src,
+                byte_off: Some(0),
+            });
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (&dst, incoming) in &producers {
+            if addresses[dst.0 as usize].is_some() || incoming.is_empty() {
+                continue;
+            }
+            let candidate = match incoming[0].kind {
+                pangs_pag::EdgeKind::Gep { byte_off } if incoming.len() == 1 => {
+                    addresses[incoming[0].src.0 as usize].map(|base| ExactAddress {
+                        root: base.root,
+                        byte_off: base
+                            .byte_off
+                            .zip(byte_off)
+                            .and_then(|(base, delta)| base.checked_add(delta)),
+                    })
+                }
+                pangs_pag::EdgeKind::Assign
+                    if incoming
+                        .iter()
+                        .all(|edge| edge.kind == pangs_pag::EdgeKind::Assign) =>
+                {
+                    let alternatives = incoming
+                        .iter()
+                        .map(|edge| addresses[edge.src.0 as usize])
+                        .collect::<Option<Vec<_>>>();
+                    alternatives.and_then(|alternatives| {
+                        let first = *alternatives.first()?;
+                        alternatives
+                            .iter()
+                            .all(|address| address.root == first.root)
+                            .then(|| ExactAddress {
+                                root: first.root,
+                                byte_off: alternatives
+                                    .iter()
+                                    .all(|address| address.byte_off == first.byte_off)
+                                    .then_some(first.byte_off)
+                                    .flatten(),
+                            })
+                    })
+                }
+                _ => None,
+            };
+            if let Some(address) = candidate {
+                addresses[dst.0 as usize] = Some(address);
+                changed = true;
+            }
+        }
+    }
+    addresses
 }
 
 #[derive(Default)]
@@ -1114,6 +1204,7 @@ impl<'a> Solver<'a> {
         let function_count = function_keys.len();
         let callsites_by_index = pag.callsites.iter().collect();
         let queued = vec![false; classes.len()];
+        let exact_addresses = exact_allocation_addresses(pag);
 
         Self {
             pir,
@@ -1128,6 +1219,9 @@ impl<'a> Solver<'a> {
             global_object_nodes,
             global_address_exposed,
             module_violation_tainted,
+            exact_addresses,
+            field_classes: HashMap::new(),
+            fields_by_root: HashMap::new(),
             callsites_by_index,
             worklist: VecDeque::new(),
             queued,
@@ -1172,6 +1266,7 @@ impl<'a> Solver<'a> {
         let mut ext = vec![false; total];
         let mut universal = vec![false; total];
         let mut esc = vec![false; total];
+        let mut global_storage = vec![false; total];
         for i in 0..total {
             let root = self.find(i);
             if root == i {
@@ -1179,6 +1274,7 @@ impl<'a> Solver<'a> {
                 ext[i] = self.classes[i].ext;
                 universal[i] = self.classes[i].universal;
                 esc[i] = self.classes[i].esc;
+                global_storage[i] = !self.classes[i].global_objs.is_empty();
             }
         }
         SteensClasses {
@@ -1187,6 +1283,7 @@ impl<'a> Solver<'a> {
             ext,
             universal,
             esc,
+            global_storage,
             global_address_exposed: self.global_address_exposed.clone(),
             module_violation_tainted: self.module_violation_tainted,
         }
@@ -1237,10 +1334,15 @@ impl<'a> Solver<'a> {
                 }
                 pangs_pag::EdgeKind::Gep { .. } => {
                     let dst = self.class_of(edge.dst);
-                    let src = self.class_of(edge.src);
                     let dst_p = self.pointee_of(dst);
-                    let src_p = self.pointee_of(src);
-                    self.join(dst_p, src_p, PROV_DIRECT_ADDRESS);
+                    if let Some(address) = self.exact_addresses[edge.dst.0 as usize] {
+                        let field = self.field_class(address.root, address.byte_off);
+                        self.join(dst_p, field, PROV_DIRECT_ADDRESS);
+                    } else {
+                        let src = self.class_of(edge.src);
+                        let src_p = self.pointee_of(src);
+                        self.join(dst_p, src_p, PROV_DIRECT_ADDRESS);
+                    }
                 }
                 pangs_pag::EdgeKind::Memcpy { .. } => {
                     let dst = self.class_of(edge.dst);
@@ -1456,17 +1558,34 @@ impl<'a> Solver<'a> {
             let Some(class) = self.global_object_class(global_index) else {
                 continue;
             };
-            let root = self.find(class);
-            let mut escape_external = self.classes[root].esc;
-            let mut escape_sources = self.classes[root]
-                .escape_sources
+            let object_root = self.find(class);
+            let mut storage_roots = BTreeSet::new();
+            for candidate in 0..self.classes.len() {
+                if self.find(candidate) == candidate
+                    && self.classes[candidate].global_objs.contains(&global_index)
+                {
+                    storage_roots.insert(candidate);
+                }
+            }
+            debug_assert!(storage_roots.contains(&object_root));
+            let mut escape_external = storage_roots
                 .iter()
-                .cloned()
+                .any(|&storage| self.classes[storage].esc);
+            let mut escape_sources = storage_roots
+                .iter()
+                .flat_map(|&storage| self.classes[storage].escape_sources.iter().cloned())
                 .collect::<Vec<_>>();
+            escape_sources.sort();
+            escape_sources.dedup();
             let own_export = format!("exported-symbol:obj:global:{}", global.key);
             let mut address_escape = escape_sources.iter().any(|source| source != &own_export);
-            let never_written = !escape_external && !stored_classes.contains(&root);
-            let mut runtime_written = runtime_stored_classes.contains(&root);
+            let never_written = !escape_external
+                && storage_roots
+                    .iter()
+                    .all(|storage| !stored_classes.contains(storage));
+            let mut runtime_written = storage_roots
+                .iter()
+                .any(|storage| runtime_stored_classes.contains(storage));
             if isolation.address.contains(&global.key) {
                 // Steensgaard may merge a dynamically-indexed aggregate with an unrelated,
                 // externally exposed pointer class.  A completed allocation-provenance proof
@@ -1528,7 +1647,8 @@ impl<'a> Solver<'a> {
                             reaches
                         }
                     })
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || self.classes[root].universal;
                 let cached = CachedRootNodeSummary {
                     reaches_function_pointer,
                     external,
@@ -1668,6 +1788,26 @@ impl<'a> Solver<'a> {
         let mut out = BTreeMap::new();
         let mut pointee_out = BTreeMap::new();
         let mut pointee_external = BTreeMap::new();
+        let field_roots = self
+            .fields_by_root
+            .iter()
+            .map(|(&root, fields)| (root, fields.clone()))
+            .collect::<Vec<_>>();
+        let mut storage_by_object = HashMap::<usize, BTreeSet<usize>>::new();
+        for (object, fields) in field_roots {
+            let object_class = self.class_of(object);
+            storage_by_object
+                .entry(object_class)
+                .or_default()
+                .insert(object_class);
+            for field in fields {
+                let field = self.find(field);
+                storage_by_object
+                    .entry(object_class)
+                    .or_default()
+                    .insert(field);
+            }
+        }
         for node in &self.pag.nodes {
             if mode == PointsToMaterialization::GlobalObjects
                 && !matches!(
@@ -1718,34 +1858,36 @@ impl<'a> Solver<'a> {
                     .insert("omega:reachable-memory".to_string());
             }
             if mode == PointsToMaterialization::Targeted {
-                let Some(contents) = self.classes[pointee].pointee else {
-                    continue;
-                };
-                let contents = self.find(contents);
-                if self.classes[contents].ext {
-                    let sources = if self.classes[pointee].escape_sources.is_empty() {
-                        BTreeSet::from(["omega:reachable-contents".to_string()])
-                    } else {
-                        self.classes[pointee].escape_sources.clone()
-                    };
-                    pointee_external
-                        .entry(node.label.clone())
-                        .or_insert_with(BTreeSet::new)
-                        .extend(sources);
+                let storage_classes = storage_by_object
+                    .get(&pointee)
+                    .cloned()
+                    .unwrap_or_else(|| BTreeSet::from([pointee]));
+                let mut content_roots = BTreeSet::new();
+                for storage in storage_classes {
+                    if let Some(contents) = self.classes[storage].pointee {
+                        content_roots.insert(self.find(contents));
+                    }
                 }
-                let contents_allocs = if let Some(cached) = &by_pointee_root[contents] {
-                    cached.clone()
-                } else {
-                    let mut allocs = BTreeSet::new();
+                let mut contents_allocs = BTreeSet::new();
+                for contents in content_roots {
+                    if self.classes[contents].ext {
+                        let sources = if self.classes[contents].escape_sources.is_empty() {
+                            BTreeSet::from(["omega:reachable-contents".to_string()])
+                        } else {
+                            self.classes[contents].escape_sources.clone()
+                        };
+                        pointee_external
+                            .entry(node.label.clone())
+                            .or_insert_with(BTreeSet::new)
+                            .extend(sources);
+                    }
                     for &g in &self.classes[contents].global_objs {
-                        allocs.insert(self.global_keys[g].clone());
+                        contents_allocs.insert(self.global_keys[g].clone());
                     }
                     for &f in &self.classes[contents].fn_objs {
-                        allocs.insert(self.function_keys[f].clone());
+                        contents_allocs.insert(self.function_keys[f].clone());
                     }
-                    by_pointee_root[contents] = Some(allocs.clone());
-                    allocs
-                };
+                }
                 if !contents_allocs.is_empty() {
                     pointee_out.insert(node.label.clone(), contents_allocs);
                 }
@@ -2036,6 +2178,44 @@ impl<'a> Solver<'a> {
         self.classes[root].pointee = Some(id);
         self.enqueue(root);
         id
+    }
+
+    /// Steensgaard field identity used by both its fallback answer and the Kahlon partition
+    /// boundary. Constant offsets remain distinct. A dynamic or otherwise non-composable offset
+    /// uses one summary per allocation root and joins only the fields of that same root.
+    fn field_class(&mut self, root: NodeId, byte_off: Option<i64>) -> usize {
+        if let Some(&class) = self.field_classes.get(&(root, byte_off)) {
+            return self.find(class);
+        }
+
+        let id = self.classes.len();
+        let mut data = ClassData {
+            parent: id,
+            size: 1,
+            ..ClassData::default()
+        };
+        let root_class = self.class_of(root);
+        data.global_objs
+            .extend(self.classes[root_class].global_objs.iter().copied());
+        self.classes.push(data);
+        self.queued.push(false);
+        self.field_classes.insert((root, byte_off), id);
+
+        let existing = self.fields_by_root.entry(root).or_default().clone();
+        self.fields_by_root.entry(root).or_default().push(id);
+        let summary = self.field_classes.get(&(root, None)).copied();
+        match byte_off {
+            None => {
+                let mut class = id;
+                for field in existing {
+                    class = self.join(class, field, PROV_DIRECT_ADDRESS);
+                }
+                class
+            }
+            Some(_) => summary
+                .map(|summary| self.join(id, summary, PROV_DIRECT_ADDRESS))
+                .unwrap_or(id),
+        }
     }
 
     fn set_ext(&mut self, class: usize) {

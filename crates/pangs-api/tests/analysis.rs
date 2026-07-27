@@ -3605,7 +3605,7 @@ fn exact_root_certificate_handles_dynamic_geps_and_same_root_assigns() {
 }
 
 #[test]
-fn andersen_refines_spurious_external_store_address_modref() {
+fn field_aware_steens_separates_external_store_address_modref() {
     let fixture = m5_fixture("andersen_refines_store_external.pir.json");
     let steens = Analysis::run(
         &Pir::from_path(&fixture).unwrap(),
@@ -3628,16 +3628,14 @@ fn andersen_refines_spurious_external_store_address_modref() {
 
     let table = andersen.lookup_global("@Table").unwrap();
     assert!(steens.modrefs().iter().any(|mr| {
-        mr.global == pangs_api::GlobalTarget::Unknown("omega_store".to_string())
+        mr.global == pangs_api::GlobalTarget::Name(table)
             && mr.access == Access::Mod
-            && mr.via == pangs_api::Via::Unknown
+            && mr.via == pangs_api::Via::Aliased
             && mr.witness.as_deref() == Some("driver@m5_store.c:8:1#0")
-            && mr.detail.as_deref()
-                == Some(
-                    "edge:store|omega:steens_external|pointee_count=1:provenance=direct_address_flow,scalar_or_unknown_payload,memory_merging,universal_origin",
-                )
-            && mr.address_node.as_deref() == Some("val:driver:%gp")
-            && mr.pointee_globals == vec!["@Table".to_string()]
+    }));
+    assert!(!steens.modrefs().iter().any(|mr| {
+        mr.global == pangs_api::GlobalTarget::Unknown("omega_store".to_string())
+            && mr.witness.as_deref() == Some("driver@m5_store.c:8:1#0")
     }));
     assert!(andersen.modrefs().iter().any(|mr| {
         mr.global == pangs_api::GlobalTarget::Name(table)
