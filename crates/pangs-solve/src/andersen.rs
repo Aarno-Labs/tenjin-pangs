@@ -504,6 +504,7 @@ enum ExternalRegion {
     UnknownReturn(u32),
     EscapedFunctionParam(u32),
     ForgedPointer(u32),
+    ReceiverPayload(u32),
 }
 
 impl ExternalRegion {
@@ -524,8 +525,15 @@ impl ExternalRegion {
             Self::UnknownReturn(id) => format!("unknown_return:{id}"),
             Self::EscapedFunctionParam(id) => format!("escaped_function_param:{id}"),
             Self::ForgedPointer(id) => format!("forged_pointer:{id}"),
+            Self::ReceiverPayload(id) => format!("receiver_payload:{id}"),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AllocationOrigins {
+    roots: BTreeSet<NodeId>,
+    complete: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -563,6 +571,8 @@ struct Refiner<'a> {
     exact_addresses: Vec<Option<ExactAddress>>,
     /// Experimental, automatically inferred receiver-relative container operations.
     receiver_payload_ops: HashMap<usize, ReceiverPayloadOp>,
+    /// Bounded address-preserving allocation origins for receiver payload values.
+    receiver_payload_origins: Vec<AllocationOrigins>,
 
     /// Union-find for the independent prepartition constraint graph. PAG nodes occupy
     /// `[0, n_base)`; allocation-relative memory regions are synthetic vertices above it.
@@ -669,6 +679,7 @@ impl<'a> Refiner<'a> {
             ret_nodes,
             exact_addresses: exact_allocation_addresses(pag),
             receiver_payload_ops: HashMap::new(),
+            receiver_payload_origins: Vec::new(),
             ap_parent: Vec::new(),
             prepartition_regions: Vec::new(),
             prepartition_edge_vertices: Vec::new(),
@@ -683,6 +694,8 @@ impl<'a> Refiner<'a> {
         };
         if receiver_payloads_enabled() {
             refiner.receiver_payload_ops = refiner.infer_receiver_payload_ops();
+            refiner.receiver_payload_origins =
+                bounded_allocation_origins(pag, knobs::ANDERSEN_RECEIVER_PAYLOAD_ORIGIN_LIMIT);
         }
         refiner.build_scope();
         refiner
@@ -729,6 +742,7 @@ impl<'a> Refiner<'a> {
     fn infer_receiver_payload_ops(&self) -> HashMap<usize, ReceiverPayloadOp> {
         let mut inferred = HashMap::<usize, ReceiverPayloadOp>::new();
         let mut local_adjacency = HashMap::<usize, Vec<Vec<usize>>>::new();
+        let mut local_copy_adjacency = HashMap::<usize, Vec<Vec<usize>>>::new();
         for (function, pir_function) in self.pir.functions.iter().enumerate() {
             if pir_function.external || !self.param_nodes.contains_key(&(function, 0)) {
                 continue;
@@ -738,6 +752,7 @@ impl<'a> Refiner<'a> {
                 continue;
             }
             let mut adjacency = vec![Vec::new(); self.n_base];
+            let mut copy_adjacency = vec![Vec::new(); self.n_base];
             for edge in &self.pag.edges {
                 if !matches!(
                     &edge.owner,
@@ -749,6 +764,9 @@ impl<'a> Refiner<'a> {
                     EdgeKind::Assign | EdgeKind::Load | EdgeKind::Gep { .. } => {
                         if self.pointer_transfer(edge.src, edge.dst) {
                             adjacency[edge.src.0 as usize].push(edge.dst.0 as usize);
+                            if edge.kind == EdgeKind::Assign {
+                                copy_adjacency[edge.src.0 as usize].push(edge.dst.0 as usize);
+                            }
                         }
                     }
                     _ => {}
@@ -801,6 +819,7 @@ impl<'a> Refiner<'a> {
                 inferred.insert(function, operation);
             }
             local_adjacency.insert(function, adjacency);
+            local_copy_adjacency.insert(function, copy_adjacency);
         }
 
         // Lift leaf behavior through thin wrappers. This is a small monotone summary fixpoint:
@@ -826,6 +845,9 @@ impl<'a> Refiner<'a> {
                 let Some(callee_operation) = inferred.get(&callee).cloned() else {
                     continue;
                 };
+                let Some(copy_adjacency) = local_copy_adjacency.get(&caller) else {
+                    continue;
+                };
                 let Some(adjacency) = local_adjacency.get(&caller) else {
                     continue;
                 };
@@ -835,7 +857,7 @@ impl<'a> Refiner<'a> {
                 let Some(&callee_receiver_actual) = callsite.args.first() else {
                     continue;
                 };
-                if !graph_reachable(caller_receiver.0 as usize, adjacency)
+                if !graph_reachable(caller_receiver.0 as usize, copy_adjacency)
                     .contains(&(callee_receiver_actual.0 as usize))
                 {
                     continue;
@@ -852,7 +874,7 @@ impl<'a> Refiner<'a> {
                             continue;
                         };
                         if self.node_may_carry_pointer(parameter)
-                            && graph_reachable(parameter.0 as usize, adjacency)
+                            && graph_reachable(parameter.0 as usize, copy_adjacency)
                                 .contains(&(actual.0 as usize))
                         {
                             let target = lifted.stored_params.entry(caller_index).or_default();
@@ -866,13 +888,38 @@ impl<'a> Refiner<'a> {
                     if let (Some(result), Some(&ret)) =
                         (callsite.result, self.ret_nodes.get(&caller))
                     {
-                        if graph_reachable(result.0 as usize, adjacency).contains(&(ret.0 as usize))
+                        if graph_reachable(result.0 as usize, copy_adjacency)
+                            .contains(&(ret.0 as usize))
                         {
                             let old_len = lifted.returned_regions.len();
                             lifted
                                 .returned_regions
                                 .extend(callee_operation.returned_regions.iter().copied());
                             changed |= lifted.returned_regions.len() != old_len;
+                        } else {
+                            // The callee may return receiver-owned storage which this wrapper
+                            // dereferences before returning a nested payload (for example,
+                            // get_entry(map) followed by entry->value). Infer the wrapper's own
+                            // load location rather than incorrectly forwarding the callee's
+                            // receiver field.
+                            let derived = graph_reachable(result.0 as usize, adjacency);
+                            for edge in &self.pag.edges {
+                                if edge.kind != EdgeKind::Load
+                                    || !matches!(
+                                        &edge.owner,
+                                        pangs_pag::Owner::Function(owner)
+                                            if owner == &caller_function.key
+                                    )
+                                    || !derived.contains(&(edge.src.0 as usize))
+                                    || !graph_reachable(edge.dst.0 as usize, copy_adjacency)
+                                        .contains(&(ret.0 as usize))
+                                {
+                                    continue;
+                                }
+                                changed |= lifted
+                                    .returned_regions
+                                    .insert(self.receiver_payload_location(edge.src));
+                            }
                         }
                     }
                 }
@@ -1269,6 +1316,7 @@ impl<'a> Refiner<'a> {
             })
             .collect::<Vec<_>>();
         let mut payload_vertices = HashMap::<(NodeId, FieldLocation), usize>::new();
+        let mut receiver_support_vertices = HashSet::<usize>::new();
         for (operation, root, arguments, result) in payload_calls {
             for (&index, locations) in &operation.stored_params {
                 if let Some(argument) = arguments.get(index) {
@@ -1281,29 +1329,33 @@ impl<'a> Refiner<'a> {
                             location,
                         );
                         let argument = argument.0 as usize;
-                        self.ap_union(argument, payload);
-                        self.prepartition_flow_edges.push((argument, payload));
-                        // If this payload is itself a certified allocation address, its
-                        // allocation-relative field initializers are predecessors of consumers
-                        // which later dereference the value returned by the container.
-                        if let Some(address) = self.exact_addresses[argument] {
+                        // Connect the payload to its bounded allocation origins, not to the
+                        // polluted carrier. For incomplete rows the final solve adds an explicit
+                        // receiver-local unknown token; no excluded concrete carrier constraint
+                        // is needed inside this source-closed slice.
+                        let origins = self.receiver_payload_origins[argument]
+                            .roots
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>();
+                        for origin in origins {
                             let field_vertices = self
                                 .prepartition_regions
                                 .iter()
                                 .enumerate()
                                 .filter_map(|(vertex, region)| {
                                     region
-                                        .is_some_and(|(root, _)| root == address.root)
+                                        .is_some_and(|(root, _)| root == origin)
                                         .then_some(vertex)
                                 })
                                 .collect::<Vec<_>>();
                             for field in field_vertices {
-                                self.ap_union(field, payload);
                                 self.prepartition_flow_edges.push((field, payload));
+                                receiver_support_vertices.insert(field);
                             }
-                            let object = address.root.0 as usize;
-                            self.ap_union(object, payload);
+                            let object = origin.0 as usize;
                             self.prepartition_flow_edges.push((object, payload));
+                            receiver_support_vertices.insert(object);
                         }
                     }
                 }
@@ -1410,6 +1462,12 @@ impl<'a> Refiner<'a> {
                     interesting.insert(self.ap_find(vertex));
                 }
             }
+        }
+        // Allocation-field initializers supporting a receiver payload remain separate weak
+        // components. Admit those components independently instead of merging every payload
+        // object into the indirect-call megapartition.
+        for vertex in receiver_support_vertices {
+            interesting.insert(self.ap_find(vertex));
         }
 
         // Per-partition oversize estimate: nodes × (nodes + edges touching the partition),
@@ -2246,13 +2304,23 @@ impl<'a> Refiner<'a> {
             } else {
                 let envelope = steens_by_key
                     .get(key)
-                    .map(|r| self.non_confined_target_indices(&r.targets))
+                    .map(|row| {
+                        if !self.receiver_payload_ops.is_empty() && row.unknown_callee {
+                            // In the call-target lattice, unknown is top: it envelopes every
+                            // address-taken function, not merely the named targets Steensgaard
+                            // happened to retain alongside the unknown bit.
+                            self.all_address_taken_non_confined_target_indices()
+                        } else {
+                            self.non_confined_target_indices(&row.targets)
+                        }
+                    })
                     .unwrap_or_default();
                 envelopes.insert(site, envelope);
                 // A Steensgaard unknown-callee verdict means named address flow is not a
                 // complete account of possible internal callbacks. Activate the envelope
                 // eagerly and retain fallback provenance for this site.
                 if !controls.disable_eager_unknown
+                    && self.receiver_payload_ops.is_empty()
                     && steens_by_key.get(key).is_some_and(|row| row.unknown_callee)
                 {
                     eager_sites.insert(site);
@@ -2693,8 +2761,12 @@ impl<'a> Refiner<'a> {
         let mut payload_cells = HashMap::<(NodeId, FieldLocation), Cell>::new();
 
         let mut summarized_calls = 0usize;
-        let mut certified_payloads = 0usize;
-        let mut unresolved_payloads = 0usize;
+        let mut singleton_payloads = 0usize;
+        let mut multi_payloads = 0usize;
+        let mut incomplete_payloads = 0usize;
+        let mut origin_facts = 0usize;
+        let mut context_profiles =
+            HashMap::<(NodeId, FieldLocation), (usize, usize, BTreeSet<NodeId>)>::new();
         for callsite in &self.pag.callsites {
             let Some((operation, root)) =
                 self.receiver_payload_summary_call(callsite, &selected_roots)
@@ -2708,17 +2780,31 @@ impl<'a> Refiner<'a> {
                             let payload = *payload_cells
                                 .entry((root, location))
                                 .or_insert_with(|| solve.allocate_cell());
-                            if let Some(address) = self.exact_addresses[argument.0 as usize] {
-                                // The independent exact-address certificate is stronger than
-                                // the carrier's context-insensitive points-to row. Seed the
-                                // certified allocation directly so unrelated external facts on
-                                // the carrier do not leak into this receiver context.
-                                solve.add_pts(payload, address.root.0);
-                                certified_payloads += 1;
-                            } else {
-                                solve.add_copy(argument.0, payload);
-                                unresolved_payloads += 1;
+                            let origins = &self.receiver_payload_origins[argument.0 as usize];
+                            for &origin in &origins.roots {
+                                solve.add_pts(payload, origin.0);
                             }
+                            origin_facts += origins.roots.len();
+                            if origins.complete {
+                                if origins.roots.len() <= 1 {
+                                    singleton_payloads += 1;
+                                } else {
+                                    multi_payloads += 1;
+                                }
+                            } else {
+                                incomplete_payloads += 1;
+                                let unknown =
+                                    solve.region(ExternalRegion::ReceiverPayload(payload));
+                                solve.add_pts_with_source(
+                                    payload,
+                                    unknown,
+                                    Some("omega:receiver_payload_origin_overflow"),
+                                );
+                            }
+                            let profile = context_profiles.entry((root, location)).or_default();
+                            profile.0 += usize::from(origins.complete);
+                            profile.1 += usize::from(!origins.complete);
+                            profile.2.extend(origins.roots.iter().copied());
                         }
                     }
                 }
@@ -2742,12 +2828,30 @@ impl<'a> Refiner<'a> {
                 .collect::<Vec<_>>();
             context_labels.sort();
             eprintln!(
-                "pangs receiver payloads: contexts={} summarized_calls={} certified_payloads={} unresolved_payloads={} roots={context_labels:?}",
+                "pangs receiver payloads: contexts={} summarized_calls={} singleton_payloads={} multi_payloads={} incomplete_payloads={} origin_facts={} roots={context_labels:?}",
                 selected_roots.len(),
                 summarized_calls,
-                certified_payloads,
-                unresolved_payloads
+                singleton_payloads,
+                multi_payloads,
+                incomplete_payloads,
+                origin_facts
             );
+            let mut profiles = context_profiles.into_iter().collect::<Vec<_>>();
+            profiles.sort_by_key(|((root, location), _)| (root.0, *location));
+            for ((root, location), (complete, incomplete, origins)) in profiles {
+                let sample = origins
+                    .iter()
+                    .take(12)
+                    .map(|origin| self.pag.nodes[origin.0 as usize].label.clone())
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "pangs receiver payload origins: receiver={} location={location:?} complete_rows={} incomplete_rows={} distinct_origins={} sample={sample:?}",
+                    self.pag.nodes[root.0 as usize].label,
+                    complete,
+                    incomplete,
+                    origins.len()
+                );
+            }
         }
     }
 
@@ -3128,6 +3232,22 @@ impl<'a> Refiner<'a> {
         )
     }
 
+    fn all_address_taken_non_confined_target_indices(&self) -> Vec<usize> {
+        let mut functions = self
+            .fn_cell_to_index
+            .values()
+            .copied()
+            .filter(|function| {
+                !self
+                    .confined_targets
+                    .contains(&self.pir.functions[*function].key)
+            })
+            .collect::<Vec<_>>();
+        functions.sort_unstable();
+        functions.dedup();
+        functions
+    }
+
     fn target_indices<'b>(&self, targets: impl Iterator<Item = &'b str>) -> Vec<usize> {
         let mut funcs: Vec<usize> = targets
             .filter_map(|target| self.func_index.get(target).copied())
@@ -3167,7 +3287,7 @@ impl<'a> Refiner<'a> {
                 targets.sort();
                 // M2.0 subset tripwire: a more-exact tier may only narrow. Andersen's
                 // per-site targets must be ⊆ the Steensgaard envelope it refined.
-                if let Some(steens) = steens {
+                if let Some(steens) = steens.filter(|steens| !steens.unknown_callee) {
                     crate::debug_assert_narrows(
                         &cs.key,
                         "andersen",
@@ -3187,8 +3307,12 @@ impl<'a> Refiner<'a> {
                     });
                 let exact = self.exact_targets.contains_key(&cs.key);
                 let fallback = !exact && eager_sites.contains(&idx);
-                let unknown_callee =
-                    steens.map(|r| r.unknown_callee).unwrap_or(false) || operand_unknown;
+                let steens_unknown = steens.map(|r| r.unknown_callee).unwrap_or(false);
+                let unknown_callee = if !self.receiver_payload_ops.is_empty() {
+                    operand_unknown || (targets.is_empty() && steens_unknown)
+                } else {
+                    steens_unknown || operand_unknown
+                };
                 out.push(IndirectCallResolution {
                     callsite_key: cs.key.clone(),
                     targets,
@@ -3444,6 +3568,98 @@ fn graph_reachable(start: usize, adjacency: &[Vec<usize>]) -> HashSet<usize> {
         }
     }
     reachable
+}
+
+/// Recover a bounded set of concrete allocation origins using only address-preserving PAG
+/// operations. This is intentionally independent of Steensgaard: loads and other unsupported
+/// producers make a row incomplete, while assignments (including phi/select and direct
+/// actual/formal bindings) and GEPs preserve the allocation root. The retained roots are useful
+/// positive facts; `complete == false` is an explicit overflow/unknown bit.
+fn bounded_allocation_origins(pag: &Pag, limit: usize) -> Vec<AllocationOrigins> {
+    assert!(limit > 0, "allocation-origin limit must be positive");
+    let mut incoming = vec![Vec::<&pangs_pag::Edge>::new(); pag.nodes.len()];
+    for edge in &pag.edges {
+        if matches!(
+            edge.kind,
+            EdgeKind::AddrOf | EdgeKind::Assign | EdgeKind::Load | EdgeKind::Gep { .. }
+        ) {
+            incoming[edge.dst.0 as usize].push(edge);
+        }
+    }
+
+    let mut roots = vec![BTreeSet::<NodeId>::new(); pag.nodes.len()];
+    let mut overflow = vec![false; pag.nodes.len()];
+    loop {
+        let mut changed = false;
+        for (destination, producers) in incoming.iter().enumerate() {
+            for edge in producers {
+                match edge.kind {
+                    EdgeKind::AddrOf => {
+                        if roots[destination].len() < limit {
+                            changed |= roots[destination].insert(edge.src);
+                        } else if !roots[destination].contains(&edge.src) && !overflow[destination]
+                        {
+                            overflow[destination] = true;
+                            changed = true;
+                        }
+                    }
+                    EdgeKind::Assign | EdgeKind::Gep { .. } => {
+                        let source = edge.src.0 as usize;
+                        if overflow[source] && !overflow[destination] {
+                            overflow[destination] = true;
+                            changed = true;
+                        }
+                        let source_roots = roots[source].iter().copied().collect::<Vec<_>>();
+                        for root in source_roots {
+                            if roots[destination].len() < limit {
+                                changed |= roots[destination].insert(root);
+                            } else if !roots[destination].contains(&root) && !overflow[destination]
+                            {
+                                overflow[destination] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut complete = pag
+        .nodes
+        .iter()
+        .map(|node| node.label.rsplit(':').next() == Some("null"))
+        .collect::<Vec<_>>();
+    loop {
+        let mut changed = false;
+        for (destination, producers) in incoming.iter().enumerate() {
+            if complete[destination] || producers.is_empty() || overflow[destination] {
+                continue;
+            }
+            let all_supported_and_complete = producers.iter().all(|edge| match edge.kind {
+                EdgeKind::AddrOf => true,
+                EdgeKind::Assign | EdgeKind::Gep { .. } => complete[edge.src.0 as usize],
+                _ => false,
+            });
+            if all_supported_and_complete {
+                complete[destination] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    roots
+        .into_iter()
+        .zip(complete)
+        .map(|(roots, complete)| AllocationOrigins { roots, complete })
+        .collect()
 }
 
 fn receiver_payload_vertex(
@@ -5364,7 +5580,7 @@ mod tests {
             crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
         let exact_targets = BTreeMap::new();
         let confined_targets = BTreeSet::new();
-        let refiner = Refiner::new(
+        let mut refiner = Refiner::new(
             &pir,
             &pag,
             &classes,
@@ -5391,6 +5607,45 @@ mod tests {
             operations[&function("get")].returned_regions,
             BTreeSet::from([FieldLocation::Exact(16)])
         );
+
+        let node = |label: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == label)
+                .unwrap_or_else(|| panic!("missing PAG node {label}"))
+                .id
+        };
+        let origins = super::bounded_allocation_origins(&pag, 64);
+        let mixed = &origins[node("val:driver:%mixed").0 as usize];
+        assert!(mixed.complete);
+        assert_eq!(mixed.roots.len(), 2);
+        let loaded = &origins[node("val:driver:%loaded").0 as usize];
+        assert!(!loaded.complete, "loads must retain an unknown-origin bit");
+
+        let bounded = super::bounded_allocation_origins(&pag, 1);
+        let mixed = &bounded[node("val:driver:%mixed").0 as usize];
+        assert_eq!(mixed.roots.len(), 1);
+        assert!(
+            !mixed.complete,
+            "truncating an allocation-origin set must retain overflow"
+        );
+
+        assert!(
+            base.indirect_calls[0].unknown_callee,
+            "the context-insensitive container should carry the forged payload to the call"
+        );
+        refiner.receiver_payload_ops = operations;
+        refiner.receiver_payload_origins = super::bounded_allocation_origins(
+            &pag,
+            super::knobs::ANDERSEN_RECEIVER_PAYLOAD_ORIGIN_LIMIT,
+        );
+        refiner.build_scope();
+        let super::RefinerOutcome::Complete(output) = refiner.run(AndersenControls::default())
+        else {
+            panic!("receiver payload regression unexpectedly exhausted")
+        };
+        assert_eq!(output.indirect_calls[0].targets, vec!["target".to_string()]);
+        assert!(!output.indirect_calls[0].unknown_callee);
     }
 
     #[test]
@@ -5452,7 +5707,7 @@ mod tests {
                     let s = steens_by_key.get(a.callsite_key.as_str()).unwrap();
                     for t in &a.targets {
                         assert!(
-                            s.targets.contains(t),
+                            s.unknown_callee || s.targets.contains(t),
                             "{}: andersen target {} not in steens for {} (ledger break)",
                             path.display(),
                             t,

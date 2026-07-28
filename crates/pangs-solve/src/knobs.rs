@@ -65,6 +65,11 @@ pub(crate) const ANDERSEN_EXTERNAL_SOURCE_LIMIT: usize = 32;
 /// receiver-relative payload abstraction. Additional roots share an overflow context.
 pub(crate) const ANDERSEN_RECEIVER_PAYLOAD_CONTEXT_LIMIT: usize = 16;
 
+/// Maximum number of allocation origins retained for one receiver payload argument. Additional
+/// origins set the argument's incomplete bit and are represented by a receiver-local unknown
+/// region rather than structurally joining all omitted objects.
+pub(crate) const ANDERSEN_RECEIVER_PAYLOAD_ORIGIN_LIMIT: usize = 64;
+
 /// Per-query state/worklist cap for the experimental CFL query kernel.
 pub(crate) const CFL_QUERY_STATE_BUDGET: usize = 25_000;
 

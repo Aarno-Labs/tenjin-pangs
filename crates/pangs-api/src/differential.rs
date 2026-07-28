@@ -1,8 +1,8 @@
 //! Cross-stage differential ledger (`PLAN-M1.md` §M1.8, `PLAN-M1_lite_delta.md` §M1.8).
 //!
 //! Runs `conservative` → `steens` → `andersen` on one module and checks the relations the
-//! lite design guarantees: indirect-call targets narrow monotonically
-//! (`andersen ⊆ steens ⊆ conservative`), no *new* Ω/unknown facts appear as precision
+//! lite design guarantees: indirect-call targets narrow monotonically, treating an Ω/unknown
+//! edge as top over every concrete target, no *new* Ω/unknown facts appear as precision
 //! rises, and rewritable coverage only grows. A violation is a soundness or monotonicity
 //! bug, not a precision difference, so the CLI exits 3 on any.
 
@@ -113,6 +113,7 @@ pub fn run_differential(
         &steens.icall_targets,
         "conservative",
         &cons.icall_targets,
+        &cons.icall_unknown,
     );
     check_targets(
         &mut report,
@@ -120,6 +121,7 @@ pub fn run_differential(
         &ander.icall_targets,
         "steens",
         &steens.icall_targets,
+        &steens.icall_unknown,
     );
 
     // No new Ω/unknown facts as precision rises.
@@ -191,8 +193,12 @@ fn check_targets(
     fine_map: &BTreeMap<String, BTreeSet<String>>,
     coarse: &str,
     coarse_map: &BTreeMap<String, BTreeSet<String>>,
+    coarse_unknown: &BTreeSet<String>,
 ) {
     for (key, fine_set) in fine_map {
+        if coarse_unknown.contains(key) {
+            continue;
+        }
         let empty = BTreeSet::new();
         let coarse_set = coarse_map.get(key).unwrap_or(&empty);
         for t in fine_set {
@@ -238,7 +244,14 @@ mod tests {
         fine.insert("site@0".to_string(), set(&["a", "b"]));
         let mut coarse = BTreeMap::new();
         coarse.insert("site@0".to_string(), set(&["a"]));
-        check_targets(&mut report, "andersen", &fine, "steens", &coarse);
+        check_targets(
+            &mut report,
+            "andersen",
+            &fine,
+            "steens",
+            &coarse,
+            &BTreeSet::new(),
+        );
         assert_eq!(report.violations.len(), 1);
         assert!(report.violations[0].contains("target b not present"));
     }
@@ -250,7 +263,29 @@ mod tests {
         fine.insert("site@0".to_string(), set(&["a"]));
         let mut coarse = BTreeMap::new();
         coarse.insert("site@0".to_string(), set(&["a", "b"]));
-        check_targets(&mut report, "andersen", &fine, "steens", &coarse);
+        check_targets(
+            &mut report,
+            "andersen",
+            &fine,
+            "steens",
+            &coarse,
+            &BTreeSet::new(),
+        );
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn checker_treats_a_coarse_unknown_edge_as_target_top() {
+        let mut report = DifferentialReport::default();
+        let fine = BTreeMap::from([("site@0".to_string(), set(&["newly_named"]))]);
+        check_targets(
+            &mut report,
+            "andersen",
+            &fine,
+            "steens",
+            &BTreeMap::new(),
+            &set(&["site@0"]),
+        );
         assert!(report.is_clean());
     }
 }
