@@ -1015,6 +1015,21 @@ entry:
   ret i1 %cmp
 }
 
+define void @switch_compare(i8* %p) {
+entry:
+  %bits = ptrtoint i8* %p to i64
+  switch i64 %bits, label %ordinary [
+    i64 0, label %special
+    i64 -1, label %special
+  ]
+
+ordinary:
+  ret void
+
+special:
+  ret void
+}
+
 define i1 @unsupported_arithmetic(i8* %p) {
 entry:
   %bits = ptrtoint i8* %p to i64
@@ -1156,6 +1171,7 @@ entry:
     assert!(innocuous("direct_compare"));
     assert!(innocuous("arithmetic_compare"));
     assert!(innocuous("select_compare"));
+    assert!(innocuous("switch_compare"));
     assert!(!innocuous("unsupported_arithmetic"));
     assert!(!innocuous("externally_observed"));
     assert!(!innocuous("reified"));

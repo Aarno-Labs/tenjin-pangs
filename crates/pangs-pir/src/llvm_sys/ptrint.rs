@@ -3,7 +3,7 @@
 //! Integerizing a pointer is not itself evidence that the pointer representation escapes.  This
 //! module proves two deliberately narrow classes of harmless uses:
 //!
-//! * a closed integer computation whose only terminal operation is a comparison; and
+//! * a closed integer computation whose only terminal operation is a comparison or switch; and
 //! * a paired subtraction of two pointer representations.
 //!
 //! The second class relies on the supported-program contract documented in `DESIGN_lite.md`:
@@ -43,8 +43,11 @@ pub(super) unsafe fn classify(value: LLVMValueRef) -> PtrToIntUse {
 }
 
 /// Proves that a `ptrtoint` result remains inside the small integer domain whose only terminal
-/// operation is `icmp`. Unknown users fail closed. Cyclic phi graphs are accepted only when every
-/// edge leaving the cycle eventually reaches a supported comparison/arithmetic node.
+/// operation is `icmp` or `switch`. A switch is the optimized multi-way form of comparisons
+/// against constants (notably Clang's null/TOMBSTONE hashmap checks); it observes the integer only
+/// to select a control-flow successor. Unknown users fail closed. Cyclic phi graphs are accepted
+/// only when every edge leaving the cycle eventually reaches a supported
+/// comparison/arithmetic node.
 unsafe fn has_closed_comparison_uses(value: LLVMValueRef) -> bool {
     unsafe fn visit(
         value: LLVMValueRef,
@@ -68,7 +71,7 @@ unsafe fn has_closed_comparison_uses(value: LLVMValueRef) -> bool {
                 break;
             }
             closed = match LLVMGetInstructionOpcode(user) {
-                LLVMOpcode::LLVMICmp => true,
+                LLVMOpcode::LLVMICmp | LLVMOpcode::LLVMSwitch => true,
                 LLVMOpcode::LLVMAdd
                 | LLVMOpcode::LLVMSub
                 | LLVMOpcode::LLVMAnd
