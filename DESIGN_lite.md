@@ -37,12 +37,13 @@ recoverable later behind a stable interface (§6 below).
                  └──────────────┬─────────────────────────────────────────────┘
                                 ▼
                  ┌────────────────────────────────────────────────────────────┐
-                 │  C'. Steensgaard — partitions + first escape bits ONLY     │
+                 │  C'. Steensgaard — base answer + first escape bits         │
                  └──────────────┬─────────────────────────────────────────────┘
                                 ▼
                  ┌────────────────────────────────────────────────────────────┐
                  │  D'. Partition-scoped Andersen (PIP internals), exhaustive │
-                 │      over admitted interesting partitions; joint CG LFP    │
+                 │      prepartition graph · directional SCC admission        │
+                 │      receiver payloads + bounded origins · joint CG LFP    │
                  └──────────────┬─────────────────────────────────────────────┘
                                 ▼
                  ┌────────────────────────────────────────────────────────────┐
@@ -54,7 +55,11 @@ No authoritative tier E. Experimental CFL query prototypes exist behind the quer
 but they do not feed analysis, disposition, or transformation artifacts. No certificate
 checks run between production phases: B2's exact answers take precedence, everything
 else reads D's solution, and FSA intersection is applied once as a final
-soundness-preserving filter on icall results.
+soundness-preserving filter on icall results. Receiver-allocation-relative payload
+summaries and their bounded allocation-origin analysis are currently opt-in D'
+extensions (`PANGS_ANDERSEN_RECEIVER_PAYLOADS`); they are described below because their
+object domain, fallback semantics, and admission dependencies are part of the intended
+portable design even while corpus validation continues.
 
 ## 2. Phase details (deltas from `DESIGN.md` §4)
 
@@ -112,12 +117,13 @@ initialization may therefore be stationary, while thread writers, signal reachab
 recursion, `atexit`, unresolved effects, or a post-publication write fail closed. This
 certificate is fact input to disposition, not a terminal strategy decision.
 
-### C'. Steensgaard, demoted to partitioner
+### C'. Steensgaard, demoted to base solver
 A sequential numeric-ID union-find with type/signature compatibility filtering. Its
-*only* jobs are (a) **Kahlon partitions** to scope D' (the reason exhaustive
-field-sensitive Andersen doesn't OOM — CORAL's baselines did, at 128 GB, on
-OpenSSL-sized inputs), (b) the first wave of escape bits, and (c) the complete base-tier
-answer used wherever D' cannot refine. It settles no query by certificate.
+*only* jobs are (a) a conservative structural summary used to bound D', (b) the first
+wave of escape bits, and (c) the complete base-tier answer used wherever D' cannot
+refine. It settles no query by certificate. D' no longer has to use a Steensgaard
+equivalence class verbatim as its admission unit: it builds an independent constraint
+prepartition graph and uses Steensgaard at cut boundaries.
 
 Its partition boundary is allocation-field aware when the fixed PAG independently proves
 an address root. Constant GEP offsets get distinct synthetic storage classes. LLVM
@@ -130,7 +136,9 @@ Synthetic global-field
 classes carry their owning-global membership so they seed interesting partitions and
 contribute to aggregate escape/write facts. Andersen consumes the same root-relative
 address proof to seed a field directly at a partition boundary instead of requiring the
-base-address partition to be co-admitted.
+base-address partition to be co-admitted. This allocation-relative vocabulary is derived
+from PAG operations and byte offsets, not LLVM pointee types, so it remains compatible
+with an opaque-pointer front end.
 
 ### D'. The one real solver
 Partition-scoped, inclusion-based, PIP internals (implicit-Ω constraint forms and
@@ -138,41 +146,112 @@ per-variable points-to sets). Every interesting partition (one reachable from
 client-relevant pointers: icall operands, mutable globals and what they reach, or
 escape-relevant objects) is considered without certificate-residue routing; the admission
 policy below decides whether Andersen or the Steensgaard fallback supplies its answer.
-The current implementation runs admitted partitions in one sequential solve;
-partition-level parallelism remains a clean future seam because Kahlon partitions are
-flow-closed. The implementation keeps the optimization surface narrow, but profiles of
-dense promoted partitions
-justified two general mechanisms: semi-naive constraint joins and threshold-triggered
-collapse of strongly connected copy variables.
+The current implementation runs admitted regions in one sequential solve. The
+implementation keeps the optimization surface narrow, but profiles of dense promoted
+regions justified two general mechanisms: semi-naive constraint joins and
+threshold-triggered collapse of strongly connected copy variables.
 
 **Partition admission and fallback:**
 
-Steensgaard supplies the complete base-tier answer for every partition. An interesting
-partition is admitted to Andersen when its quadratic cost proxy fits the configured
-budget. An oversize partition remains at its Steensgaard answer, and the result records
-the number and largest size of such fallbacks. Provenance separation also permits a
-bounded promotion: a sparse, medium-sized partition that exceeds the old cost proxy may
-still be admitted when its node and edge counts fit fixed caps and it contains no
-integer-forged/universal external source. Larger or forged partitions retain the ordinary
-fallback. Complete Andersen facts overwrite only admitted partitions, so omission by the
-refiner is conservative.
+Steensgaard supplies the complete base-tier answer everywhere. D' independently builds a
+prepartition graph from the actual inclusion constraints, with synthetic vertices for
+allocation-relative fields. Weak components are the ordinary admission unit. An
+interesting component is admitted to Andersen when its quadratic cost proxy fits the
+configured budget. An oversize component remains at its Steensgaard answer, and the
+result records the number and largest size of such fallbacks. Provenance separation also
+permits a bounded promotion: a sparse, medium-sized component that exceeds the old cost
+proxy may still be admitted when its node and edge counts fit fixed caps and it contains
+no integer-forged/universal external source.
+
+For an indirect call stranded in an oversize weak component, D' may instead admit a
+bounded, source-closed slice of the directed condensation graph. It starts at the call
+operand's SCC and closes over predecessor SCCs, because every excluded predecessor would
+be a missing producer. Outgoing dependencies may cross the cut: their consumers retain
+the complete Steensgaard summary when refined and base facts are merged. If the closed
+slice exceeds its budget or contains a disallowed universal source, the whole site keeps
+the ordinary fallback. Complete Andersen facts overwrite only admitted nodes, so omission
+by the refiner is conservative.
+
+**Receiver-allocation-relative payload summaries (experimental):**
+
+Many generic containers are context-insensitive precisely at the interface that stores
+and retrieves pointer payloads. D' recognizes a deliberately narrow structural pattern
+without using function names or LLVM aggregate types:
+
+- the first pointer parameter acts as a receiver;
+- another pointer parameter can flow to a store through receiver-reachable memory; or
+- a receiver-reachable load can flow to the function's pointer return.
+
+The same analysis lifts these operations through thin direct wrappers. A wrapper that
+returns the direct callee result inherits its regions; one that dereferences that result
+before returning a nested payload records its own load location instead. A family is
+enabled only when at least one member is observed on two independently certified receiver
+allocation roots, which avoids treating every method-like function as a context family.
+
+For a summarized direct call, the payload cell is keyed by
+`(receiver allocation root, FieldLocation)`. Thus two receiver allocations do not share a
+generic value slot, and constant-offset members such as a map entry's key and value remain
+distinct. D' replaces only the matching payload actual/formal and return/result bindings;
+receiver, key, and control bindings remain context-insensitive. A call is summarized only
+when its receiver has one independently exact allocation root selected within the
+16-context limit. Uncertified receivers, unselected roots, and excess contexts retain the
+ordinary unsummarized function body. This is a bounded object-sensitive summary for a
+common container idiom, not general call-string or object sensitivity.
+
+Receiver payload cells are also vertices in the prepartition graph. Store-side
+dependencies flow into the cell and loads flow out. Allocation-field initializer
+components needed to populate a payload are marked interesting and considered for
+admission under their own budgets; they are not weakly unioned into the call operand's
+megacomponent merely because they support the result.
+
+**Bounded allocation-origin certification (experimental):**
+
+Payload stores need a more discriminating seed than the carrier's Steensgaard class.
+An independent positive dataflow analysis computes, for every PAG value,
+`{ allocation roots, complete }`. `AddrOf` introduces a root; address-preserving
+assignment (including phi/select and flattened direct call/return bindings) and GEP copy
+roots forward. Loads and unsupported producers prevent completeness. Null is the complete
+empty set. At most 64 roots are retained per value; seeing another root sets
+`complete = false` rather than silently truncating the abstract value.
+
+A complete row seeds exactly its named allocation roots into the receiver-relative
+payload cell. An incomplete row seeds all retained positive roots plus a distinct
+receiver-payload external region. The unknown bit therefore remains sound without
+copying the carrier's entire contaminated Steensgaard points-to class into every
+receiver context. The external token propagates through normal Andersen constraints and
+is interpreted as unknown at consumers; it never certifies a finite target set.
+
+The abstract domain is separable from receiver summarization: it is implemented as an
+independent PAG pass and can serve other clients. The current option nevertheless wires
+it only into receiver summaries and exposes no separate origin-analysis flag. Receiver
+summarization supplies its current precision payoff by giving those facts a contextual
+destination. Conversely, receiver summaries remain sound without a complete origin proof
+because incomplete or overflowing rows explicitly carry the local unknown region.
 
 **Call graph via monotone on-the-fly discovery:**
 
 1. Build one persistent solve from base PAG constraints, Ω seeds, and pinned B1/B2
    exact bindings.
 2. Propagate to quiescence, then discover function objects reaching each non-exact
-   icall operand within its `FSA ∩ Steensgaard` envelope.
+   icall operand within its FSA-compatible coarse envelope.
 3. Install each newly grounded argument/parameter and return/result binding once, using
    copy-edge delta propagation to seed the edge from the source's existing facts.
 4. Resume the same solve until both propagation and target discovery are quiescent.
 
-Unknown-origin operands retain conservative Steensgaard fallback provenance and activate
-the remaining envelope when the origin may denote client code. A resource limit cannot
-emit a partial ascending solve: the entire Andersen tier falls back to the complete
-Steensgaard result, while independently proven exact callsite answers survive. The old
-stateless descending construction remains only as a temporary differential oracle during
-the migration (`20260723_MONOTONE_OTF_CG_PLAN.md`).
+The target domain is a small lattice, not just a set: a coarse `unknown_callee` is top
+over all remaining address-taken, signature-compatible functions, even when its
+diagnostic `targets` list does not enumerate them. Ordinarily that top value activates
+the remaining conservative envelope. With receiver payload summaries enabled, discovery
+first solves the contextual operand: named function objects activate only their
+corresponding targets, while a receiver-payload or other external region activates the
+full envelope and preserves unknown fallback. This permits a contextual solution to
+replace a coarse unknown with a finite named set without violating the refinement order.
+
+A resource limit cannot emit a partial ascending solve: the entire Andersen tier falls
+back to the complete Steensgaard result, while independently proven exact callsite
+answers survive. The old stateless descending construction remains only as a temporary
+differential oracle during the migration
+(`20260723_MONOTONE_OTF_CG_PLAN.md`).
 
 **Finite field domain:**
 
@@ -187,7 +266,8 @@ location for that root; a direct whole-object access is likewise bridged to that
 Nested GEPs canonicalize to a root-relative exact offset or lane only when that location
 occurs in the fixed PAG's finite location vocabulary. Other nested or recursive locations
 route to the root's unknown summary rather than creating an unbounded field-of-field
-chain.
+chain. Receiver payload summaries reuse this same `Exact`/`Lane`/`Unknown`
+`FieldLocation` domain; they do not introduce a second layout model.
 
 C' uses the same exact/lane/unknown distinction for independently rooted GEPs. Its classes
 are intentionally coarser than D's inclusion sets, but field contents no longer merge
@@ -285,17 +365,25 @@ demand queries: golden-file the whole solution on small inputs, diff across chan
 
 The transformation-facing result is guarded by checks at several independent levels:
 
-- Debug subset tripwires require `Andersen ⊆ Steensgaard ⊆ FSA` at every narrowed
-  indirect-call site; exact B2 answers are checked against their envelopes separately.
+- Debug refinement tripwires compare indirect-call results in the target lattice.
+  With a finite coarse result they require
+  `Andersen.targets ⊆ Steensgaard.targets ⊆ FSA`; with coarse `unknown_callee`,
+  Steensgaard is top and a finite Andersen target absent from its diagnostic target list
+  is legal. Exact B2 answers are checked against their envelopes separately.
 - The temporary subtractive construction can run as a differential oracle for the
   monotone additive call-graph fixed point. Any additive target outside the descending
-  result is a defect.
+  result is a defect unless the descending row was unknown, in which case its omitted
+  named targets are represented by top.
 - Injected exhaustion tests abandon propagation, discovery, and activation at their
   quiet boundaries and require indirect calls, node resolutions, and global points-to
   facts to revert together. Independently proven exact sites remain exact.
 - The `differential` command compares conservative, Steensgaard, and Andersen artifacts;
   emitted schemas are validated; LLVM callsite instrumentation plus `check-traces`
   detects dynamically observed callees absent from the static envelope.
+- The synthetic receiver-container regression checks field matching, receiver separation,
+  complete multi-origin rows, cap overflow, incomplete-origin propagation, and refinement
+  of a coarse unknown call to a named target. Wrapper lifting, nested projections, and
+  context-limit fallback belong in the same suite as the experiment graduates.
 
 These checks are not precision certificates between production tiers. They are
 soundness-regression tripwires around the one authoritative lite pipeline.
@@ -311,7 +399,9 @@ soundness-regression tripwires around the one authoritative lite pipeline.
 
 **Not cut, anywhere:** Ω boundary model, int↔ptr provenance rules, violation
 detection → Ω-taint, FSA envelope, KELP safe-fallback discipline, byte-offset field
-sensitivity. Soundness is the hard constraint and is untouched.
+sensitivity. Bounded domains always pair retained positive facts with an explicit
+incomplete/unknown bit and route overflow to a conservative fallback. Soundness is the
+hard constraint and is untouched.
 
 `ptrtoint` validation is use-sensitive and fails closed. A raw integer address is exempt from the
 Ω seed only when its complete SSA use graph terminates in supported comparisons, or when it is one
@@ -377,9 +467,12 @@ conservative until a target-specific synthetic-copy representation is available.
 
 ## 4. The residual risk, named
 
-The cut precision is tier-E context-sensitivity, which CORAL's finding III says
-parameter-passed function pointers need. Two reasons to expect a small coverage hit
-*for this client*:
+The principal cut precision remains general tier-E context-sensitivity, which CORAL's
+finding III says parameter-passed function pointers need. Receiver-relative payload
+summaries recover one frequent object-sensitive container pattern, but do not distinguish
+arbitrary calls, receiver state not expressible in the finite field domain, recursion,
+or receivers without a certified allocation root. Two reasons to expect a small
+remaining coverage hit *for this client*:
 
 1. The canonical parameter-passed cases — qsort comparators, signal handlers,
    pthread_create thunks — pass through **external code and are Ω-frozen regardless of
@@ -389,9 +482,33 @@ parameter-passed function pointers need. Two reasons to expect a small coverage 
    B1-InitVal + array-carve-out level, which lite keeps.
 
 The genuine exposure is `DESIGN.md` §11.4's mega-component risk: if the imprecise
-residue merges load-bearing components, coverage collapses. This is empirical and cheap
-to measure through corpus coverage, component/rewrite-slice size, and the provenance of
-the false edges that are load-bearing.
+residue merges load-bearing components, coverage collapses. Independent prepartitioning
+and source-closed SCC slices reduce how much of such a component must be solved.
+Receiver-relative payloads remove some generic-container bridges, while bounded origins
+avoid importing the carrier's entire Steensgaard class through each bridge. Their risks
+are precision loss at the explicit context/origin caps and additional work to admit
+allocation-field support components; both are visible in profiling and fail closed.
+
+On `exe-chibicc-O1.bc`, enabling receiver payloads plus bounded origins currently changes
+the dominant admitted region and the formerly unknown macro-handler call as follows:
+
+| Metric | Baseline | Extension enabled |
+|---|---:|---:|
+| Megapartition vertices | 10,284 | 9,465 |
+| Megapartition edges | 12,290 | 11,604 |
+| Quadratic cost proxy | 232,151,016 | 199,418,085 |
+| Andersen propagation steps | ~3,632 | ~4,754 |
+| Indirect calls resolved by Andersen | 0 | 1 |
+| Unknown indirect calls | 1 | 0 |
+
+The recovered call in `preprocess2` has exactly the five macro handlers
+`base_file_macro`, `counter_macro`, `file_macro`, `line_macro`, and
+`timestamp_macro`. Its returned `Macro *` set contains the 50 named macro allocations,
+and loading `Macro.handler` narrows those to the five functions without an external
+region. The size reduction is real but not free: same-process measurements showed about
+15% wall-time and 23% solve-time overhead on this input. The feature therefore remains
+opt-in until broader-corpus measurements establish whether the call-graph and component
+precision justify that cost.
 
 ## 5. Historical milestones and current status
 
@@ -405,6 +522,11 @@ the false edges that are load-bearing.
 3. **M3 — measure and decide (lite selected):** corpus measurements kept Andersen as
    the authoritative final tier. CFL/MHS query kernels were implemented as experimental
    diagnostics and then deliberately left disconnected from production results.
+4. **M4 — structural megapartition refinements (experimental):** independent
+   allocation-relative prepartitioning, directional source-closed SCC admission, and
+   receiver-allocation payload summaries with bounded allocation origins are implemented.
+   The first two are general admission machinery; the receiver/origin pair is opt-in
+   while its cross-corpus precision/runtime tradeoff is evaluated.
 
 ## 6. Upgrade path (why the simplification is reversible)
 
@@ -424,6 +546,11 @@ Nothing in lite forecloses the full design:
   refined.
 - Typed heap clones are an additive object-domain change: clones join the PAG alongside
   site objects (the full design's conservative mode), invisible to the solver loop.
+- Receiver payload inference depends only on PAG value flow, root-relative byte
+  locations, and function signatures. It does not inspect typed-pointer element types,
+  so an LLVM 15+ front end can preserve the design by emitting the same finite layout
+  vocabulary from DataLayout plus operation metadata. The bounded-origin pass is already
+  pointer-type agnostic.
 
 **Future upgrade gates:**
 - Localization coverage on Vim/PHP acceptable to the client → ship lite, stop.
@@ -431,7 +558,8 @@ Nothing in lite forecloses the full design:
   multi-type allocation sites) → add typed clones, not tier E.
 - Coverage limited by *context-insensitive icall residue merging components*
   (diagnosable: load-bearing FP edges trace to parameter-passed fn ptrs that are not
-  Ω-frozen) → build tier E as the refinement pass, i.e., graduate to `DESIGN.md`.
+  Ω-frozen) → first determine whether the flow matches the receiver-payload abstraction;
+  otherwise build tier E as the refinement pass, i.e., graduate to `DESIGN.md`.
 
 The provenance tags (§2F) are what make these diagnoses mechanical rather than
 forensic: every coverage-blocking edge names the phase that produced it.
