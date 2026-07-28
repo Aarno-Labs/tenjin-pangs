@@ -1,0 +1,109 @@
+{
+  "module": "m1_4b.receiver_payload_inference",
+  "functions": [
+    {
+      "key": "put",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [
+          { "class": "integer" },
+          { "class": "integer" },
+          { "class": "integer" }
+        ],
+        "cc": "ccc"
+      },
+      "param_names": ["%map", "%key", "%value"],
+      "body": [
+        { "kind": "gep", "dest": "%payload", "base": "%map", "byte_off": 16 },
+        { "kind": "store", "address": "%payload", "value": "%value" }
+      ]
+    },
+    {
+      "key": "get",
+      "sig": {
+        "ret": { "class": "integer" },
+        "params": [
+          { "class": "integer" },
+          { "class": "integer" }
+        ],
+        "cc": "ccc"
+      },
+      "param_names": ["%map", "%key"],
+      "body": [
+        { "kind": "gep", "dest": "%payload", "base": "%map", "byte_off": 16 },
+        { "kind": "load", "dest": "%value", "address": "%payload" },
+        { "kind": "return", "value": "%value" }
+      ]
+    },
+    {
+      "key": "driver",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        {
+          "kind": "call_direct",
+          "callee": "put",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": [
+              { "class": "integer" },
+              { "class": "integer" },
+              { "class": "integer" }
+            ],
+            "cc": "ccc"
+          },
+          "args": ["@map_a", "@key_a", "@value_a"]
+        },
+        {
+          "kind": "call_direct",
+          "callee": "put",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": [
+              { "class": "integer" },
+              { "class": "integer" },
+              { "class": "integer" }
+            ],
+            "cc": "ccc"
+          },
+          "args": ["@map_b", "@key_b", "@value_b"]
+        },
+        {
+          "kind": "call_direct",
+          "callee": "get",
+          "sig": {
+            "ret": { "class": "integer" },
+            "params": [
+              { "class": "integer" },
+              { "class": "integer" }
+            ],
+            "cc": "ccc"
+          },
+          "args": ["@map_a", "@key_a"],
+          "dest": "%a"
+        },
+        {
+          "kind": "call_direct",
+          "callee": "get",
+          "sig": {
+            "ret": { "class": "integer" },
+            "params": [
+              { "class": "integer" },
+              { "class": "integer" }
+            ],
+            "cc": "ccc"
+          },
+          "args": ["@map_b", "@key_b"],
+          "dest": "%b"
+        }
+      ]
+    }
+  ],
+  "globals": [
+    { "key": "map_a", "mutable": true, "exported": false },
+    { "key": "map_b", "mutable": true, "exported": false },
+    { "key": "key_a", "mutable": false, "exported": false },
+    { "key": "key_b", "mutable": false, "exported": false },
+    { "key": "value_a", "mutable": true, "exported": false },
+    { "key": "value_b", "mutable": true, "exported": false }
+  ]
+}

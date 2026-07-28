@@ -61,6 +61,10 @@ pub(crate) const PARTITION_PROFILE_OCCUPANT_SAMPLE_LIMIT: usize = 6;
 /// Maximum number of external-source explanations retained per node.
 pub(crate) const ANDERSEN_EXTERNAL_SOURCE_LIMIT: usize = 32;
 
+/// Maximum number of certified receiver allocations materialized by the experimental
+/// receiver-relative payload abstraction. Additional roots share an overflow context.
+pub(crate) const ANDERSEN_RECEIVER_PAYLOAD_CONTEXT_LIMIT: usize = 16;
+
 /// Per-query state/worklist cap for the experimental CFL query kernel.
 pub(crate) const CFL_QUERY_STATE_BUDGET: usize = 25_000;
 
@@ -103,6 +107,11 @@ pub(crate) const ENV_ANDERSEN_DIFFERENTIAL_SUBTRACTIVE: &str =
 
 /// Selects a node label for detailed Andersen provenance explanations.
 pub(crate) const ENV_ANDERSEN_EXPLAIN_NODE: &str = "PANGS_ANDERSEN_EXPLAIN_NODE";
+
+/// Enables the experimental receiver-allocation-relative payload summaries. The experiment
+/// infers container-like first-parameter receivers and separates their pointer payload by
+/// independently certified allocation root.
+pub(crate) const ENV_ANDERSEN_RECEIVER_PAYLOADS: &str = "PANGS_ANDERSEN_RECEIVER_PAYLOADS";
 
 /// Enables partition admission profiling when present.
 pub(crate) const ENV_PARTITION_PROFILE: &str = "PANGS_PARTITION_PROFILE";

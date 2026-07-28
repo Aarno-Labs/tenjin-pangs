@@ -528,6 +528,15 @@ impl ExternalRegion {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct ReceiverPayloadOp {
+    /// Pointer parameters (other than the receiver) whose values may be stored in receiver
+    /// reachable memory, together with the allocation-relative fields they populate.
+    stored_params: BTreeMap<usize, BTreeSet<FieldLocation>>,
+    /// Allocation-relative receiver fields from which the function may return a pointer.
+    returned_regions: BTreeSet<FieldLocation>,
+}
+
 struct Refiner<'a> {
     pir: &'a Pir,
     pag: &'a Pag,
@@ -552,6 +561,8 @@ struct Refiner<'a> {
     /// Independently certified allocation-relative addresses used to cut GEP dependencies at
     /// field-aware partition boundaries.
     exact_addresses: Vec<Option<ExactAddress>>,
+    /// Experimental, automatically inferred receiver-relative container operations.
+    receiver_payload_ops: HashMap<usize, ReceiverPayloadOp>,
 
     /// Union-find for the independent prepartition constraint graph. PAG nodes occupy
     /// `[0, n_base)`; allocation-relative memory regions are synthetic vertices above it.
@@ -657,6 +668,7 @@ impl<'a> Refiner<'a> {
             param_nodes,
             ret_nodes,
             exact_addresses: exact_allocation_addresses(pag),
+            receiver_payload_ops: HashMap::new(),
             ap_parent: Vec::new(),
             prepartition_regions: Vec::new(),
             prepartition_edge_vertices: Vec::new(),
@@ -669,6 +681,9 @@ impl<'a> Refiner<'a> {
             admission_structures: Vec::new(),
             materialize_global_points_to: false,
         };
+        if receiver_payloads_enabled() {
+            refiner.receiver_payload_ops = refiner.infer_receiver_payload_ops();
+        }
         refiner.build_scope();
         refiner
     }
@@ -681,6 +696,271 @@ impl<'a> Refiner<'a> {
 
     fn pointer_transfer(&self, src: NodeId, dst: NodeId) -> bool {
         self.node_may_carry_pointer(src) && self.node_may_carry_pointer(dst)
+    }
+
+    fn receiver_payload_location(&self, address: NodeId) -> FieldLocation {
+        self.exact_addresses[address.0 as usize]
+            .map(|exact| exact.location)
+            .or_else(|| {
+                self.pag.edges.iter().find_map(|edge| {
+                    (edge.dst == address)
+                        .then(|| match edge.kind {
+                            EdgeKind::Gep { byte_off, lane } => {
+                                Some(FieldLocation::from_gep(byte_off, lane))
+                            }
+                            _ => None,
+                        })
+                        .flatten()
+                })
+            })
+            .unwrap_or(FieldLocation::Unknown)
+    }
+
+    /// Infer a deliberately small container interface without relying on source names or LLVM
+    /// aggregate types. The first pointer parameter is the receiver. A pointer parameter is a
+    /// payload input when local value flow can carry it to a store through receiver-reachable
+    /// memory; a pointer return is a payload output when a receiver-reachable load can reach the
+    /// return node. Thin direct wrappers are recognized by the same graph because their
+    /// actual-to-formal and return-to-result assignments are already explicit PAG edges.
+    ///
+    /// To avoid turning every object method into a context family, an operation is enabled only
+    /// in a connected family with at least one member called on two independently certified
+    /// receiver allocation roots.
+    fn infer_receiver_payload_ops(&self) -> HashMap<usize, ReceiverPayloadOp> {
+        let mut inferred = HashMap::<usize, ReceiverPayloadOp>::new();
+        let mut local_adjacency = HashMap::<usize, Vec<Vec<usize>>>::new();
+        for (function, pir_function) in self.pir.functions.iter().enumerate() {
+            if pir_function.external || !self.param_nodes.contains_key(&(function, 0)) {
+                continue;
+            }
+            let receiver = self.param_nodes[&(function, 0)];
+            if !self.node_may_carry_pointer(receiver) {
+                continue;
+            }
+            let mut adjacency = vec![Vec::new(); self.n_base];
+            for edge in &self.pag.edges {
+                if !matches!(
+                    &edge.owner,
+                    pangs_pag::Owner::Function(owner) if owner == &pir_function.key
+                ) {
+                    continue;
+                }
+                match edge.kind {
+                    EdgeKind::Assign | EdgeKind::Load | EdgeKind::Gep { .. } => {
+                        if self.pointer_transfer(edge.src, edge.dst) {
+                            adjacency[edge.src.0 as usize].push(edge.dst.0 as usize);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let receiver_reachable = graph_reachable(receiver.0 as usize, &adjacency);
+            let mut operation = ReceiverPayloadOp::default();
+            for edge in &self.pag.edges {
+                if !matches!(
+                    &edge.owner,
+                    pangs_pag::Owner::Function(owner) if owner == &pir_function.key
+                ) {
+                    continue;
+                }
+                if edge.kind == EdgeKind::Store
+                    && receiver_reachable.contains(&(edge.dst.0 as usize))
+                {
+                    for index in 1..pir_function.sig.params.len() {
+                        let Some(&parameter) = self.param_nodes.get(&(function, index)) else {
+                            continue;
+                        };
+                        if self.node_may_carry_pointer(parameter)
+                            && graph_reachable(parameter.0 as usize, &adjacency)
+                                .contains(&(edge.src.0 as usize))
+                        {
+                            operation
+                                .stored_params
+                                .entry(index)
+                                .or_default()
+                                .insert(self.receiver_payload_location(edge.dst));
+                        }
+                    }
+                }
+                if edge.kind == EdgeKind::Load
+                    && receiver_reachable.contains(&(edge.src.0 as usize))
+                {
+                    if let Some(&ret) = self.ret_nodes.get(&function) {
+                        if graph_reachable(edge.dst.0 as usize, &adjacency)
+                            .contains(&(ret.0 as usize))
+                        {
+                            operation
+                                .returned_regions
+                                .insert(self.receiver_payload_location(edge.src));
+                        }
+                    }
+                }
+            }
+            if !operation.stored_params.is_empty() || !operation.returned_regions.is_empty() {
+                inferred.insert(function, operation);
+            }
+            local_adjacency.insert(function, adjacency);
+        }
+
+        // Lift leaf behavior through thin wrappers. This is a small monotone summary fixpoint:
+        // if caller.receiver reaches callee.receiver, translate the callee's payload positions
+        // back to caller parameters and translate a payload return through the call result.
+        loop {
+            let mut changed = false;
+            for callsite in &self.pag.callsites {
+                if callsite.kind != CallKind::Direct {
+                    continue;
+                }
+                let Some(&caller) = self.func_index.get(&callsite.caller) else {
+                    continue;
+                };
+                let Some(callee) = callsite
+                    .callee
+                    .as_ref()
+                    .and_then(|callee| self.func_index.get(callee))
+                    .copied()
+                else {
+                    continue;
+                };
+                let Some(callee_operation) = inferred.get(&callee).cloned() else {
+                    continue;
+                };
+                let Some(adjacency) = local_adjacency.get(&caller) else {
+                    continue;
+                };
+                let Some(&caller_receiver) = self.param_nodes.get(&(caller, 0)) else {
+                    continue;
+                };
+                let Some(&callee_receiver_actual) = callsite.args.first() else {
+                    continue;
+                };
+                if !graph_reachable(caller_receiver.0 as usize, adjacency)
+                    .contains(&(callee_receiver_actual.0 as usize))
+                {
+                    continue;
+                }
+
+                let caller_function = &self.pir.functions[caller];
+                let mut lifted = inferred.get(&caller).cloned().unwrap_or_default();
+                for (callee_index, regions) in callee_operation.stored_params {
+                    let Some(&actual) = callsite.args.get(callee_index) else {
+                        continue;
+                    };
+                    for caller_index in 1..caller_function.sig.params.len() {
+                        let Some(&parameter) = self.param_nodes.get(&(caller, caller_index)) else {
+                            continue;
+                        };
+                        if self.node_may_carry_pointer(parameter)
+                            && graph_reachable(parameter.0 as usize, adjacency)
+                                .contains(&(actual.0 as usize))
+                        {
+                            let target = lifted.stored_params.entry(caller_index).or_default();
+                            let old_len = target.len();
+                            target.extend(regions.iter().copied());
+                            changed |= target.len() != old_len;
+                        }
+                    }
+                }
+                if !callee_operation.returned_regions.is_empty() {
+                    if let (Some(result), Some(&ret)) =
+                        (callsite.result, self.ret_nodes.get(&caller))
+                    {
+                        if graph_reachable(result.0 as usize, adjacency).contains(&(ret.0 as usize))
+                        {
+                            let old_len = lifted.returned_regions.len();
+                            lifted
+                                .returned_regions
+                                .extend(callee_operation.returned_regions.iter().copied());
+                            changed |= lifted.returned_regions.len() != old_len;
+                        }
+                    }
+                }
+                if !lifted.stored_params.is_empty() || !lifted.returned_regions.is_empty() {
+                    inferred.insert(caller, lifted);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Connect inferred operations through direct wrapper/helper calls.
+        let mut family_edges = HashMap::<usize, HashSet<usize>>::new();
+        for callsite in &self.pag.callsites {
+            if callsite.kind != CallKind::Direct {
+                continue;
+            }
+            let Some(&caller) = self.func_index.get(&callsite.caller) else {
+                continue;
+            };
+            let Some(callee) = callsite
+                .callee
+                .as_ref()
+                .and_then(|callee| self.func_index.get(callee))
+                .copied()
+            else {
+                continue;
+            };
+            if inferred.contains_key(&caller) && inferred.contains_key(&callee) {
+                family_edges.entry(caller).or_default().insert(callee);
+                family_edges.entry(callee).or_default().insert(caller);
+            }
+        }
+
+        let mut seed_functions = HashSet::new();
+        for (&function, operation) in &inferred {
+            let roots =
+                self.pag
+                    .callsites
+                    .iter()
+                    .filter(|callsite| {
+                        callsite.kind == CallKind::Direct
+                            && callsite.callee.as_deref().is_some_and(|callee| {
+                                self.func_index.get(callee) == Some(&function)
+                            })
+                    })
+                    .filter_map(|callsite| callsite.args.first())
+                    .filter_map(|receiver| self.exact_addresses[receiver.0 as usize])
+                    .map(|address| address.root)
+                    .collect::<HashSet<_>>();
+            if roots.len() >= 2
+                && (!operation.stored_params.is_empty() || !operation.returned_regions.is_empty())
+            {
+                seed_functions.insert(function);
+            }
+        }
+
+        let mut enabled = seed_functions.clone();
+        let mut stack = seed_functions.into_iter().collect::<Vec<_>>();
+        while let Some(function) = stack.pop() {
+            for &neighbor in family_edges.get(&function).into_iter().flatten() {
+                if enabled.insert(neighbor) {
+                    stack.push(neighbor);
+                }
+            }
+        }
+        inferred.retain(|function, _| enabled.contains(function));
+
+        if andersen_profile_enabled() {
+            let mut descriptions = inferred
+                .iter()
+                .map(|(&function, operation)| {
+                    format!(
+                        "{}(store={:?},load={})",
+                        self.pir.functions[function].key,
+                        operation.stored_params,
+                        !operation.returned_regions.is_empty()
+                    )
+                })
+                .collect::<Vec<_>>();
+            descriptions.sort();
+            eprintln!(
+                "pangs receiver payloads: inferred={} operations={descriptions:?}",
+                descriptions.len()
+            );
+        }
+        inferred
     }
 
     // ----- partition extraction + interesting-set + oversize guard ----------------------
@@ -888,8 +1168,12 @@ impl<'a> Refiner<'a> {
         self.prepartition_edge_vertices = vec![None; self.pag.edges.len()];
         self.prepartition_flow_edges.clear();
         let mut regions = HashMap::new();
+        let suppressed_payload_bindings = self.receiver_payload_binding_edges();
 
         for (edge_index, edge) in self.pag.edges.iter().enumerate() {
+            if suppressed_payload_bindings.contains(&(edge.src, edge.dst)) {
+                continue;
+            }
             let src = edge.src.0 as usize;
             let dst = edge.dst.0 as usize;
             let endpoints = match edge.kind {
@@ -962,6 +1246,82 @@ impl<'a> Refiner<'a> {
                 }
             }
             self.prepartition_edge_vertices[edge_index] = endpoints;
+        }
+
+        // Receiver-relative payload cells participate in admission, not just in the final
+        // inclusion solve. Otherwise a source-closed slice could admit a get while excluding
+        // the puts which populate its contextual payload.
+        let selected_roots = self.receiver_payload_context_roots();
+        let payload_calls = self
+            .pag
+            .callsites
+            .iter()
+            .filter_map(|callsite| {
+                self.receiver_payload_summary_call(callsite, &selected_roots)
+                    .map(|(operation, root)| {
+                        (
+                            operation.clone(),
+                            root,
+                            callsite.args.clone(),
+                            callsite.result,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut payload_vertices = HashMap::<(NodeId, FieldLocation), usize>::new();
+        for (operation, root, arguments, result) in payload_calls {
+            for (&index, locations) in &operation.stored_params {
+                if let Some(argument) = arguments.get(index) {
+                    for &location in locations {
+                        let payload = receiver_payload_vertex(
+                            &mut self.ap_parent,
+                            &mut self.prepartition_regions,
+                            &mut payload_vertices,
+                            root,
+                            location,
+                        );
+                        let argument = argument.0 as usize;
+                        self.ap_union(argument, payload);
+                        self.prepartition_flow_edges.push((argument, payload));
+                        // If this payload is itself a certified allocation address, its
+                        // allocation-relative field initializers are predecessors of consumers
+                        // which later dereference the value returned by the container.
+                        if let Some(address) = self.exact_addresses[argument] {
+                            let field_vertices = self
+                                .prepartition_regions
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(vertex, region)| {
+                                    region
+                                        .is_some_and(|(root, _)| root == address.root)
+                                        .then_some(vertex)
+                                })
+                                .collect::<Vec<_>>();
+                            for field in field_vertices {
+                                self.ap_union(field, payload);
+                                self.prepartition_flow_edges.push((field, payload));
+                            }
+                            let object = address.root.0 as usize;
+                            self.ap_union(object, payload);
+                            self.prepartition_flow_edges.push((object, payload));
+                        }
+                    }
+                }
+            }
+            for &location in &operation.returned_regions {
+                if let Some(result) = result {
+                    let payload = receiver_payload_vertex(
+                        &mut self.ap_parent,
+                        &mut self.prepartition_regions,
+                        &mut payload_vertices,
+                        root,
+                        location,
+                    );
+                    let result = result.0 as usize;
+                    self.ap_union(payload, result);
+                    self.prepartition_flow_edges.push((payload, result));
+                }
+            }
         }
 
         // On-the-fly indirect-call bindings are constraints too. Add every binding admitted
@@ -2166,9 +2526,14 @@ impl<'a> Refiner<'a> {
                 .map(|address| address.location),
         );
 
+        let suppressed_payload_bindings = self.receiver_payload_binding_edges();
+
         // Base constraints from PAG edges (in-scope only; partitions are self-contained).
         for edge in &self.pag.edges {
             if !self.in_scope[edge.dst.0 as usize] && !self.in_scope[edge.src.0 as usize] {
+                continue;
+            }
+            if suppressed_payload_bindings.contains(&(edge.src, edge.dst)) {
                 continue;
             }
             match edge.kind {
@@ -2203,6 +2568,7 @@ impl<'a> Refiner<'a> {
         }
 
         self.apply_boundary_omega_seeds(&mut solve);
+        self.apply_receiver_payload_summaries(&mut solve);
 
         if profile {
             eprintln!(
@@ -2223,6 +2589,166 @@ impl<'a> Refiner<'a> {
             );
         }
         solve
+    }
+
+    /// Actual/formal payload bindings which the experimental receiver-relative summary replaces.
+    /// Receiver and key/control parameters retain their ordinary context-insensitive bindings.
+    fn receiver_payload_binding_edges(&self) -> HashSet<(NodeId, NodeId)> {
+        let mut suppressed = HashSet::new();
+        let selected_roots = self.receiver_payload_context_roots();
+        for callsite in &self.pag.callsites {
+            let Some((operation, _)) =
+                self.receiver_payload_summary_call(callsite, &selected_roots)
+            else {
+                continue;
+            };
+            let function = self.func_index[callsite.callee.as_ref().unwrap()];
+            for &index in operation.stored_params.keys() {
+                if let (Some(&argument), Some(&parameter)) = (
+                    callsite.args.get(index),
+                    self.param_nodes.get(&(function, index)),
+                ) {
+                    suppressed.insert((argument, parameter));
+                }
+            }
+            if !operation.returned_regions.is_empty() {
+                if let (Some(&ret), Some(result)) = (self.ret_nodes.get(&function), callsite.result)
+                {
+                    suppressed.insert((ret, result));
+                }
+            }
+        }
+        suppressed
+    }
+
+    fn receiver_payload_context_roots(&self) -> HashSet<NodeId> {
+        let mut profiles = HashMap::<NodeId, (usize, usize, usize)>::new();
+        for callsite in self.pag.callsites.iter().filter(|callsite| {
+            callsite.kind == CallKind::Direct
+                && !self
+                    .func_index
+                    .get(&callsite.caller)
+                    .is_some_and(|caller| self.receiver_payload_ops.contains_key(caller))
+        }) {
+            let Some((root, operation)) = (|| {
+                let function = callsite
+                    .callee
+                    .as_ref()
+                    .and_then(|callee| self.func_index.get(callee))?;
+                let operation = self.receiver_payload_ops.get(function)?;
+                let receiver = *callsite.args.first()?;
+                let root = self.exact_addresses[receiver.0 as usize]?.root;
+                Some((root, operation))
+            })() else {
+                continue;
+            };
+            let profile = profiles.entry(root).or_default();
+            profile.0 += usize::from(!operation.stored_params.is_empty());
+            profile.1 += usize::from(!operation.returned_regions.is_empty());
+            profile.2 += 1;
+        }
+        let mut roots = profiles.into_iter().collect::<Vec<_>>();
+        // Prefer receiver roots observed at both updates and lookups, then hot roots. This makes
+        // the bounded contexts useful without depending on allocation numbering.
+        roots.sort_by_key(|(root, (stores, loads, calls))| {
+            (
+                std::cmp::Reverse(usize::from(*stores > 0 && *loads > 0)),
+                std::cmp::Reverse(*calls),
+                root.0,
+            )
+        });
+        roots.truncate(knobs::ANDERSEN_RECEIVER_PAYLOAD_CONTEXT_LIMIT);
+        roots.into_iter().map(|(root, _)| root).collect()
+    }
+
+    fn receiver_payload_summary_call<'b>(
+        &'b self,
+        callsite: &pangs_pag::Callsite,
+        selected_roots: &HashSet<NodeId>,
+    ) -> Option<(&'b ReceiverPayloadOp, NodeId)> {
+        if callsite.kind != CallKind::Direct
+            || self
+                .func_index
+                .get(&callsite.caller)
+                .is_some_and(|caller| self.receiver_payload_ops.contains_key(caller))
+        {
+            return None;
+        }
+        let function = callsite
+            .callee
+            .as_ref()
+            .and_then(|callee| self.func_index.get(callee))?;
+        let operation = self.receiver_payload_ops.get(function)?;
+        let receiver = *callsite.args.first()?;
+        let root = self.exact_addresses[receiver.0 as usize]?.root;
+        selected_roots.contains(&root).then_some((operation, root))
+    }
+
+    fn apply_receiver_payload_summaries(&self, solve: &mut Solve) {
+        if self.receiver_payload_ops.is_empty() {
+            return;
+        }
+
+        let selected_roots = self.receiver_payload_context_roots();
+        let mut payload_cells = HashMap::<(NodeId, FieldLocation), Cell>::new();
+
+        let mut summarized_calls = 0usize;
+        let mut certified_payloads = 0usize;
+        let mut unresolved_payloads = 0usize;
+        for callsite in &self.pag.callsites {
+            let Some((operation, root)) =
+                self.receiver_payload_summary_call(callsite, &selected_roots)
+            else {
+                continue;
+            };
+            for (&index, locations) in &operation.stored_params {
+                if let Some(argument) = callsite.args.get(index) {
+                    if self.node_may_carry_pointer(*argument) {
+                        for &location in locations {
+                            let payload = *payload_cells
+                                .entry((root, location))
+                                .or_insert_with(|| solve.allocate_cell());
+                            if let Some(address) = self.exact_addresses[argument.0 as usize] {
+                                // The independent exact-address certificate is stronger than
+                                // the carrier's context-insensitive points-to row. Seed the
+                                // certified allocation directly so unrelated external facts on
+                                // the carrier do not leak into this receiver context.
+                                solve.add_pts(payload, address.root.0);
+                                certified_payloads += 1;
+                            } else {
+                                solve.add_copy(argument.0, payload);
+                                unresolved_payloads += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            for &location in &operation.returned_regions {
+                if let Some(result) = callsite.result {
+                    if self.node_may_carry_pointer(result) {
+                        let payload = *payload_cells
+                            .entry((root, location))
+                            .or_insert_with(|| solve.allocate_cell());
+                        solve.add_copy(payload, result.0);
+                    }
+                }
+            }
+            summarized_calls += 1;
+        }
+        if andersen_profile_enabled() {
+            let mut context_labels = selected_roots
+                .iter()
+                .map(|root| self.pag.nodes[root.0 as usize].label.clone())
+                .collect::<Vec<_>>();
+            context_labels.sort();
+            eprintln!(
+                "pangs receiver payloads: contexts={} summarized_calls={} certified_payloads={} unresolved_payloads={} roots={context_labels:?}",
+                selected_roots.len(),
+                summarized_calls,
+                certified_payloads,
+                unresolved_payloads
+            );
+        }
     }
 
     fn activate_target(
@@ -2901,6 +3427,40 @@ fn andersen_max_resumes() -> usize {
 
 fn partition_profile_enabled() -> bool {
     std::env::var_os(knobs::ENV_PARTITION_PROFILE).is_some()
+}
+
+fn receiver_payloads_enabled() -> bool {
+    std::env::var_os(knobs::ENV_ANDERSEN_RECEIVER_PAYLOADS).is_some()
+}
+
+fn graph_reachable(start: usize, adjacency: &[Vec<usize>]) -> HashSet<usize> {
+    let mut reachable = HashSet::from([start]);
+    let mut stack = vec![start];
+    while let Some(node) = stack.pop() {
+        for &successor in &adjacency[node] {
+            if reachable.insert(successor) {
+                stack.push(successor);
+            }
+        }
+    }
+    reachable
+}
+
+fn receiver_payload_vertex(
+    parents: &mut Vec<usize>,
+    regions: &mut Vec<Option<(NodeId, FieldRegion)>>,
+    vertices: &mut HashMap<(NodeId, FieldLocation), usize>,
+    root: NodeId,
+    location: FieldLocation,
+) -> usize {
+    if let Some(&vertex) = vertices.get(&(root, location)) {
+        return vertex;
+    }
+    let vertex = parents.len();
+    parents.push(vertex);
+    regions.push(Some((root, FieldRegion::access(location, None))));
+    vertices.insert((root, location), vertex);
+    vertex
 }
 
 fn partition_profile_top() -> usize {
@@ -4793,6 +5353,43 @@ mod tests {
         assert_ne!(
             refiner.partition_of_node(node("val:setup:%p0")),
             refiner.partition_of_node(node("val:setup:%p1"))
+        );
+    }
+
+    #[test]
+    fn receiver_payload_inference_recovers_matching_store_and_load_regions() {
+        let (pir, pag) = load("receiver_payload_inference.pir.json");
+        let labels = BTreeSet::new();
+        let (base, classes) =
+            crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
+        let exact_targets = BTreeMap::new();
+        let confined_targets = BTreeSet::new();
+        let refiner = Refiner::new(
+            &pir,
+            &pag,
+            &classes,
+            &base,
+            BuildMode::Library,
+            u64::MAX,
+            &exact_targets,
+            &confined_targets,
+            false,
+        );
+        let operations = refiner.infer_receiver_payload_ops();
+        let function = |name: &str| {
+            pir.functions
+                .iter()
+                .position(|function| function.key == name)
+                .unwrap()
+        };
+
+        assert_eq!(
+            operations[&function("put")].stored_params[&2],
+            BTreeSet::from([FieldLocation::Exact(16)])
+        );
+        assert_eq!(
+            operations[&function("get")].returned_regions,
+            BTreeSet::from([FieldLocation::Exact(16)])
         );
     }
 
