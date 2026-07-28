@@ -980,7 +980,7 @@ entry:
 }
 
 #[test]
-fn llvm_sys_classifies_closed_ptrtoint_comparison_use_chains() {
+fn llvm_sys_classifies_innocuous_ptrtoint_use_shapes() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("ptrtoint_uses.ll");
     fs::write(
@@ -988,11 +988,8 @@ fn llvm_sys_classifies_closed_ptrtoint_comparison_use_chains() {
         r#"
 declare void @sink(i64)
 declare void @sink_ptr(i8*)
-declare i8* @strchr(i8*, i32)
-declare i8* @unknown_search(i8*)
 declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1 immarg)
 @observed_difference = global i64 0
-@search_bytes = constant [4 x i8] c"abc\00"
 
 define i1 @direct_compare(i8* %p, i8* %q) {
 entry:
@@ -1067,77 +1064,33 @@ entry:
   ret void
 }
 
-define void @persisted_common_pointer_difference(i8* %base) {
+define void @shared_paired_pointer_differences(i8* %p, i8* %q, i8* %r) {
 entry:
-  %lhs = getelementptr i8, i8* %base, i64 24
-  %rhs = getelementptr i8, i8* %base, i64 4
-  %pi = ptrtoint i8* %lhs to i64
-  %qi = ptrtoint i8* %rhs to i64
-  %bytes = sub i64 %pi, %qi
-  %elements = sdiv exact i64 %bytes, 4
-  call void @sink(i64 %elements)
-  store i64 %elements, i64* @observed_difference
+  %pi = ptrtoint i8* %p to i64
+  %qi = ptrtoint i8* %q to i64
+  %ri = ptrtoint i8* %r to i64
+  %first = sub i64 %pi, %qi
+  %second = sub i64 %ri, %qi
+  call void @sink(i64 %first)
+  call void @sink(i64 %second)
   ret void
 }
 
-define void @spilled_common_pointer_difference(i8* %base, i1 %condition) {
+define void @paired_and_raw_pointer_use(i8* %p, i8* %q) {
 entry:
-  %slot = alloca i8*
-  store i8* null, i8** %slot
-  br i1 %condition, label %left, label %right
-left:
-  %left.ptr = getelementptr i8, i8* %base, i64 32
-  store i8* %left.ptr, i8** %slot
-  br label %merge
-right:
-  %right.ptr = getelementptr i8, i8* %base, i64 64
-  store i8* %right.ptr, i8** %slot
-  br label %merge
-merge:
-  %lhs = load i8*, i8** %slot
-  %rhs = getelementptr i8, i8* %base, i64 4
-  %pi = ptrtoint i8* %lhs to i64
-  %qi = ptrtoint i8* %rhs to i64
+  %pi = ptrtoint i8* %p to i64
+  %qi = ptrtoint i8* %q to i64
   %delta = sub i64 %pi, %qi
-  store i64 %delta, i64* @observed_difference
+  call void @sink(i64 %delta)
+  call void @sink(i64 %pi)
   ret void
 }
 
-define void @spilled_mixed_pointer_difference(i8* %p, i8* %q, i1 %condition) {
+define void @unpaired_pointer_integer_subtraction(i8* %p) {
 entry:
-  %slot = alloca i8*
-  br i1 %condition, label %left, label %right
-left:
-  store i8* %p, i8** %slot
-  br label %merge
-right:
-  store i8* %q, i8** %slot
-  br label %merge
-merge:
-  %lhs = load i8*, i8** %slot
-  %pi = ptrtoint i8* %lhs to i64
-  %qi = ptrtoint i8* %p to i64
-  %delta = sub i64 %pi, %qi
-  store i64 %delta, i64* @observed_difference
-  ret void
-}
-
-define void @modeled_interior_result_difference() {
-entry:
-  %found = call i8* @strchr(i8* getelementptr ([4 x i8], [4 x i8]* @search_bytes, i64 0, i64 0), i32 98)
-  %found.i = ptrtoint i8* %found to i64
-  %delta = sub i64 %found.i, ptrtoint ([4 x i8]* @search_bytes to i64)
-  store i64 %delta, i64* @observed_difference
-  ret void
-}
-
-define void @unknown_result_difference() {
-entry:
-  %base = getelementptr [4 x i8], [4 x i8]* @search_bytes, i64 0, i64 0
-  %found = call i8* @unknown_search(i8* %base)
-  %found.i = ptrtoint i8* %found to i64
-  %delta = sub i64 %found.i, ptrtoint ([4 x i8]* @search_bytes to i64)
-  store i64 %delta, i64* @observed_difference
+  %pi = ptrtoint i8* %p to i64
+  %delta = sub i64 %pi, 4
+  call void @sink(i64 %delta)
   ret void
 }
 
@@ -1182,7 +1135,7 @@ entry:
     .unwrap();
 
     let pir = pir_from_llvm_sys(&ll_path);
-    let comparison_only = |function: &str| {
+    let innocuous = |function: &str| {
         let function = pir
             .functions
             .iter()
@@ -1200,23 +1153,21 @@ entry:
             .collect::<Vec<_>>();
         !conversions.is_empty() && conversions.into_iter().all(|closed| closed)
     };
-    assert!(comparison_only("direct_compare"));
-    assert!(comparison_only("arithmetic_compare"));
-    assert!(comparison_only("select_compare"));
-    assert!(!comparison_only("unsupported_arithmetic"));
-    assert!(!comparison_only("externally_observed"));
-    assert!(!comparison_only("reified"));
-    assert!(!comparison_only("mixed_use"));
-    assert!(comparison_only("closed_pointer_difference"));
-    assert!(comparison_only("persisted_common_pointer_difference"));
-    assert!(comparison_only("spilled_common_pointer_difference"));
-    assert!(!comparison_only("spilled_mixed_pointer_difference"));
-    assert!(comparison_only("modeled_interior_result_difference"));
-    assert!(!comparison_only("unknown_result_difference"));
-    assert!(!comparison_only("escaping_pointer_difference"));
-    assert!(!comparison_only("reified_pointer_difference"));
-    assert!(!comparison_only("stored_pointer_difference"));
-    assert!(!comparison_only("escaping_derived_address"));
+    assert!(innocuous("direct_compare"));
+    assert!(innocuous("arithmetic_compare"));
+    assert!(innocuous("select_compare"));
+    assert!(!innocuous("unsupported_arithmetic"));
+    assert!(!innocuous("externally_observed"));
+    assert!(!innocuous("reified"));
+    assert!(!innocuous("mixed_use"));
+    assert!(innocuous("closed_pointer_difference"));
+    assert!(innocuous("shared_paired_pointer_differences"));
+    assert!(!innocuous("paired_and_raw_pointer_use"));
+    assert!(!innocuous("unpaired_pointer_integer_subtraction"));
+    assert!(innocuous("escaping_pointer_difference"));
+    assert!(innocuous("reified_pointer_difference"));
+    assert!(innocuous("stored_pointer_difference"));
+    assert!(innocuous("escaping_derived_address"));
 }
 
 #[test]

@@ -397,21 +397,32 @@ soundness-regression tripwires around the one authoritative lite pipeline.
 | Typed heap clones + conservatism dial | Back-propagation pass, clone⁄site duality, per-client mode switch | Heap objects coarser by type. Hurts heap-heavy alias precision; mutable-*globals* client is the least heap-dependent client we have. |
 | KallGraph per-query parallelism | Read-only query pool, shared caches | None at this scale — `DESIGN.md` §1 already called it "overkill insurance" below 1 MLoC. Kahlon partitions leave a clean parallelization seam, but the current D' solve is sequential. |
 
-**Not cut, anywhere:** Ω boundary model, int↔ptr provenance rules, violation
+**Not cut, anywhere:** Ω boundary model, int↔ptr violation
 detection → Ω-taint, FSA envelope, KELP safe-fallback discipline, byte-offset field
 sensitivity. Bounded domains always pair retained positive facts with an explicit
 incomplete/unknown bit and route overflow to a conservative fallback. Soundness is the
-hard constraint and is untouched.
+hard constraint, subject to the explicit paired-subtraction input contract below.
 
 `ptrtoint` validation is use-sensitive and fails closed. A raw integer address is exempt from the
 Ω seed only when its complete SSA use graph terminates in supported comparisons, or when it is one
-operand of a paired subtraction whose source pointers have exactly one common structural
-provenance root. The latter produces a relocation-invariant relative offset: translating the
-common allocation changes both operands equally and leaves their modular difference unchanged, so
-the offset may subsequently be stored, returned, or passed through integer wrappers. Distinct or
-unknown roots, mixed raw-address uses, arbitrary memory-loaded pointer provenance, and unmatched
-conversions retain the normal violation and Ω treatment. This proof is isolated in the PIR LLVM
-front end's pointer-integer-use module rather than distributed through individual clients.
+operand of a subtraction paired with another same-width `ptrtoint`. LLVM erases the distinction
+between source-level pointer subtraction and subtraction of two explicitly integerized addresses.
+Lite therefore adopts the supported-program contract that this paired shape represents ordinary C
+pointer difference and is not being used to encode a callable address for reconstruction locally
+or across an unanalyzed boundary. Under C's defined-execution semantics the former already implies
+operands within one array object, so recovering a common allocation root in LLVM IR adds complexity
+without strengthening the contract needed by the current points-to, mod/ref, call-graph, and
+disposition clients. Mixed raw-address uses and unmatched conversions retain the normal violation
+and Ω treatment, and a locally visible `inttoptr` remains independently audited.
+
+This contract has a narrow theoretical soundness hole: low-level code may deliberately compute a
+relative function-address integer and later reconstruct and call the function, either locally or
+after communicating the integer outside the analyzed module. Treating that subtraction as harmless
+can hide an indirect callee or unknown incoming caller and thereby invalidate context-threading or
+localization. Numeric layout leakage, address hashing, and other integer-only observations are
+outside the supported clients and are not reasons to retain provenance recovery. Supporting
+integer-encoded callbacks would require frontend/source semantics or reinstating a stricter
+provenance-sensitive mode; bare LLVM `ptrtoint`/`sub` shape cannot distinguish the two idioms.
 
 External calls remain Ω boundaries by default.  A small exact-name summary may replace
 that boundary only when it encodes a documented, auditable pointer transfer; unlisted
