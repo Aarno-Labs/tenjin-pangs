@@ -228,6 +228,37 @@ summarization supplies its current precision payoff by giving those facts a cont
 destination. Conversely, receiver summaries remain sound without a complete origin proof
 because incomplete or overflowing rows explicitly carry the local unknown region.
 
+**Shared closed-producer certificates (experimental):**
+
+An indirect-call operand may retain Steensgaard's unknown-callee bit even after Andersen
+finds only named function objects. With `PANGS_ANDERSEN_CLOSED_PRODUCERS` enabled, D'
+constructs one producer graph shared by every in-scope indirect call. Its vertices are PAG
+values and materialized allocation-relative memory cells. Assignments and GEPs preserve
+producers; solved stores feed their possible destination cells; solved loads consume their
+possible source cells. Direct-call parameter and return summaries require no separate
+syntax because PAG construction has already flattened those bindings into assignments.
+Aggregate copies currently make their affected destination cells incomplete; certifying
+field-preserving memcpy requires a width-aware projection summary and is left for a later
+extension.
+
+The graph is condensed into SCCs once. A component is incomplete when it contains an
+external-region producer, depends on an incomplete component, or forms an ungrounded
+producer cycle. Exact allocation-address certificates are accepted as closed address
+terminals even when field-aware partitioning placed their carrier outside the admitted
+slice. Each callsite query is then a constant-time component lookup plus enumeration of
+the operand's Andersen pointees. The Steensgaard unknown bit is removed only when the
+component is complete, the pointee set is nonempty, and every pointee is a named function
+object. External regions, non-function objects, empty sets, and unsupported producers
+retain the original fallback.
+
+The prototype needs Andersen's materialized memory cells to connect loads and stores. It
+therefore permits a bounded promotion of a non-forged indirect-call partition, capped at
+8,192 nodes and 8,192 edges, despite rejection by the quadratic admission proxy. Larger
+or integer-forged partitions retain normal admission and fallback behavior. This
+supporting promotion is an implementation limitation of the prototype, not a requirement
+of the certificate abstraction; a future fixed-PAG memory-projection graph could remove
+that dependency.
+
 **Call graph via monotone on-the-fly discovery:**
 
 1. Build one persistent solve from base PAG constraints, Ω seeds, and pinned B1/B2

@@ -1,0 +1,101 @@
+{
+  "module": "m1_4b.closed_producer_compositional",
+  "functions": [
+    {
+      "key": "put",
+      "sig": {
+        "ret": { "class": "void" },
+        "params": [{ "class": "integer" }, { "class": "integer" }],
+        "cc": "ccc"
+      },
+      "param_names": ["%receiver", "%value"],
+      "body": [
+        { "kind": "gep", "dest": "%field", "base": "%receiver", "byte_off": 8 },
+        { "kind": "store", "address": "%field", "value": "%value" }
+      ]
+    },
+    {
+      "key": "get",
+      "sig": {
+        "ret": { "class": "integer" },
+        "params": [{ "class": "integer" }],
+        "cc": "ccc"
+      },
+      "param_names": ["%receiver"],
+      "body": [
+        { "kind": "gep", "dest": "%field", "base": "%receiver", "byte_off": 8 },
+        { "kind": "load", "dest": "%value", "address": "%field" },
+        { "kind": "return", "value": "%value" }
+      ]
+    },
+    {
+      "key": "driver",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%closed", "ty": "struct.Carrier" },
+        {
+          "kind": "call_direct",
+          "callee": "put",
+          "sig": {
+            "ret": { "class": "void" },
+            "params": [{ "class": "integer" }, { "class": "integer" }],
+            "cc": "ccc"
+          },
+          "args": ["%closed", "target"]
+        },
+        {
+          "kind": "call_direct",
+          "callee": "get",
+          "sig": {
+            "ret": { "class": "integer" },
+            "params": [{ "class": "integer" }],
+            "cc": "ccc"
+          },
+          "args": ["%closed"],
+          "dest": "%first"
+        },
+        {
+          "kind": "call_indirect",
+          "operand": "%first",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        },
+        {
+          "kind": "call_direct",
+          "callee": "get",
+          "sig": {
+            "ret": { "class": "integer" },
+            "params": [{ "class": "integer" }],
+            "cc": "ccc"
+          },
+          "args": ["%closed"],
+          "dest": "%second"
+        },
+        {
+          "kind": "call_indirect",
+          "operand": "%second",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        },
+        { "kind": "alloca", "dest": "%open", "ty": "struct.Carrier" },
+        { "kind": "gep", "dest": "%open.field", "base": "%open", "byte_off": 8 },
+        { "kind": "int_to_ptr", "dest": "%forged", "source": "%bits" },
+        { "kind": "store", "address": "%open.field", "value": "%forged" },
+        { "kind": "load", "dest": "%unknown", "address": "%open.field" },
+        {
+          "kind": "call_indirect",
+          "operand": "%unknown",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "target",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": []
+}

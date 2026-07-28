@@ -70,6 +70,13 @@ pub(crate) const ANDERSEN_RECEIVER_PAYLOAD_CONTEXT_LIMIT: usize = 16;
 /// region rather than structurally joining all omitted objects.
 pub(crate) const ANDERSEN_RECEIVER_PAYLOAD_ORIGIN_LIMIT: usize = 64;
 
+/// The closed-producer prototype needs concrete allocation-relative load/store destinations.
+/// Permit it to promote a bounded, non-forged indirect-call partition even when the quadratic
+/// admission proxy rejects it. The producer graph itself remains linear; these caps bound the
+/// supporting inclusion solve used to name memory projections.
+pub(crate) const ANDERSEN_CLOSED_PRODUCER_MAX_NODES: u64 = 8_192;
+pub(crate) const ANDERSEN_CLOSED_PRODUCER_MAX_EDGES: u64 = 8_192;
+
 /// Per-query state/worklist cap for the experimental CFL query kernel.
 pub(crate) const CFL_QUERY_STATE_BUDGET: usize = 25_000;
 
@@ -117,6 +124,11 @@ pub(crate) const ENV_ANDERSEN_EXPLAIN_NODE: &str = "PANGS_ANDERSEN_EXPLAIN_NODE"
 /// infers container-like first-parameter receivers and separates their pointer payload by
 /// independently certified allocation root.
 pub(crate) const ENV_ANDERSEN_RECEIVER_PAYLOADS: &str = "PANGS_ANDERSEN_RECEIVER_PAYLOADS";
+
+/// Enables the experimental shared closed-producer certificate for indirect-call operands.
+/// A certified operand may discard a Steensgaard unknown bit when its complete Andersen
+/// points-to set contains only named functions.
+pub(crate) const ENV_ANDERSEN_CLOSED_PRODUCERS: &str = "PANGS_ANDERSEN_CLOSED_PRODUCERS";
 
 /// Enables partition admission profiling when present.
 pub(crate) const ENV_PARTITION_PROFILE: &str = "PANGS_PARTITION_PROFILE";

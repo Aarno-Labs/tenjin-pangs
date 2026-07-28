@@ -199,6 +199,7 @@ struct AndersenControls {
     inject_exhaustion: Option<String>,
     disable_eager_unknown: bool,
     subtractive_differential: bool,
+    closed_producers: bool,
 }
 
 impl AndersenControls {
@@ -213,6 +214,7 @@ impl AndersenControls {
                 knobs::ENV_ANDERSEN_DIFFERENTIAL_SUBTRACTIVE,
             )
             .is_some(),
+            closed_producers: closed_producers_enabled(),
         }
     }
 }
@@ -389,6 +391,25 @@ struct RefinedNodeResolution {
 struct TargetDiscovery {
     targets: Vec<(usize, usize)>,
     eager_sites: Vec<usize>,
+}
+
+/// A single source-closed producer graph shared by all indirect-call queries.
+///
+/// The graph contains PAG values plus materialized allocation-relative field cells. Edges are
+/// producer dependencies, not points-to edges: assignments/GEPs preserve their source, stores
+/// feed every solved destination cell, and loads consume every solved source cell. Direct call
+/// argument/return summaries need no special representation because PAG construction has already
+/// flattened them into `Assign` edges. Unsupported aggregate copies fail closed.
+struct ClosedProducerAnalysis {
+    complete: Vec<bool>,
+}
+
+#[derive(Debug)]
+struct ClosedProducerQuery {
+    complete: bool,
+    targets: Vec<usize>,
+    external: bool,
+    non_function: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1510,6 +1531,24 @@ impl<'a> Refiner<'a> {
                 oversize.insert(ap);
             }
         }
+        if closed_producers_enabled() {
+            let call_partitions = self
+                .pag
+                .callsites
+                .iter()
+                .filter(|callsite| callsite.kind == CallKind::Indirect)
+                .filter_map(|callsite| callsite.operand)
+                .map(|operand| self.ap_find(operand.0 as usize))
+                .collect::<HashSet<_>>();
+            oversize.retain(|partition| {
+                let nodes = nodes_in.get(partition).copied().unwrap_or(0);
+                let edges = edges_in.get(partition).copied().unwrap_or(0);
+                !call_partitions.contains(partition)
+                    || forged_partitions.contains(partition)
+                    || nodes > knobs::ANDERSEN_CLOSED_PRODUCER_MAX_NODES
+                    || edges > knobs::ANDERSEN_CLOSED_PRODUCER_MAX_EDGES
+            });
+        }
         if self.collect_admission_structures && self.admission_profile_root.is_none() {
             self.admission_structures = self.collect_admission_structure_profiles(
                 &interesting,
@@ -2499,8 +2538,13 @@ impl<'a> Refiner<'a> {
                 solve.scc_copy_edges_removed,
             );
         }
-        let indirect_calls =
-            self.emit_indirect_calls(&in_scope_sites, &activated, &eager_sites, &solve);
+        let indirect_calls = self.emit_indirect_calls(
+            &in_scope_sites,
+            &activated,
+            &eager_sites,
+            &solve,
+            controls.closed_producers,
+        );
         let nodes = self.emit_node_resolutions(&solve);
         let global_points_to = if self.materialize_global_points_to {
             self.emit_global_points_to(&solve)
@@ -3257,14 +3301,227 @@ impl<'a> Refiner<'a> {
         funcs
     }
 
+    fn closed_producer_analysis(&self, solve: &Solve) -> ClosedProducerAnalysis {
+        let node_count = solve.next_field as usize;
+        let mut dependencies = Vec::<(usize, usize)>::new();
+        let mut terminal = vec![false; node_count];
+        let mut explicit_open = vec![false; node_count];
+        let mut has_producer = vec![false; node_count];
+
+        let mut add_dependency = |source: Cell, destination: Cell| {
+            let source = solve.canonical(source) as usize;
+            let destination = solve.canonical(destination) as usize;
+            if source != destination {
+                dependencies.push((source, destination));
+            }
+        };
+
+        for node in &self.pag.nodes {
+            let index = solve.canonical(node.id.0) as usize;
+            let exact_address = self.exact_addresses[node.id.0 as usize].is_some();
+            if !self.in_scope[node.id.0 as usize] && !exact_address {
+                explicit_open[index] = true;
+            }
+            if exact_address
+                || matches!(
+                    node.label.rsplit(':').next(),
+                    Some("null") | Some("0") | Some("zeroinitializer")
+                )
+            {
+                terminal[index] = true;
+                has_producer[index] = true;
+            }
+        }
+
+        // An external-region pointee is an explicit missing producer. This includes unknown
+        // call results and unknown stores that the Andersen solve has propagated into a
+        // concrete allocation-relative cell.
+        for cell in 0..solve.next_field {
+            if solve.points_to(cell).is_some_and(|points_to| {
+                points_to
+                    .iter()
+                    .any(|pointee| solve.external_region(*pointee).is_some())
+            }) {
+                explicit_open[solve.canonical(cell) as usize] = true;
+            }
+        }
+
+        for edge in &self.pag.edges {
+            match edge.kind {
+                EdgeKind::AddrOf => {
+                    let destination = solve.canonical(edge.dst.0) as usize;
+                    terminal[destination] = true;
+                    has_producer[destination] = true;
+                }
+                EdgeKind::Assign | EdgeKind::Gep { .. } => {
+                    if self.pointer_transfer(edge.src, edge.dst) {
+                        add_dependency(edge.src.0, edge.dst.0);
+                    }
+                }
+                EdgeKind::Load => {
+                    let destination = solve.canonical(edge.dst.0) as usize;
+                    let Some(objects) = solve.points_to(edge.src.0) else {
+                        explicit_open[destination] = true;
+                        continue;
+                    };
+                    if objects.is_empty() {
+                        explicit_open[destination] = true;
+                        continue;
+                    }
+                    add_dependency(edge.src.0, edge.dst.0);
+                    for &object in objects {
+                        if solve.external_region(object).is_some() {
+                            explicit_open[destination] = true;
+                        } else {
+                            add_dependency(object, edge.dst.0);
+                        }
+                    }
+                }
+                EdgeKind::Store => {
+                    let Some(objects) = solve.points_to(edge.dst.0) else {
+                        continue;
+                    };
+                    for &object in objects {
+                        if solve.external_region(object).is_some() {
+                            continue;
+                        }
+                        // The address is a guard dependency: a missing address producer could
+                        // hide another store destination even if the stored value is closed.
+                        add_dependency(edge.dst.0, object);
+                        add_dependency(edge.src.0, object);
+                    }
+                }
+                EdgeKind::Memcpy { .. } => {
+                    let Some(destinations) = solve.points_to(edge.dst.0) else {
+                        continue;
+                    };
+                    for &destination in destinations {
+                        if solve.external_region(destination).is_some() {
+                            continue;
+                        }
+                        explicit_open[solve.canonical(destination) as usize] = true;
+                        for (&(base, _), &field) in &solve.fields {
+                            if base == destination {
+                                explicit_open[solve.canonical(field) as usize] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        for &(_, destination) in &dependencies {
+            has_producer[destination] = true;
+        }
+        for index in 0..node_count {
+            if !has_producer[index] && !terminal[index] {
+                explicit_open[index] = true;
+            }
+        }
+
+        let active = vec![true; node_count];
+        let (component_of, component_sizes) = directed_sccs(&active, &dependencies);
+        let mut component_open = vec![false; component_sizes.len()];
+        let mut component_terminal = vec![false; component_sizes.len()];
+        let mut component_has_predecessor = vec![false; component_sizes.len()];
+        let mut component_successors = vec![Vec::<usize>::new(); component_sizes.len()];
+        for index in 0..node_count {
+            let component = component_of[index];
+            component_open[component] |= explicit_open[index];
+            component_terminal[component] |= terminal[index];
+        }
+        for &(source, destination) in &dependencies {
+            let source = component_of[source];
+            let destination = component_of[destination];
+            if source != destination {
+                component_successors[source].push(destination);
+                component_has_predecessor[destination] = true;
+            }
+        }
+        for successors in &mut component_successors {
+            successors.sort_unstable();
+            successors.dedup();
+        }
+        // A producer cycle with neither a terminal nor an incoming producer is not evidence
+        // of a value. Mark it open before propagating open predecessors through the DAG.
+        for component in 0..component_sizes.len() {
+            if !component_terminal[component] && !component_has_predecessor[component] {
+                component_open[component] = true;
+            }
+        }
+        let mut worklist = component_open
+            .iter()
+            .enumerate()
+            .filter_map(|(component, &open)| open.then_some(component))
+            .collect::<Vec<_>>();
+        while let Some(component) = worklist.pop() {
+            for &successor in &component_successors[component] {
+                if !component_open[successor] {
+                    component_open[successor] = true;
+                    worklist.push(successor);
+                }
+            }
+        }
+        let complete = component_of
+            .iter()
+            .map(|&component| !component_open[component])
+            .collect();
+        eprintln!(
+            "pangs closed producer graph: nodes={} dependencies={} components={} open_components={}",
+            node_count,
+            dependencies.len(),
+            component_sizes.len(),
+            component_open.iter().filter(|&&open| open).count()
+        );
+        ClosedProducerAnalysis { complete }
+    }
+
+    fn query_closed_producer(
+        &self,
+        analysis: &ClosedProducerAnalysis,
+        solve: &Solve,
+        operand: NodeId,
+    ) -> ClosedProducerQuery {
+        let complete = analysis.complete[solve.canonical(operand.0) as usize];
+        let mut targets = Vec::new();
+        let mut external = false;
+        let mut non_function = false;
+        if let Some(points_to) = solve.points_to(operand.0) {
+            for &cell in points_to {
+                if solve.external_region(cell).is_some() {
+                    external = true;
+                    continue;
+                }
+                let root = solve.field_base.get(&cell).copied().unwrap_or(cell);
+                if let Some(&function) = self.fn_cell_to_index.get(&root) {
+                    targets.push(function);
+                } else {
+                    non_function = true;
+                }
+            }
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        ClosedProducerQuery {
+            complete,
+            targets,
+            external,
+            non_function,
+        }
+    }
+
     fn emit_indirect_calls(
         &self,
         in_scope_sites: &[usize],
         activated: &HashMap<usize, BTreeSet<usize>>,
         eager_sites: &HashSet<usize>,
         pts: &Solve,
+        closed_producers_enabled: bool,
     ) -> Vec<IndirectCallResolution> {
         let in_scope: HashSet<usize> = in_scope_sites.iter().copied().collect();
+        let closed_producers = closed_producers_enabled.then(|| self.closed_producer_analysis(pts));
         let mut out = Vec::new();
         for (idx, cs) in self.pag.callsites.iter().enumerate() {
             if cs.kind != CallKind::Indirect {
@@ -3306,13 +3563,48 @@ impl<'a> Refiner<'a> {
                         })
                     });
                 let exact = self.exact_targets.contains_key(&cs.key);
-                let fallback = !exact && eager_sites.contains(&idx);
+                let mut fallback = !exact && eager_sites.contains(&idx);
                 let steens_unknown = steens.map(|r| r.unknown_callee).unwrap_or(false);
-                let unknown_callee = if !self.receiver_payload_ops.is_empty() {
+                let mut unknown_callee = if !self.receiver_payload_ops.is_empty() {
                     operand_unknown || (targets.is_empty() && steens_unknown)
                 } else {
                     steens_unknown || operand_unknown
                 };
+                if let (Some(analysis), Some(operand)) = (&closed_producers, cs.operand) {
+                    let certificate = self.query_closed_producer(analysis, pts, operand);
+                    let certified = certificate.complete
+                        && !certificate.external
+                        && !certificate.non_function
+                        && !certificate.targets.is_empty();
+                    if certified {
+                        targets = certificate
+                            .targets
+                            .iter()
+                            .map(|&function| self.pir.functions[function].key.clone())
+                            .collect();
+                        targets.sort();
+                        if let Some(steens) = steens {
+                            debug_assert_narrows(
+                                &cs.key,
+                                "closed-producer",
+                                &targets,
+                                "steens",
+                                &steens.targets,
+                            );
+                        }
+                        unknown_callee = false;
+                        fallback = false;
+                    }
+                    eprintln!(
+                        "pangs closed producer: callsite={} complete={} raw_targets={} external={} non_function={} certified={}",
+                        cs.key,
+                        certificate.complete,
+                        certificate.targets.len(),
+                        certificate.external,
+                        certificate.non_function,
+                        certified
+                    );
+                }
                 out.push(IndirectCallResolution {
                     callsite_key: cs.key.clone(),
                     targets,
@@ -3555,6 +3847,10 @@ fn partition_profile_enabled() -> bool {
 
 fn receiver_payloads_enabled() -> bool {
     std::env::var_os(knobs::ENV_ANDERSEN_RECEIVER_PAYLOADS).is_some()
+}
+
+fn closed_producers_enabled() -> bool {
+    std::env::var_os(knobs::ENV_ANDERSEN_CLOSED_PRODUCERS).is_some()
 }
 
 fn graph_reachable(start: usize, adjacency: &[Vec<usize>]) -> HashSet<usize> {
@@ -5150,6 +5446,102 @@ mod tests {
         assert!(call.unknown_callee);
         assert!(call.fallback);
         assert!(result.metrics.andersen_complete);
+    }
+
+    #[test]
+    fn closed_producer_graph_shares_compositional_direct_call_flow() {
+        let (pir, pag) = load("closed_producer_compositional.pir.json");
+        let labels = BTreeSet::new();
+        let (base, classes) =
+            crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
+        let exact_targets = BTreeMap::new();
+        let confined_targets = BTreeSet::new();
+        let mut refiner = Refiner::new(
+            &pir,
+            &pag,
+            &classes,
+            &base,
+            BuildMode::Library,
+            u64::MAX,
+            &exact_targets,
+            &confined_targets,
+            false,
+        );
+        let mut solve = refiner.build_base_solve();
+        solve.run();
+        let analysis = refiner.closed_producer_analysis(&solve);
+        let indirect = pag
+            .callsites
+            .iter()
+            .filter(|callsite| callsite.kind == pangs_pag::CallKind::Indirect)
+            .collect::<Vec<_>>();
+        assert_eq!(indirect.len(), 3);
+
+        for callsite in &indirect[..2] {
+            let query = refiner.query_closed_producer(
+                &analysis,
+                &solve,
+                callsite.operand.expect("indirect operand"),
+            );
+            assert!(query.complete);
+            assert!(!query.external);
+            assert!(!query.non_function);
+            assert_eq!(
+                query
+                    .targets
+                    .iter()
+                    .map(|&function| pir.functions[function].key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["target"]
+            );
+        }
+
+        let unknown = refiner.query_closed_producer(
+            &analysis,
+            &solve,
+            indirect[2].operand.expect("indirect operand"),
+        );
+        assert!(!unknown.complete);
+        assert!(unknown.external);
+        assert!(unknown.targets.is_empty());
+    }
+
+    #[test]
+    fn closed_producer_certificate_clears_only_certified_unknown_calls() {
+        let (pir, pag) = load("closed_producer_compositional.pir.json");
+        let labels = BTreeSet::new();
+        let (mut base, classes) =
+            crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
+        let mut rows = base.indirect_calls.iter_mut();
+        for row in rows.by_ref().take(2) {
+            // Model a deliberately conservative base-tier unknown bit. The closed-producer
+            // tier may remove it only after independently certifying the fixed PAG slice.
+            row.unknown_callee = true;
+            row.fallback = true;
+        }
+        let result = finish_andersen_controlled(
+            &pir,
+            &pag,
+            &classes,
+            base,
+            BuildMode::Library,
+            u64::MAX,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            AndersenControls {
+                closed_producers: true,
+                ..AndersenControls::default()
+            },
+        );
+        assert_eq!(result.indirect_calls.len(), 3);
+        for row in &result.indirect_calls[..2] {
+            assert_eq!(row.targets, vec!["target".to_string()]);
+            assert!(!row.unknown_callee);
+            assert!(!row.fallback);
+        }
+        assert!(result.indirect_calls[2].unknown_callee);
+        assert!(result.indirect_calls[2].fallback);
     }
 
     #[test]
