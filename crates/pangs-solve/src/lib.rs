@@ -862,6 +862,7 @@ struct Solver<'a> {
     global_address_exposed: Vec<bool>,
     module_violation_tainted: bool,
     exact_addresses: Vec<Option<ExactAddress>>,
+    field_contaminated_roots: HashSet<NodeId>,
     field_classes: HashMap<(NodeId, FieldLocation), usize>,
     fields_by_root: HashMap<NodeId, Vec<usize>>,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
@@ -1035,6 +1036,36 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
         }
     }
     addresses
+}
+
+/// Identify allocations that cannot safely retain independent constant-offset cells during
+/// Steensgaard solving. The PAG does not retain enough aggregate layout/type information to
+/// prove that a memcpy is field-compatible or to classify typed union overlays, so copies fail
+/// closed and contaminate every allocation-relative endpoint. Unknown and affine-lane locations
+/// likewise overlap more than one concrete field and collapse their allocation to its
+/// whole-object cell. Constant union members that lower to the same byte offset already share
+/// one field identity; partial typed overlaps cannot be distinguished without richer PAG data.
+fn field_contaminated_roots(pag: &Pag, addresses: &[Option<ExactAddress>]) -> HashSet<NodeId> {
+    let mut contaminated = HashSet::new();
+
+    for address in addresses.iter().flatten() {
+        if !matches!(address.location, FieldLocation::Exact(_)) {
+            contaminated.insert(address.root);
+        }
+    }
+
+    for edge in &pag.edges {
+        if !matches!(edge.kind, pangs_pag::EdgeKind::Memcpy { .. }) {
+            continue;
+        }
+        for endpoint in [edge.src, edge.dst] {
+            if let Some(address) = addresses[endpoint.0 as usize] {
+                contaminated.insert(address.root);
+            }
+        }
+    }
+
+    contaminated
 }
 
 #[derive(Default)]
@@ -1271,6 +1302,7 @@ impl<'a> Solver<'a> {
         let callsites_by_index = pag.callsites.iter().collect();
         let queued = vec![false; classes.len()];
         let exact_addresses = exact_allocation_addresses(pag);
+        let field_contaminated_roots = field_contaminated_roots(pag, &exact_addresses);
 
         Self {
             pir,
@@ -1286,6 +1318,7 @@ impl<'a> Solver<'a> {
             global_address_exposed,
             module_violation_tainted,
             exact_addresses,
+            field_contaminated_roots,
             field_classes: HashMap::new(),
             fields_by_root: HashMap::new(),
             callsites_by_index,
@@ -2276,9 +2309,12 @@ impl<'a> Solver<'a> {
     }
 
     /// Steensgaard field identity used by both its fallback answer and the Kahlon partition
-    /// boundary. Constant offsets remain distinct. A dynamic or otherwise non-composable offset
-    /// uses one summary per allocation root and joins only the fields of that same root.
+    /// boundary. Eligible constant-offset objects retain distinct fields; an object marked by
+    /// an unknown/lane access or memcpy falls back to its whole-object class.
     fn field_class(&mut self, root: NodeId, location: FieldLocation) -> usize {
+        if self.field_contaminated_roots.contains(&root) {
+            return self.class_of(root);
+        }
         if let Some(&class) = self.field_classes.get(&(root, location)) {
             return self.find(class);
         }
@@ -2693,6 +2729,110 @@ mod tests {
             classes.pointee[field_class], classes.pointee[copy_class],
             "both carriers must still designate the same allocation-relative field"
         );
+    }
+
+    fn field_contamination_fixture(extra: Vec<Stmt>, globals: Vec<Global>) -> (Pir, Pag) {
+        let mut lowering = pangs_pir::LoweringStats::default();
+        lowering
+            .semantic_value_kinds
+            .insert("%f::field".into(), ValueKind::Pointer);
+        let mut body = vec![Stmt::Gep {
+            dest: "%f::field".into(),
+            base: "@aggregate".into(),
+            byte_off: Some(8),
+            lane: None,
+            loc: None,
+        }];
+        body.extend(extra);
+        let pir = Pir {
+            module: "field-contamination".into(),
+            source: None,
+            lowering,
+            target: None,
+            functions: vec![Func {
+                key: "f".into(),
+                sig: void_sig(),
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body,
+            }],
+            globals,
+            global_init: Vec::new(),
+        };
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        (pir, pag)
+    }
+
+    fn class_for_label(classes: &SteensClasses, pag: &Pag, label: &str) -> usize {
+        let node = pag.nodes.iter().find(|node| node.label == label).unwrap();
+        classes.class_of(node.id)
+    }
+
+    #[test]
+    fn constant_only_object_retains_distinct_field_storage() {
+        let (pir, pag) = field_contamination_fixture(
+            Vec::new(),
+            vec![Global {
+                key: "aggregate".into(),
+                ..Global::default()
+            }],
+        );
+        let (_, classes) = solve_steensgaard_with_classes(&pir, &pag, BuildMode::Executable);
+        let object = class_for_label(&classes, &pag, "obj:global:aggregate");
+        let address = class_for_label(&classes, &pag, "val:f:%f::field");
+        assert_ne!(classes.pointee[address], Some(object));
+    }
+
+    #[test]
+    fn unknown_gep_contaminates_all_fields_of_its_allocation() {
+        let (pir, pag) = field_contamination_fixture(
+            vec![Stmt::Gep {
+                dest: "%f::dynamic".into(),
+                base: "@aggregate".into(),
+                byte_off: None,
+                lane: None,
+                loc: None,
+            }],
+            vec![Global {
+                key: "aggregate".into(),
+                ..Global::default()
+            }],
+        );
+        let (_, classes) = solve_steensgaard_with_classes(&pir, &pag, BuildMode::Executable);
+        let object = class_for_label(&classes, &pag, "obj:global:aggregate");
+        let address = class_for_label(&classes, &pag, "val:f:%f::field");
+        assert_eq!(classes.pointee[address], Some(object));
+    }
+
+    #[test]
+    fn memcpy_contaminates_allocation_relative_endpoints() {
+        let (pir, pag) = field_contamination_fixture(
+            vec![Stmt::Memcpy {
+                dst: "@aggregate".into(),
+                src: "@source".into(),
+                bytes: Some(16),
+                proven_fnptr_init: false,
+                loc: None,
+            }],
+            vec![
+                Global {
+                    key: "aggregate".into(),
+                    ..Global::default()
+                },
+                Global {
+                    key: "source".into(),
+                    ..Global::default()
+                },
+            ],
+        );
+        let (_, classes) = solve_steensgaard_with_classes(&pir, &pag, BuildMode::Executable);
+        let object = class_for_label(&classes, &pag, "obj:global:aggregate");
+        let address = class_for_label(&classes, &pag, "val:f:%f::field");
+        assert_eq!(classes.pointee[address], Some(object));
     }
 
     #[test]
