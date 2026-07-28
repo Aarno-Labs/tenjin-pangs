@@ -3647,6 +3647,7 @@ mod tests {
                 pangs_pir::Stmt::Load {
                     dest: "%old".into(),
                     address: "@g_counter".into(),
+                    access_bytes: Some(4),
                     loc: loc.clone(),
                 },
                 pangs_pir::Stmt::GlobalRef {
@@ -3665,6 +3666,7 @@ mod tests {
                 pangs_pir::Stmt::Store {
                     address: "@g_counter".into(),
                     value: "%new".into(),
+                    access_bytes: Some(4),
                     loc: loc.clone(),
                 },
                 pangs_pir::Stmt::GlobalRef {

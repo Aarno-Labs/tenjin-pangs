@@ -2754,6 +2754,7 @@ fn direct_atomic_rmw(body: &[Stmt], mod_ref_index: usize, global: &str) -> Optio
         address,
         value,
         loc: store_loc,
+        ..
     } = &body[store_index]
     else {
         return None;
@@ -2816,7 +2817,12 @@ fn direct_global_load_reference(
     let load_index = (0..before).rev().find(|&index| {
         matches!(
             &body[index],
-            Stmt::Load { dest, address, loc: load_loc }
+            Stmt::Load {
+                dest,
+                address,
+                loc: load_loc,
+                ..
+            }
                 if dest == value && same_global_address(address, global) && load_loc == loc
         )
     })?;
@@ -6983,6 +6989,7 @@ mod component_tests {
                 Stmt::Store {
                     address: "@interior_pointer".into(),
                     value: "@__global_init::0".into(),
+                    access_bytes: None,
                     loc: None,
                 },
             ],

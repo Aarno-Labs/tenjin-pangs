@@ -535,6 +535,14 @@ pub struct Edge {
     pub src: NodeId,
     pub dst: NodeId,
     pub owner: Owner,
+    /// Operation-specific memory width. Kept on the edge so solvers do not need to recover a
+    /// pointee type from an LLVM pointer (which is impossible with opaque pointers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_bytes: Option<u64>,
+    /// Distinguishes a genuinely unknown-width operation (for example dynamic memset) from a
+    /// legacy hand-written load/store that predates `access_bytes`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub access_extent_unknown: bool,
     #[serde(default)]
     pub loc: Option<Loc>,
 }
@@ -895,19 +903,41 @@ impl<'a> Builder<'a> {
                     self.add_edge(EdgeKind::Assign, src, dst, owner.clone(), loc.clone());
                 }
             }
-            Stmt::Load { dest, address, loc } => {
+            Stmt::Load {
+                dest,
+                address,
+                access_bytes,
+                loc,
+            } => {
                 let src = self.operand_node(func_index, owner_scope(&owner), address);
                 let dst = self.value_node(func_index, owner_scope(&owner), dest);
-                self.add_edge(EdgeKind::Load, src, dst, owner, loc.clone());
+                self.add_memory_edge(
+                    EdgeKind::Load,
+                    src,
+                    dst,
+                    owner,
+                    *access_bytes,
+                    false,
+                    loc.clone(),
+                );
             }
             Stmt::Store {
                 address,
                 value,
+                access_bytes,
                 loc,
             } => {
                 let src = self.operand_node(func_index, owner_scope(&owner), value);
                 let dst = self.operand_node(func_index, owner_scope(&owner), address);
-                self.add_edge(EdgeKind::Store, src, dst, owner, loc.clone());
+                self.add_memory_edge(
+                    EdgeKind::Store,
+                    src,
+                    dst,
+                    owner,
+                    *access_bytes,
+                    false,
+                    loc.clone(),
+                );
             }
             Stmt::Gep {
                 dest,
@@ -980,7 +1010,9 @@ impl<'a> Builder<'a> {
                     loc.clone(),
                 );
             }
-            Stmt::Memset { dst, loc, .. } => {
+            Stmt::Memset {
+                dst, bytes, loc, ..
+            } => {
                 // Model the write even though the fill byte is not a pointer.  The synthetic
                 // source prevents the pointer solver from interpreting the scalar operand,
                 // while the Store edge lets allocation-specific write proofs see the effect.
@@ -995,7 +1027,15 @@ impl<'a> Builder<'a> {
                         scope: owner_scope(&owner),
                     },
                 );
-                self.add_edge(EdgeKind::Store, source, destination, owner, loc.clone());
+                self.add_memory_edge(
+                    EdgeKind::Store,
+                    source,
+                    destination,
+                    owner,
+                    *bytes,
+                    bytes.is_none(),
+                    loc.clone(),
+                );
             }
             Stmt::Unknown {
                 operands,
@@ -1379,8 +1419,26 @@ impl<'a> Builder<'a> {
             src,
             dst,
             owner,
+            access_bytes: None,
+            access_extent_unknown: false,
             loc,
         });
+        id
+    }
+
+    fn add_memory_edge(
+        &mut self,
+        kind: EdgeKind,
+        src: NodeId,
+        dst: NodeId,
+        owner: Owner,
+        access_bytes: Option<u64>,
+        access_extent_unknown: bool,
+        loc: Option<Loc>,
+    ) -> EdgeId {
+        let id = self.add_edge(kind, src, dst, owner, loc);
+        self.edges[id.0 as usize].access_bytes = access_bytes;
+        self.edges[id.0 as usize].access_extent_unknown = access_extent_unknown;
         id
     }
 

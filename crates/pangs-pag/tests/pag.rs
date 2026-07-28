@@ -216,6 +216,7 @@ fn fresh_allocator_result_is_a_bounded_heap_object() {
                     Stmt::Load {
                         dest: "%value".into(),
                         address: "%heap".into(),
+                        access_bytes: Some(8),
                         loc: None,
                     },
                 ],
@@ -240,6 +241,10 @@ fn fresh_allocator_result_is_a_bounded_heap_object() {
         .unwrap();
     assert!(!callsite.external_boundary);
     assert!(pag.nodes.iter().any(|node| node.label == "obj:heap:main:0"));
+    assert!(pag
+        .edges
+        .iter()
+        .any(|edge| edge.kind == pangs_pag::EdgeKind::Load && edge.access_bytes == Some(8)));
     assert!(!pag.omega_seeds.iter().any(|seed| {
         seed.kind == OmegaSeedKind::ExternalCallBoundary
             && seed.target == SeedTarget::Callsite(callsite.id)

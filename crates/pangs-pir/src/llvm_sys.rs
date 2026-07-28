@@ -1215,6 +1215,7 @@ unsafe fn lower_instruction(
             body.push(Stmt::Load {
                 dest: dest.clone(),
                 address: fctx.operand_key(address),
+                access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(inst))),
                 loc: loc(inst),
             });
             lowering.bump_modeled("load");
@@ -1249,6 +1250,7 @@ unsafe fn lower_instruction(
             body.push(Stmt::Store {
                 address: fctx.operand_key(address),
                 value: fctx.operand_key(value),
+                access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(value))),
                 loc: loc(inst),
             });
             lowering.bump_modeled("store");
@@ -1757,7 +1759,7 @@ unsafe fn lower_landingpad(
 }
 
 unsafe fn lower_cmpxchg(
-    _ctx: &ModuleCtx,
+    ctx: &ModuleCtx,
     fctx: &mut FunctionCtx,
     inst: LLVMValueRef,
     body: &mut Vec<Stmt>,
@@ -1768,11 +1770,16 @@ unsafe fn lower_cmpxchg(
     body.push(Stmt::Load {
         dest: format!("{}.old", fctx.local_key(inst)),
         address: fctx.operand_key(address),
+        access_bytes: Some(type_size_key(
+            ctx.data_layout,
+            LLVMTypeOf(LLVMGetOperand(inst, 1)),
+        )),
         loc: loc(inst),
     });
     body.push(Stmt::Store {
         address: fctx.operand_key(address),
         value: fctx.operand_key(replacement),
+        access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(replacement))),
         loc: loc(inst),
     });
     lowering.bump_modeled("cmpxchg");
@@ -1785,7 +1792,7 @@ unsafe fn lower_cmpxchg(
 }
 
 unsafe fn lower_atomicrmw(
-    _ctx: &ModuleCtx,
+    ctx: &ModuleCtx,
     fctx: &mut FunctionCtx,
     inst: LLVMValueRef,
     body: &mut Vec<Stmt>,
@@ -1796,11 +1803,13 @@ unsafe fn lower_atomicrmw(
     body.push(Stmt::Load {
         dest: fctx.local_key(inst),
         address: fctx.operand_key(address),
+        access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(inst))),
         loc: loc(inst),
     });
     body.push(Stmt::Store {
         address: fctx.operand_key(address),
         value: fctx.operand_key(value),
+        access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(value))),
         loc: loc(inst),
     });
     lowering.bump_modeled("atomicrmw");
@@ -2035,6 +2044,7 @@ unsafe fn lower_global_initializer_value(
         body.push(Stmt::Store {
             address: address.to_string(),
             value: value.clone(),
+            access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(constant))),
             loc: None,
         });
         lowering.bump_modeled("global_init_store");
@@ -2177,7 +2187,9 @@ unsafe fn proven_initialized_fnptr_aggregate_copy(
     {
         return false;
     }
-    let destination_ty = LLVMGetElementType(LLVMTypeOf(destination));
+    // Global storage has an operation-specific value type even when pointer types are opaque.
+    // Do not recover it with LLVMGetElementType(LLVMTypeOf(destination)).
+    let destination_ty = LLVMGlobalGetValueType(destination);
     if source_ty != destination_ty
         || LLVMABISizeOfType(ctx.data_layout, source_ty) != bytes
         || LLVMABISizeOfType(ctx.data_layout, destination_ty) != bytes
@@ -2666,7 +2678,7 @@ unsafe fn function_signature(
     function: LLVMValueRef,
     lowering: &mut LoweringStats,
 ) -> Signature {
-    let function_ty = LLVMGetElementType(LLVMTypeOf(function));
+    let function_ty = LLVMGlobalGetValueType(function);
     let cc = cc_key(LLVMGetFunctionCallConv(function), lowering);
     Signature {
         ret: abi_class(LLVMGetReturnType(function_ty)),

@@ -862,8 +862,7 @@ struct Solver<'a> {
     global_address_exposed: Vec<bool>,
     module_violation_tainted: bool,
     exact_addresses: Vec<Option<ExactAddress>>,
-    field_contaminated_roots: HashSet<NodeId>,
-    field_classes: HashMap<(NodeId, FieldLocation), usize>,
+    field_classes: HashMap<(NodeId, FieldRegion), usize>,
     fields_by_root: HashMap<NodeId, Vec<usize>>,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
     worklist: VecDeque<usize>,
@@ -902,6 +901,91 @@ pub(crate) enum FieldLocation {
     Exact(i64),
     Lane(pangs_pir::GepLane),
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FieldRegion {
+    location: FieldLocation,
+    /// `Some(0)` denotes an address identity, while `None` is an access of unknown extent.
+    width: Option<u64>,
+}
+
+impl FieldRegion {
+    fn address(location: FieldLocation) -> Self {
+        Self {
+            location,
+            width: Some(0),
+        }
+    }
+
+    fn access(location: FieldLocation, width: Option<u64>) -> Self {
+        Self { location, width }
+    }
+
+    fn may_overlap(self, other: Self) -> bool {
+        if matches!(self.location, FieldLocation::Unknown)
+            || matches!(other.location, FieldLocation::Unknown)
+        {
+            return true;
+        }
+        let (Some(lhs_width), Some(rhs_width)) = (self.width, other.width) else {
+            return true;
+        };
+        // Address identities occupy one byte for overlap purposes. This connects a GEP's
+        // storage identity to a wider load/store/memcpy covering that address, while two
+        // distinct zero-width legacy accesses remain separate.
+        let lhs_width = lhs_width.max(1);
+        let rhs_width = rhs_width.max(1);
+
+        match (self.location, other.location) {
+            (FieldLocation::Exact(lhs), FieldLocation::Exact(rhs)) => {
+                let lhs = i128::from(lhs);
+                let rhs = i128::from(rhs);
+                lhs < rhs + i128::from(rhs_width) && rhs < lhs + i128::from(lhs_width)
+            }
+            (FieldLocation::Exact(exact), FieldLocation::Lane(lane)) => {
+                lane_overlaps_exact(lane, rhs_width, exact, lhs_width)
+            }
+            (FieldLocation::Lane(lane), FieldLocation::Exact(exact)) => {
+                lane_overlaps_exact(lane, lhs_width, exact, rhs_width)
+            }
+            (FieldLocation::Lane(lhs), FieldLocation::Lane(rhs)) => {
+                let modulus = gcd_u64(lhs.modulus, rhs.modulus);
+                let residue_delta = i128::from(lhs.residue) - i128::from(rhs.residue);
+                congruence_in_range(
+                    residue_delta,
+                    modulus,
+                    -(i128::from(lhs_width) - 1),
+                    i128::from(rhs_width) - 1,
+                )
+            }
+            (FieldLocation::Unknown, _) | (_, FieldLocation::Unknown) => true,
+        }
+    }
+}
+
+fn lane_overlaps_exact(
+    lane: pangs_pir::GepLane,
+    lane_width: u64,
+    exact: i64,
+    exact_width: u64,
+) -> bool {
+    congruence_in_range(
+        i128::from(lane.residue) - i128::from(exact),
+        lane.modulus,
+        -(i128::from(lane_width) - 1),
+        i128::from(exact_width) - 1,
+    )
+}
+
+fn congruence_in_range(residue: i128, modulus: u64, min: i128, max: i128) -> bool {
+    if min > max {
+        return false;
+    }
+    let modulus = i128::from(modulus);
+    let normalized = residue.rem_euclid(modulus);
+    let first = min + (normalized - min).rem_euclid(modulus);
+    first <= max
 }
 
 impl FieldLocation {
@@ -1036,36 +1120,6 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
         }
     }
     addresses
-}
-
-/// Identify allocations that cannot safely retain independent constant-offset cells during
-/// Steensgaard solving. The PAG does not retain enough aggregate layout/type information to
-/// prove that a memcpy is field-compatible or to classify typed union overlays, so copies fail
-/// closed and contaminate every allocation-relative endpoint. Unknown and affine-lane locations
-/// likewise overlap more than one concrete field and collapse their allocation to its
-/// whole-object cell. Constant union members that lower to the same byte offset already share
-/// one field identity; partial typed overlaps cannot be distinguished without richer PAG data.
-fn field_contaminated_roots(pag: &Pag, addresses: &[Option<ExactAddress>]) -> HashSet<NodeId> {
-    let mut contaminated = HashSet::new();
-
-    for address in addresses.iter().flatten() {
-        if !matches!(address.location, FieldLocation::Exact(_)) {
-            contaminated.insert(address.root);
-        }
-    }
-
-    for edge in &pag.edges {
-        if !matches!(edge.kind, pangs_pag::EdgeKind::Memcpy { .. }) {
-            continue;
-        }
-        for endpoint in [edge.src, edge.dst] {
-            if let Some(address) = addresses[endpoint.0 as usize] {
-                contaminated.insert(address.root);
-            }
-        }
-    }
-
-    contaminated
 }
 
 #[derive(Default)]
@@ -1302,7 +1356,6 @@ impl<'a> Solver<'a> {
         let callsites_by_index = pag.callsites.iter().collect();
         let queued = vec![false; classes.len()];
         let exact_addresses = exact_allocation_addresses(pag);
-        let field_contaminated_roots = field_contaminated_roots(pag, &exact_addresses);
 
         Self {
             pir,
@@ -1318,7 +1371,6 @@ impl<'a> Solver<'a> {
             global_address_exposed,
             module_violation_tainted,
             exact_addresses,
-            field_contaminated_roots,
             field_classes: HashMap::new(),
             fields_by_root: HashMap::new(),
             callsites_by_index,
@@ -1402,7 +1454,7 @@ impl<'a> Solver<'a> {
                         continue;
                     }
                     let dst = self.class_of(edge.dst);
-                    if let Some(storage) = self.exact_storage_class(edge.dst) {
+                    if let Some(storage) = self.exact_storage_class(edge.dst, Some(0), true) {
                         // A complete fixed-PAG certificate proves every producer of `dst`
                         // names this one allocation-relative location. Preserve that fact
                         // directly instead of recursively unifying the pointer carriers,
@@ -1419,7 +1471,11 @@ impl<'a> Solver<'a> {
                         continue;
                     }
                     let dst = self.class_of(edge.dst);
-                    let storage = self.storage_class_for_address(edge.src);
+                    // Missing widths occur only in legacy/hand-written PIR. Preserve its
+                    // historical same-offset semantics; LLVM lowering always emits a width.
+                    let width =
+                        (!edge.access_extent_unknown).then_some(edge.access_bytes.unwrap_or(0));
+                    let storage = self.storage_class_for_address(edge.src, width, true);
                     self.join(
                         dst,
                         storage,
@@ -1427,11 +1483,13 @@ impl<'a> Solver<'a> {
                     );
                 }
                 pangs_pag::EdgeKind::Store => {
+                    let width =
+                        (!edge.access_extent_unknown).then_some(edge.access_bytes.unwrap_or(0));
+                    let storage = self.storage_class_for_address(edge.dst, width, true);
                     if !self.node_may_carry_pointer(edge.src) {
                         continue;
                     }
                     let src = self.class_of(edge.src);
-                    let storage = self.storage_class_for_address(edge.dst);
                     self.join(
                         storage,
                         src,
@@ -1442,7 +1500,8 @@ impl<'a> Solver<'a> {
                     let dst = self.class_of(edge.dst);
                     let dst_p = self.pointee_of(dst);
                     if let Some(address) = self.exact_addresses[edge.dst.0 as usize] {
-                        let storage = self.field_class(address.root, address.location);
+                        let storage =
+                            self.field_class(address.root, FieldRegion::address(address.location));
                         self.join(dst_p, storage, PROV_DIRECT_ADDRESS);
                     } else {
                         let src = self.class_of(edge.src);
@@ -1450,9 +1509,9 @@ impl<'a> Solver<'a> {
                         self.join(dst_p, src_p, PROV_DIRECT_ADDRESS);
                     }
                 }
-                pangs_pag::EdgeKind::Memcpy { .. } => {
-                    let dst_storage = self.storage_class_for_address(edge.dst);
-                    let src_storage = self.storage_class_for_address(edge.src);
+                pangs_pag::EdgeKind::Memcpy { bytes } => {
+                    let dst_storage = self.storage_class_for_address(edge.dst, bytes, false);
+                    let src_storage = self.storage_class_for_address(edge.src, bytes, false);
                     let dst_content = self.pointee_of(dst_storage);
                     let src_content = self.pointee_of(src_storage);
                     self.join(
@@ -2286,21 +2345,37 @@ impl<'a> Solver<'a> {
 
     /// Return the independently certified allocation-relative storage cell for `address`,
     /// using the same per-allocation field identities as certified GEPs.
-    fn exact_storage_class(&mut self, address: NodeId) -> Option<usize> {
+    fn exact_storage_class(
+        &mut self,
+        address: NodeId,
+        width: Option<u64>,
+        direct_root_at_zero: bool,
+    ) -> Option<usize> {
         let address = self.exact_addresses[address.0 as usize]?;
-        if address.location == FieldLocation::Unknown {
-            return None;
-        }
         Some(match address.location {
-            FieldLocation::Exact(0) if !address.via_gep => self.class_of(address.root),
-            location => self.field_class(address.root, location),
+            FieldLocation::Exact(0) if !address.via_gep && direct_root_at_zero => {
+                let root = self.class_of(address.root);
+                if width != Some(0) {
+                    let region = self
+                        .field_class(address.root, FieldRegion::access(address.location, width));
+                    self.join(root, region, PROV_DIRECT_ADDRESS)
+                } else {
+                    root
+                }
+            }
+            location => self.field_class(address.root, FieldRegion::access(location, width)),
         })
     }
 
     /// Resolve a memory address to its storage class, preferring an allocation-relative
     /// certificate over the (potentially much broader) Steensgaard carrier class.
-    fn storage_class_for_address(&mut self, address: NodeId) -> usize {
-        if let Some(storage) = self.exact_storage_class(address) {
+    fn storage_class_for_address(
+        &mut self,
+        address: NodeId,
+        width: Option<u64>,
+        direct_root_at_zero: bool,
+    ) -> usize {
+        if let Some(storage) = self.exact_storage_class(address, width, direct_root_at_zero) {
             storage
         } else {
             let class = self.class_of(address);
@@ -2308,14 +2383,11 @@ impl<'a> Solver<'a> {
         }
     }
 
-    /// Steensgaard field identity used by both its fallback answer and the Kahlon partition
-    /// boundary. Eligible constant-offset objects retain distinct fields; an object marked by
-    /// an unknown/lane access or memcpy falls back to its whole-object class.
-    fn field_class(&mut self, root: NodeId, location: FieldLocation) -> usize {
-        if self.field_contaminated_roots.contains(&root) {
-            return self.class_of(root);
-        }
-        if let Some(&class) = self.field_classes.get(&(root, location)) {
+    /// Allocation-relative byte-region identity used by both the fallback answer and Kahlon
+    /// partitioning. Exact, affine-lane, and memcpy accesses join only when their byte intervals
+    /// can overlap; an unknown location or extent naturally aliases every region of the object.
+    fn field_class(&mut self, root: NodeId, region: FieldRegion) -> usize {
+        if let Some(&class) = self.field_classes.get(&(root, region)) {
             return self.find(class);
         }
 
@@ -2330,16 +2402,16 @@ impl<'a> Solver<'a> {
             .extend(self.classes[root_class].global_objs.iter().copied());
         self.classes.push(data);
         self.queued.push(false);
-        self.field_classes.insert((root, location), id);
+        self.field_classes.insert((root, region), id);
 
         self.fields_by_root.entry(root).or_default().push(id);
         let aliasing = self
             .field_classes
             .iter()
-            .filter_map(|(&(candidate_root, candidate_location), &class)| {
+            .filter_map(|(&(candidate_root, candidate_region), &class)| {
                 (candidate_root == root
-                    && candidate_location != location
-                    && location.may_alias(candidate_location))
+                    && candidate_region != region
+                    && region.may_overlap(candidate_region))
                 .then_some(class)
             })
             .collect::<Vec<_>>();
@@ -2580,6 +2652,7 @@ mod tests {
                     Stmt::Store {
                         address: "%f::scalar.addr".into(),
                         value: "7".into(),
+                        access_bytes: Some(8),
                         loc: None,
                     },
                     Stmt::Gep {
@@ -2592,16 +2665,19 @@ mod tests {
                     Stmt::Store {
                         address: "%f::pointer.addr".into(),
                         value: "@target".into(),
+                        access_bytes: Some(8),
                         loc: None,
                     },
                     Stmt::Load {
                         dest: "%f::scalar".into(),
                         address: "%f::scalar.addr".into(),
+                        access_bytes: Some(8),
                         loc: None,
                     },
                     Stmt::Load {
                         dest: "%f::pointer".into(),
                         address: "%f::pointer.addr".into(),
+                        access_bytes: Some(8),
                         loc: None,
                     },
                 ],
@@ -2663,6 +2739,25 @@ mod tests {
             ),
             FieldLocation::Unknown
         );
+    }
+
+    #[test]
+    fn typed_regions_use_byte_overlap_for_exact_and_affine_accesses() {
+        let exact = |offset, width| FieldRegion::access(FieldLocation::Exact(offset), Some(width));
+        let lane = |modulus, residue, width| {
+            FieldRegion::access(
+                FieldLocation::Lane(pangs_pir::GepLane::new(modulus, residue).unwrap()),
+                Some(width),
+            )
+        };
+
+        assert!(exact(8, 8).may_overlap(exact(12, 8)));
+        assert!(!exact(8, 8).may_overlap(exact(16, 8)));
+        assert!(lane(24, 8, 8).may_overlap(exact(12, 8)));
+        assert!(!lane(24, 8, 8).may_overlap(lane(24, 16, 8)));
+        assert!(lane(24, 8, 9).may_overlap(lane(24, 16, 8)));
+        assert!(FieldRegion::access(FieldLocation::Unknown, Some(1)).may_overlap(exact(4096, 1)));
+        assert!(FieldRegion::access(FieldLocation::Exact(0), None).may_overlap(exact(4096, 1)));
     }
 
     #[test]
@@ -2788,7 +2883,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_gep_contaminates_all_fields_of_its_allocation() {
+    fn unknown_gep_overlaps_every_field_of_its_allocation() {
         let (pir, pag) = field_contamination_fixture(
             vec![Stmt::Gep {
                 dest: "%f::dynamic".into(),
@@ -2803,21 +2898,30 @@ mod tests {
             }],
         );
         let (_, classes) = solve_steensgaard_with_classes(&pir, &pag, BuildMode::Executable);
-        let object = class_for_label(&classes, &pag, "obj:global:aggregate");
-        let address = class_for_label(&classes, &pag, "val:f:%f::field");
-        assert_eq!(classes.pointee[address], Some(object));
+        let field = class_for_label(&classes, &pag, "val:f:%f::field");
+        let dynamic = class_for_label(&classes, &pag, "val:f:%f::dynamic");
+        assert_eq!(classes.pointee[field], classes.pointee[dynamic]);
     }
 
     #[test]
-    fn memcpy_contaminates_allocation_relative_endpoints() {
+    fn bounded_memcpy_does_not_contaminate_nonoverlapping_fields() {
         let (pir, pag) = field_contamination_fixture(
-            vec![Stmt::Memcpy {
-                dst: "@aggregate".into(),
-                src: "@source".into(),
-                bytes: Some(16),
-                proven_fnptr_init: false,
-                loc: None,
-            }],
+            vec![
+                Stmt::Gep {
+                    dest: "%f::outside".into(),
+                    base: "@aggregate".into(),
+                    byte_off: Some(24),
+                    lane: None,
+                    loc: None,
+                },
+                Stmt::Memcpy {
+                    dst: "@aggregate".into(),
+                    src: "@source".into(),
+                    bytes: Some(16),
+                    proven_fnptr_init: false,
+                    loc: None,
+                },
+            ],
             vec![
                 Global {
                     key: "aggregate".into(),
@@ -2830,9 +2934,9 @@ mod tests {
             ],
         );
         let (_, classes) = solve_steensgaard_with_classes(&pir, &pag, BuildMode::Executable);
-        let object = class_for_label(&classes, &pag, "obj:global:aggregate");
-        let address = class_for_label(&classes, &pag, "val:f:%f::field");
-        assert_eq!(classes.pointee[address], Some(object));
+        let copied = class_for_label(&classes, &pag, "val:f:%f::field");
+        let outside = class_for_label(&classes, &pag, "val:f:%f::outside");
+        assert_ne!(classes.pointee[copied], classes.pointee[outside]);
     }
 
     #[test]
@@ -2990,6 +3094,8 @@ mod tests {
                 src: NodeId(0),
                 dst: NodeId(2),
                 owner: pangs_pag::Owner::Module,
+                access_bytes: None,
+                access_extent_unknown: false,
                 loc: None,
             },
             pangs_pag::Edge {
@@ -2998,6 +3104,8 @@ mod tests {
                 src: NodeId(1),
                 dst: NodeId(3),
                 owner: pangs_pag::Owner::Module,
+                access_bytes: None,
+                access_extent_unknown: false,
                 loc: None,
             },
             pangs_pag::Edge {
@@ -3009,6 +3117,8 @@ mod tests {
                 src: NodeId(3),
                 dst: NodeId(5),
                 owner: pangs_pag::Owner::Module,
+                access_bytes: None,
+                access_extent_unknown: false,
                 loc: None,
             },
         ];

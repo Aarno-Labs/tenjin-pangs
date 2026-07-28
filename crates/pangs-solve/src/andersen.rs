@@ -4031,15 +4031,11 @@ mod tests {
     fn dynamic_array_indices_preserve_struct_field_lanes() {
         let (pir, pag) = load("array_lane_fnptr.pir.json");
 
-        // Steensgaard's object-scoped field gate deliberately retains only constant offsets.
-        // An affine array lane contaminates the allocation and falls back to whole-object
-        // storage, while Andersen can still refine the two disjoint lanes.
+        // Access widths prove that the affine callback and data lanes cannot overlap, so both
+        // Steensgaard and Andersen retain the distinction.
         let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
         assert_eq!(steens.indirect_calls.len(), 1);
-        assert_eq!(
-            steens.indirect_calls[0].targets,
-            vec!["f0".to_string(), "f1".to_string()]
-        );
+        assert_eq!(steens.indirect_calls[0].targets, vec!["f0".to_string()]);
 
         let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
         assert_eq!(andersen.indirect_calls.len(), 1);

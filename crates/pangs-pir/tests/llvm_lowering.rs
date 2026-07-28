@@ -149,6 +149,20 @@ fn lowers_llvm14_bitcode_function_pointer_smoke() {
         .body
         .iter()
         .any(|stmt| matches!(stmt, Stmt::Store { .. })));
+    assert!(target.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Load {
+            access_bytes: Some(8),
+            ..
+        }
+    )));
+    assert!(target.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Store {
+            access_bytes: Some(4 | 8),
+            ..
+        }
+    )));
     assert!(target
         .body
         .iter()

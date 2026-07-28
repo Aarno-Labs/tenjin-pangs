@@ -287,12 +287,20 @@ pub enum Stmt {
     Load {
         dest: String,
         address: String,
+        /// ABI width of the loaded LLVM value. This is obtained from the load instruction's
+        /// result type, never by inspecting the address pointer's element type.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access_bytes: Option<u64>,
         #[serde(default)]
         loc: Option<Loc>,
     },
     Store {
         address: String,
         value: String,
+        /// ABI width of the stored LLVM value. This is obtained from the stored operand's type,
+        /// never by inspecting the address pointer's element type.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access_bytes: Option<u64>,
         #[serde(default)]
         loc: Option<Loc>,
     },
