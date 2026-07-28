@@ -49,6 +49,7 @@ fn fixture() -> (Manifest, Vec<AuditRecord>) {
                 line: Some(1),
                 extra: Extra::new(),
             },
+            storage_members: Vec::new(),
             facts: Facts {
                 written: bool_fact(false),
                 omega_escaped_address: bool_fact(false),
@@ -75,6 +76,7 @@ fn fixture() -> (Manifest, Vec<AuditRecord>) {
             disposition: None,
             extra: Extra::new(),
         }],
+        synthetic_globals: Vec::new(),
         unkeyed_globals: Vec::new(),
         coupling_groups: Vec::new(),
         coupling_candidates: Vec::new(),

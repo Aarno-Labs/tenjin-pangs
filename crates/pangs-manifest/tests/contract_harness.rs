@@ -45,7 +45,7 @@ fn contract_manifest() -> Manifest {
         })
     };
     serde_json::from_value(json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "run": {
             "analysis": {
                 "pangs_git": "test",
@@ -68,6 +68,7 @@ fn contract_manifest() -> Manifest {
             global("src/toy.c::published", "published", "once-lock", None),
             global("src/toy.c::counter", "counter", "atomic", None)
         ],
+        "synthetic_globals": [],
         "unkeyed_globals": [],
         "coupling_groups": [
             {

@@ -18,6 +18,9 @@
       "type": "string",
       "minLength": 1
     },
+    "synthetic_kind": {
+      "enum": ["unnamed-compound-literal"]
+    },
     "file": {
       "type": ["string", "null"],
       "minLength": 1

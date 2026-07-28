@@ -148,20 +148,30 @@ one scan, or it does not belong in the vector. Nothing here re-enters the solver
 The concrete JSON/Rust encodings of these types — the evidenced-bool object and its
 per-fact evidenced polarity, witness records, the certificate-slot union, the
 localization verdict, and cascade skip reasons — are fixed in `DISPOSITION_PLAN.md`
-§1.5 and are part of what D1a's golden test freezes. Schema v3 makes unknown mod/ref
-candidate scope explicit so an abbreviated finite set cannot be mistaken for module-wide Ω.
+§1.5 and are part of what D1a's golden test freezes. Schema v3 made unknown mod/ref
+candidate scope explicit so an abbreviated finite set could not be mistaken for
+module-wide Ω; schema v4 adds owner storage closures and the auxiliary synthetic-global
+inventory.
 
 ## 3. The manifest
 
 One versioned JSON document per analyzed program — **`pangs-manifest.json`,
-`schema_version: 3`** — superseding and subsuming `ONCELOCK.md` §2's standalone schema
+`schema_version: 4`** — superseding and subsuming `ONCELOCK.md` §2's standalone schema
 (which becomes the `facts.phase_stationarity` sub-object; see §8). It is the single
 artifact consumed by *both* toolchain stages and referenced by override files.
 
 **Population — "client-relevant global" defined precisely:** `globals[]` contains
-**every defined mutable global**: every global with a definition in the analyzed
-module whose type is not const-qualified (the existing `GlobalInfo.mutable` bit),
-after the existing ignore-list filter, function-scope statics included. Excluded:
+every **source-actionable defined mutable global**: every global with a definition in
+the analyzed module whose type is not const-qualified (the existing
+`GlobalInfo.mutable` bit), after the existing ignore-list filter, function-scope
+statics included. Compiler-generated anonymous backing objects remain part of the
+PAG, points-to solution, mod/ref analysis, and raw analysis exports, but are not
+independent disposition subjects. When a backing object has one named
+constant-initializer owner, it appears in that owner's `storage_members`; its safety
+facts are folded conservatively into the owner's fact vector, and materialization
+must move, clone, initialize, or protect the complete storage closure. A backing
+object with no unique owner appears only in `synthetic_globals`, with the failed
+ownership proof, outside the actionable coverage denominator. Excluded:
 `const` globals (nothing to decide — already immutable in source), external
 declarations (no defining TU here; not ours to rewrite). Stationary and never-written
 globals are *included* — they are precisely the `immutable`/`once-lock` candidates.
@@ -210,7 +220,7 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
 
 ```jsonc
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "run": {
     "analysis": {                        // analysis-owned (§3.3): provenance fields
       "entry_spine": { ... },            //   (pangs git, input hash, opts) +
@@ -637,7 +647,7 @@ None of these amendments change A′–D′ or any solver semantics.
 Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
 
 - **D1 — manifest + policy stage (implemented).** Fact-vector assembly from existing
-  scans; cascade evaluation with trace; schema v3 emission; run-header reproducibility
+  scans; cascade evaluation with trace; schema v4 emission; run-header reproducibility
   fields. No new analysis.
 - **D2 — override machinery (implemented).** TOML parsing, §4.2 validation, override
   report, soundness-inventory append for accepted risks, CI exit-code discipline.

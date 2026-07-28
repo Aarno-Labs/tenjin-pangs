@@ -121,6 +121,8 @@ pub struct FuncInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalInfo {
     pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synthetic_kind: Option<String>,
     pub file: Option<String>,
     pub line: Option<u32>,
     pub is_const: bool,
@@ -909,6 +911,8 @@ impl Analysis {
             }
             globals.push(GlobalInfo {
                 key: global.key.clone(),
+                synthetic_kind: is_unnamed_compound_literal(global)
+                    .then(|| "unnamed-compound-literal".into()),
                 file: global.file.clone(),
                 line: global.line,
                 is_const: global.is_const,
@@ -2742,6 +2746,12 @@ fn global_symbol_labels(key: &str) -> Vec<String> {
 fn is_ignored_client_global(key: &str) -> bool {
     let key = key.strip_prefix('@').unwrap_or(key);
     key.starts_with(".str") || key.starts_with("__PRETTY_FUNCTION__") || key.starts_with("__const")
+}
+
+fn is_unnamed_compound_literal(global: &pangs_pir::Global) -> bool {
+    let symbol = global.key.strip_prefix('@').unwrap_or(&global.key);
+    global.linkage == SymbolLinkage::Internal
+        && (symbol == ".compoundliteral" || symbol.starts_with(".compoundliteral."))
 }
 
 fn signature_text(sig: &pangs_pir::Signature) -> String {
@@ -6758,6 +6768,7 @@ mod component_tests {
     fn global(key: &str) -> GlobalInfo {
         GlobalInfo {
             key: key.to_string(),
+            synthetic_kind: None,
             file: None,
             line: None,
             is_const: false,

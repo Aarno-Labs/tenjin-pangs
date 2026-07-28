@@ -23,8 +23,9 @@ use pangs_manifest::{
     EvidencedBool, Extra, Facts, GlobalRecord as DispositionGlobal, GroupStrategySupport, Key,
     Linkage, Localization, LocalizationBlocker, LocalizationVerdict,
     Manifest as DispositionManifest, Meta, OnceLockGroupSupport, RunHeader, ScalarClass, Site,
-    UnkeyedGlobal, ViolationRelevance as ManifestViolationRelevance, ViolationRelevanceDiagnostic,
-    Witness, WordSizedScalar, SCHEMA_VERSION,
+    StorageMember, SyntheticGlobal, UnkeyedGlobal,
+    ViolationRelevance as ManifestViolationRelevance, ViolationRelevanceDiagnostic, Witness,
+    WordSizedScalar, SCHEMA_VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -157,6 +158,9 @@ pub fn assemble_disposition_artifacts(
     }
     let global_facts_started = Instant::now();
     let mut globals = Vec::new();
+    let mut synthetic_globals = Vec::new();
+    let compound_literal_owners = compound_literal_owners(analysis, module);
+    let mut pending_storage_members = Vec::new();
     let mut unkeyed_globals = Vec::new();
     for (index, info) in analysis.globals().iter().enumerate() {
         if !info.mutable || !info.is_definition {
@@ -213,7 +217,7 @@ pub fn assemble_disposition_artifacts(
             fact_rows.access_failure[index],
         );
         let localization = fact_rows.localization[index].clone();
-        globals.push(DispositionGlobal {
+        let record = DispositionGlobal {
             key,
             meta: Meta {
                 linkage: match info.linkage {
@@ -252,9 +256,55 @@ pub fn assemble_disposition_artifacts(
                 violation_relevance: fact_rows.violation_diagnostics[index].clone(),
                 extra: Extra::new(),
             },
+            storage_members: Vec::new(),
             disposition: None,
             extra: Extra::new(),
-        });
+        };
+        if is_unnamed_compound_literal(info) {
+            let owner = compound_literal_owners.get(&info.key).cloned().flatten();
+            let witness = Witness {
+                kind: "compiler-generated-backing-storage".into(),
+                site: None,
+                symbol: Some(info.key.clone()),
+                note: Some(match &owner {
+                    Some(owner) => format!(
+                        "constant-initializer ownership is unique; facts roll up to {owner}"
+                    ),
+                    None => "no unique named constant-initializer owner".into(),
+                }),
+                extra: Extra::new(),
+            };
+            synthetic_globals.push(SyntheticGlobal {
+                llvm_name: info.key.clone(),
+                kind: "unnamed-compound-literal".into(),
+                owner: owner.clone(),
+                witness,
+                extra: Extra::new(),
+            });
+            if let Some(owner) = owner {
+                pending_storage_members.push((owner, record));
+            }
+        } else {
+            globals.push(record);
+        }
+    }
+    let global_by_key = globals
+        .iter()
+        .enumerate()
+        .map(|(index, global)| (global.key.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    for (owner, member) in pending_storage_members {
+        let Some(&owner_index) = global_by_key.get(&owner) else {
+            anyhow::bail!("synthetic storage owner {owner} has no disposition subject");
+        };
+        fold_storage_member(&mut globals[owner_index], member);
+    }
+    // Keep deterministic construction independent of LLVM's global enumeration order.
+    synthetic_globals.sort_by(|left, right| left.llvm_name.cmp(&right.llvm_name));
+    for global in &mut globals {
+        global
+            .storage_members
+            .sort_by(|left, right| left.llvm_name.cmp(&right.llvm_name));
     }
     if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
@@ -437,6 +487,7 @@ pub fn assemble_disposition_artifacts(
             extra: Extra::new(),
         },
         globals,
+        synthetic_globals,
         unkeyed_globals,
         coupling_groups,
         coupling_candidates: Vec::new(),
@@ -460,6 +511,236 @@ pub fn assemble_disposition_artifacts(
     }];
     canonicalize_audit(&mut ledger)?;
     Ok((manifest, ledger))
+}
+
+fn is_unnamed_compound_literal(info: &pangs_api::GlobalInfo) -> bool {
+    info.synthetic_kind.as_deref() == Some("unnamed-compound-literal")
+}
+
+fn disposition_key(info: &pangs_api::GlobalInfo) -> Option<Key> {
+    let symbol = info.key.strip_prefix('@').unwrap_or(&info.key);
+    info.file
+        .as_deref()
+        .map_or_else(|| Key::unqualified(symbol), |file| Key::new(file, symbol))
+        .or_else(|_| Key::unqualified(symbol))
+        .ok()
+}
+
+/// Finds source-level globals that uniquely own compiler-generated compound-literal storage.
+///
+/// LLVM names initializer references without a leading `@`; analysis keys may retain it, so
+/// identity is normalized only for this PIR-to-analysis join. A multiply referenced literal is
+/// deliberately left ownerless: choosing either source global would hide a shared-storage
+/// obligation.
+fn compound_literal_owners(
+    analysis: &Analysis,
+    module: &pangs_pir::Pir,
+) -> BTreeMap<String, Option<Key>> {
+    let infos = analysis
+        .globals()
+        .iter()
+        .map(|info| {
+            (
+                info.key.strip_prefix('@').unwrap_or(&info.key).to_owned(),
+                info,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let synthetic_names = infos
+        .iter()
+        .filter_map(|(name, info)| is_unnamed_compound_literal(info).then_some(name.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut owners = synthetic_names
+        .iter()
+        .map(|name| (name.clone(), BTreeSet::<Key>::new()))
+        .collect::<BTreeMap<_, _>>();
+    let initializer_refs = module
+        .globals
+        .iter()
+        .map(|global| {
+            (
+                global
+                    .key
+                    .strip_prefix('@')
+                    .unwrap_or(&global.key)
+                    .to_owned(),
+                global
+                    .init_refs
+                    .iter()
+                    .map(|referenced| {
+                        referenced
+                            .strip_prefix('@')
+                            .unwrap_or(referenced)
+                            .to_owned()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for initializer in &module.globals {
+        let initializer_name = initializer
+            .key
+            .strip_prefix('@')
+            .unwrap_or(&initializer.key);
+        let Some(info) = infos.get(initializer_name).copied() else {
+            continue;
+        };
+        if is_unnamed_compound_literal(info) || !info.mutable || !info.is_definition {
+            continue;
+        }
+        let Some(owner) = disposition_key(info) else {
+            continue;
+        };
+        let mut pending = initializer_refs
+            .get(initializer_name)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        while let Some(referenced) = pending.pop() {
+            if synthetic_names.contains(&referenced) && seen.insert(referenced.clone()) {
+                owners
+                    .get_mut(&referenced)
+                    .expect("synthetic owner table is complete")
+                    .insert(owner.clone());
+                pending.extend(
+                    initializer_refs
+                        .get(&referenced)
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+            }
+        }
+    }
+
+    owners
+        .into_iter()
+        .map(|(name, candidates)| {
+            let owner = (candidates.len() == 1)
+                .then(|| candidates.into_iter().next())
+                .flatten();
+            let analysis_name = infos
+                .get(&name)
+                .expect("synthetic analysis global exists")
+                .key
+                .clone();
+            (analysis_name, owner)
+        })
+        .collect()
+}
+
+fn fold_storage_member(owner: &mut DispositionGlobal, member: DispositionGlobal) {
+    owner.storage_members.push(StorageMember {
+        llvm_name: member.meta.llvm_name.clone(),
+        kind: "unnamed-compound-literal".into(),
+        extra: Extra::new(),
+    });
+
+    fold_or_fact(&mut owner.facts.written, member.facts.written);
+    fold_or_fact(
+        &mut owner.facts.omega_escaped_address,
+        member.facts.omega_escaped_address,
+    );
+    fold_or_fact(
+        &mut owner.facts.violation_taint,
+        member.facts.violation_taint,
+    );
+    fold_or_fact(&mut owner.facts.thread_visible, member.facts.thread_visible);
+    fold_or_fact(
+        &mut owner.facts.signal_context_access,
+        member.facts.signal_context_access,
+    );
+    fold_and_fact(
+        &mut owner.facts.access_set_complete,
+        member.facts.access_set_complete,
+    );
+    owner.facts.phase_stationarity = fold_certificate(
+        owner.facts.phase_stationarity.take(),
+        member.facts.phase_stationarity,
+    );
+    owner.facts.localization =
+        fold_localization(owner.facts.localization.take(), member.facts.localization);
+    owner
+        .facts
+        .violation_relevance
+        .extend(member.facts.violation_relevance);
+}
+
+fn fold_or_fact(owner: &mut EvidencedBool, member: EvidencedBool) {
+    if !owner.value && member.value {
+        *owner = member;
+    }
+}
+
+fn fold_and_fact(owner: &mut EvidencedBool, member: EvidencedBool) {
+    if owner.value && !member.value {
+        *owner = member;
+    }
+}
+
+fn fold_certificate(
+    owner: Option<Certificate>,
+    member: Option<Certificate>,
+) -> Option<Certificate> {
+    match (owner, member) {
+        (Some(owner @ Certificate::Failed { .. }), _) => Some(owner),
+        (_, Some(member @ Certificate::Failed { .. })) => Some(member),
+        (
+            Some(owner @ Certificate::Certified { .. }),
+            Some(member @ Certificate::Certified { .. }),
+        ) if owner == member => Some(owner),
+        (Some(Certificate::Certified { .. }), Some(Certificate::Certified { .. })) => {
+            Some(Certificate::Failed {
+                codes: vec!["storage-closure-phase-mismatch".into()],
+                witnesses: vec![Witness {
+                    kind: "storage-closure-phase-mismatch".into(),
+                    site: None,
+                    symbol: None,
+                    note: Some(
+                        "owner and backing storage have different publication certificates".into(),
+                    ),
+                    extra: Extra::new(),
+                }],
+                recipe: None,
+                diagnostics: None,
+                extra: Extra::new(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn fold_localization(
+    owner: Option<Localization>,
+    member: Option<Localization>,
+) -> Option<Localization> {
+    let (Some(mut owner), Some(member)) = (owner, member) else {
+        return None;
+    };
+    if owner.component != member.component {
+        owner.verdict = LocalizationVerdict::Blocked;
+        owner.blockers.push(LocalizationBlocker {
+            code: "storage-closure-component-mismatch".into(),
+            witness: Witness {
+                kind: "storage-closure-component-mismatch".into(),
+                site: None,
+                symbol: None,
+                note: Some(format!(
+                    "owner component {} differs from backing-storage component {}",
+                    owner.component, member.component
+                )),
+                extra: Extra::new(),
+            },
+            extra: Extra::new(),
+        });
+    } else if member.verdict == LocalizationVerdict::Blocked {
+        owner.verdict = LocalizationVerdict::Blocked;
+        owner.blockers.extend(member.blockers);
+    }
+    Some(owner)
 }
 
 #[derive(Default)]
@@ -832,6 +1113,7 @@ fn assemble_atomic_eligibility(
         let signal_lock_free = !global.facts.signal_context_access.value
             || width.is_some_and(|width| target.supported_atomic_widths.contains(&width));
         detailed_globals[gid.0 as usize] = global.facts.word_sized_scalar.value
+            && global.storage_members.is_empty()
             && global.facts.access_set_complete.value
             && !global.facts.violation_taint.value
             && signal_lock_free;
@@ -870,6 +1152,20 @@ fn assemble_atomic_eligibility(
             witnesses.push(witness);
         };
 
+        if !global.storage_members.is_empty() {
+            fail(
+                "nontrivial-storage-closure",
+                atomic_witness(
+                    "atomic-nontrivial-storage-closure",
+                    Some(global.key.to_string()),
+                    None,
+                    Some(
+                        "one atomic declaration cannot materialize compiler-generated backing storage"
+                            .into(),
+                    ),
+                ),
+            );
+        }
         if !global.facts.word_sized_scalar.value {
             fail(
                 "word-sized-scalar",
@@ -1241,13 +1537,22 @@ fn assemble_mutex_eligibility(
             );
         }
 
-        let accessors = &accessors_by_global[gid.0 as usize];
+        let closure_gids = storage_closure_gids(analysis, global);
+        let accessors = closure_gids
+            .iter()
+            .flat_map(|gid| &accessors_by_global[gid.0 as usize])
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let access_site_count = closure_gids
+            .iter()
+            .map(|gid| access_site_counts[gid.0 as usize])
+            .sum::<usize>();
         if codes.is_empty() {
-            if let Some(path) = reachability.accessor_path(accessors) {
+            if let Some(path) = reachability.accessor_path(&accessors) {
                 codes.push("reentrant-access-path".into());
                 witnesses.push(mutex_path_witness(analysis, &global.key.to_string(), &path));
             }
-            if let Some((path, caller, unknown)) = reachability.unknown_callee_path(accessors) {
+            if let Some((path, caller, unknown)) = reachability.unknown_callee_path(&accessors) {
                 codes.push("unknown-callee-reentrancy".into());
                 witnesses.push(mutex_unknown_callee_witness(
                     analysis,
@@ -1290,7 +1595,7 @@ fn assemble_mutex_eligibility(
                 witnesses,
                 recipe: None,
                 diagnostics: Some(serde_json::json!({
-                    "access_sites_observed": access_site_counts[gid.0 as usize],
+                    "access_sites_observed": access_site_count,
                     "accessor_functions": accessor_functions,
                     "reentrancy_check": if global.facts.access_set_complete.value
                         && !global.facts.signal_context_access.value
@@ -1318,7 +1623,20 @@ fn mutex_declaration(
         "align_bits": global.meta.align_bits,
         "initializer_ir": analysis.globals()[gid].initializer_ir,
         "linkage": global.meta.linkage,
+        "storage_members": global.storage_members,
     })
+}
+
+fn storage_closure_gids(analysis: &Analysis, global: &DispositionGlobal) -> Vec<GlobalId> {
+    std::iter::once(global.meta.llvm_name.as_str())
+        .chain(
+            global
+                .storage_members
+                .iter()
+                .map(|member| member.llvm_name.as_str()),
+        )
+        .filter_map(|name| analysis.lookup_global(name))
+        .collect()
 }
 
 fn mutex_source_materialization(
@@ -1387,7 +1705,7 @@ fn assemble_group_mutex_support(
                     Some(group.id.clone()),
                 ));
             }
-            if let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) {
+            for gid in storage_closure_gids(analysis, global) {
                 accessors.extend(&accessors_by_global[gid.0 as usize]);
             }
         }
@@ -3056,6 +3374,8 @@ impl<'a> From<&'a pangs_api::FuncInfo> for FunctionRecord<'a> {
 #[derive(Serialize)]
 struct GlobalRecord<'a> {
     key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    synthetic_kind: &'a Option<String>,
     file: &'a Option<String>,
     line: Option<u32>,
     is_const: bool,
@@ -3069,6 +3389,7 @@ impl<'a> From<&'a pangs_api::GlobalInfo> for GlobalRecord<'a> {
     fn from(info: &'a pangs_api::GlobalInfo) -> Self {
         Self {
             key: &info.key,
+            synthetic_kind: &info.synthetic_kind,
             file: &info.file,
             line: info.line,
             is_const: info.is_const,
@@ -3725,6 +4046,124 @@ mod tests {
             certificate["source_materialization"]["code"],
             "declaration-source-unmapped"
         );
+    }
+
+    #[test]
+    fn unnamed_compound_literal_rolls_into_unique_initializer_owner() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        pir.globals[0].init_refs.push(".compoundliteral".into());
+        pir.globals.push(pangs_pir::Global {
+            key: ".compoundliteral".into(),
+            linkage: pangs_pir::SymbolLinkage::Internal,
+            size_bits: Some(128),
+            align_bits: Some(64),
+            ..pangs_pir::Global::default()
+        });
+        let pangs_pir::Stmt::GlobalRef { global, .. } = &mut pir.functions[0].body[0] else {
+            panic!("trivial fixture starts with a global access")
+        };
+        *global = ".compoundliteral".into();
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        assert_eq!(
+            analysis
+                .globals()
+                .iter()
+                .find(|global| global.key == ".compoundliteral")
+                .unwrap()
+                .synthetic_kind
+                .as_deref(),
+            Some("unnamed-compound-literal")
+        );
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.globals.len(), 1);
+        assert_eq!(
+            manifest.globals[0].key.to_string(),
+            "fixtures/synthetic/trivial/trivial.c::g_counter"
+        );
+        assert_eq!(manifest.globals[0].storage_members.len(), 1);
+        assert!(manifest.globals[0].facts.written.value);
+        assert_eq!(
+            manifest.globals[0].storage_members[0].llvm_name,
+            ".compoundliteral"
+        );
+        assert_eq!(manifest.synthetic_globals.len(), 1);
+        assert_eq!(
+            manifest.synthetic_globals[0]
+                .owner
+                .as_ref()
+                .map(ToString::to_string),
+            Some("fixtures/synthetic/trivial/trivial.c::g_counter".into())
+        );
+        manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn shared_compound_literal_remains_ownerless_diagnostic_storage() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        pir.globals[0].init_refs.push(".compoundliteral".into());
+        pir.globals.push(pangs_pir::Global {
+            key: "second_owner".into(),
+            file: Some("fixtures/synthetic/trivial/trivial.c".into()),
+            line: Some(2),
+            linkage: pangs_pir::SymbolLinkage::Internal,
+            init_refs: vec![".compoundliteral".into()],
+            ..pangs_pir::Global::default()
+        });
+        pir.globals.push(pangs_pir::Global {
+            key: ".compoundliteral".into(),
+            linkage: pangs_pir::SymbolLinkage::Internal,
+            size_bits: Some(128),
+            align_bits: Some(64),
+            ..pangs_pir::Global::default()
+        });
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.globals.len(), 2);
+        assert!(manifest
+            .globals
+            .iter()
+            .all(|global| global.storage_members.is_empty()));
+        assert_eq!(manifest.synthetic_globals.len(), 1);
+        assert!(manifest.synthetic_globals[0].owner.is_none());
+        assert!(manifest.synthetic_globals[0]
+            .witness
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("no unique"));
+        manifest.validate().unwrap();
     }
 
     #[test]

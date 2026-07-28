@@ -9,7 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub type Extra = BTreeMap<String, Value>;
 
 #[derive(Debug, Error)]
@@ -558,9 +558,32 @@ pub struct Disposition {
 pub struct GlobalRecord {
     pub key: Key,
     pub meta: Meta,
+    /// Compiler-generated storage objects that must be transformed together with this
+    /// source-level global. Their analysis facts are conservatively folded into `facts`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_members: Vec<StorageMember>,
     pub facts: Facts,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disposition: Option<Disposition>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StorageMember {
+    pub llvm_name: String,
+    pub kind: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyntheticGlobal {
+    pub llvm_name: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Key>,
+    pub witness: Witness,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -861,6 +884,9 @@ pub struct Manifest {
     pub schema_version: u32,
     pub run: RunHeader,
     pub globals: Vec<GlobalRecord>,
+    /// Analyzed storage objects that have no independent source-level disposition.
+    #[serde(default)]
+    pub synthetic_globals: Vec<SyntheticGlobal>,
     pub unkeyed_globals: Vec<UnkeyedGlobal>,
     pub coupling_groups: Vec<CouplingGroup>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -882,6 +908,7 @@ impl Manifest {
             });
         }
         let mut global_keys = BTreeSet::new();
+        let mut storage_members = BTreeMap::new();
         for global in &self.globals {
             if !global_keys.insert(global.key.clone()) {
                 return Err(Error::InvalidInvariant(format!(
@@ -889,7 +916,49 @@ impl Manifest {
                     global.key
                 )));
             }
+            for member in &global.storage_members {
+                if storage_members
+                    .insert(member.llvm_name.clone(), global.key.clone())
+                    .is_some()
+                {
+                    return Err(Error::InvalidInvariant(format!(
+                        "synthetic storage member {} has multiple owners",
+                        member.llvm_name
+                    )));
+                }
+            }
             global.facts.validate()?;
+        }
+        let mut synthetic_names = BTreeSet::new();
+        for synthetic in &self.synthetic_globals {
+            if !synthetic_names.insert(synthetic.llvm_name.clone()) {
+                return Err(Error::InvalidInvariant(format!(
+                    "duplicate synthetic global {}",
+                    synthetic.llvm_name
+                )));
+            }
+            if let Some(owner) = &synthetic.owner {
+                if !global_keys.contains(owner) {
+                    return Err(Error::InvalidInvariant(format!(
+                        "synthetic global {} names absent owner {owner}",
+                        synthetic.llvm_name
+                    )));
+                }
+                if storage_members.get(&synthetic.llvm_name) != Some(owner) {
+                    return Err(Error::InvalidInvariant(format!(
+                        "owned synthetic global {} is absent from the named owner's storage closure",
+                        synthetic.llvm_name
+                    )));
+                }
+            }
+        }
+        if let Some(name) = storage_members
+            .keys()
+            .find(|name| !synthetic_names.contains(*name))
+        {
+            return Err(Error::InvalidInvariant(format!(
+                "storage member {name} has no synthetic-global record"
+            )));
         }
         let mut group_ids = BTreeSet::new();
         for group in &self.coupling_groups {
@@ -957,8 +1026,13 @@ impl Manifest {
     pub fn canonicalize(&mut self) {
         self.globals.sort_by(|a, b| a.key.cmp(&b.key));
         for global in &mut self.globals {
+            global
+                .storage_members
+                .sort_by(|a, b| a.llvm_name.cmp(&b.llvm_name));
             canonicalize_facts(&mut global.facts);
         }
+        self.synthetic_globals
+            .sort_by(|a, b| a.llvm_name.cmp(&b.llvm_name));
         self.unkeyed_globals.sort_by(|a, b| {
             a.llvm_name
                 .cmp(&b.llvm_name)

@@ -521,6 +521,15 @@ region. The size reduction is real but not free: same-process measurements showe
 opt-in until broader-corpus measurements establish whether the call-graph and component
 precision justify that cost.
 
+Disposition inventory is source-actionable rather than identical to the solver's object
+inventory. Compiler-generated unnamed compound-literal objects stay in the PAG and all
+baseline semantic analyses. A literal uniquely referenced by one named global initializer
+becomes a member of that global's storage closure: hazard/completeness facts fold into the
+owner, and a transformation must handle the closure as a unit. Ownerless or shared
+synthetic objects remain diagnostic records outside the actionable coverage denominator.
+This is a client-layer ownership projection only; it does not remove objects or edges from
+A′–D′.
+
 ## 5. Historical milestones and current status
 
 1. **M1 — sound end-to-end (landed):** A' + C' + D' with joint CG discovery, Ω taint,

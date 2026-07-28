@@ -2,13 +2,27 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "PANGS disposition manifest",
   "type": "object",
-  "required": ["schema_version", "run", "globals", "unkeyed_globals", "coupling_groups"],
+  "required": ["schema_version", "run", "globals", "synthetic_globals", "unkeyed_globals", "coupling_groups"],
   "properties": {
-    "schema_version": { "const": 3 },
+    "schema_version": { "const": 4 },
     "run": { "$ref": "#/definitions/run" },
     "globals": {
       "type": "array",
       "items": { "$ref": "#/definitions/global" }
+    },
+    "synthetic_globals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["llvm_name", "kind", "witness"],
+        "properties": {
+          "llvm_name": { "type": "string" },
+          "kind": { "type": "string", "minLength": 1 },
+          "owner": { "$ref": "#/definitions/key" },
+          "witness": { "$ref": "#/definitions/witness" }
+        },
+        "additionalProperties": true
+      }
     },
     "unkeyed_globals": {
       "type": "array",
@@ -247,6 +261,18 @@
       "properties": {
         "key": { "$ref": "#/definitions/key" },
         "meta": { "$ref": "#/definitions/meta" },
+        "storage_members": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["llvm_name", "kind"],
+            "properties": {
+              "llvm_name": { "type": "string" },
+              "kind": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": true
+          }
+        },
         "facts": { "$ref": "#/definitions/facts" },
         "disposition": { "$ref": "#/definitions/disposition" }
       },

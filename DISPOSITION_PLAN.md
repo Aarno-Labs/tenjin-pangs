@@ -275,7 +275,7 @@ regenerates exactly the `source: "override"` records and preserves
 `analysis`/`entry-spine` records semantically unchanged — byte-identical after
 canonical re-emission — so the D2 idempotence test covers this artifact too.
 
-### 1.5 Fact and certificate encodings (introduced in schema v2; current schema v3)
+### 1.5 Fact and certificate encodings (introduced in schema v2; current schema v4)
 
 These shapes complete `DISPOSITION.md` §2/§3.
 
@@ -463,7 +463,7 @@ The D2 idempotence test is therefore exact: `pangs-dispose` on its own output wi
 same config and overrides is a byte-level no-op across both artifacts, and changing
 only the overrides file changes only dispose-owned content.
 
-### 1.8 Concrete shared-record shapes (introduced in schema v2; current schema v3)
+### 1.8 Concrete shared-record shapes (introduced in schema v2; current schema v4)
 
 Typing rule for D1a: **shared records are strongly typed now; pass-owned certificate
 payloads are typed envelopes around opaque values.** Concretely, the certificate-slot
@@ -679,7 +679,7 @@ conventions):
 
 | Crate | Contents | Depended on by |
 |---|---|---|
-| `pangs-manifest` | schema v3 serde types (additively evolved from v2: `Key`, `Meta`, `Facts`, `PhaseStationarity`, `Disposition`, `CascadeTrace`, `CouplingGroup`, `RunHeader`, `OverrideReport`, `AuditRecord`), key grammar + parser (§1.1), marker codec (§1.2), schema-version constants, canonical JSON read/write | analysis, `pangs-dispose`, C→C tool, Rust rewriter — **the one shared dependency; keep it std+serde+serde_json+sha2 only** (`sha2` earns its slot: §1.4 audit ids) |
+| `pangs-manifest` | schema v4 serde types (additively evolved from v2: `Key`, `Meta`, `Facts`, `PhaseStationarity`, `Disposition`, `CascadeTrace`, `CouplingGroup`, `RunHeader`, `OverrideReport`, `AuditRecord`, owner storage closures, and synthetic-global inventory), key grammar + parser (§1.1), marker codec (§1.2), schema-version constants, canonical JSON read/write | analysis, `pangs-dispose`, C→C tool, Rust rewriter — **the one shared dependency; keep it std+serde+serde_json+sha2 only** (`sha2` earns its slot: §1.4 audit ids) |
 | `pangs-dispose` | the policy stage: cascade evaluator, override machinery, group disposition resolution, report + ledger emission. Library + thin CLI | CI, users |
 | (existing analysis crate, phase F) | fact-assembly post-pass, coupling post-pass (D2b), marker-inventory schema checks | — |
 
