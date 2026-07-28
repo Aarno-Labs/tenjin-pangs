@@ -1631,6 +1631,34 @@ entry:
 }
 
 #[test]
+fn llvm_sys_records_runtime_global_rewrite_roots_through_constant_casts() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("rewrite-roots.ll");
+    fs::write(
+        &ll_path,
+        r#"
+%Map = type { i8*, i64 }
+@include_guards = internal global %Map zeroinitializer
+
+declare void @consume(i8*)
+
+define void @include_file() {
+entry:
+  call void @consume(i8* bitcast (%Map* @include_guards to i8*))
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    assert_eq!(
+        pir.lowering.rewrite_global_refs["include_file"],
+        vec!["include_guards"]
+    );
+}
+
+#[test]
 fn llvm_sys_lowers_ifunc_callee_as_unknown() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("ifunc.ll");

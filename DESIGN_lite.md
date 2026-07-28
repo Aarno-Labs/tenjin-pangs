@@ -340,9 +340,16 @@ With an exhaustive materialized solution, every client is a scan, not a query en
   not by itself make the allocation's address externally reachable. Certified
   initializer/callback-table aggregate copies and allocation provenance may establish
   immutable contents without treating arbitrary runtime aggregate memory as precise.
-- **Globals localization:** the one-`Context` rewrite graph from `DESIGN.md` §7 closes
-  backward over internal callers of accessors and records the exact rewritten functions
-  and call sites. Ordinary outbound external calls do not connect or freeze the slice.
+- **Globals localization:** the one-`Context` rewrite graph from `DESIGN.md` §7 starts
+  from functions containing runtime references that materialize a global's address or
+  value, closes backward over their internal callers, and records the exact rewritten
+  functions and call sites. This rewrite-root inventory is deliberately independent of
+  mod/ref attribution: when a caller passes `&g` to a generic pointer-taking helper, the
+  caller's expression is rewritten to `&ctx->g`; the helper neither needs a context
+  parameter nor has to recover `g` as a singleton memory-effect target. LLVM lowering
+  collects roots recursively through constant operands, while static initializer
+  references remain a separate obligation. Ordinary outbound external calls do not
+  connect or freeze the slice.
   Unknown incoming callers and unresolved alternative callees block only when they
   intersect a required signature rewrite. A global whose address is captured in a
   static aggregate initializer also blocks until source-level aggregate-initializer

@@ -347,6 +347,9 @@ pub struct ComponentInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextFieldPlan {
     pub global: GlobalId,
+    /// Functions containing runtime references that the source rewriter must redirect. The
+    /// schema name is retained for compatibility; pointer-taking callees that merely dereference
+    /// an already-redirected argument are not included.
     pub accessors: Vec<FuncId>,
     pub functions: Vec<FuncId>,
     pub rewrite_callsites: Vec<CallsiteId>,
@@ -1723,7 +1726,7 @@ impl Analysis {
             &globals,
             &callsites,
             &call_edges,
-            &modrefs,
+            &runtime_global_rewrite_roots(module, &func_lookup, &global_lookup, globals.len()),
             &aggregate_initializer_address_users(module),
             opts.build_mode,
         );
@@ -5648,20 +5651,10 @@ fn compute_context_rewrite_plan(
     globals: &[GlobalInfo],
     _callsites: &[CallsiteInfo],
     edges: &[CallEdge],
-    modrefs: &[ModRef],
+    rewrite_roots: &[BTreeSet<FuncId>],
     initializer_address_users: &BTreeMap<String, BTreeSet<String>>,
     build_mode: BuildMode,
 ) -> ContextRewritePlan {
-    let mut accessors = vec![BTreeSet::<FuncId>::new(); globals.len()];
-    for mr in modrefs {
-        if let GlobalTarget::Name(global) = mr.global {
-            let info = &globals[global.0 as usize];
-            if info.mutable && !info.stationary {
-                accessors[global.0 as usize].insert(mr.func);
-            }
-        }
-    }
-
     // Reverse internal call edges are the only paths over which the context must be threaded.
     // External calls keep their ABI; they are not context recipients and cannot connect callers.
     let mut callers = vec![Vec::<(FuncId, Option<CallsiteId>)>::new(); funcs.len()];
@@ -5696,7 +5689,11 @@ fn compute_context_rewrite_plan(
     let mut plan_functions = BTreeSet::new();
     let mut plan_callsites = BTreeSet::new();
     let mut fields = Vec::new();
-    for (index, field_accessors) in accessors.into_iter().enumerate() {
+    for (index, field_accessors) in rewrite_roots.iter().enumerate() {
+        let info = &globals[index];
+        if !info.mutable || info.stationary {
+            continue;
+        }
         if field_accessors.is_empty() {
             continue;
         }
@@ -5775,7 +5772,7 @@ fn compute_context_rewrite_plan(
         plan_callsites.extend(rewrite_callsites.iter().copied());
         fields.push(ContextFieldPlan {
             global: GlobalId(index as u32),
-            accessors: field_accessors.into_iter().collect(),
+            accessors: field_accessors.iter().copied().collect(),
             functions: functions.into_iter().collect(),
             rewrite_callsites: rewrite_callsites.into_iter().collect(),
             blockers,
@@ -5786,6 +5783,92 @@ fn compute_context_rewrite_plan(
         functions: plan_functions.into_iter().collect(),
         rewrite_callsites: plan_callsites.into_iter().collect(),
         fields,
+    }
+}
+
+/// Functions containing runtime expressions that directly name each global.
+///
+/// These are context-rewrite roots, not memory-effect accessors.  In particular, a caller that
+/// passes `&g` to a generic pointer-taking helper belongs here, while the helper does not need a
+/// context parameter merely because it later dereferences that pointer.
+fn runtime_global_rewrite_roots(
+    module: &Pir,
+    func_lookup: &HashMap<String, FuncId>,
+    global_lookup: &HashMap<String, GlobalId>,
+    global_count: usize,
+) -> Vec<BTreeSet<FuncId>> {
+    let mut roots = vec![BTreeSet::new(); global_count];
+    let mut record = |func: FuncId, name: &str| {
+        let name = name.strip_prefix('@').unwrap_or(name);
+        if let Some(global) = global_lookup.get(name) {
+            roots[global.0 as usize].insert(func);
+        }
+    };
+
+    // LLVM lowering walks the original instruction operands recursively through constants.  This
+    // catches constant GEP/cast expressions whose printed PIR operand is intentionally opaque.
+    for (function, globals) in &module.lowering.rewrite_global_refs {
+        let Some(&func) = func_lookup.get(function) else {
+            continue;
+        };
+        for global in globals {
+            record(func, global);
+        }
+    }
+
+    // Serialized and hand-written PIR do not retain the in-process lowering index. Recover all
+    // ordinary direct operands, plus the established direct memory-reference marker.
+    for function in &module.functions {
+        let Some(&func) = func_lookup.get(&function.key) else {
+            continue;
+        };
+        for stmt in &function.body {
+            if let Stmt::GlobalRef { global, .. } = stmt {
+                record(func, global);
+            }
+            visit_runtime_operands(stmt, |operand| {
+                if operand.starts_with('@') {
+                    record(func, operand);
+                }
+            });
+        }
+    }
+    roots
+}
+
+fn visit_runtime_operands(stmt: &Stmt, mut visit: impl FnMut(&str)) {
+    match stmt {
+        Stmt::Alloca { .. } | Stmt::VarArg { .. } | Stmt::GlobalRef { .. } => {}
+        Stmt::Assign { sources, .. } => sources.iter().for_each(|value| visit(value)),
+        Stmt::ScalarOp { lhs, rhs, .. } => {
+            visit(lhs);
+            visit(rhs);
+        }
+        Stmt::Load { address, .. } | Stmt::Gep { base: address, .. } => visit(address),
+        Stmt::Store { address, value, .. } => {
+            visit(address);
+            visit(value);
+        }
+        Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => visit(source),
+        Stmt::Memcpy { dst, src, .. } => {
+            visit(dst);
+            visit(src);
+        }
+        Stmt::Memset { dst, value, .. } => {
+            visit(dst);
+            visit(value);
+        }
+        Stmt::Unknown { operands, .. } => operands.iter().for_each(|value| visit(value)),
+        Stmt::Return { value, .. } => {
+            if let Some(value) = value {
+                visit(value);
+            }
+        }
+        Stmt::CallDirect { args, .. } => args.iter().for_each(|value| visit(value)),
+        Stmt::CallIndirect { operand, args, .. } => {
+            visit(operand);
+            args.iter().for_each(|value| visit(value));
+        }
     }
 }
 
@@ -6841,17 +6924,7 @@ mod component_tests {
         main_to_uses.callsite = Some(CallsiteId(0));
         let mut main_to_printf = edge(0, 2);
         main_to_printf.callsite = Some(CallsiteId(1));
-        let modrefs = vec![ModRef {
-            func: FuncId(1),
-            global: GlobalTarget::Name(GlobalId(0)),
-            access: Access::Ref,
-            via: Via::Direct,
-            witness: None,
-            detail: None,
-            address_node: None,
-            pointee_globals: Vec::new(),
-            global_candidates: GlobalCandidateSet::Finite(Rc::from([GlobalId(0)])),
-        }];
+        let rewrite_roots = vec![BTreeSet::from([FuncId(1)])];
         let callsites = vec![
             CallsiteInfo {
                 key: "main@uses#0".into(),
@@ -6873,7 +6946,7 @@ mod component_tests {
             &[global("g")],
             &callsites,
             &[main_to_uses, main_to_printf],
-            &modrefs,
+            &rewrite_roots,
             &BTreeMap::new(),
             BuildMode::Executable,
         );
@@ -6884,21 +6957,90 @@ mod component_tests {
     }
 
     #[test]
+    fn context_rewrite_roots_include_global_passed_to_generic_helper() {
+        let module = Pir {
+            module: "rewrite-root".into(),
+            source: None,
+            lowering: LoweringStats::default(),
+            target: None,
+            functions: vec![
+                pangs_pir::Func {
+                    key: "include_file".into(),
+                    sig: pangs_pir::Signature {
+                        ret: pangs_pir::AbiClass::Void,
+                        params: Vec::new(),
+                        vararg: false,
+                        cc: "ccc".into(),
+                    },
+                    param_names: Vec::new(),
+                    file: None,
+                    line: None,
+                    external: false,
+                    exported: false,
+                    address_taken: false,
+                    body: vec![Stmt::CallDirect {
+                        callee: "hashmap_get".into(),
+                        sig: pangs_pir::Signature {
+                            ret: pangs_pir::AbiClass::Integer,
+                            params: vec![pangs_pir::Param::Integer],
+                            vararg: false,
+                            cc: "ccc".into(),
+                        },
+                        args: vec!["@include_guards".into()],
+                        dest: None,
+                        loc: None,
+                    }],
+                },
+                pangs_pir::Func {
+                    key: "hashmap_get".into(),
+                    sig: pangs_pir::Signature {
+                        ret: pangs_pir::AbiClass::Integer,
+                        params: vec![pangs_pir::Param::Integer],
+                        vararg: false,
+                        cc: "ccc".into(),
+                    },
+                    param_names: vec!["%map".into()],
+                    file: None,
+                    line: None,
+                    external: false,
+                    exported: false,
+                    address_taken: false,
+                    body: vec![Stmt::Load {
+                        dest: "%value".into(),
+                        address: "%map".into(),
+                        access_bytes: None,
+                        loc: None,
+                    }],
+                },
+            ],
+            globals: vec![pangs_pir::Global {
+                key: "include_guards".into(),
+                ..pangs_pir::Global::default()
+            }],
+            global_init: Vec::new(),
+        };
+        let func_lookup = HashMap::from([
+            ("include_file".into(), FuncId(0)),
+            ("hashmap_get".into(), FuncId(1)),
+        ]);
+        let global_lookup = HashMap::from([("include_guards".into(), GlobalId(0))]);
+
+        let roots = runtime_global_rewrite_roots(
+            &module,
+            &func_lookup,
+            &global_lookup,
+            module.globals.len(),
+        );
+
+        assert_eq!(roots, vec![BTreeSet::from([FuncId(0)])]);
+    }
+
+    #[test]
     fn context_rewrite_blocks_an_unknown_incoming_caller_of_a_rewritten_function() {
         let funcs = vec![func("main", false), func("uses_global", false)];
         let mut main_to_uses = edge(0, 1);
         main_to_uses.callsite = Some(CallsiteId(0));
-        let modrefs = vec![ModRef {
-            func: FuncId(1),
-            global: GlobalTarget::Name(GlobalId(0)),
-            access: Access::Ref,
-            via: Via::Direct,
-            witness: None,
-            detail: None,
-            address_node: None,
-            pointee_globals: Vec::new(),
-            global_candidates: GlobalCandidateSet::Finite(Rc::from([GlobalId(0)])),
-        }];
+        let rewrite_roots = vec![BTreeSet::from([FuncId(1)])];
         let callsites = vec![CallsiteInfo {
             key: "main@uses#0".into(),
             caller: FuncId(0),
@@ -6918,7 +7060,7 @@ mod component_tests {
             &[global("g")],
             &callsites,
             &[main_to_uses, unknown_incoming],
-            &modrefs,
+            &rewrite_roots,
             &BTreeMap::new(),
             BuildMode::Executable,
         );
@@ -6931,17 +7073,7 @@ mod component_tests {
     #[test]
     fn context_rewrite_blocks_an_address_captured_by_a_static_initializer() {
         let funcs = vec![func("main", false)];
-        let modrefs = vec![ModRef {
-            func: FuncId(0),
-            global: GlobalTarget::Name(GlobalId(0)),
-            access: Access::Ref,
-            via: Via::Direct,
-            witness: None,
-            detail: None,
-            address_node: None,
-            pointee_globals: Vec::new(),
-            global_candidates: GlobalCandidateSet::Finite(Rc::from([GlobalId(0)])),
-        }];
+        let rewrite_roots = vec![BTreeSet::from([FuncId(0)])];
         let initializer_users = BTreeMap::from([(
             "g".to_string(),
             BTreeSet::from(["address_table".to_string()]),
@@ -6952,7 +7084,7 @@ mod component_tests {
             &[global("g")],
             &[],
             &[],
-            &modrefs,
+            &rewrite_roots,
             &initializer_users,
             BuildMode::Executable,
         );

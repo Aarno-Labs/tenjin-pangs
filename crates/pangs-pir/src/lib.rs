@@ -451,6 +451,13 @@ pub struct LoweringStats {
     /// only the former carry pointer-analysis payload.  Missing entries mean `Unknown`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub semantic_value_kinds: BTreeMap<String, ValueKind>,
+    /// Runtime LLVM instructions that mention each global, grouped by function.  This is
+    /// source-rewrite metadata rather than a points-to fact: passing `@g` to a generic helper
+    /// must make the caller a context-rewrite root even when the helper's mod/ref summary cannot
+    /// recover `g`.  Kept only in-process; serialized PIR can reconstruct ordinary direct
+    /// operands from `Func::body`.
+    #[serde(default, skip_serializing)]
+    pub rewrite_global_refs: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub functions: u64,
     #[serde(default)]
@@ -527,6 +534,7 @@ impl LoweringStats {
             && self.missing_debug_locations.is_empty()
             && self.non_ccc_calling_conventions.is_empty()
             && self.semantic_value_kinds.is_empty()
+            && self.rewrite_global_refs.is_empty()
     }
 
     pub fn bump_instruction(&mut self, op: impl Into<String>) {

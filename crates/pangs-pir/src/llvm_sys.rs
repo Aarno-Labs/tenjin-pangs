@@ -641,10 +641,12 @@ unsafe fn lower_function(
     }
 
     let mut raw_boundaries = Vec::with_capacity(blocks.len());
+    let mut rewrite_global_refs = BTreeSet::new();
     for &block in &blocks {
         let mut groups = Vec::<RawStatementBoundary>::new();
         let mut inst = LLVMGetFirstInstruction(block);
         while !inst.is_null() {
+            collect_instruction_global_refs(ctx, inst, &mut rewrite_global_refs);
             let opcode = LLVMGetInstructionOpcode(inst);
             let key = opcode_key_for_inst(inst, opcode);
             if LLVMIsATerminatorInst(inst).is_null() {
@@ -677,6 +679,11 @@ unsafe fn lower_function(
 
     let value_kinds = std::mem::take(&mut fctx.value_kinds);
     lowering.semantic_value_kinds.extend(value_kinds);
+    if !rewrite_global_refs.is_empty() {
+        lowering
+            .rewrite_global_refs
+            .insert(key.clone(), rewrite_global_refs.into_iter().collect());
+    }
 
     Func {
         key: key.clone(),
@@ -692,6 +699,36 @@ unsafe fn lower_function(
         ),
         address_taken: address_taken.contains(&key),
         body,
+    }
+}
+
+/// Collect global variables mentioned by one instruction without following SSA definitions.
+/// Constant operands are recursive because LLVM can hide a global under a constant GEP/cast or
+/// aggregate.  Instruction operands themselves are boundaries: following them would turn this
+/// syntactic rewrite-root inventory into transitive value flow.
+unsafe fn collect_instruction_global_refs(
+    ctx: &ModuleCtx,
+    instruction: LLVMValueRef,
+    out: &mut BTreeSet<String>,
+) {
+    let mut stack = (0..LLVMGetNumOperands(instruction) as u32)
+        .map(|index| LLVMGetOperand(instruction, index))
+        .collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    while let Some(value) = stack.pop() {
+        if value.is_null() || !seen.insert(value as usize) {
+            continue;
+        }
+        if !LLVMIsAGlobalVariable(value).is_null() || !LLVMIsAGlobalAlias(value).is_null() {
+            let name = value_name(value);
+            if let Some(global) = resolve_global_name(ctx, &name) {
+                out.insert(global);
+            }
+            continue;
+        }
+        if !LLVMIsAConstant(value).is_null() && constant_has_traversable_operands(value) {
+            push_operands(value, &mut stack);
+        }
     }
 }
 

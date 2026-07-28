@@ -611,9 +611,11 @@ below is a shared record and is fixed here:
     re-parsing spellings.
 - **`localization(g)`** — assembled from the single `ContextRewritePlan`, stated
   exactly because it feeds a cascade guard:
-  - The plan starts at accessors of localizable mutable globals and closes backward over
-    internal callers to executable `main`. It records the exact signatures and call sites
-    that must receive the one context parameter.
+  - The plan starts at functions containing runtime rewrite roots for localizable mutable
+    globals and closes backward over internal callers to executable `main`. It records the
+    exact signatures and call sites that must receive the one context parameter. The
+    exported `accessors` list retains its schema name but denotes these rewrite-root
+    functions, not every function that may dereference an already-passed pointer.
   - `verdict: "ok"` iff the field's rewrite slice has no unrewritable boundary. Ordinary
     outgoing calls to external APIs do not participate in the slice and keep their ABI.
   - `component` is the context-plan identifier (`ctx0001`), not a call-graph component.
@@ -623,8 +625,8 @@ below is a shared record and is fixed here:
     `aggregate-initializer-address-dependency` records a static initializer that retains the
     global's link-time address; localization remains blocked until the source rewrite can rebuild
     such aggregates from the runtime context address.
-  - `g` with no accessor in the context plan ⇒ `localization: null` (the client did not cover
-    it; surfaces as `fact-not-computed` in the trace rather than a fabricated
+  - `g` with no runtime rewrite root in the context plan ⇒ `localization: null` (the client
+    did not cover it; surfaces as `fact-not-computed` in the trace rather than a fabricated
     verdict).
 - **Spawn / signal-registration API registries.** A registry entry carries its
   calling convention, so extensions are well-defined:
