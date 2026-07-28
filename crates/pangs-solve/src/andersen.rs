@@ -1,8 +1,8 @@
 //! Partition-scoped, field-sensitive inclusion (Andersen) solver — the lite design's one
 //! real solver (`DESIGN_lite.md` §2 D', `PLAN-M1_lite_delta.md` §M1.4b).
 //!
-//! It runs *on top of* Steensgaard: `solve_steensgaard_with_classes` provides the union-find
-//! classes (Kahlon partitions) and the authoritative global escape facts. Andersen then
+//! It runs *on top of* Steensgaard: `solve_steensgaard_with_classes` provides sound target
+//! envelopes, fallback answers, and authoritative global escape facts. Andersen then
 //! refines the **points-to sets** within interesting, within-budget partitions, which
 //! sharpens per-node points-to-derived outputs — indirect-call concrete targets,
 //! `reaches_function_pointer`, `external`, and `pointee_globals` (mod/ref) — while global
@@ -11,9 +11,9 @@
 //! Soundness rests on three facts:
 //! * Steensgaard unification is a sound over-approximation of Andersen, so refined targets
 //!   are always ⊆ the Steensgaard targets (the narrowing ledger, asserted in tests).
-//! * Constraints never cross a partition: assign/load/store/gep all *join* in Steensgaard,
-//!   and an `&o` object lives in the pointer's pointee class, which we fold into the same
-//!   Andersen partition — so a partition is a self-contained subproblem.
+//! * Admission partitions are weak components of the inclusion constraints. Certified memory
+//!   accesses pass through allocation-relative byte-region vertices; unresolved accesses retain
+//!   their address carrier. Sound indirect-call envelopes contribute their possible bindings.
 //! * Anything reachable only through Ω stays Ω (absorbing), and the global escape/unknown
 //!   outputs that drive component freezing are taken verbatim from Steensgaard.
 
@@ -26,7 +26,7 @@ use pangs_pir::Pir;
 
 use crate::knobs;
 use crate::{
-    debug_assert_narrows, exact_allocation_addresses, ExactAddress, FieldLocation,
+    debug_assert_narrows, exact_allocation_addresses, ExactAddress, FieldLocation, FieldRegion,
     IndirectCallResolution, SolveResult, SteensClasses,
 };
 
@@ -551,8 +551,13 @@ struct Refiner<'a> {
     /// field-aware partition boundaries.
     exact_addresses: Vec<Option<ExactAddress>>,
 
-    /// Andersen partition root for each Steensgaard class root (class ∪ pointee folded).
+    /// Union-find for the independent prepartition constraint graph. PAG nodes occupy
+    /// `[0, n_base)`; allocation-relative memory regions are synthetic vertices above it.
     ap_parent: Vec<usize>,
+    /// Region identity for synthetic prepartition vertices.
+    prepartition_regions: Vec<Option<(NodeId, FieldRegion)>>,
+    /// Constraint endpoints used by diagnostics, parallel to `pag.edges`.
+    prepartition_edge_vertices: Vec<Option<(usize, usize)>>,
     /// Whether a base node sits in an interesting, within-budget partition.
     in_scope: Vec<bool>,
     oversize_fallbacks: usize,
@@ -648,6 +653,8 @@ impl<'a> Refiner<'a> {
             ret_nodes,
             exact_addresses: exact_allocation_addresses(pag),
             ap_parent: Vec::new(),
+            prepartition_regions: Vec::new(),
+            prepartition_edge_vertices: Vec::new(),
             in_scope: vec![false; n_base],
             oversize_fallbacks: 0,
             oversize_fallback_max_size: 0,
@@ -687,15 +694,162 @@ impl<'a> Refiner<'a> {
         }
     }
 
-    /// Fold Steensgaard classes into Andersen partitions (class ∪ pointee), pick the
-    /// interesting ones (reachable from icall operands, globals, or escape), then drop any
-    /// that blow the oversize budget back to the Steensgaard answer.
+    fn partition_of_node(&self, node: NodeId) -> usize {
+        ap_find_const(&self.ap_parent, node.0 as usize)
+    }
+
+    fn prepartition_region_vertex(
+        &mut self,
+        regions: &mut HashMap<(NodeId, FieldRegion), usize>,
+        root: NodeId,
+        region: FieldRegion,
+    ) -> usize {
+        if let Some(&vertex) = regions.get(&(root, region)) {
+            return vertex;
+        }
+        let vertex = self.ap_parent.len();
+        self.ap_parent.push(vertex);
+        self.prepartition_regions.push(Some((root, region)));
+        regions.insert((root, region), vertex);
+
+        // Region identities are allocation-relative. Join only regions of this allocation
+        // whose byte extents may overlap; unrelated allocations and disjoint fields remain
+        // distinct even if Steensgaard put their pointer carriers in one class.
+        let aliases = regions
+            .iter()
+            .filter_map(|(&(candidate_root, candidate_region), &candidate)| {
+                (candidate != vertex
+                    && candidate_root == root
+                    && region.may_overlap(candidate_region))
+                .then_some(candidate)
+            })
+            .collect::<Vec<_>>();
+        for alias in aliases {
+            self.ap_union(vertex, alias);
+        }
+        vertex
+    }
+
+    fn prepartition_storage_vertex(
+        &mut self,
+        regions: &mut HashMap<(NodeId, FieldRegion), usize>,
+        address_node: NodeId,
+        width: Option<u64>,
+        direct_root_at_zero: bool,
+    ) -> Option<usize> {
+        let address = self.exact_addresses[address_node.0 as usize]?;
+        if address.location == FieldLocation::Exact(0) && !address.via_gep && direct_root_at_zero {
+            return Some(address.root.0 as usize);
+        }
+        Some(self.prepartition_region_vertex(
+            regions,
+            address.root,
+            FieldRegion::access(address.location, width),
+        ))
+    }
+
+    /// Build weak components of the actual inclusion constraints, using independent
+    /// allocation-relative region vertices for certified memory accesses. This graph is
+    /// intentionally not derived from final Steensgaard equivalence classes: those classes
+    /// remain the sound fallback and target envelope, but no longer dictate admission size.
     fn build_scope(&mut self) {
-        let total = self.classes.pointee.len();
-        self.ap_parent = (0..total).collect();
-        for root in 0..total {
-            if let Some(p) = self.classes.pointee[root] {
-                self.ap_union(root, p);
+        self.ap_parent = (0..self.n_base).collect();
+        self.prepartition_regions = vec![None; self.n_base];
+        self.prepartition_edge_vertices = vec![None; self.pag.edges.len()];
+        let mut regions = HashMap::new();
+
+        for (edge_index, edge) in self.pag.edges.iter().enumerate() {
+            let src = edge.src.0 as usize;
+            let dst = edge.dst.0 as usize;
+            let endpoints = match edge.kind {
+                EdgeKind::AddrOf => Some((dst, src)),
+                EdgeKind::Assign if self.pointer_transfer(edge.src, edge.dst) => Some((src, dst)),
+                EdgeKind::Assign => None,
+                EdgeKind::Load if self.node_may_carry_pointer(edge.dst) => {
+                    let width =
+                        (!edge.access_extent_unknown).then_some(edge.access_bytes.unwrap_or(0));
+                    let storage = self
+                        .prepartition_storage_vertex(&mut regions, edge.src, width, true)
+                        .unwrap_or(src);
+                    Some((storage, dst))
+                }
+                EdgeKind::Load => None,
+                EdgeKind::Store if self.node_may_carry_pointer(edge.src) => {
+                    let width =
+                        (!edge.access_extent_unknown).then_some(edge.access_bytes.unwrap_or(0));
+                    let storage = self
+                        .prepartition_storage_vertex(&mut regions, edge.dst, width, true)
+                        .unwrap_or(dst);
+                    Some((storage, src))
+                }
+                EdgeKind::Store => None,
+                EdgeKind::Gep { .. } => {
+                    let region = self
+                        .prepartition_storage_vertex(&mut regions, edge.dst, Some(0), false)
+                        .unwrap_or(src);
+                    // The destination pointer is the carrier for this precise location in
+                    // Andersen; connecting it to the region keeps its producer and consumers
+                    // in the same component without connecting the allocation's other fields.
+                    Some((dst, region))
+                }
+                EdgeKind::Memcpy { bytes } => {
+                    let dst_storage = self
+                        .prepartition_storage_vertex(&mut regions, edge.dst, bytes, false)
+                        .unwrap_or(dst);
+                    let src_storage = self
+                        .prepartition_storage_vertex(&mut regions, edge.src, bytes, false)
+                        .unwrap_or(src);
+                    Some((dst_storage, src_storage))
+                }
+            };
+            if let Some((left, right)) = endpoints {
+                self.ap_union(left, right);
+            }
+            self.prepartition_edge_vertices[edge_index] = endpoints;
+        }
+
+        // On-the-fly indirect-call bindings are constraints too. Add every binding admitted
+        // by the sound Steensgaard target envelope (plus independently exact overrides) so
+        // an argument's address-producing constraints cannot be stranded outside the
+        // callee parameter's component.
+        let base_targets = self
+            .base
+            .indirect_calls
+            .iter()
+            .map(|row| (row.callsite_key.as_str(), row.targets.as_slice()))
+            .collect::<HashMap<_, _>>();
+        for callsite in &self.pag.callsites {
+            if callsite.kind != CallKind::Indirect {
+                continue;
+            }
+            let mut targets = base_targets
+                .get(callsite.key.as_str())
+                .into_iter()
+                .flat_map(|targets| targets.iter().map(String::as_str))
+                .chain(
+                    self.exact_targets
+                        .get(&callsite.key)
+                        .into_iter()
+                        .flat_map(|targets| targets.iter().map(String::as_str)),
+                )
+                .filter_map(|target| self.func_index.get(target).copied())
+                .collect::<Vec<_>>();
+            targets.sort_unstable();
+            targets.dedup();
+            for function in targets {
+                for (index, &argument) in callsite.args.iter().enumerate() {
+                    if let Some(&parameter) = self.param_nodes.get(&(function, index)) {
+                        if self.pointer_transfer(argument, parameter) {
+                            self.ap_union(argument.0 as usize, parameter.0 as usize);
+                        }
+                    }
+                }
+                if let (Some(result), Some(&ret)) = (callsite.result, self.ret_nodes.get(&function))
+                {
+                    if self.pointer_transfer(ret, result) {
+                        self.ap_union(ret.0 as usize, result.0 as usize);
+                    }
+                }
             }
         }
 
@@ -704,14 +858,14 @@ impl<'a> Refiner<'a> {
         for callsite in &self.pag.callsites {
             if callsite.kind == CallKind::Indirect {
                 if let Some(op) = callsite.operand {
-                    let ap = self.ap_find(self.classes.class_of(op));
+                    let ap = self.ap_find(op.0 as usize);
                     interesting.insert(ap);
                 }
             }
         }
         for node in &self.pag.nodes {
             let class = self.classes.class_of(node.id);
-            let ap = self.ap_find(class);
+            let ap = self.ap_find(node.id.0 as usize);
             let escape = self.classes.ext[class] || self.classes.esc[class];
             let is_global = matches!(
                 node.kind,
@@ -724,9 +878,17 @@ impl<'a> Refiner<'a> {
                 interesting.insert(ap);
             }
         }
-        for class in 0..total {
-            if self.classes.global_storage[class] {
-                interesting.insert(self.ap_find(class));
+        for vertex in self.n_base..self.prepartition_regions.len() {
+            if let Some((root, _)) = self.prepartition_regions[vertex] {
+                if matches!(
+                    self.pag.nodes[root.0 as usize].kind,
+                    NodeKind::Object {
+                        object: ObjectKind::Global,
+                        ..
+                    }
+                ) {
+                    interesting.insert(self.ap_find(vertex));
+                }
             }
         }
 
@@ -734,13 +896,19 @@ impl<'a> Refiner<'a> {
         // a proxy for "constraints × pts bits" (`PLAN-M1_lite_delta.md` §M1.4b).
         let mut nodes_in: HashMap<usize, u64> = HashMap::new();
         for node in &self.pag.nodes {
-            let ap = self.ap_find(self.classes.class_of(node.id));
+            let ap = self.ap_find(node.id.0 as usize);
+            *nodes_in.entry(ap).or_insert(0) += 1;
+        }
+        for vertex in self.n_base..self.prepartition_regions.len() {
+            let ap = self.ap_find(vertex);
             *nodes_in.entry(ap).or_insert(0) += 1;
         }
         let mut edges_in: HashMap<usize, u64> = HashMap::new();
-        for edge in &self.pag.edges {
-            let ap = self.ap_find(self.classes.class_of(edge.dst));
-            *edges_in.entry(ap).or_insert(0) += 1;
+        for (edge_index, _) in self.pag.edges.iter().enumerate() {
+            if let Some((left, _)) = self.prepartition_edge_vertices[edge_index] {
+                let ap = self.ap_find(left);
+                *edges_in.entry(ap).or_insert(0) += 1;
+            }
         }
 
         let mut oversize: HashSet<usize> = HashSet::new();
@@ -806,7 +974,7 @@ impl<'a> Refiner<'a> {
         }
 
         for i in 0..self.n_base {
-            let ap = self.ap_find(self.classes.class_of(NodeId(i as u32)));
+            let ap = self.ap_find(i);
             self.in_scope[i] = interesting.contains(&ap) && !oversize.contains(&ap);
         }
     }
@@ -853,7 +1021,7 @@ impl<'a> Refiner<'a> {
         let mut profiles: HashMap<usize, PartitionProfile> = HashMap::new();
         for node in &self.pag.nodes {
             let class = self.classes.class_of(node.id);
-            let root = ap_find_const(&self.ap_parent, class);
+            let root = self.partition_of_node(node.id);
             let profile = profiles.entry(root).or_insert_with(|| PartitionProfile {
                 root,
                 ..PartitionProfile::default()
@@ -884,7 +1052,7 @@ impl<'a> Refiner<'a> {
             let Some(operand) = callsite.operand else {
                 continue;
             };
-            let root = ap_find_const(&self.ap_parent, self.classes.class_of(operand));
+            let root = self.partition_of_node(operand);
             profiles
                 .entry(root)
                 .or_insert_with(|| PartitionProfile {
@@ -893,8 +1061,11 @@ impl<'a> Refiner<'a> {
                 })
                 .icalls += 1;
         }
-        for edge in &self.pag.edges {
-            let root = ap_find_const(&self.ap_parent, self.classes.class_of(edge.dst));
+        for (edge_index, edge) in self.pag.edges.iter().enumerate() {
+            let Some((vertex, _)) = self.prepartition_edge_vertices[edge_index] else {
+                continue;
+            };
+            let root = ap_find_const(&self.ap_parent, vertex);
             *profiles
                 .entry(root)
                 .or_insert_with(|| PartitionProfile {
@@ -939,7 +1110,7 @@ impl<'a> Refiner<'a> {
         let mut profiles: HashMap<usize, PartitionProfile> = HashMap::new();
         for node in &self.pag.nodes {
             let class = self.classes.class_of(node.id);
-            let ap = ap_find_const(&self.ap_parent, class);
+            let ap = self.partition_of_node(node.id);
             let profile = profiles.entry(ap).or_insert_with(|| PartitionProfile {
                 root: ap,
                 ..PartitionProfile::default()
@@ -970,7 +1141,7 @@ impl<'a> Refiner<'a> {
             let Some(operand) = callsite.operand else {
                 continue;
             };
-            let ap = ap_find_const(&self.ap_parent, self.classes.class_of(operand));
+            let ap = self.partition_of_node(operand);
             profiles
                 .entry(ap)
                 .or_insert_with(|| PartitionProfile {
@@ -979,8 +1150,11 @@ impl<'a> Refiner<'a> {
                 })
                 .icalls += 1;
         }
-        for edge in &self.pag.edges {
-            let ap = ap_find_const(&self.ap_parent, self.classes.class_of(edge.dst));
+        for (edge_index, edge) in self.pag.edges.iter().enumerate() {
+            let Some((vertex, _)) = self.prepartition_edge_vertices[edge_index] else {
+                continue;
+            };
+            let ap = ap_find_const(&self.ap_parent, vertex);
             *profiles
                 .entry(ap)
                 .or_insert_with(|| PartitionProfile {
@@ -1155,52 +1329,41 @@ impl<'a> Refiner<'a> {
 
     fn omega_seed_partition(&self, seed: &pangs_pag::OmegaSeed) -> Option<usize> {
         match seed.target {
-            SeedTarget::Node(node) => {
-                Some(ap_find_const(&self.ap_parent, self.classes.class_of(node)))
-            }
+            SeedTarget::Node(node) => Some(self.partition_of_node(node)),
             SeedTarget::Callsite(callsite) => self
                 .pag
                 .callsites
                 .get(callsite.0 as usize)
                 .and_then(|callsite| callsite.operand)
-                .map(|node| ap_find_const(&self.ap_parent, self.classes.class_of(node))),
+                .map(|node| self.partition_of_node(node)),
         }
     }
 
-    fn diagnostic_join_edge(&self, edge: &pangs_pag::Edge) -> Option<(usize, usize, &'static str)> {
-        let src = self.classes.class_of(edge.src);
-        let dst = self.classes.class_of(edge.dst);
-        match edge.kind {
-            EdgeKind::AddrOf => Some((self.classes.pointee[dst]?, src, "addr_of")),
-            EdgeKind::Assign => Some((src, dst, "assign")),
-            EdgeKind::Load => Some((dst, self.classes.pointee[src]?, "load")),
-            EdgeKind::Store => Some((self.classes.pointee[dst]?, src, "store")),
-            EdgeKind::Gep { byte_off, lane } => Some((
-                self.classes.pointee[dst]?,
-                self.classes.pointee[src]?,
+    fn diagnostic_join_edge(&self, edge_index: usize) -> Option<(usize, usize, &'static str)> {
+        let edge = &self.pag.edges[edge_index];
+        let (left, right) = self.prepartition_edge_vertices[edge_index]?;
+        let family = match edge.kind {
+            EdgeKind::AddrOf => "addr_of",
+            EdgeKind::Assign => "assign",
+            EdgeKind::Load => "load",
+            EdgeKind::Store => "store",
+            EdgeKind::Gep { byte_off, lane } => {
                 if byte_off.is_some() || lane.is_some() {
                     "gep_const"
                 } else {
                     "gep_unknown"
-                },
-            )),
-            EdgeKind::Memcpy { .. } => {
-                let dst_p = self.classes.pointee[dst]?;
-                let src_p = self.classes.pointee[src]?;
-                Some((
-                    self.classes.pointee[dst_p]?,
-                    self.classes.pointee[src_p]?,
-                    "memcpy",
-                ))
+                }
             }
-        }
+            EdgeKind::Memcpy { .. } => "memcpy",
+        };
+        Some((left, right, family))
     }
 
     fn partition_hubs(&self, ap: usize, limit: usize) -> Vec<String> {
         let mut counts: HashMap<usize, (usize, usize)> = HashMap::new();
         let mut witnesses: HashMap<usize, Vec<String>> = HashMap::new();
-        for edge in &self.pag.edges {
-            let Some((left, right, family)) = self.diagnostic_join_edge(edge) else {
+        for (edge_index, edge) in self.pag.edges.iter().enumerate() {
+            let Some((left, right, family)) = self.diagnostic_join_edge(edge_index) else {
                 continue;
             };
             if ap_find_const(&self.ap_parent, left) != ap
@@ -1263,11 +1426,11 @@ impl<'a> Refiner<'a> {
         }
 
         let mut by_class = HashMap::<usize, Collision>::new();
-        for edge in &self.pag.edges {
+        for (edge_index, edge) in self.pag.edges.iter().enumerate() {
             let EdgeKind::Gep { byte_off, lane } = edge.kind else {
                 continue;
             };
-            let Some((left, right, _)) = self.diagnostic_join_edge(edge) else {
+            let Some((left, right, _)) = self.diagnostic_join_edge(edge_index) else {
                 continue;
             };
             if ap_find_const(&self.ap_parent, left) != ap
@@ -1341,8 +1504,8 @@ impl<'a> Refiner<'a> {
             let NodeKind::Object { object, key, .. } = &node.kind else {
                 continue;
             };
-            let class = self.classes.class_of(node.id);
-            if ap_find_const(&self.ap_parent, class) != ap {
+            let class = node.id.0 as usize;
+            if self.partition_of_node(node.id) != ap {
                 continue;
             }
             let occupants = by_class.entry(class).or_default();
@@ -1402,9 +1565,7 @@ impl<'a> Refiner<'a> {
             let NodeKind::Object { object, .. } = &node.kind else {
                 continue;
             };
-            let entry = object_kinds
-                .entry(self.classes.class_of(node.id))
-                .or_default();
+            let entry = object_kinds.entry(node.id.0 as usize).or_default();
             match object {
                 ObjectKind::Function => entry.0 = true,
                 ObjectKind::Alloca | ObjectKind::Global | ObjectKind::ExternalReadonly => {
@@ -1416,11 +1577,12 @@ impl<'a> Refiner<'a> {
         self.pag
             .edges
             .iter()
-            .filter_map(|edge| {
+            .enumerate()
+            .filter_map(|(edge_index, edge)| {
                 let EdgeKind::Memcpy { bytes } = edge.kind else {
                     return None;
                 };
-                let (left, right, _) = self.diagnostic_join_edge(edge)?;
+                let (left, right, _) = self.diagnostic_join_edge(edge_index)?;
                 if ap_find_const(&self.ap_parent, left) != ap
                     || ap_find_const(&self.ap_parent, right) != ap
                 {
@@ -1450,7 +1612,7 @@ impl<'a> Refiner<'a> {
     fn partition_cut_components(&self, ap: usize, cut: PartitionCut, limit: usize) -> Vec<usize> {
         let mut nodes = BTreeSet::<u32>::new();
         for node in &self.pag.nodes {
-            if ap_find_const(&self.ap_parent, self.classes.class_of(node.id)) == ap {
+            if self.partition_of_node(node.id) == ap {
                 nodes.insert(node.id.0);
             }
         }
@@ -1460,8 +1622,8 @@ impl<'a> Refiner<'a> {
             if cut.removes(family) {
                 continue;
             }
-            let src_ap = ap_find_const(&self.ap_parent, self.classes.class_of(edge.src));
-            let dst_ap = ap_find_const(&self.ap_parent, self.classes.class_of(edge.dst));
+            let src_ap = self.partition_of_node(edge.src);
+            let dst_ap = self.partition_of_node(edge.dst);
             if src_ap == ap && dst_ap == ap {
                 nodes.insert(edge.src.0);
                 nodes.insert(edge.dst.0);
@@ -1494,19 +1656,20 @@ impl<'a> Refiner<'a> {
         sizes
     }
 
-    fn class_label_sample(&self, class: usize, limit: usize) -> Vec<String> {
-        let mut labels = self
-            .pag
-            .nodes
-            .iter()
-            .filter(|node| self.classes.class_of(node.id) == class)
-            .map(|node| node.label.clone())
-            .take(limit)
-            .collect::<Vec<_>>();
-        if labels.is_empty() && class >= self.n_base {
-            labels.push(format!("synthetic:{class}"));
+    fn class_label_sample(&self, vertex: usize, _limit: usize) -> Vec<String> {
+        if vertex < self.n_base {
+            return vec![self.pag.nodes[vertex].label.clone()];
         }
-        labels
+        self.prepartition_regions
+            .get(vertex)
+            .and_then(|region| *region)
+            .map(|(root, region)| {
+                vec![format!(
+                    "region:{}:{:?}",
+                    self.pag.nodes[root.0 as usize].label, region
+                )]
+            })
+            .unwrap_or_else(|| vec![format!("synthetic:{vertex}")])
     }
 
     // ----- monotone on-the-fly call-graph refinement -----------------------------------
@@ -3717,7 +3880,7 @@ mod tests {
 
     use super::{
         finish_andersen_controlled, solve_andersen, solve_andersen_with_overrides,
-        AndersenControls, ExternalRegion, Solve,
+        AndersenControls, ExternalRegion, Refiner, Solve,
     };
     use crate::{solve_steensgaard, FieldLocation, PointsToMaterialization};
 
@@ -4369,6 +4532,46 @@ mod tests {
             .unwrap();
         assert_eq!(andersen_a.targets, vec!["g".to_string()]);
         assert!(andersen.metrics.rounds >= 1);
+    }
+
+    #[test]
+    fn prepartition_graph_keeps_disjoint_allocation_regions_separate() {
+        let (pir, pag) = load("cg_refinement.pir.json");
+        let labels = BTreeSet::new();
+        let (base, classes) =
+            crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
+        let exact_targets = BTreeMap::new();
+        let confined_targets = BTreeSet::new();
+        let refiner = Refiner::new(
+            &pir,
+            &pag,
+            &classes,
+            &base,
+            BuildMode::Library,
+            u64::MAX,
+            &exact_targets,
+            &confined_targets,
+            false,
+        );
+        let node = |label: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == label)
+                .unwrap_or_else(|| panic!("missing PAG node {label}"))
+                .id
+        };
+
+        // %p0 and %q0 are two GEP instructions naming the same byte interval. %p1 names
+        // offset 8 of the same allocation. The former must meet; the latter must not be
+        // pulled in merely because Steensgaard used one carrier/pointee class.
+        assert_eq!(
+            refiner.partition_of_node(node("val:setup:%p0")),
+            refiner.partition_of_node(node("val:setup:%q0"))
+        );
+        assert_ne!(
+            refiner.partition_of_node(node("val:setup:%p0")),
+            refiner.partition_of_node(node("val:setup:%p1"))
+        );
     }
 
     #[test]
