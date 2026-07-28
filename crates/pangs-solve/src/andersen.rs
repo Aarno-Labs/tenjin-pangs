@@ -11,9 +11,11 @@
 //! Soundness rests on three facts:
 //! * Steensgaard unification is a sound over-approximation of Andersen, so refined targets
 //!   are always ⊆ the Steensgaard targets (the narrowing ledger, asserted in tests).
-//! * Admission partitions are weak components of the inclusion constraints. Certified memory
-//!   accesses pass through allocation-relative byte-region vertices; unresolved accesses retain
-//!   their address carrier. Sound indirect-call envelopes contribute their possible bindings.
+//! * Ordinary admission partitions are weak components of the inclusion constraints. An
+//!   oversize component may expose a source-closed directed-SCC predecessor slice around an
+//!   indirect-call operand; excluded successors retain their complete Steensgaard fallback rows.
+//!   Certified memory accesses use allocation-relative byte-region vertices, while unresolved
+//!   accesses retain their address carrier.
 //! * Anything reachable only through Ω stays Ω (absorbing), and the global escape/unknown
 //!   outputs that drive component freezing are taken verbatim from Steensgaard.
 
@@ -558,6 +560,9 @@ struct Refiner<'a> {
     prepartition_regions: Vec<Option<(NodeId, FieldRegion)>>,
     /// Constraint endpoints used by diagnostics, parallel to `pag.edges`.
     prepartition_edge_vertices: Vec<Option<(usize, usize)>>,
+    /// Directed inclusion dependencies. Source-closed SCC slices use these to ensure no
+    /// excluded predecessor can feed an admitted Andersen subproblem.
+    prepartition_flow_edges: Vec<(usize, usize)>,
     /// Whether a base node sits in an interesting, within-budget partition.
     in_scope: Vec<bool>,
     oversize_fallbacks: usize,
@@ -655,6 +660,7 @@ impl<'a> Refiner<'a> {
             ap_parent: Vec::new(),
             prepartition_regions: Vec::new(),
             prepartition_edge_vertices: Vec::new(),
+            prepartition_flow_edges: Vec::new(),
             in_scope: vec![false; n_base],
             oversize_fallbacks: 0,
             oversize_fallback_max_size: 0,
@@ -748,6 +754,130 @@ impl<'a> Refiner<'a> {
         ))
     }
 
+    /// Select the source-closed SCC predecessor slice needed by indirect-call operands in one
+    /// oversize weak component. Excluded successors keep their Steensgaard rows at the merge
+    /// boundary; source closure means no excluded predecessor needs to be under-approximately
+    /// reconstructed inside Andersen.
+    fn directional_icall_slice(&self, ap: usize) -> Option<HashSet<usize>> {
+        let active = (0..self.ap_parent.len())
+            .map(|vertex| ap_find_const(&self.ap_parent, vertex) == ap)
+            .collect::<Vec<_>>();
+        let mut seeds = BTreeMap::<usize, u8>::new();
+        for vertex in self
+            .pag
+            .callsites
+            .iter()
+            .filter(|callsite| callsite.kind == CallKind::Indirect)
+            .filter_map(|callsite| callsite.operand)
+            .map(|node| node.0 as usize)
+            .filter(|&vertex| active[vertex])
+        {
+            seeds.insert(vertex, 0);
+        }
+        if seeds.is_empty() {
+            return None;
+        }
+
+        let (component_of, component_sizes) = directed_sccs(&active, &self.prepartition_flow_edges);
+        let mut predecessors = vec![HashSet::new(); component_sizes.len()];
+        for &(source, destination) in &self.prepartition_flow_edges {
+            if !active[source] || !active[destination] {
+                continue;
+            }
+            let source_component = component_of[source];
+            let destination_component = component_of[destination];
+            if source_component != destination_component {
+                predecessors[destination_component].insert(source_component);
+            }
+        }
+
+        let seed_count = seeds.len();
+        let mut candidates = seeds
+            .into_iter()
+            .map(|(seed, priority)| {
+                let mut closure = HashSet::from([component_of[seed]]);
+                let mut stack = vec![component_of[seed]];
+                while let Some(component) = stack.pop() {
+                    for &predecessor in &predecessors[component] {
+                        if closure.insert(predecessor) {
+                            stack.push(predecessor);
+                        }
+                    }
+                }
+                let nodes = closure
+                    .iter()
+                    .map(|&component| component_sizes[component])
+                    .sum::<usize>();
+                (priority, nodes, seed, closure)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(priority, nodes, seed, _)| (*priority, *nodes, *seed));
+
+        let mut components = HashSet::new();
+        let mut selected_seeds = 0usize;
+        for (_, _, _, closure) in candidates {
+            let mut candidate = components.clone();
+            candidate.extend(closure);
+            let nodes = candidate
+                .iter()
+                .map(|&component| component_sizes[component] as u64)
+                .sum::<u64>();
+            let edges = self
+                .prepartition_flow_edges
+                .iter()
+                .filter(|(source, destination)| {
+                    active[*source]
+                        && active[*destination]
+                        && candidate.contains(&component_of[*source])
+                        && candidate.contains(&component_of[*destination])
+                })
+                .count() as u64;
+            let cost = nodes.saturating_mul(nodes.saturating_add(edges));
+            if cost <= self.budget {
+                components = candidate;
+                selected_seeds += 1;
+            }
+        }
+        if components.is_empty() {
+            return None;
+        }
+        let vertices = active
+            .iter()
+            .enumerate()
+            .filter_map(|(vertex, &active)| {
+                (active && components.contains(&component_of[vertex])).then_some(vertex)
+            })
+            .collect::<HashSet<_>>();
+        let edges = self
+            .prepartition_flow_edges
+            .iter()
+            .filter(|(source, destination)| {
+                vertices.contains(source) && vertices.contains(destination)
+            })
+            .count() as u64;
+        let nodes = vertices.len() as u64;
+        let cost = nodes.saturating_mul(nodes.saturating_add(edges));
+        if partition_profile_enabled() || admission_profile_enabled() {
+            eprintln!(
+                "pangs directional admission: root={} total_sccs={} largest_scc={} slice_sccs={} slice_nodes={} slice_edges={} slice_cost={} budget={} admitted={}",
+                ap,
+                component_sizes.len(),
+                component_sizes.iter().copied().max().unwrap_or(0),
+                components.len(),
+                nodes,
+                edges,
+                cost,
+                self.budget,
+                cost <= self.budget
+            );
+            eprintln!(
+                "pangs directional admission: root={} candidate_seeds={} selected_seeds={}",
+                ap, seed_count, selected_seeds
+            );
+        }
+        (cost <= self.budget).then_some(vertices)
+    }
+
     /// Build weak components of the actual inclusion constraints, using independent
     /// allocation-relative region vertices for certified memory accesses. This graph is
     /// intentionally not derived from final Steensgaard equivalence classes: those classes
@@ -756,6 +886,7 @@ impl<'a> Refiner<'a> {
         self.ap_parent = (0..self.n_base).collect();
         self.prepartition_regions = vec![None; self.n_base];
         self.prepartition_edge_vertices = vec![None; self.pag.edges.len()];
+        self.prepartition_flow_edges.clear();
         let mut regions = HashMap::new();
 
         for (edge_index, edge) in self.pag.edges.iter().enumerate() {
@@ -804,6 +935,31 @@ impl<'a> Refiner<'a> {
             };
             if let Some((left, right)) = endpoints {
                 self.ap_union(left, right);
+                match edge.kind {
+                    EdgeKind::AddrOf => self.prepartition_flow_edges.push((right, left)),
+                    EdgeKind::Assign | EdgeKind::Load => {
+                        self.prepartition_flow_edges.push((left, right));
+                    }
+                    EdgeKind::Store | EdgeKind::Gep { .. } | EdgeKind::Memcpy { .. } => {
+                        self.prepartition_flow_edges.push((right, left));
+                    }
+                }
+                // The concrete Andersen implementation still evaluates memory constraints
+                // through their address carrier. Retain that dependency even when the
+                // allocation-relative storage vertex supplies the payload dependency.
+                match edge.kind {
+                    EdgeKind::Load if left != src => {
+                        self.prepartition_flow_edges.push((src, dst));
+                    }
+                    EdgeKind::Store if left != dst => {
+                        self.prepartition_flow_edges.push((dst, left));
+                    }
+                    EdgeKind::Memcpy { .. } => {
+                        self.prepartition_flow_edges.push((src, left));
+                        self.prepartition_flow_edges.push((dst, left));
+                    }
+                    _ => {}
+                }
             }
             self.prepartition_edge_vertices[edge_index] = endpoints;
         }
@@ -841,6 +997,8 @@ impl<'a> Refiner<'a> {
                     if let Some(&parameter) = self.param_nodes.get(&(function, index)) {
                         if self.pointer_transfer(argument, parameter) {
                             self.ap_union(argument.0 as usize, parameter.0 as usize);
+                            self.prepartition_flow_edges
+                                .push((argument.0 as usize, parameter.0 as usize));
                         }
                     }
                 }
@@ -848,6 +1006,8 @@ impl<'a> Refiner<'a> {
                 {
                     if self.pointer_transfer(ret, result) {
                         self.ap_union(ret.0 as usize, result.0 as usize);
+                        self.prepartition_flow_edges
+                            .push((ret.0 as usize, result.0 as usize));
                     }
                 }
             }
@@ -973,9 +1133,15 @@ impl<'a> Refiner<'a> {
             self.print_partition_profile(&interesting, &oversize, &nodes_in, &edges_in);
         }
 
+        let directional = oversize
+            .iter()
+            .filter_map(|&ap| self.directional_icall_slice(ap))
+            .flatten()
+            .collect::<HashSet<_>>();
         for i in 0..self.n_base {
             let ap = self.ap_find(i);
-            self.in_scope[i] = interesting.contains(&ap) && !oversize.contains(&ap);
+            self.in_scope[i] =
+                (interesting.contains(&ap) && !oversize.contains(&ap)) || directional.contains(&i);
         }
     }
 
@@ -2765,6 +2931,62 @@ fn ap_find_const(parent: &[usize], mut x: usize) -> usize {
     x
 }
 
+fn directed_sccs(active: &[bool], edges: &[(usize, usize)]) -> (Vec<usize>, Vec<usize>) {
+    let mut successors = vec![Vec::new(); active.len()];
+    let mut predecessors = vec![Vec::new(); active.len()];
+    for &(source, destination) in edges {
+        if active[source] && active[destination] {
+            successors[source].push(destination);
+            predecessors[destination].push(source);
+        }
+    }
+
+    let mut seen = vec![false; active.len()];
+    let mut order = Vec::new();
+    for start in 0..active.len() {
+        if !active[start] || seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((vertex, next)) = stack.pop() {
+            if next < successors[vertex].len() {
+                stack.push((vertex, next + 1));
+                let successor = successors[vertex][next];
+                if !seen[successor] {
+                    seen[successor] = true;
+                    stack.push((successor, 0));
+                }
+            } else {
+                order.push(vertex);
+            }
+        }
+    }
+
+    let mut component_of = vec![usize::MAX; active.len()];
+    let mut component_sizes = Vec::new();
+    for &start in order.iter().rev() {
+        if component_of[start] != usize::MAX {
+            continue;
+        }
+        let component = component_sizes.len();
+        component_of[start] = component;
+        let mut size = 0usize;
+        let mut stack = vec![start];
+        while let Some(vertex) = stack.pop() {
+            size += 1;
+            for &predecessor in &predecessors[vertex] {
+                if component_of[predecessor] == usize::MAX {
+                    component_of[predecessor] = component;
+                    stack.push(predecessor);
+                }
+            }
+        }
+        component_sizes.push(size);
+    }
+    (component_of, component_sizes)
+}
+
 fn edge_family(kind: EdgeKind) -> &'static str {
     match kind {
         EdgeKind::AddrOf => "addr_of",
@@ -3876,7 +4098,7 @@ mod tests {
     use std::path::Path;
 
     use pangs_pag::{BuildMode, Pag, PagOpts};
-    use pangs_pir::Pir;
+    use pangs_pir::{Pir, Stmt};
 
     use super::{
         finish_andersen_controlled, solve_andersen, solve_andersen_with_overrides,
@@ -4572,6 +4794,36 @@ mod tests {
             refiner.partition_of_node(node("val:setup:%p0")),
             refiner.partition_of_node(node("val:setup:%p1"))
         );
+    }
+
+    #[test]
+    fn directional_admission_refines_a_source_closed_slice_of_an_oversize_component() {
+        let (mut pir, _) = load("field_sensitive_fnptr.pir.json");
+        let setup = pir
+            .functions
+            .iter_mut()
+            .find(|function| function.key == "setup")
+            .unwrap();
+        let mut source = "%fp".to_string();
+        for index in 0..100 {
+            let destination = format!("%outgoing{index}");
+            setup.body.push(Stmt::Assign {
+                dest: destination.clone(),
+                sources: vec![source],
+                loc: None,
+            });
+            source = destination;
+        }
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let solved = solve_andersen(&pir, &pag, BuildMode::Library, 1_000);
+        let site = solved.indirect_calls.first().unwrap();
+
+        assert_eq!(site.targets, vec!["f0".to_string()]);
+        assert!(
+            !site.fallback,
+            "the small predecessor SCC slice should refine the callsite"
+        );
+        assert!(solved.metrics.oversize_fallbacks >= 1);
     }
 
     #[test]
