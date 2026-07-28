@@ -893,6 +893,7 @@ pub(crate) enum PointsToMaterialization {
 struct ExactAddress {
     root: NodeId,
     location: FieldLocation,
+    via_gep: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -974,6 +975,7 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
             addresses[edge.dst.0 as usize] = Some(ExactAddress {
                 root: edge.src,
                 location: FieldLocation::Exact(0),
+                via_gep: false,
             });
         }
     }
@@ -990,6 +992,7 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
                     addresses[incoming[0].src.0 as usize].map(|base| ExactAddress {
                         root: base.root,
                         location: base.location.add(FieldLocation::from_gep(byte_off, lane)),
+                        via_gep: true,
                     })
                 }
                 pangs_pag::EdgeKind::Assign
@@ -1006,13 +1009,20 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
                         alternatives
                             .iter()
                             .all(|address| address.root == first.root)
-                            .then(|| ExactAddress {
-                                root: first.root,
-                                location: alternatives
+                            .then(|| {
+                                let same_location = alternatives
                                     .iter()
-                                    .all(|address| address.location == first.location)
-                                    .then_some(first.location)
-                                    .unwrap_or(FieldLocation::Unknown),
+                                    .all(|address| address.location == first.location);
+                                let same_derivation = alternatives
+                                    .iter()
+                                    .all(|address| address.via_gep == first.via_gep);
+                                ExactAddress {
+                                    root: first.root,
+                                    location: (same_location && same_derivation)
+                                        .then_some(first.location)
+                                        .unwrap_or(FieldLocation::Unknown),
+                                    via_gep: same_location && same_derivation && first.via_gep,
+                                }
                             })
                     })
                 }
@@ -1358,20 +1368,28 @@ impl<'a> Solver<'a> {
                     if !self.pointer_transfer(edge.src, edge.dst) {
                         continue;
                     }
-                    let src = self.class_of(edge.src);
                     let dst = self.class_of(edge.dst);
-                    self.join(src, dst, self.assign_provenance(edge.src, edge.dst));
+                    if let Some(storage) = self.exact_storage_class(edge.dst) {
+                        // A complete fixed-PAG certificate proves every producer of `dst`
+                        // names this one allocation-relative location. Preserve that fact
+                        // directly instead of recursively unifying the pointer carriers,
+                        // which would needlessly merge their storage classes.
+                        let dst_p = self.pointee_of(dst);
+                        self.join(dst_p, storage, self.assign_provenance(edge.src, edge.dst));
+                    } else {
+                        let src = self.class_of(edge.src);
+                        self.join(src, dst, self.assign_provenance(edge.src, edge.dst));
+                    }
                 }
                 pangs_pag::EdgeKind::Load => {
                     if !self.node_may_carry_pointer(edge.dst) {
                         continue;
                     }
                     let dst = self.class_of(edge.dst);
-                    let src = self.class_of(edge.src);
-                    let pointee = self.pointee_of(src);
+                    let storage = self.storage_class_for_address(edge.src);
                     self.join(
                         dst,
-                        pointee,
+                        storage,
                         PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
                     );
                 }
@@ -1380,10 +1398,9 @@ impl<'a> Solver<'a> {
                         continue;
                     }
                     let src = self.class_of(edge.src);
-                    let dst = self.class_of(edge.dst);
-                    let pointee = self.pointee_of(dst);
+                    let storage = self.storage_class_for_address(edge.dst);
                     self.join(
-                        pointee,
+                        storage,
                         src,
                         PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
                     );
@@ -1392,8 +1409,8 @@ impl<'a> Solver<'a> {
                     let dst = self.class_of(edge.dst);
                     let dst_p = self.pointee_of(dst);
                     if let Some(address) = self.exact_addresses[edge.dst.0 as usize] {
-                        let field = self.field_class(address.root, address.location);
-                        self.join(dst_p, field, PROV_DIRECT_ADDRESS);
+                        let storage = self.field_class(address.root, address.location);
+                        self.join(dst_p, storage, PROV_DIRECT_ADDRESS);
                     } else {
                         let src = self.class_of(edge.src);
                         let src_p = self.pointee_of(src);
@@ -1401,15 +1418,13 @@ impl<'a> Solver<'a> {
                     }
                 }
                 pangs_pag::EdgeKind::Memcpy { .. } => {
-                    let dst = self.class_of(edge.dst);
-                    let src = self.class_of(edge.src);
-                    let dst_p = self.pointee_of(dst);
-                    let src_p = self.pointee_of(src);
-                    let dst_pp = self.pointee_of(dst_p);
-                    let src_pp = self.pointee_of(src_p);
+                    let dst_storage = self.storage_class_for_address(edge.dst);
+                    let src_storage = self.storage_class_for_address(edge.src);
+                    let dst_content = self.pointee_of(dst_storage);
+                    let src_content = self.pointee_of(src_storage);
                     self.join(
-                        dst_pp,
-                        src_pp,
+                        dst_content,
+                        src_content,
                         PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
                     );
                 }
@@ -2236,6 +2251,30 @@ impl<'a> Solver<'a> {
         id
     }
 
+    /// Return the independently certified allocation-relative storage cell for `address`,
+    /// using the same per-allocation field identities as certified GEPs.
+    fn exact_storage_class(&mut self, address: NodeId) -> Option<usize> {
+        let address = self.exact_addresses[address.0 as usize]?;
+        if address.location == FieldLocation::Unknown {
+            return None;
+        }
+        Some(match address.location {
+            FieldLocation::Exact(0) if !address.via_gep => self.class_of(address.root),
+            location => self.field_class(address.root, location),
+        })
+    }
+
+    /// Resolve a memory address to its storage class, preferring an allocation-relative
+    /// certificate over the (potentially much broader) Steensgaard carrier class.
+    fn storage_class_for_address(&mut self, address: NodeId) -> usize {
+        if let Some(storage) = self.exact_storage_class(address) {
+            storage
+        } else {
+            let class = self.class_of(address);
+            self.pointee_of(class)
+        }
+    }
+
     /// Steensgaard field identity used by both its fallback answer and the Kahlon partition
     /// boundary. Constant offsets remain distinct. A dynamic or otherwise non-composable offset
     /// uses one summary per allocation root and joins only the fields of that same root.
@@ -2587,6 +2626,72 @@ mod tests {
                 }),
             ),
             FieldLocation::Unknown
+        );
+    }
+
+    #[test]
+    fn allocation_relative_copy_preserves_distinct_pointer_carriers() {
+        let mut lowering = pangs_pir::LoweringStats::default();
+        lowering.semantic_value_kinds.extend([
+            ("%f::field".into(), ValueKind::Pointer),
+            ("%f::copy".into(), ValueKind::Pointer),
+        ]);
+        let pir = Pir {
+            module: "allocation-relative-copy".into(),
+            source: None,
+            lowering,
+            target: None,
+            functions: vec![Func {
+                key: "f".into(),
+                sig: void_sig(),
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![
+                    Stmt::Gep {
+                        dest: "%f::field".into(),
+                        base: "@aggregate".into(),
+                        byte_off: Some(8),
+                        lane: None,
+                        loc: None,
+                    },
+                    Stmt::Assign {
+                        dest: "%f::copy".into(),
+                        sources: vec!["%f::field".into()],
+                        loc: None,
+                    },
+                ],
+            }],
+            globals: vec![Global {
+                key: "aggregate".into(),
+                ..Global::default()
+            }],
+            global_init: Vec::new(),
+        };
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let node = |suffix: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label.ends_with(suffix))
+                .unwrap()
+                .id
+        };
+        let field = node(":%f::field");
+        let copy = node(":%f::copy");
+
+        let (_, classes) = solve_steensgaard_with_classes(&pir, &pag, BuildMode::Executable);
+        let field_class = classes.class_of(field);
+        let copy_class = classes.class_of(copy);
+        assert_ne!(
+            field_class, copy_class,
+            "a certified pointer copy need not merge its carrier classes"
+        );
+        assert_eq!(
+            classes.pointee[field_class], classes.pointee[copy_class],
+            "both carriers must still designate the same allocation-relative field"
         );
     }
 
