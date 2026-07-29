@@ -259,6 +259,46 @@ supporting promotion is an implementation limitation of the prototype, not a req
 of the certificate abstraction; a future fixed-PAG memory-projection graph could remove
 that dependency.
 
+A follow-up fixed-PAG projection experiment tested that removal on Slap. It represented
+memory as `(allocation root, field/lane)` vertices, preserved known-width aggregate copies,
+treated an unknown-length copy as an offset-preserving transfer over the finite queried
+field vocabulary, and propagated `{named function targets, incomplete}` over SCCs. A
+module-wide address-only inclusion solve could name the projection endpoints and recovered
+97 targets for `dispatch_word` plus 105 targets for each `eval_body*` site. It was not a
+viable replacement:
+
+- the address solve and projection expansion raised Slap wall time from about 0.84 seconds
+  to 6.8 seconds (45,971 vertices and 518,583 completeness dependencies after lane aliases);
+- reusing only the admitted Andersen address facts still took about 5.1 seconds and lost
+  the 105-target `eval_body*` producer chains at cut boundaries;
+- even with the global endpoints, both `eval_body*` certificates remained incomplete
+  because `Value.as.xt.fn` shares a tagged-union lane with non-function and unknown payload
+  variants; flow-insensitive lane projection cannot use the preceding `VAL_XT` test to
+  exclude them;
+- teaching the general inclusion solver to expand unknown-length array copies was much
+  worse: the Slap run was stopped after 111 seconds.
+
+The experimental implementation was therefore discarded. A useful successor needs both
+(1) demand-driven, call-operand-rooted address-origin discovery, so it never solves all
+module address carriers, and (2) a compositional tagged-variant proof (or an equivalent
+defined-indirect-call filter) before union payload alternatives can be removed. Copy
+projection alone is neither fast enough nor precise enough.
+
+A subsequent optimistic-terminal control measured the upper bound of the second item.
+It restored the module-wide projection graph and, only at an indirect-call query, ignored
+the graph's open and non-function alternatives while still requiring a nonempty finite
+set of named functions. This is intentionally not a sound certificate: an open producer
+could denote an externally supplied function. It did recover and select all 105 named
+targets at each `eval_body*` callsite (and retained the 97-target `dispatch_word`
+certificate), confirming that the rejected alternatives are the only remaining local
+precision obstacle. The result did not improve Slap's disposition coverage: it remained
+46/50 with the same four unhandled globals. It also changed `main.combined` from
+`localize` to `mutex`, because the newly explicit callees enlarge its access context, and
+in a same-build debug comparison increased wall time from 5.23 to 7.07 seconds. The
+control was discarded. A real discriminator proof is therefore useful for call-graph
+quality but is not currently on Slap's disposition critical path; demand-driven address
+origins remain a prerequisite if that work is resumed.
+
 **Call graph via monotone on-the-fly discovery:**
 
 1. Build one persistent solve from base PAG constraints, Ω seeds, and pinned B1/B2
