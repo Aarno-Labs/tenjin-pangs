@@ -6,6 +6,10 @@ keeping the performance and coverage loss measurably small. The two documents sh
 terminology — read `DESIGN.md` §1–2 first for goals, paper sources, and the
 FN-corruption/FP-coverage asymmetry that licenses everything cut here.*
 
+Retrospective measurements, discarded prototypes, and the implementation chronology
+live in [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md); this document describes the
+current architecture and its forward-looking constraints.
+
 ## 0. The thesis
 
 The full design routes queries through five tiers with certificate checks between each,
@@ -21,7 +25,7 @@ exactly.
 The bet is safe to take because of the client asymmetry (`DESIGN.md` §7): every cut
 converts to *coverage loss, never corruption*. The soundness skeleton — Ω, violation
 taint, FSA envelope, safe fallbacks — survives intact, and the cut precision is
-recoverable later behind a stable interface (§6 below).
+recoverable later behind a stable interface (§5 below).
 
 ## 1. Architecture
 
@@ -257,47 +261,9 @@ therefore permits a bounded promotion of a non-forged indirect-call partition, c
 or integer-forged partitions retain normal admission and fallback behavior. This
 supporting promotion is an implementation limitation of the prototype, not a requirement
 of the certificate abstraction; a future fixed-PAG memory-projection graph could remove
-that dependency.
-
-A follow-up fixed-PAG projection experiment tested that removal on Slap. It represented
-memory as `(allocation root, field/lane)` vertices, preserved known-width aggregate copies,
-treated an unknown-length copy as an offset-preserving transfer over the finite queried
-field vocabulary, and propagated `{named function targets, incomplete}` over SCCs. A
-module-wide address-only inclusion solve could name the projection endpoints and recovered
-97 targets for `dispatch_word` plus 105 targets for each `eval_body*` site. It was not a
-viable replacement:
-
-- the address solve and projection expansion raised Slap wall time from about 0.84 seconds
-  to 6.8 seconds (45,971 vertices and 518,583 completeness dependencies after lane aliases);
-- reusing only the admitted Andersen address facts still took about 5.1 seconds and lost
-  the 105-target `eval_body*` producer chains at cut boundaries;
-- even with the global endpoints, both `eval_body*` certificates remained incomplete
-  because `Value.as.xt.fn` shares a tagged-union lane with non-function and unknown payload
-  variants; flow-insensitive lane projection cannot use the preceding `VAL_XT` test to
-  exclude them;
-- teaching the general inclusion solver to expand unknown-length array copies was much
-  worse: the Slap run was stopped after 111 seconds.
-
-The experimental implementation was therefore discarded. A useful successor needs both
-(1) demand-driven, call-operand-rooted address-origin discovery, so it never solves all
-module address carriers, and (2) a compositional tagged-variant proof (or an equivalent
-defined-indirect-call filter) before union payload alternatives can be removed. Copy
-projection alone is neither fast enough nor precise enough.
-
-A subsequent optimistic-terminal control measured the upper bound of the second item.
-It restored the module-wide projection graph and, only at an indirect-call query, ignored
-the graph's open and non-function alternatives while still requiring a nonempty finite
-set of named functions. This is intentionally not a sound certificate: an open producer
-could denote an externally supplied function. It did recover and select all 105 named
-targets at each `eval_body*` callsite (and retained the 97-target `dispatch_word`
-certificate), confirming that the rejected alternatives are the only remaining local
-precision obstacle. The result did not improve Slap's disposition coverage: it remained
-46/50 with the same four unhandled globals. It also changed `main.combined` from
-`localize` to `mutex`, because the newly explicit callees enlarge its access context, and
-in a same-build debug comparison increased wall time from 5.23 to 7.07 seconds. The
-control was discarded. A real discriminator proof is therefore useful for call-graph
-quality but is not currently on Slap's disposition critical path; demand-driven address
-origins remain a prerequisite if that work is resumed.
+that dependency. The discarded fixed-PAG projection trials in
+[EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md) show that a useful successor also needs
+demand-driven address origins and discriminator-sensitive producer proofs.
 
 **Call graph via monotone on-the-fly discovery:**
 
@@ -578,26 +544,10 @@ avoid importing the carrier's entire Steensgaard class through each bridge. Thei
 are precision loss at the explicit context/origin caps and additional work to admit
 allocation-field support components; both are visible in profiling and fail closed.
 
-On `exe-chibicc-O1.bc`, enabling receiver payloads plus bounded origins currently changes
-the dominant admitted region and the formerly unknown macro-handler call as follows:
-
-| Metric | Baseline | Extension enabled |
-|---|---:|---:|
-| Megapartition vertices | 10,284 | 9,465 |
-| Megapartition edges | 12,290 | 11,604 |
-| Quadratic cost proxy | 232,151,016 | 199,418,085 |
-| Andersen propagation steps | ~3,632 | ~4,754 |
-| Indirect calls resolved by Andersen | 0 | 1 |
-| Unknown indirect calls | 1 | 0 |
-
-The recovered call in `preprocess2` has exactly the five macro handlers
-`base_file_macro`, `counter_macro`, `file_macro`, `line_macro`, and
-`timestamp_macro`. Its returned `Macro *` set contains the 50 named macro allocations,
-and loading `Macro.handler` narrows those to the five functions without an external
-region. The size reduction is real but not free: same-process measurements showed about
-15% wall-time and 23% solve-time overhead on this input. The feature therefore remains
-opt-in until broader-corpus measurements establish whether the call-graph and component
-precision justify that cost.
+Receiver payloads plus bounded origins reduced chibicc's dominant region and resolved its
+macro-handler call, but added enough runtime to remain opt-in pending broader-corpus
+validation. The measured counts and recovered targets are recorded in
+[EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md).
 
 Disposition inventory is source-actionable rather than identical to the solver's object
 inventory. Compiler-generated unnamed compound-literal objects stay in the PAG and all
@@ -608,25 +558,7 @@ synthetic objects remain diagnostic records outside the actionable coverage deno
 This is a client-layer ownership projection only; it does not remove objects or edges from
 A′–D′.
 
-## 5. Historical milestones and current status
-
-1. **M1 — sound end-to-end (landed):** A' + C' + D' with joint CG discovery, Ω taint,
-   violation detection, FSA filter. Correct (coarse) input for the localization client.
-   Metric from day one: fraction of mutable globals localizable, plus the
-   component-size distribution and which unknowns are load-bearing.
-2. **M2 — the precision jump (landed):** B1 + B2 + B3, including stationarity,
-   exact/simple bindings, confined subtraction, finite field summaries, and the
-   narrowing ledgers.
-3. **M3 — measure and decide (lite selected):** corpus measurements kept Andersen as
-   the authoritative final tier. CFL/MHS query kernels were implemented as experimental
-   diagnostics and then deliberately left disconnected from production results.
-4. **M4 — structural megapartition refinements (experimental):** independent
-   allocation-relative prepartitioning, directional source-closed SCC admission, and
-   receiver-allocation payload summaries with bounded allocation origins are implemented.
-   The first two are general admission machinery; the receiver/origin pair is opt-in
-   while its cross-corpus precision/runtime tradeoff is evaluated.
-
-## 6. Upgrade path (why the simplification is reversible)
+## 5. Upgrade path (why the simplification is reversible)
 
 Nothing in lite forecloses the full design:
 
