@@ -200,6 +200,7 @@ struct AndersenControls {
     disable_eager_unknown: bool,
     subtractive_differential: bool,
     closed_producers: bool,
+    closed_consumers: bool,
 }
 
 impl AndersenControls {
@@ -215,6 +216,7 @@ impl AndersenControls {
             )
             .is_some(),
             closed_producers: closed_producers_enabled(),
+            closed_consumers: closed_consumers_enabled(),
         }
     }
 }
@@ -251,6 +253,9 @@ fn finish_andersen_controlled(
             // Override only complete refined facts; keep global escape/unknown-caller facts
             // from Steensgaard. Unrefined/oversize node partitions retain their base rows.
             base.indirect_calls = refined.indirect_calls;
+            for function in &refined.closed_consumers {
+                base.unknown_callers.remove(function);
+            }
             patch_exact_overrides(pir, &mut base.indirect_calls, exact_targets);
             for resolution in refined.nodes {
                 if let Some(node) = base.nodes.get_mut(&resolution.label) {
@@ -324,6 +329,7 @@ enum RefinerOutcome {
 
 struct RefinerOutput {
     indirect_calls: Vec<IndirectCallResolution>,
+    closed_consumers: BTreeSet<String>,
     nodes: Vec<RefinedNodeResolution>,
     /// Refined global-object points-to (`obj:global:<name>` label → named allocations), only
     /// populated when `Refiner::materialize_global_points_to` is set.
@@ -1531,7 +1537,7 @@ impl<'a> Refiner<'a> {
                 oversize.insert(ap);
             }
         }
-        if closed_producers_enabled() {
+        if closed_producers_enabled() || closed_consumers_enabled() {
             let call_partitions = self
                 .pag
                 .callsites
@@ -2545,6 +2551,11 @@ impl<'a> Refiner<'a> {
             &solve,
             controls.closed_producers,
         );
+        let closed_consumers = if controls.closed_consumers {
+            self.closed_consumer_certificates(&solve)
+        } else {
+            BTreeSet::new()
+        };
         let nodes = self.emit_node_resolutions(&solve);
         let global_points_to = if self.materialize_global_points_to {
             self.emit_global_points_to(&solve)
@@ -2588,6 +2599,7 @@ impl<'a> Refiner<'a> {
         }
         RefinerOutcome::Complete(RefinerOutput {
             indirect_calls,
+            closed_consumers,
             nodes,
             global_points_to,
             resume_rounds,
@@ -3512,6 +3524,249 @@ impl<'a> Refiner<'a> {
         }
     }
 
+    /// Prove that an address-taken internal function has no unknown incoming caller.
+    ///
+    /// This is the forward dual of the closed-producer query. The completed inclusion solve
+    /// already materializes every admitted value and memory cell that may contain a named
+    /// function object. We audit every boundary consumer and every fixed PAG transfer, rather
+    /// than running one graph search per function:
+    ///
+    /// * an indirect-call operand is a safe terminal (it invokes the value inside the module);
+    /// * internal copies, calls, loads, stores, and memcpy joins are safe only when the final
+    ///   solve contains the corresponding named-function fact at every destination;
+    /// * external/vararg arguments, exported or opaque storage, pointer/integer escapes, and
+    ///   externally callable returns are open terminals.
+    ///
+    /// The result is demand-bounded by the named-function facts already present in admitted
+    /// partitions. If an address seed or transfer was cut from the solve, its function fails
+    /// closed instead of triggering a module-wide address solve.
+    fn closed_consumer_certificates(&self, solve: &Solve) -> BTreeSet<String> {
+        let mut seeded = vec![false; self.pir.functions.len()];
+        let mut open = vec![false; self.pir.functions.len()];
+        let mut boundary_roots = HashSet::<Cell>::new();
+
+        let functions_in = |cell: Cell| {
+            solve
+                .points_to(cell)
+                .into_iter()
+                .flat_map(|points_to| points_to.iter())
+                .filter_map(|cell| {
+                    let root = solve.field_base.get(cell).copied().unwrap_or(*cell);
+                    self.fn_cell_to_index.get(&root).copied()
+                })
+                .collect::<BTreeSet<_>>()
+        };
+
+        let mark_open = |functions: BTreeSet<usize>, open: &mut [bool]| {
+            for function in functions {
+                open[function] = true;
+            }
+        };
+
+        // Every concrete `&function` producer must be represented in the admitted solve.
+        // Otherwise the consumer inventory is incomplete for that function.
+        for edge in &self.pag.edges {
+            if edge.kind != EdgeKind::AddrOf {
+                continue;
+            }
+            let Some(&function) = self.fn_cell_to_index.get(&edge.src.0) else {
+                continue;
+            };
+            seeded[function] = true;
+            if !functions_in(edge.dst.0).contains(&function) {
+                open[function] = true;
+            }
+        }
+
+        // Audit transfer completeness. A missing destination fact means the relevant path
+        // crossed an admission boundary and cannot be certified by this bounded solve.
+        for edge in &self.pag.edges {
+            match edge.kind {
+                EdgeKind::AddrOf => {}
+                EdgeKind::Assign => {
+                    let source = functions_in(edge.src.0);
+                    let destination = functions_in(edge.dst.0);
+                    for function in source.difference(&destination) {
+                        open[*function] = true;
+                    }
+                }
+                EdgeKind::Gep { .. } => {
+                    // Arithmetic on a function address is outside the supported consumer
+                    // grammar. GEPs used only to address storage do not themselves contain
+                    // the function stored in that storage.
+                    mark_open(functions_in(edge.src.0), &mut open);
+                }
+                EdgeKind::Load => {
+                    // Treating a function address as the address operand is unsupported.
+                    mark_open(functions_in(edge.src.0), &mut open);
+                    let Some(objects) = solve.points_to(edge.src.0) else {
+                        continue;
+                    };
+                    let destination = functions_in(edge.dst.0);
+                    for &object in objects {
+                        if solve.is_external(object) {
+                            continue;
+                        }
+                        for function in functions_in(object).difference(&destination) {
+                            open[*function] = true;
+                        }
+                    }
+                }
+                EdgeKind::Store => {
+                    // Treating a function address as the address operand is unsupported.
+                    mark_open(functions_in(edge.dst.0), &mut open);
+                    let source = functions_in(edge.src.0);
+                    if source.is_empty() {
+                        continue;
+                    }
+                    let Some(objects) = solve.points_to(edge.dst.0) else {
+                        mark_open(source, &mut open);
+                        continue;
+                    };
+                    if objects.is_empty() {
+                        mark_open(source, &mut open);
+                        continue;
+                    }
+                    for &object in objects {
+                        if solve.is_external(object) {
+                            mark_open(source.clone(), &mut open);
+                            continue;
+                        }
+                        let destination = functions_in(object);
+                        for function in source.difference(&destination) {
+                            open[*function] = true;
+                        }
+                    }
+                }
+                EdgeKind::Memcpy { .. } => {
+                    mark_open(functions_in(edge.src.0), &mut open);
+                    mark_open(functions_in(edge.dst.0), &mut open);
+                    let Some(sources) = solve.points_to(edge.src.0) else {
+                        continue;
+                    };
+                    let Some(destinations) = solve.points_to(edge.dst.0) else {
+                        for &source in sources {
+                            mark_open(functions_in(source), &mut open);
+                        }
+                        continue;
+                    };
+                    for &source in sources {
+                        let copied = functions_in(source);
+                        for &destination in destinations {
+                            if solve.is_external(destination) {
+                                mark_open(copied.clone(), &mut open);
+                                continue;
+                            }
+                            let received = functions_in(destination);
+                            for function in copied.difference(&received) {
+                                open[*function] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // External regions model foreign storage. Anything recursively reachable from one
+        // can be retained and invoked outside the module.
+        for &region in solve.region_of_cell.keys() {
+            boundary_roots.insert(solve.canonical(region));
+        }
+
+        for seed in &self.pag.omega_seeds {
+            match (seed.kind, seed.target) {
+                (
+                    OmegaSeedKind::ExportedSymbol
+                    | OmegaSeedKind::ImportedSymbol
+                    | OmegaSeedKind::PtrToInt
+                    | OmegaSeedKind::UnknownOperandEscape,
+                    SeedTarget::Node(node),
+                ) => {
+                    if let Some(&function) = self.fn_cell_to_index.get(&node.0) {
+                        open[function] = true;
+                    }
+                    boundary_roots.insert(solve.canonical(node.0));
+                }
+                (OmegaSeedKind::ExternalCallBoundary, SeedTarget::Callsite(id)) => {
+                    if let Some(callsite) = self.pag.callsites.get(id.0 as usize) {
+                        for &argument in &callsite.args {
+                            boundary_roots.insert(solve.canonical(argument.0));
+                        }
+                    }
+                }
+                (OmegaSeedKind::VarargCallBoundary, SeedTarget::Callsite(id)) => {
+                    if let Some(callsite) = self.pag.callsites.get(id.0 as usize) {
+                        for &argument in callsite.args.iter().skip(callsite.sig.params.len()) {
+                            boundary_roots.insert(solve.canonical(argument.0));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // A pointer returned by a function which still has an unknown caller can leave the
+        // module. This is deliberately not a mutual proof: recursive removal would require
+        // a separate greatest-fixed-point argument.
+        for node in &self.pag.nodes {
+            if let NodeKind::Return { func } = &node.kind {
+                if self.base.unknown_callers.contains(func) {
+                    boundary_roots.insert(solve.canonical(node.id.0));
+                }
+            }
+        }
+
+        // Traverse all boundary-reachable storage in one shared pass. This avoids a
+        // boundary-count × graph-size cost and makes the proof linear in the retained
+        // points-to graph plus its materialized field inventory.
+        let mut seen = HashSet::new();
+        let mut pending = boundary_roots.into_iter().collect::<Vec<_>>();
+        while let Some(cell) = pending.pop() {
+            let cell = solve.canonical(cell);
+            if !seen.insert(cell) {
+                continue;
+            }
+            let Some(points_to) = solve.points_to(cell) else {
+                continue;
+            };
+            for &pointee in points_to {
+                let root = solve.field_base.get(&pointee).copied().unwrap_or(pointee);
+                if let Some(&function) = self.fn_cell_to_index.get(&root) {
+                    open[function] = true;
+                } else if !solve.is_external(pointee) {
+                    pending.push(pointee);
+                    // A boundary receiving an allocation address may inspect any of its
+                    // materialized fields. Field cells are content variables rather than
+                    // ordinary points-to successors, so include them explicitly.
+                    if let Some(fields) = solve.obj_fields.get(&root) {
+                        pending.extend(fields.iter().copied());
+                    }
+                }
+            }
+        }
+
+        let certified = self
+            .pir
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(function, metadata)| {
+                !metadata.external
+                    && seeded[*function]
+                    && !open[*function]
+                    && self.base.unknown_callers.contains(&metadata.key)
+            })
+            .map(|(_, metadata)| metadata.key.clone())
+            .collect::<BTreeSet<_>>();
+        eprintln!(
+            "pangs closed consumers: address_seeded={} base_unknown={} certified={}",
+            seeded.iter().filter(|&&value| value).count(),
+            self.base.unknown_callers.len(),
+            certified.len()
+        );
+        certified
+    }
+
     fn emit_indirect_calls(
         &self,
         in_scope_sites: &[usize],
@@ -3851,6 +4106,10 @@ fn receiver_payloads_enabled() -> bool {
 
 fn closed_producers_enabled() -> bool {
     std::env::var_os(knobs::ENV_ANDERSEN_CLOSED_PRODUCERS).is_some()
+}
+
+fn closed_consumers_enabled() -> bool {
+    std::env::var_os(knobs::ENV_ANDERSEN_CLOSED_CONSUMERS).is_some()
 }
 
 fn graph_reachable(start: usize, adjacency: &[Vec<usize>]) -> HashSet<usize> {
@@ -5542,6 +5801,57 @@ mod tests {
         }
         assert!(result.indirect_calls[2].unknown_callee);
         assert!(result.indirect_calls[2].fallback);
+    }
+
+    #[test]
+    fn closed_consumer_certificate_clears_spurious_unknown_caller() {
+        let (pir, pag) = load("closed_producer_compositional.pir.json");
+        let labels = BTreeSet::new();
+        let (mut base, classes) =
+            crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
+        // Model the class-level false positive this certificate is intended to override.
+        base.unknown_callers.insert("target".to_string());
+        let result = finish_andersen_controlled(
+            &pir,
+            &pag,
+            &classes,
+            base,
+            BuildMode::Library,
+            u64::MAX,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            AndersenControls {
+                closed_consumers: true,
+                ..AndersenControls::default()
+            },
+        );
+        assert!(!result.unknown_callers.contains("target"));
+    }
+
+    #[test]
+    fn closed_consumer_certificate_retains_external_registration() {
+        let (pir, pag) = load("closed_consumer_external.pir.json");
+        let labels = BTreeSet::new();
+        let (mut base, classes) =
+            crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
+        base.unknown_callers.insert("target".to_string());
+        let result = finish_andersen_controlled(
+            &pir,
+            &pag,
+            &classes,
+            base,
+            BuildMode::Library,
+            u64::MAX,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            AndersenControls {
+                closed_consumers: true,
+                ..AndersenControls::default()
+            },
+        );
+        assert!(result.unknown_callers.contains("target"));
     }
 
     #[test]

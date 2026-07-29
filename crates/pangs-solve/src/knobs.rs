@@ -130,6 +130,12 @@ pub(crate) const ENV_ANDERSEN_RECEIVER_PAYLOADS: &str = "PANGS_ANDERSEN_RECEIVER
 /// points-to set contains only named functions.
 pub(crate) const ENV_ANDERSEN_CLOSED_PRODUCERS: &str = "PANGS_ANDERSEN_CLOSED_PRODUCERS";
 
+/// Enables the experimental closed-consumer certificate for address-taken internal
+/// functions. A certified function address reaches only internal indirect-call operands
+/// and modeled internal pointer-flow/storage operations, so Steensgaard's unknown-caller
+/// bit may be removed.
+pub(crate) const ENV_ANDERSEN_CLOSED_CONSUMERS: &str = "PANGS_ANDERSEN_CLOSED_CONSUMERS";
+
 /// Enables partition admission profiling when present.
 pub(crate) const ENV_PARTITION_PROFILE: &str = "PANGS_PARTITION_PROFILE";
 

@@ -105,3 +105,67 @@ comparison, wall time increased from 5.23 to 7.07 seconds.
 The control was discarded. A real discriminator proof would improve call-graph quality,
 but it was not on Slap's disposition critical path. Demand-driven address origins remain
 a prerequisite if that work is resumed.
+
+## Slap optimistic closed-consumer upper bound
+
+The indirect-call control above was combined with an optimistic upper bound for
+unknown-caller certification. After selecting the finite internal targets at the three
+indirect calls, the control removed Steensgaard's escape-derived unknown-caller bit from
+those target functions. This models the hoped-for result of a closed-consumer proof, but
+not the proof itself: it did not establish that every use of each function address ended
+at one of the selected internal calls.
+
+The projection again selected 97 targets for `dispatch_word` and 105 targets for each
+`eval_body*` site. Their union contained 105 functions, all of which lost unknown-caller
+taint in the control. Slap's disposition coverage improved from 46/50 to 49/50:
+
+- `cli_args`, `frame_save_target`, and `save_buf` changed from `unhandled` to `localize`;
+- `main.combined` again changed from `localize` to `mutex` because the explicit callees
+  enlarged its access context; and
+- `stack` remained unhandled.
+
+For `stack`, resolving the evaluator calls removed its unknown-callee blocker, but three
+unknown-caller witnesses remained: `sort_cmp`, `grade_asc`, and `grade_desc`. These are
+comparator callbacks passed through external sorting APIs, so they need registry-aware
+consumer reasoning rather than the internal-call certificate measured here. `stack`
+also retained its independent `derived:external-pointee` Ω escape and incomplete access
+set.
+
+The debug run took 6.82 seconds wall time and 308 MiB peak RSS. The prototype was
+discarded because both optimistic steps were unsound controls and the module-wide
+address solve remained too expensive. The coverage gain does justify pursuing a real,
+demand-driven closed-consumer certificate for internal indirect-call targets. External
+callback registries are a separate extension if eliminating `stack` becomes the goal.
+
+## Slap closed-consumer certificate
+
+The sound successor to the optimistic unknown-caller control was implemented as a
+forward consumer audit over the bounded Andersen solve. It uses the final named-function
+facts rather than running one reachability query per function. Internal indirect-call
+operands are safe terminals; all external, exported, integerized, opaque-storage, and
+externally returned paths remain open. Missing transfers at partition boundaries fail
+closed. Boundary traversal includes allocation-relative fields, so an external pointer
+to a struct also exposes callbacks stored in its materialized fields.
+
+With only `PANGS_ANDERSEN_CLOSED_CONSUMERS` plus the receiver-payload option enabled, the
+certificate independently promoted the bounded call partition and certified 105 of
+Slap's 108 address-seeded functions. The run took 5.33 seconds and 308 MiB peak RSS.
+Disposition coverage remained 46/50 because the three newly unblocked unknown-caller
+paths still had unknown-callee blockers at `eval_body` and `eval_body_fast`.
+
+With both closed-consumer and retained closed-producer certificates enabled, the consumer
+result remained 105 functions, `dispatch_word` retained its 97-target producer
+certificate, and the two evaluator sites remained producer-incomplete with zero
+materialized targets. The final run took 5.09 seconds and 308 MiB peak RSS. The remaining
+disposition inventory was therefore unchanged:
+
+- `cli_args`, `frame_save_target`, and `save_buf` were blocked only by
+  `unknown-callee-taint`; and
+- `stack` was blocked by both `unknown-callee-taint` and the unknown callers associated
+  with its external sorting callbacks.
+
+This validates that closed-consumer reasoning is soundly separable and removes the
+unknown-caller half of the measured critical path. Reaching the 49/50 optimistic upper
+bound still requires a discriminator-sensitive producer proof for the tagged
+`eval_body*` operands. Registry-aware sorting callbacks and `stack`'s independent Ω
+escape remain separate work.

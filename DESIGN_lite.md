@@ -265,6 +265,43 @@ that dependency. The discarded fixed-PAG projection trials in
 [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md) show that a useful successor also needs
 demand-driven address origins and discriminator-sensitive producer proofs.
 
+**Closed-consumer certificates (experimental):**
+
+Unknown incoming callers are the forward dual of unknown indirect callees. Steensgaard
+marks a function unknown-caller when its unified function-object class escapes, but the
+class may contain a callback whose concrete address uses all terminate at internal
+indirect calls. With `PANGS_ANDERSEN_CLOSED_CONSUMERS` enabled, D' audits the completed
+Andersen facts for each named function address and removes the Steensgaard unknown-caller
+bit only when every represented consumer is internal.
+
+The proof is shared rather than per-function. It visits the materialized named-function
+facts once and checks their fixed PAG transfers:
+
+- an indirect-call operand is a safe terminal, regardless of whether other alternatives
+  at that operand remain unknown;
+- internal assignments, direct-call bindings, loads, stores, and memcpy joins must
+  preserve each named-function fact at every modeled destination;
+- external and vararg arguments, exported or opaque storage, pointer/integer escape,
+  unsupported function-address arithmetic, external regions, and returns from functions
+  that still have unknown callers are open terminals; and
+- an address producer or transfer omitted at an admission boundary makes that function
+  uncertifiable.
+
+Boundary reachability follows pointer contents transitively and includes materialized
+allocation fields, so passing a struct containing a callback to external code is open
+even when the callback is not in the root object's field-sensitive contents. The proof
+does not run an address solve for the whole module and does not perform one traversal per
+callback. Boundary reachability is one linear multi-source traversal; transfer auditing
+is bounded by the fixed PAG edges and the memcpy endpoint pairs already represented by
+the solve.
+
+Like the closed-producer prototype, it permits the bounded non-forged indirect-call
+partition promotion when enabled, but the two certificates are otherwise independent.
+A function address consumed at an unresolved internal indirect call can be certified as
+having no external caller without proving that the call operand contains only that
+finite family. The function's existing escape diagnostics remain available; only the
+complete unknown-caller fact is narrowed.
+
 **Call graph via monotone on-the-fly discovery:**
 
 1. Build one persistent solve from base PAG constraints, Ω seeds, and pinned B1/B2
