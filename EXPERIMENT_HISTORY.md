@@ -209,3 +209,30 @@ The retained prototype remains opt-in. Dense sets are indexed by the module-wide
 ID, so a large, sparse module could allocate much more empty bitmap space than these
 corpora. A production default should either validate this shape across the corpus or use
 a sparse chunked/Roaring representation for promoted sets.
+
+### Full-corpus forced-admission profile (2026-07-31)
+
+The retained `scripts/profile_hybrid_bitsets_corpus.py` ran every top-level corpus
+bitcode except the requested OpenSSL and Vim modules (49 modules, 98 configurations),
+with a release binary, executable/library build mode inferred from the filename, and
+`--partition-budget 18446744073709551615`. It alternated first-run order by module and
+hashed callgraph, ModRef, globals, stationarity, and audit exports. The first 40
+configurations used a 30-minute cap and the remaining 58 used a 10-minute cap. The
+result JSON records the policy transition and every timeout.
+
+Of 49 pairs, 36 completed successfully, 12 had one or two timeouts, and `lib-curl-O0`
+baseline was externally terminated (exit 143) after reaching about 35.4 GiB. The 34
+completed pairs with nonzero wall measurements totalled 1,944.18 s baseline versus
+1,626.69 s hybrid (-16.3%). Their geometric-mean and median hybrid/baseline ratios were
+0.860 and 0.891, respectively; hybrid won 24, lost 3, and tied 7. Across all 36
+completed RSS pairs, aggregate peak RSS fell from 19.86 GiB to 12.00 GiB (-39.6%);
+the geometric-mean and median ratios were 0.816 and 0.986.
+
+The five client-visible output families were byte-identical for all 36 completed
+pairs. Large completed wins included chibicc O0 (58.67 to 28.60 s; 1.48 GiB to
+546 MiB), FLAC (37.75 to 20.98 s; 581 to 410 MiB), mbedtls (245.10 to 204.07 s;
+1.75 GiB to 1.08 GiB), and zstd (467.35 to 382.84 s; 3.83 GiB to 2.47 GiB).
+Several forced-full modules remained pathological under both representations, notably
+tmux/cairo/curl/placebo
+(high-RSS timeouts). The representation reduces memory substantially in many expensive
+completed cases, but it does not by itself remove those propagation pathologies.
