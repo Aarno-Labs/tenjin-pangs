@@ -7,8 +7,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use pangs_pag::{
-    direct_vararg_call_is_benign, positionally_modeled_vararg_functions, BuildMode as PagBuildMode,
-    Edge, EdgeKind, Owner, Pag, PagOpts,
+    positionally_modeled_vararg_functions, BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag,
+    PagOpts, VarargCallProof,
 };
 use pangs_pir::{
     fsa_compatible, Access, LoweringStats, Pir, ScalarOp, ScalarTypeClass, Stmt, SymbolLinkage,
@@ -873,6 +873,7 @@ impl Analysis {
                 ..PagOpts::default()
             },
         );
+        let mut vararg_call_proof = VarargCallProof::new(module);
         let mut func_lookup = HashMap::new();
         let mut functions = Vec::new();
         for (idx, func) in module.functions.iter().enumerate() {
@@ -973,7 +974,9 @@ impl Analysis {
                     Stmt::Alloca { .. } | Stmt::Assign { .. } | Stmt::Gep { .. } => {
                         aggregate_fnptrs.note(stmt);
                     }
-                    Stmt::CallDirect { callee, loc, .. } => {
+                    Stmt::CallDirect {
+                        callee, args, loc, ..
+                    } => {
                         let cs = push_callsite(
                             &mut callsites,
                             &mut noloc_ord,
@@ -983,6 +986,13 @@ impl Analysis {
                             loc,
                         );
                         let callsite_key = callsites[cs.0 as usize].key.clone();
+                        let vararg_kind = direct_vararg_audit_kind(
+                            module,
+                            callee,
+                            Some(args),
+                            &positional_vararg_functions,
+                            &mut vararg_call_proof,
+                        );
                         detect_direct_call_audits(
                             &mut findings,
                             &mut audit_taints,
@@ -992,15 +1002,10 @@ impl Analysis {
                             stmt,
                             loc,
                             &callsite_key,
-                            &positional_vararg_functions,
+                            vararg_kind,
                         );
-                        if let Stmt::CallDirect { sig, args, .. } = stmt {
-                            if let Some(kind) = direct_vararg_audit_kind(
-                                module,
-                                callee,
-                                Some(args),
-                                &positional_vararg_functions,
-                            ) {
+                        if let Stmt::CallDirect { sig, .. } = stmt {
+                            if let Some(kind) = vararg_kind {
                                 record_vararg_deferred_audit(
                                     &mut deferred_audits,
                                     caller,
@@ -1340,6 +1345,7 @@ impl Analysis {
                     &indirect_vararg_keys,
                     &solved,
                     &positional_vararg_functions,
+                    &mut vararg_call_proof,
                 );
                 if !safe_indirect_varargs.is_empty() {
                     let pag_started = Instant::now();
@@ -1425,6 +1431,7 @@ impl Analysis {
                     &indirect_vararg_keys,
                     &solved,
                     &positional_vararg_functions,
+                    &mut vararg_call_proof,
                 );
                 if disposition_facts {
                     registry_entries = resolve_registry_entries(
@@ -3162,7 +3169,7 @@ fn detect_direct_call_audits(
     stmt: &Stmt,
     loc: &Option<pangs_pir::Loc>,
     callsite_key: &str,
-    positional_vararg_functions: &BTreeSet<String>,
+    vararg_kind: Option<&'static str>,
 ) {
     if let Some(kind) = direct_boundary_kind(callee) {
         push_audit_finding(
@@ -3181,7 +3188,7 @@ fn detect_direct_call_audits(
             audit_taints,
             module,
             caller,
-            direct_vararg_audit_kind(module, callee, Some(args), positional_vararg_functions),
+            vararg_kind,
             Some(format!("callee:{callee}")),
             sig,
             args,
@@ -3332,8 +3339,9 @@ fn direct_vararg_audit_kind(
     callee: &str,
     args: Option<&[String]>,
     positional_vararg_functions: &BTreeSet<String>,
+    vararg_call_proof: &mut VarargCallProof<'_>,
 ) -> Option<&'static str> {
-    if direct_vararg_call_is_benign(module, callee, args.unwrap_or_default()) {
+    if vararg_call_proof.is_benign(callee, args.unwrap_or_default()) {
         return None;
     }
     match module.functions.iter().find(|func| func.key == callee) {
@@ -3349,6 +3357,7 @@ fn safe_indirect_vararg_callsites(
     indirect_vararg_keys: &BTreeSet<String>,
     solved: &pangs_solve::SolveResult,
     positional_vararg_functions: &BTreeSet<String>,
+    vararg_call_proof: &mut VarargCallProof<'_>,
 ) -> BTreeSet<String> {
     solved
         .indirect_calls
@@ -3359,6 +3368,7 @@ fn safe_indirect_vararg_callsites(
                 indirect_vararg_keys,
                 site,
                 positional_vararg_functions,
+                vararg_call_proof,
             )
         })
         .map(|site| site.callsite_key.clone())
@@ -3370,6 +3380,7 @@ fn indirect_vararg_site_is_safe(
     indirect_vararg_keys: &BTreeSet<String>,
     site: &IndirectCallResolution,
     positional_vararg_functions: &BTreeSet<String>,
+    vararg_call_proof: &mut VarargCallProof<'_>,
 ) -> bool {
     if !indirect_vararg_keys.contains(&site.callsite_key)
         || site.unknown_callee
@@ -3385,8 +3396,14 @@ fn indirect_vararg_site_is_safe(
             .map(|func| {
                 func.sig.vararg
                     && !func.external
-                    && direct_vararg_audit_kind(module, target, None, positional_vararg_functions)
-                        .is_none()
+                    && direct_vararg_audit_kind(
+                        module,
+                        target,
+                        None,
+                        positional_vararg_functions,
+                        vararg_call_proof,
+                    )
+                    .is_none()
             })
             .unwrap_or(false)
     })

@@ -295,3 +295,20 @@ Forced-admission spot checks retained the large-instance payoff: YAPET O0 improv
 gifsicle O1 stayed near 102 s while falling from 1.10 GiB to 500 MiB. This is the intended
 disposition: sparse bounded instances avoid linear-vector overhead, while dense expensive
 instances still receive bitmap memory savings.
+
+### Compositional `va_list` forwarder memoization (2026-07-31)
+
+The forwarder proof now retains one module-scoped context in both PAG construction and the
+client audit scan. Fixed helper contracts are memoized by callee, variadic wrapper format indexes
+are memoized separately, and direct calls are screened for carriage of the locally relevant
+`va_list` or two distinct fixed parameters before recursively requesting a callee summary.
+Potentially relevant recursive SCCs fail closed: an in-progress lookup propagates an explicit
+cycle result through the whole active proof rather than being cached as an ordinary negative and
+then ignored beside another sink. Tests cover repeated nested wrappers, self and mutual recursion,
+and irrelevant recursive calls.
+
+With the normal 200,000 partition budget and baseline points-to sets, release measurements were
+1.47 s/165,288 KiB for Lua O0 and 19.34 s/655,292 KiB for SQLite O0, matching the earlier
+proof-ablation and pre-regression range. Lua O1 measured 0.95 s/124,528 KiB and SQLite O1
+11.93 s/627,956 KiB. The callgraph, ModRef, globals, audit, and stationarity exports for both
+O0 modules were byte-identical to the earlier proof-ablation outputs.

@@ -739,6 +739,7 @@ struct Builder<'a> {
     globals: BTreeMap<String, usize>,
     functions: BTreeMap<String, usize>,
     positional_vararg_functions: BTreeSet<String>,
+    vararg_call_proof: VarargCallProof<'a>,
     callsite_ordinals: BTreeMap<usize, u32>,
 }
 
@@ -769,6 +770,7 @@ impl<'a> Builder<'a> {
             globals,
             functions,
             positional_vararg_functions,
+            vararg_call_proof: VarargCallProof::new(pir),
             callsite_ordinals: BTreeMap::new(),
         }
     }
@@ -1383,8 +1385,8 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn direct_vararg_call_requires_boundary(&self, callee: &str, args: &[String]) -> bool {
-        if direct_vararg_call_is_benign(self.pir, callee, args) {
+    fn direct_vararg_call_requires_boundary(&mut self, callee: &str, args: &[String]) -> bool {
+        if self.vararg_call_proof.is_benign(callee, args) {
             return false;
         }
         let Some(func) = self
@@ -1774,19 +1776,39 @@ fn is_known_benign_vararg_callee(callee: &str) -> bool {
 /// accepted only when every constant LLVM byte string selected by the format operand contains no
 /// `%n`; every unsupported or genuinely dynamic shape fails closed.
 pub fn direct_vararg_call_is_benign(pir: &Pir, callee: &str, args: &[String]) -> bool {
-    if is_known_benign_vararg_callee(callee) {
-        return true;
-    }
-    proven_printf_effect(pir, callee, args).is_some()
-        || internal_vfprintf_forwarder_format_index(pir, callee)
-            .and_then(|index| args.get(index))
-            .is_some_and(|operand| constant_formats_are_percent_n_free(pir, operand))
+    VarargCallProof::new(pir).is_benign(callee, args)
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Reusable proof context for direct variadic calls in one PIR module.  The structural contracts
+/// of internal `va_list` forwarders are properties of callees, rather than callsites, so clients
+/// which inspect a whole module should retain one context instead of launching the proof anew for
+/// every call.
+pub struct VarargCallProof<'a> {
+    pir: &'a Pir,
+    functions: BTreeMap<&'a str, &'a pangs_pir::Func>,
+    fixed_forwarders: BTreeMap<String, FixedForwarderState>,
+    variadic_forwarders: BTreeMap<String, Option<usize>>,
+    #[cfg(test)]
+    fixed_summary_computations: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FixedVfprintfForwarder {
     format_param: usize,
     va_list_param: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FixedForwarderState {
+    InProgress,
+    Done(Option<FixedVfprintfForwarder>),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FixedForwarderLookup {
+    Contract(FixedVfprintfForwarder),
+    NoContract,
+    Cycle,
 }
 
 #[derive(Clone, Debug)]
@@ -1801,176 +1823,292 @@ struct VaForwardSink {
 /// forwarding chain ending in `vfprintf`. The returned index identifies the wrapper's fixed format
 /// parameter. Helpers in the chain receive the format and `va_list` through fixed parameters and
 /// must themselves have a closed, single-forward structural contract.
-fn internal_vfprintf_forwarder_format_index(pir: &Pir, callee: &str) -> Option<usize> {
-    let func = pir.functions.iter().find(|func| func.key == callee)?;
-    if func.external || !func.sig.vararg || func.param_names.len() != func.sig.params.len() {
-        return None;
+impl<'a> VarargCallProof<'a> {
+    pub fn new(pir: &'a Pir) -> Self {
+        Self {
+            pir,
+            functions: pir
+                .functions
+                .iter()
+                .map(|func| (func.key.as_str(), func))
+                .collect(),
+            fixed_forwarders: BTreeMap::new(),
+            variadic_forwarders: BTreeMap::new(),
+            #[cfg(test)]
+            fixed_summary_computations: 0,
+        }
     }
 
-    let starts = func
-        .body
-        .iter()
-        .filter_map(|stmt| vararg_intrinsic_operand(stmt, "llvm.va_start"))
-        .collect::<Vec<_>>();
-    let ends = func
-        .body
-        .iter()
-        .filter_map(|stmt| vararg_intrinsic_operand(stmt, "llvm.va_end"))
-        .collect::<Vec<_>>();
-    if starts.is_empty() {
-        return None;
+    pub fn is_benign(&mut self, callee: &str, args: &[String]) -> bool {
+        if is_known_benign_vararg_callee(callee) {
+            return true;
+        }
+        proven_printf_effect(self.pir, callee, args).is_some()
+            || self
+                .internal_vfprintf_forwarder_format_index(callee)
+                .and_then(|index| args.get(index))
+                .is_some_and(|operand| constant_formats_are_percent_n_free(self.pir, operand))
     }
 
-    let mut start_roots = starts
-        .iter()
-        .map(|value| unique_local_alloca_root(func, value))
-        .collect::<Option<Vec<_>>>()?;
-    let mut end_roots = ends
-        .iter()
-        .map(|value| unique_local_alloca_root(func, value))
-        .collect::<Option<Vec<_>>>()?;
-    start_roots.sort_unstable();
-    start_roots.dedup();
-    end_roots.sort_unstable();
-    end_roots.dedup();
-    if end_roots.iter().any(|root| !start_roots.contains(root)) {
-        return None;
-    }
-    let va_list_roots = start_roots.iter().copied().collect::<BTreeSet<_>>();
-    let va_list_values = local_pointer_derivatives(func, &va_list_roots);
-    let start_values = starts.into_iter().collect::<BTreeSet<_>>();
-    let end_values = ends.into_iter().collect::<BTreeSet<_>>();
-
-    let mut visiting = BTreeSet::from([callee.to_string()]);
-    let sinks = func
-        .body
-        .iter()
-        .enumerate()
-        .filter_map(|(stmt_index, stmt)| {
-            let (format_arg, va_list_arg) = forwarding_call_arg_indexes(pir, stmt, &mut visiting)?;
-            let Stmt::CallDirect { args, .. } = stmt else {
-                return None;
-            };
-            va_list_values
-                .contains(args[va_list_arg].as_str())
-                .then(|| VaForwardSink {
-                    stmt_index,
-                    format_value: args[format_arg].clone(),
-                    va_list_value: args[va_list_arg].clone(),
-                    va_list_arg,
-                })
-        })
-        .collect::<Vec<_>>();
-    if sinks.len() != 1 {
-        return None;
-    }
-    let sink = &sinks[0];
-    let forward_root = unique_local_alloca_root(func, &sink.va_list_value)?;
-    if !start_roots.contains(&forward_root)
-        || !va_list_uses_are_confined(func, &va_list_values, sink, &start_values, &end_values)
-    {
-        return None;
+    fn internal_vfprintf_forwarder_format_index(&mut self, callee: &str) -> Option<usize> {
+        if let Some(summary) = self.variadic_forwarders.get(callee) {
+            return *summary;
+        }
+        let summary = self.compute_vfprintf_forwarder_format_index(callee);
+        self.variadic_forwarders.insert(callee.to_string(), summary);
+        summary
     }
 
-    let indexes = func
-        .param_names
-        .iter()
-        .enumerate()
-        .filter_map(|(index, param)| {
-            value_is_unchanged_copy(func, param, &sink.format_value).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    (indexes.len() == 1).then(|| indexes[0])
-}
-
-fn forwarding_call_arg_indexes(
-    pir: &Pir,
-    stmt: &Stmt,
-    visiting: &mut BTreeSet<String>,
-) -> Option<(usize, usize)> {
-    let Stmt::CallDirect { callee, args, .. } = stmt else {
-        return None;
-    };
-    if callee.strip_prefix('@').unwrap_or(callee) == "vfprintf" {
-        return (args.len() == 3).then_some((1, 2));
-    }
-    let contract = internal_fixed_vfprintf_forwarder(pir, callee, visiting)?;
-    (contract.format_param < args.len() && contract.va_list_param < args.len())
-        .then_some((contract.format_param, contract.va_list_param))
-}
-
-fn internal_fixed_vfprintf_forwarder(
-    pir: &Pir,
-    callee: &str,
-    visiting: &mut BTreeSet<String>,
-) -> Option<FixedVfprintfForwarder> {
-    if !visiting.insert(callee.to_string()) {
-        return None;
-    }
-    let contract = (|| {
-        let func = pir.functions.iter().find(|func| func.key == callee)?;
-        if func.external || func.sig.vararg || func.param_names.len() != func.sig.params.len() {
+    fn compute_vfprintf_forwarder_format_index(&mut self, callee: &str) -> Option<usize> {
+        let func = *self.functions.get(callee)?;
+        if func.external || !func.sig.vararg || func.param_names.len() != func.sig.params.len() {
             return None;
         }
-        let contracts = func
+
+        let starts = func
+            .body
+            .iter()
+            .filter_map(|stmt| vararg_intrinsic_operand(stmt, "llvm.va_start"))
+            .collect::<Vec<_>>();
+        let ends = func
+            .body
+            .iter()
+            .filter_map(|stmt| vararg_intrinsic_operand(stmt, "llvm.va_end"))
+            .collect::<Vec<_>>();
+        if starts.is_empty() {
+            return None;
+        }
+
+        let mut start_roots = starts
+            .iter()
+            .map(|value| unique_local_alloca_root(func, value))
+            .collect::<Option<Vec<_>>>()?;
+        let mut end_roots = ends
+            .iter()
+            .map(|value| unique_local_alloca_root(func, value))
+            .collect::<Option<Vec<_>>>()?;
+        start_roots.sort_unstable();
+        start_roots.dedup();
+        end_roots.sort_unstable();
+        end_roots.dedup();
+        if end_roots.iter().any(|root| !start_roots.contains(root)) {
+            return None;
+        }
+        let va_list_roots = start_roots.iter().copied().collect::<BTreeSet<_>>();
+        let va_list_values = local_pointer_derivatives(func, &va_list_roots);
+        let start_values = starts.into_iter().collect::<BTreeSet<_>>();
+        let end_values = ends.into_iter().collect::<BTreeSet<_>>();
+
+        let sinks = func
             .body
             .iter()
             .enumerate()
             .filter_map(|(stmt_index, stmt)| {
-                let (format_arg, va_list_arg) = forwarding_call_arg_indexes(pir, stmt, visiting)?;
                 let Stmt::CallDirect { args, .. } = stmt else {
                     return None;
                 };
-                let format_value = &args[format_arg];
-                let va_list_value = &args[va_list_arg];
-                let format_params = func
-                    .param_names
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, param)| {
-                        value_is_unchanged_copy(func, param, format_value).then_some(index)
-                    })
-                    .collect::<Vec<_>>();
-                let va_list_params = func
-                    .param_names
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, param)| {
-                        let derived = unchanged_pointer_derivatives(func, param);
-                        let sink = VaForwardSink {
-                            stmt_index,
-                            format_value: format_value.clone(),
-                            va_list_value: va_list_value.clone(),
-                            va_list_arg,
-                        };
-                        (derived.contains(va_list_value.as_str())
-                            && va_list_uses_are_confined(
-                                func,
-                                &derived,
-                                &sink,
-                                &BTreeSet::new(),
-                                &BTreeSet::new(),
-                            ))
-                        .then_some(index)
-                    })
-                    .collect::<Vec<_>>();
-                if format_params.len() == 1
-                    && va_list_params.len() == 1
-                    && format_params[0] != va_list_params[0]
-                {
-                    Some(FixedVfprintfForwarder {
-                        format_param: format_params[0],
-                        va_list_param: va_list_params[0],
-                    })
-                } else {
-                    None
+                // Most direct calls in a wrapper cannot carry its local `va_list`.  Establish that
+                // cheap local fact before asking for the callee's compositional summary.
+                if !args.iter().any(|arg| va_list_values.contains(arg.as_str())) {
+                    return None;
                 }
+                let (format_arg, va_list_arg) = match self.forwarding_call_arg_indexes(stmt) {
+                    FixedForwarderLookup::Contract(contract) => {
+                        (contract.format_param, contract.va_list_param)
+                    }
+                    FixedForwarderLookup::NoContract | FixedForwarderLookup::Cycle => return None,
+                };
+                va_list_values
+                    .contains(args[va_list_arg].as_str())
+                    .then(|| VaForwardSink {
+                        stmt_index,
+                        format_value: args[format_arg].clone(),
+                        va_list_value: args[va_list_arg].clone(),
+                        va_list_arg,
+                    })
             })
             .collect::<Vec<_>>();
-        (contracts.len() == 1).then(|| contracts[0])
-    })();
-    visiting.remove(callee);
-    contract
+        if sinks.len() != 1 {
+            return None;
+        }
+        let sink = &sinks[0];
+        let forward_root = unique_local_alloca_root(func, &sink.va_list_value)?;
+        if !start_roots.contains(&forward_root)
+            || !va_list_uses_are_confined(func, &va_list_values, sink, &start_values, &end_values)
+        {
+            return None;
+        }
+
+        let indexes = func
+            .param_names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, param)| {
+                value_is_unchanged_copy(func, param, &sink.format_value).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        (indexes.len() == 1).then(|| indexes[0])
+    }
+
+    fn forwarding_call_arg_indexes(&mut self, stmt: &Stmt) -> FixedForwarderLookup {
+        let Stmt::CallDirect { callee, args, .. } = stmt else {
+            return FixedForwarderLookup::NoContract;
+        };
+        if callee.strip_prefix('@').unwrap_or(callee) == "vfprintf" {
+            return if args.len() == 3 {
+                FixedForwarderLookup::Contract(FixedVfprintfForwarder {
+                    format_param: 1,
+                    va_list_param: 2,
+                })
+            } else {
+                FixedForwarderLookup::NoContract
+            };
+        }
+        match self.internal_fixed_vfprintf_forwarder(callee) {
+            FixedForwarderLookup::Contract(contract)
+                if contract.format_param < args.len() && contract.va_list_param < args.len() =>
+            {
+                FixedForwarderLookup::Contract(contract)
+            }
+            FixedForwarderLookup::Cycle => FixedForwarderLookup::Cycle,
+            FixedForwarderLookup::Contract(_) | FixedForwarderLookup::NoContract => {
+                FixedForwarderLookup::NoContract
+            }
+        }
+    }
+
+    fn internal_fixed_vfprintf_forwarder(&mut self, callee: &str) -> FixedForwarderLookup {
+        match self.fixed_forwarders.get(callee).copied() {
+            Some(FixedForwarderState::Done(Some(contract))) => {
+                return FixedForwarderLookup::Contract(contract);
+            }
+            Some(FixedForwarderState::Done(None)) => return FixedForwarderLookup::NoContract,
+            Some(FixedForwarderState::InProgress) => return FixedForwarderLookup::Cycle,
+            None => {}
+        }
+        self.fixed_forwarders
+            .insert(callee.to_string(), FixedForwarderState::InProgress);
+        #[cfg(test)]
+        {
+            self.fixed_summary_computations += 1;
+        }
+
+        let computed = self.compute_fixed_vfprintf_forwarder(callee);
+        let contract = match computed {
+            FixedForwarderLookup::Contract(contract) => Some(contract),
+            FixedForwarderLookup::NoContract | FixedForwarderLookup::Cycle => None,
+        };
+        self.fixed_forwarders
+            .insert(callee.to_string(), FixedForwarderState::Done(contract));
+        computed
+    }
+
+    fn compute_fixed_vfprintf_forwarder(&mut self, callee: &str) -> FixedForwarderLookup {
+        let Some(func) = self.functions.get(callee).copied() else {
+            return FixedForwarderLookup::NoContract;
+        };
+        if func.external || func.sig.vararg || func.param_names.len() != func.sig.params.len() {
+            return FixedForwarderLookup::NoContract;
+        }
+
+        let pointer_derivatives = func
+            .param_names
+            .iter()
+            .map(|param| unchanged_pointer_derivatives(func, param))
+            .collect::<Vec<_>>();
+        let mut contracts = Vec::new();
+        for (stmt_index, stmt) in func.body.iter().enumerate() {
+            let Stmt::CallDirect { args, .. } = stmt else {
+                continue;
+            };
+            if !call_could_forward_distinct_params(func, args, &pointer_derivatives) {
+                continue;
+            }
+            let contract = match self.forwarding_call_arg_indexes(stmt) {
+                FixedForwarderLookup::Contract(contract) => contract,
+                // A potentially relevant recursive cycle is rejected as a whole.  In
+                // particular, do not cache a summary inferred by ignoring the back edge: that
+                // would make mutually recursive wrappers depend on traversal order.
+                FixedForwarderLookup::Cycle => return FixedForwarderLookup::Cycle,
+                FixedForwarderLookup::NoContract => continue,
+            };
+            let format_arg = contract.format_param;
+            let va_list_arg = contract.va_list_param;
+            let format_value = &args[format_arg];
+            let va_list_value = &args[va_list_arg];
+            let format_params = func
+                .param_names
+                .iter()
+                .enumerate()
+                .filter_map(|(index, param)| {
+                    value_is_unchanged_copy(func, param, format_value).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let va_list_params = func
+                .param_names
+                .iter()
+                .enumerate()
+                .filter_map(|(index, param)| {
+                    let derived = unchanged_pointer_derivatives(func, param);
+                    let sink = VaForwardSink {
+                        stmt_index,
+                        format_value: format_value.clone(),
+                        va_list_value: va_list_value.clone(),
+                        va_list_arg,
+                    };
+                    (derived.contains(va_list_value.as_str())
+                        && va_list_uses_are_confined(
+                            func,
+                            &derived,
+                            &sink,
+                            &BTreeSet::new(),
+                            &BTreeSet::new(),
+                        ))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if format_params.len() == 1
+                && va_list_params.len() == 1
+                && format_params[0] != va_list_params[0]
+            {
+                contracts.push(FixedVfprintfForwarder {
+                    format_param: format_params[0],
+                    va_list_param: va_list_params[0],
+                });
+            }
+        }
+        if contracts.len() == 1 {
+            FixedForwarderLookup::Contract(contracts[0])
+        } else {
+            FixedForwarderLookup::NoContract
+        }
+    }
+}
+
+fn call_could_forward_distinct_params(
+    func: &pangs_pir::Func,
+    args: &[String],
+    pointer_derivatives: &[BTreeSet<&str>],
+) -> bool {
+    args.iter().enumerate().any(|(format_arg, format_value)| {
+        let format_params = func
+            .param_names
+            .iter()
+            .enumerate()
+            .filter(|(_, param)| value_is_unchanged_copy(func, param, format_value));
+        format_params.into_iter().any(|(format_param, _)| {
+            args.iter().enumerate().any(|(va_list_arg, va_list_value)| {
+                va_list_arg != format_arg
+                    && pointer_derivatives
+                        .iter()
+                        .enumerate()
+                        .any(|(va_list_param, derived)| {
+                            va_list_param != format_param
+                                && derived.contains(va_list_value.as_str())
+                        })
+            })
+        })
+    })
 }
 
 fn vararg_intrinsic_operand<'a>(stmt: &'a Stmt, expected: &str) -> Option<&'a str> {
@@ -2529,7 +2667,7 @@ fn is_exported_global(marked: bool, key: &str, opts: &PagOpts) -> bool {
 mod tests {
     use super::{
         direct_vararg_call_is_benign, EdgeKind, NodeKind, ObjectKind, OmegaSeedKind, Pag, PagOpts,
-        SeedTarget,
+        SeedTarget, VarargCallProof,
     };
     use pangs_pir::{Global, Pir};
 
@@ -2778,6 +2916,117 @@ mod tests {
             "report_chained",
             &["@safe".to_string(), "%value".to_string()]
         ));
+    }
+
+    #[test]
+    fn repeated_nested_forwarders_reuse_callee_summaries() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"repeated-forwarders",
+                "globals":[
+                    {"key":"safe","is_const":true,"mutable":false,"initializer_ir":"[3 x i8] c\"%d\\00\""}
+                ],
+                "functions":[
+                    {
+                        "key":"report",
+                        "sig":{"ret":{"class":"void"},"params":[{"class":"integer"}],"vararg":true},
+                        "param_names":["%fmt"],
+                        "body":[
+                            {"kind":"alloca","dest":"%ap","ty":"va_list"},
+                            {"kind":"unknown","op":"llvm.va_start","operands":["%ap"],"reason":"varargs_intrinsic"},
+                            {"kind":"call_direct","callee":"forward","sig":{"ret":{"class":"void"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["%fmt","%ap"]},
+                            {"kind":"unknown","op":"llvm.va_end","operands":["%ap"],"reason":"varargs_intrinsic"}
+                        ]
+                    },
+                    {
+                        "key":"forward",
+                        "sig":{"ret":{"class":"void"},"params":[{"class":"integer"},{"class":"integer"}]},
+                        "param_names":["%fmt","%ap"],
+                        "body":[
+                            {"kind":"call_direct","callee":"final","sig":{"ret":{"class":"void"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["%fmt","%ap"]}
+                        ]
+                    },
+                    {
+                        "key":"final",
+                        "sig":{"ret":{"class":"void"},"params":[{"class":"integer"},{"class":"integer"}]},
+                        "param_names":["%fmt","%ap"],
+                        "body":[
+                            {"kind":"call_direct","callee":"vfprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"},{"class":"integer"}]},"args":["%stream","%fmt","%ap"]}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let mut proof = VarargCallProof::new(&pir);
+        for _ in 0..50 {
+            assert!(proof.is_benign("report", &["@safe".to_string()]));
+        }
+        assert_eq!(proof.fixed_summary_computations, 2);
+        assert_eq!(proof.variadic_forwarders.len(), 1);
+    }
+
+    #[test]
+    fn relevant_recursive_forwarder_cycles_fail_closed_but_irrelevant_calls_are_filtered() {
+        let make_pir = |helper_body: &str, extra_functions: &str| {
+            serde_json::from_str::<Pir>(&format!(
+                r#"{{
+                    "module":"recursive-forwarders",
+                    "globals":[
+                        {{"key":"safe","is_const":true,"mutable":false,"initializer_ir":"[3 x i8] c\"%d\\00\""}}
+                    ],
+                    "functions":[
+                        {{
+                            "key":"report",
+                            "sig":{{"ret":{{"class":"void"}},"params":[{{"class":"integer"}}],"vararg":true}},
+                            "param_names":["%fmt"],
+                            "body":[
+                                {{"kind":"alloca","dest":"%ap","ty":"va_list"}},
+                                {{"kind":"unknown","op":"llvm.va_start","operands":["%ap"],"reason":"varargs_intrinsic"}},
+                                {{"kind":"call_direct","callee":"helper","sig":{{"ret":{{"class":"void"}},"params":[{{"class":"integer"}},{{"class":"integer"}}]}},"args":["%fmt","%ap"]}},
+                                {{"kind":"unknown","op":"llvm.va_end","operands":["%ap"],"reason":"varargs_intrinsic"}}
+                            ]
+                        }},
+                        {{
+                            "key":"helper",
+                            "sig":{{"ret":{{"class":"void"}},"params":[{{"class":"integer"}},{{"class":"integer"}}]}},
+                            "param_names":["%fmt","%ap"],
+                            "body":[{helper_body}]
+                        }}
+                        {extra_functions}
+                    ]
+                }}"#
+            ))
+            .unwrap()
+        };
+        let direct_sink = r#"{"kind":"call_direct","callee":"vfprintf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"},{"class":"integer"}]},"args":["%stream","%fmt","%ap"]}"#;
+        let self_call = r#"{"kind":"call_direct","callee":"helper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["%fmt","%ap"]}"#;
+
+        // A naive in-progress=false lookup can ignore this back edge and accept the remaining
+        // terminal.  The complete summary rejects the relevant recursive use instead.
+        let self_recursive = make_pir(&format!("{direct_sink},{self_call}"), "");
+        assert!(!VarargCallProof::new(&self_recursive).is_benign("report", &["@safe".to_string()]));
+
+        let mutual_call = r#"{"kind":"call_direct","callee":"mutual","sig":{"ret":{"class":"void"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["%fmt","%ap"]}"#;
+        let mutual_function = format!(
+            r#",{{
+                "key":"mutual",
+                "sig":{{"ret":{{"class":"void"}},"params":[{{"class":"integer"}},{{"class":"integer"}}]}},
+                "param_names":["%fmt","%ap"],
+                "body":[{direct_sink},{self_call}]
+            }}"#
+        );
+        let mutually_recursive = make_pir(mutual_call, &mutual_function);
+        assert!(
+            !VarargCallProof::new(&mutually_recursive).is_benign("report", &["@safe".to_string()])
+        );
+
+        let irrelevant_call = r#"{"kind":"call_direct","callee":"helper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["@constant-a","@constant-b"]}"#;
+        let irrelevant_recursion = make_pir(&format!("{irrelevant_call},{direct_sink}"), "");
+        assert!(
+            VarargCallProof::new(&irrelevant_recursion).is_benign("report", &["@safe".to_string()])
+        );
     }
 
     #[test]
