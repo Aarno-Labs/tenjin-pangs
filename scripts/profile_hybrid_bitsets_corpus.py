@@ -2,8 +2,8 @@
 """Paired time/RSS measurements for opt-in hybrid Andersen points-to sets.
 
 The default input is every top-level ``*.bc`` in the PANGS corpus except
-OpenSSL and Vim.  Each module is solved with a maximal partition budget in
-both the ordinary hash-set and opt-in hybrid representations.  Analysis
+OpenSSL and Vim.  Each module is solved with the requested partition budget
+in both the ordinary hash-set and opt-in hybrid representations.  Analysis
 exports are retained only long enough to compute content hashes, so a full
 corpus pass does not leave a large output tree behind.
 
@@ -42,6 +42,14 @@ def parse_args() -> argparse.Namespace:
         "--pangs", type=pathlib.Path, default=ROOT / "target" / "release" / "pangs"
     )
     parser.add_argument("--results", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--partition-budget",
+        default=MAX_PARTITION_BUDGET,
+        help=(
+            "partition admission budget passed to pangs "
+            f"(default: {MAX_PARTITION_BUDGET}; normal default: 200000)"
+        ),
+    )
     parser.add_argument(
         "--timeout-seconds",
         type=int,
@@ -118,6 +126,7 @@ def run_one(
     pangs: pathlib.Path,
     module: pathlib.Path,
     label: str,
+    partition_budget: str,
     timeout_seconds: int,
     threshold: int | None,
     run_dir: pathlib.Path,
@@ -143,7 +152,7 @@ def run_one(
         "--build-mode",
         build_mode(module),
         "--partition-budget",
-        MAX_PARTITION_BUDGET,
+        partition_budget,
     ]
     env = os.environ.copy()
     for key in (
@@ -233,6 +242,12 @@ def main() -> int:
         raise SystemExit(f"pangs binary is not executable: {pangs}")
     if args.timeout_seconds <= 0:
         raise SystemExit("--timeout-seconds must be positive")
+    try:
+        partition_budget = str(int(args.partition_budget))
+    except ValueError as error:
+        raise SystemExit("--partition-budget must be a nonnegative integer") from error
+    if int(partition_budget) < 0:
+        raise SystemExit("--partition-budget must be a nonnegative integer")
     if args.threshold is not None and args.threshold < 0:
         raise SystemExit("--threshold must be nonnegative")
 
@@ -246,7 +261,7 @@ def main() -> int:
         document = json.loads(results.read_text())
         if document.get("included_modules") != [module.name for module in included]:
             raise SystemExit("existing result file has a different corpus selection")
-        if document.get("partition_budget") != MAX_PARTITION_BUDGET:
+        if document.get("partition_budget") != partition_budget:
             raise SystemExit("existing result file has a different partition budget")
         if document.get("timeout_seconds") != args.timeout_seconds:
             document.setdefault("timeout_policy_transitions", []).append(
@@ -262,7 +277,7 @@ def main() -> int:
             "schema": 1,
             "pangs": str(pangs),
             "corpus": str(corpus),
-            "partition_budget": MAX_PARTITION_BUDGET,
+            "partition_budget": partition_budget,
             "stage": "andersen",
             "hybrid_threshold": args.threshold,
             "timeout_seconds": args.timeout_seconds,
@@ -290,6 +305,7 @@ def main() -> int:
                     pangs,
                     module,
                     label,
+                    partition_budget,
                     args.timeout_seconds,
                     args.threshold,
                     run_dir,

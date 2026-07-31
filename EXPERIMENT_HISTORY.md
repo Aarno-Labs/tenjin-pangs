@@ -236,3 +236,27 @@ Several forced-full modules remained pathological under both representations, no
 tmux/cairo/curl/placebo
 (high-RSS timeouts). The representation reduces memory substantially in many expensive
 completed cases, but it does not by itself remove those propagation pathologies.
+
+### Full-corpus normal-admission profile (2026-07-31)
+
+The same 49-module subset was rerun with the normal `--partition-budget 200000` rather
+than forced full admission. The first 30 configurations used a five-minute cap and the
+remaining 68 used a one-minute cap. The initial census produced 42 complete pairs; all
+five client-visible export families were byte-identical for those pairs.
+
+The 40 completed pairs with nonzero wall measurements totalled 140.72 s baseline versus
+136.08 s hybrid (-3.3%). Their geometric-mean and median hybrid/baseline ratios were
+0.923 and 0.985. Aggregate peak RSS across all 42 completed pairs was effectively flat:
+5.431 GiB baseline versus 5.420 GiB hybrid (-0.2%), with a 1.000 median ratio. The
+single-pass timing ratios contained substantial scheduling noise: a repeat changed
+Zstandard from an apparent 2x hybrid regression to 6.72 s baseline versus 6.39 s hybrid.
+
+YAPET O1 retained a repeatable benefit (2.07--3.21 s baseline and 75--76 MiB versus
+1.26--1.52 s hybrid and 63--65 MiB). Its storage profile had 2,312 small and 855 dense
+sets, using about 1.18 MiB of bitmap words. Placebo showed the opposite pattern: repeated
+baselines took 52.8--75.1 s, while hybrid runs took 70.3--77.9 s, with essentially
+identical 1.03 GiB RSS. Its profile had 24,981 small-vector sets and **zero** dense sets.
+It therefore pays linear small-vector operations without receiving bitmap storage or
+union benefits. On normally admitted instances, the current representation is broadly
+memory-neutral and only selectively faster; a production design should retain a hash or
+sparse middle tier between tiny vectors and density-qualified bitmaps.
