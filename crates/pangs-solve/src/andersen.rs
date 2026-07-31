@@ -20,6 +20,7 @@
 //!   outputs that drive component freezing are taken verbatim from Steensgaard.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::Instant;
 
 use pangs_pag::{
     BuildMode, CallKind, EdgeKind, NodeId, NodeKind, ObjectKind, OmegaSeedKind, Pag, SeedTarget,
@@ -201,6 +202,7 @@ struct AndersenControls {
     subtractive_differential: bool,
     closed_producers: bool,
     closed_consumers: bool,
+    offline_quotient: bool,
 }
 
 impl AndersenControls {
@@ -217,6 +219,7 @@ impl AndersenControls {
             .is_some(),
             closed_producers: closed_producers_enabled(),
             closed_consumers: closed_consumers_enabled(),
+            offline_quotient: std::env::var_os(knobs::ENV_ANDERSEN_OFFLINE_QUOTIENT).is_some(),
         }
     }
 }
@@ -2396,6 +2399,26 @@ impl<'a> Refiner<'a> {
                 func,
             );
         }
+        if controls.offline_quotient {
+            let offline = solve.offline_quotient(&self.offline_late_generators());
+            if andersen_profile_enabled() {
+                eprintln!(
+                    "pangs andersen offline quotient: original_nodes={} original_edges={} quotient_nodes={} quotient_edges_before_factor={} quotient_edges={} static_scc_merges={} substitutions={} value_number_merges={} factored_groups={} factored_edges_removed={} synthetic_nodes={} elapsed_us={}",
+                    offline.original_nodes,
+                    offline.original_edges,
+                    offline.quotient_nodes,
+                    offline.quotient_edges_before_factor,
+                    offline.quotient_edges,
+                    offline.static_scc_merges,
+                    offline.substitutions,
+                    offline.value_number_merges,
+                    offline.factored_groups,
+                    offline.factored_edges_removed,
+                    offline.synthetic_nodes,
+                    offline.elapsed_micros,
+                );
+            }
+        }
 
         let max_steps = controls.max_steps;
         let max_resumes = controls
@@ -2501,7 +2524,12 @@ impl<'a> Refiner<'a> {
                 "subtractive differential requires pure-LFP mode (set {})",
                 knobs::ENV_ANDERSEN_DISABLE_EAGER_UNKNOWN
             );
-            let oracle = self.subtractive_oracle(&in_scope_sites, &envelopes, &exact_map);
+            let oracle = self.subtractive_oracle(
+                &in_scope_sites,
+                &envelopes,
+                &exact_map,
+                controls.offline_quotient,
+            );
             for &site in &in_scope_sites {
                 let additive = activated.get(&site).cloned().unwrap_or_default();
                 let descending = oracle.get(&site).cloned().unwrap_or_default();
@@ -2948,6 +2976,27 @@ impl<'a> Refiner<'a> {
         }
     }
 
+    /// Cells which can acquire an independent generator after base construction. Static
+    /// load/GEP destinations and seeded allocation identities are added by `Solve`; this
+    /// supplies the call-graph-dependent remainder.
+    fn offline_late_generators(&self) -> HashSet<Cell> {
+        let mut protected = self
+            .pag
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::Object { .. }))
+            .map(|node| node.id.0)
+            .collect::<HashSet<_>>();
+        protected.extend(self.param_nodes.values().map(|node| node.0));
+        protected.extend(
+            self.pag
+                .callsites
+                .iter()
+                .filter_map(|callsite| callsite.result.map(|node| node.0)),
+        );
+        protected
+    }
+
     /// Temporary migration oracle: solve the old descending target construction to
     /// convergence. It is enabled only by an explicit diagnostic switch and intentionally
     /// shares base construction and target activation with the additive path so differences
@@ -2957,6 +3006,7 @@ impl<'a> Refiner<'a> {
         sites: &[usize],
         envelopes: &HashMap<usize, Vec<usize>>,
         exact: &HashMap<usize, Vec<usize>>,
+        offline_quotient: bool,
     ) -> HashMap<usize, BTreeSet<usize>> {
         let mut targets = sites
             .iter()
@@ -2987,6 +3037,9 @@ impl<'a> Refiner<'a> {
                         function,
                     );
                 }
+            }
+            if offline_quotient {
+                solve.offline_quotient(&self.offline_late_generators());
             }
             solve.run();
 
@@ -4761,6 +4814,46 @@ struct Solve {
     hybrid_points_to: bool,
 }
 
+#[derive(Debug, Default)]
+struct OfflineQuotientProfile {
+    original_nodes: usize,
+    original_edges: usize,
+    quotient_nodes: usize,
+    quotient_edges_before_factor: usize,
+    quotient_edges: usize,
+    static_scc_merges: usize,
+    substitutions: usize,
+    value_number_merges: usize,
+    factored_groups: usize,
+    factored_edges_removed: usize,
+    synthetic_nodes: usize,
+    elapsed_micros: u128,
+}
+
+fn offline_find(parent: &mut [Cell], cell: Cell) -> Cell {
+    let mut root = cell;
+    while parent[root as usize] != root {
+        root = parent[root as usize];
+    }
+    let mut current = cell;
+    while parent[current as usize] != current {
+        let next = parent[current as usize];
+        parent[current as usize] = root;
+        current = next;
+    }
+    root
+}
+
+fn offline_union_into(parent: &mut [Cell], member: Cell, representative: Cell) -> bool {
+    let member = offline_find(parent, member);
+    let representative = offline_find(parent, representative);
+    if member == representative {
+        return false;
+    }
+    parent[member as usize] = representative;
+    true
+}
+
 impl Solve {
     fn new(n_base: usize, profile: bool) -> Self {
         Self {
@@ -5165,6 +5258,240 @@ impl Solve {
             self.add_copy(base, summary);
             self.add_copy(summary, base);
         }
+    }
+
+    fn copy_edge_pairs(&self) -> Vec<(Cell, Cell)> {
+        let mut edges = self
+            .succ
+            .iter()
+            .chain(&self.pending_succ)
+            .flat_map(|(&source, destinations)| {
+                destinations
+                    .iter()
+                    .map(move |&destination| (self.canonical(source), self.canonical(destination)))
+            })
+            .filter(|(source, destination)| source != destination)
+            .collect::<Vec<_>>();
+        edges.sort_unstable();
+        edges.dedup();
+        edges
+    }
+
+    /// Construct an exact quotient of the fixed inclusion system before propagation.
+    ///
+    /// Besides ordinary static copy SCCs, two equation identities are used:
+    ///
+    /// * if an unseeded variable has exactly one copy predecessor and cannot receive a late
+    ///   load/GEP/call-binding fact, its least solution equals that predecessor's solution;
+    /// * two such variables with the same nonempty predecessor set have identical equations.
+    ///
+    /// `late_generators` names base cells which later indirect-call activation may seed or
+    /// target. Object identities and complex-constraint results are detected locally. The
+    /// resulting equivalences are materialized as mutual copy edges and handed to the same
+    /// representative remapper used by dynamic SCC collapse, so all original cell IDs remain
+    /// valid query handles while pointee allocation identities are left untouched.
+    fn offline_quotient(&mut self, late_generators: &HashSet<Cell>) -> OfflineQuotientProfile {
+        let started = Instant::now();
+        let original_nodes = self.next_field as usize;
+        let original_edges = self.copy_edge_pairs();
+        let mut profile = OfflineQuotientProfile {
+            original_nodes,
+            original_edges: original_edges.len(),
+            ..OfflineQuotientProfile::default()
+        };
+        if original_nodes == 0 {
+            profile.elapsed_micros = started.elapsed().as_micros();
+            return profile;
+        }
+
+        let mut parent = (0..original_nodes as Cell).collect::<Vec<_>>();
+        let active = vec![true; original_nodes];
+        let usize_edges = original_edges
+            .iter()
+            .map(|&(source, destination)| (source as usize, destination as usize))
+            .collect::<Vec<_>>();
+        let (component_of, component_sizes) = directed_sccs(&active, &usize_edges);
+        let mut representative_of_component = vec![None; component_sizes.len()];
+        for cell in 0..original_nodes as Cell {
+            let component = component_of[cell as usize];
+            let representative = representative_of_component[component].get_or_insert(cell);
+            if offline_union_into(&mut parent, cell, *representative) {
+                profile.static_scc_merges += 1;
+            }
+        }
+
+        let mut fixed_generator = vec![false; original_nodes];
+        for &cell in late_generators {
+            if (cell as usize) < original_nodes {
+                fixed_generator[cell as usize] = true;
+            }
+        }
+        // A seeded variable has an independent generator. Every concrete object identity is
+        // protected as well because later load/store/memcpy expansion may address its contents.
+        for (&cell, objects) in &self.pts {
+            fixed_generator[cell as usize] = true;
+            for object in objects.iter() {
+                if (object as usize) < original_nodes {
+                    fixed_generator[object as usize] = true;
+                }
+            }
+        }
+        for &cell in self.external_sources.keys() {
+            fixed_generator[cell as usize] = true;
+        }
+        for destination in self
+            .loads
+            .values()
+            .chain(self.pending_loads.values())
+            .flatten()
+        {
+            fixed_generator[*destination as usize] = true;
+        }
+        for &(_, destination) in self
+            .geps
+            .values()
+            .chain(self.pending_geps.values())
+            .flatten()
+        {
+            fixed_generator[destination as usize] = true;
+        }
+
+        loop {
+            let mut root_fixed = vec![false; original_nodes];
+            for (cell, &fixed) in fixed_generator.iter().enumerate() {
+                if fixed {
+                    let root = offline_find(&mut parent, cell as Cell);
+                    root_fixed[root as usize] = true;
+                }
+            }
+            let mut incoming = vec![BTreeSet::<Cell>::new(); original_nodes];
+            for &(source, destination) in &original_edges {
+                let source = offline_find(&mut parent, source);
+                let destination = offline_find(&mut parent, destination);
+                if source != destination {
+                    incoming[destination as usize].insert(source);
+                }
+            }
+
+            let roots = (0..original_nodes as Cell)
+                .filter(|&cell| offline_find(&mut parent, cell) == cell)
+                .collect::<Vec<_>>();
+            let substitutions = roots
+                .iter()
+                .filter_map(|&root| {
+                    (!root_fixed[root as usize] && incoming[root as usize].len() == 1)
+                        .then(|| (root, *incoming[root as usize].iter().next().unwrap()))
+                })
+                .collect::<Vec<_>>();
+            let mut changed = false;
+            for (member, predecessor) in substitutions {
+                if offline_union_into(&mut parent, member, predecessor) {
+                    profile.substitutions += 1;
+                    changed = true;
+                }
+            }
+            if changed {
+                continue;
+            }
+
+            let mut equivalent = BTreeMap::<Vec<Cell>, Vec<Cell>>::new();
+            for root in roots {
+                if root_fixed[root as usize] || incoming[root as usize].is_empty() {
+                    continue;
+                }
+                equivalent
+                    .entry(incoming[root as usize].iter().copied().collect())
+                    .or_default()
+                    .push(root);
+            }
+            for members in equivalent.values().filter(|members| members.len() > 1) {
+                let representative = members[0];
+                for &member in &members[1..] {
+                    if offline_union_into(&mut parent, member, representative) {
+                        profile.value_number_merges += 1;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Turn the proven equation equalities into SCCs. One remap then handles points-to
+        // state, all complex constraints, memcpy endpoints, work queues, and original IDs.
+        let roots = (0..original_nodes as Cell)
+            .map(|cell| offline_find(&mut parent, cell))
+            .collect::<Vec<_>>();
+        if roots
+            .iter()
+            .enumerate()
+            .any(|(cell, &root)| root != cell as Cell)
+        {
+            for (cell, &root) in roots.iter().enumerate() {
+                let cell = cell as Cell;
+                if cell != root {
+                    self.add_copy(cell, root);
+                    self.add_copy(root, cell);
+                }
+            }
+            self.collapse_copy_sccs();
+        }
+
+        profile.quotient_nodes = (0..original_nodes as Cell)
+            .map(|cell| self.canonical(cell))
+            .collect::<HashSet<_>>()
+            .len();
+        profile.quotient_edges_before_factor = self.copy_edges();
+
+        // Exact fanout factoring: S x D is replaced by S -> union -> D when every source in
+        // S has precisely D as its successor set. The synthetic variable denotes only the
+        // union of source contents and is never inserted as a pointee allocation identity.
+        let mut fanout_by_source = BTreeMap::<Cell, BTreeSet<Cell>>::new();
+        for (source, destination) in self.copy_edge_pairs() {
+            fanout_by_source
+                .entry(source)
+                .or_default()
+                .insert(destination);
+        }
+        let mut fanout_groups = BTreeMap::<Vec<Cell>, Vec<Cell>>::new();
+        for (source, destinations) in fanout_by_source {
+            if destinations.len() < 2 {
+                continue;
+            }
+            let destinations = destinations.into_iter().collect::<Vec<_>>();
+            fanout_groups.entry(destinations).or_default().push(source);
+        }
+        let profitable = fanout_groups
+            .into_iter()
+            .filter(|(destinations, sources)| {
+                sources.len() >= 2
+                    && sources.len().saturating_mul(destinations.len())
+                        > sources.len().saturating_add(destinations.len())
+            })
+            .collect::<Vec<_>>();
+        for (destinations, sources) in profitable {
+            let old_edges = sources.len().saturating_mul(destinations.len());
+            let new_edges = sources.len().saturating_add(destinations.len());
+            for &source in &sources {
+                self.succ.remove(&source);
+                self.pending_succ.remove(&source);
+            }
+            let union = self.allocate_cell();
+            for source in sources {
+                self.add_copy(source, union);
+            }
+            for destination in destinations {
+                self.add_copy(union, destination);
+            }
+            profile.factored_groups += 1;
+            profile.synthetic_nodes += 1;
+            profile.factored_edges_removed += old_edges.saturating_sub(new_edges);
+        }
+        profile.quotient_edges = self.copy_edges();
+        self.new_copy_edges_since_scc = self.pending_succ.values().map(HashSet::len).sum();
+        profile.elapsed_micros = started.elapsed().as_micros();
+        profile
     }
 
     fn should_collapse_copy_sccs(&self) -> bool {
@@ -6430,6 +6757,179 @@ mod tests {
         assert_eq!(solve.copy_fact_pairs_processed, 8);
         solve.run();
         assert_eq!(solve.copy_fact_pairs_processed, 8);
+    }
+
+    fn original_points_to(solve: &Solve, cells: usize) -> Vec<HashSet<Cell>> {
+        (0..cells as Cell)
+            .map(|cell| {
+                solve
+                    .points_to(cell)
+                    .map(|set| set.iter().collect())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn offline_quotient_exactly_substitutes_chains_diamonds_and_static_cycles() {
+        fn problem() -> Solve {
+            let mut solve = Solve::new(16, false);
+            solve.add_pts(0, 10);
+            solve.add_pts(1, 11);
+            solve.add_copy(0, 2);
+            solve.add_copy(1, 2);
+            solve.add_copy(0, 3);
+            solve.add_copy(1, 3);
+            solve.add_copy(2, 4);
+            solve.add_copy(4, 5);
+            solve.add_copy(5, 4);
+            solve.add_external_sources(0, &["client-root".to_string()]);
+            solve
+        }
+
+        let mut baseline = problem();
+        baseline.run();
+        let expected = original_points_to(&baseline, 16);
+
+        let mut quotient = problem();
+        let profile = quotient.offline_quotient(&HashSet::new());
+        quotient.run();
+        assert_eq!(original_points_to(&quotient, 16), expected);
+        assert!(profile.static_scc_merges >= 1);
+        assert!(profile.substitutions >= 1);
+        assert!(profile.value_number_merges >= 1);
+        // Original query IDs remain valid and retain copied provenance.
+        assert!(quotient
+            .external_sources_for(5)
+            .unwrap()
+            .contains("client-root"));
+    }
+
+    #[test]
+    fn offline_quotient_preserves_load_store_gep_and_memcpy_closure() {
+        fn problem() -> Solve {
+            let mut solve = Solve::new(24, false);
+            solve.known_locations.insert(FieldLocation::Exact(4));
+            solve.add_pts(0, 8);
+            solve.add_pts(1, 9);
+            solve.add_pts(4, 14);
+            solve.add_pts(8, 12);
+            solve.add_pts(9, 13);
+            solve.add_copy(0, 2);
+            solve.add_load(2, 3);
+            solve.add_store(2, 4, None);
+            solve.add_gep(2, FieldLocation::Exact(4), 5);
+            solve.add_memcpy(2, 1);
+            solve
+        }
+
+        let mut baseline = problem();
+        baseline.run();
+        let expected = original_points_to(&baseline, 24);
+
+        let mut quotient = problem();
+        quotient.offline_quotient(&HashSet::new());
+        quotient.run();
+        assert_eq!(original_points_to(&quotient, 24), expected);
+        assert_eq!(
+            quotient.memcpy_pairs_processed,
+            baseline.memcpy_pairs_processed
+        );
+    }
+
+    #[test]
+    fn offline_quotient_protects_independent_and_late_generators() {
+        let mut solve = Solve::new(12, false);
+        solve.add_pts(0, 8);
+        solve.add_copy(0, 2);
+        solve.add_copy(0, 3);
+        solve.add_pts(2, 9); // Superficially similar to 3, but independently seeded.
+        solve.offline_quotient(&HashSet::from([3])); // Model a late call result/formal.
+        assert_ne!(solve.canonical(2), solve.canonical(3));
+        assert_ne!(solve.canonical(0), solve.canonical(3));
+
+        // A late call-binding fact must not flow backwards into its old predecessor.
+        solve.add_pts(3, 10);
+        solve.run();
+        assert!(!solve.points_to(0).unwrap().contains(&10));
+        assert!(solve.points_to(3).unwrap().contains(&10));
+        assert!(solve.points_to(2).unwrap().contains(&9));
+        assert!(!solve.points_to(3).unwrap().contains(&9));
+    }
+
+    #[test]
+    fn offline_quotient_factors_identical_fanout_without_exposing_union_cell() {
+        fn problem() -> Solve {
+            let mut solve = Solve::new(16, false);
+            solve.add_pts(0, 10);
+            solve.add_pts(1, 11);
+            solve.add_pts(2, 12);
+            for source in 0..3 {
+                for destination in 4..7 {
+                    solve.add_copy(source, destination);
+                }
+            }
+            solve
+        }
+
+        let mut baseline = problem();
+        baseline.run();
+        let expected = original_points_to(&baseline, 16);
+
+        let mut quotient = problem();
+        let profile = quotient.offline_quotient(&HashSet::from([4, 5, 6]));
+        let union = 16;
+        quotient.run();
+        assert_eq!(original_points_to(&quotient, 16), expected);
+        assert_eq!(profile.factored_groups, 1);
+        assert_eq!(profile.synthetic_nodes, 1);
+        assert_eq!(profile.factored_edges_removed, 3);
+        assert!(quotient
+            .pts
+            .values()
+            .all(|points_to| !points_to.contains(&union)));
+    }
+
+    #[test]
+    fn offline_quotient_preserves_indirect_targets_and_client_visible_rows() {
+        let (pir, pag) = load("two_global_fnptrs.pir.json");
+        let (base, classes) = crate::solve_steensgaard_with_classes(&pir, &pag, BuildMode::Library);
+        let exact = BTreeMap::new();
+        let confined = BTreeSet::new();
+        let mut baseline = finish_andersen_controlled(
+            &pir,
+            &pag,
+            &classes,
+            base.clone(),
+            BuildMode::Library,
+            u64::MAX,
+            &exact,
+            &confined,
+            true,
+            AndersenControls::default(),
+        );
+        let mut quotient = finish_andersen_controlled(
+            &pir,
+            &pag,
+            &classes,
+            base,
+            BuildMode::Library,
+            u64::MAX,
+            &exact,
+            &confined,
+            true,
+            AndersenControls {
+                offline_quotient: true,
+                ..AndersenControls::default()
+            },
+        );
+        // Propagation work is intentionally allowed to differ; every exported fact is not.
+        baseline.metrics = Default::default();
+        quotient.metrics = Default::default();
+        assert_eq!(
+            serde_json::to_value(quotient).unwrap(),
+            serde_json::to_value(baseline).unwrap()
+        );
     }
 
     #[test]

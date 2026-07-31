@@ -312,3 +312,46 @@ With the normal 200,000 partition budget and baseline points-to sets, release me
 proof-ablation and pre-regression range. Lua O1 measured 0.95 s/124,528 KiB and SQLite O1
 11.93 s/627,956 KiB. The callgraph, ModRef, globals, audit, and stationarity exports for both
 O0 modules were byte-identical to the earlier proof-ablation outputs.
+
+### Exact offline Andersen quotient (2026-07-31)
+
+`PANGS_ANDERSEN_OFFLINE_QUOTIENT=1` enables an exact simplification of the initial inclusion
+system after eager/exact call bindings are installed and before propagation. It collapses static
+copy SCCs; substitutes a generator-free variable whose only predecessor is one copy variable;
+and value-numbers generator-free variables with identical nonempty predecessor sets. Address/Ω
+seeds, all allocation identities, load and GEP results, function parameters, and call results are
+protected as independent or possible late generators. The existing representative map preserves
+every original query ID, while cells inside points-to sets remain the original allocation
+identities. Profitable sources with exactly the same complete successor set are additionally
+factored through a synthetic union variable; that variable is never installed as a pointee.
+
+Broader neighborhood hashing was deliberately not implemented: identical successors do not imply
+identical least points-to solutions. Likewise, multi-generator variables are merged only when
+their normalized predecessor equations are literally identical, and partial bicliques are not
+factored. These restrictions keep this an Andersen-equivalent quotient rather than hybrid
+unification.
+
+On YAPET O1, one profiled construction began with 6,977 cells and 1,344 copy edges. The quotient
+merged 23 cells in static SCCs, 336 by sole-predecessor substitution, and five by value numbering,
+leaving 6,613 representatives. The condensed graph had 948 edges; four exact fanout groups removed
+another 218 edges, leaving 730 plus four synthetic variables. Offline construction cost 1.97 ms.
+In the matched profile, propagation steps fell from 117,596 to 79,558, copy-fact pairs from
+22,096,960 to 14,011,062, load/store/GEP pairs from 492,469/954,555/2,765,298 to
+287,663/534,945/1,592,371, and dynamic SCC passes from 14 to 11. Memcpy pair volume was unchanged
+at 10,782,185, confirming that this optimization makes the surrounding closure cheaper without
+altering the byte-copy relation itself.
+
+Ten interleaved release pairs used baseline hash points-to sets for each requested budget:
+
+| YAPET O1 budget | Baseline wall / solve / RSS | Offline quotient wall / solve / RSS | Change |
+| --- | ---: | ---: | ---: |
+| 200,000 | 1.484 s / 1.397 s / 79,566 KiB | 1.141 s / 1.053 s / 80,720 KiB | wall -23.1%; solve -24.6%; RSS +1.5% |
+| `u64::MAX` | 1.506 s / 1.420 s / 80,735 KiB | 1.264 s / 1.179 s / 77,738 KiB | wall -16.1%; solve -17.0%; RSS -3.7% |
+
+Both budgets reported zero oversize fallbacks and therefore admitted the same O1 problem; the
+difference between rows is hash-scheduling noise. Pooling the 20 runs gives a 19.6% wall reduction,
+a 20.8% solve-time reduction, and effectively neutral RSS (-1.2%). Callgraph, ModRef, globals,
+audit, and stationarity were byte-identical for every paired comparison. Focused tests cover
+chains, diamonds, static cycles, independent/late generators, load/store/GEP/memcpy closure,
+original client query IDs, and non-pointee synthetic fanout nodes; the full workspace test suite
+and formatting checks pass. The prototype remains default-off pending broader corpus evaluation.

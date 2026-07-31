@@ -120,6 +120,12 @@ pub(crate) const ENV_ANDERSEN_COPY_SCC_MIN_EDGES: &str = "PANGS_ANDERSEN_COPY_SC
 /// Disables Andersen copy-graph SCC collapsing when present.
 pub(crate) const ENV_ANDERSEN_DISABLE_COPY_SCC: &str = "PANGS_ANDERSEN_DISABLE_COPY_SCC";
 
+/// Enables exact offline simplification of the initial Andersen inclusion system. The
+/// prototype collapses static copy SCCs, substitutes variables whose only generator is one
+/// copy predecessor, value-numbers generator-free variables with identical predecessors,
+/// and factors exact repeated copy fanout through synthetic union variables.
+pub(crate) const ENV_ANDERSEN_OFFLINE_QUOTIENT: &str = "PANGS_ANDERSEN_OFFLINE_QUOTIENT";
+
 /// Optional hard propagation-step limit used for diagnostics and fault tests.
 pub(crate) const ENV_ANDERSEN_MAX_STEPS: &str = "PANGS_ANDERSEN_MAX_STEPS";
 
