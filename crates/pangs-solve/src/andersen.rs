@@ -2545,9 +2545,10 @@ impl<'a> Refiner<'a> {
             );
         }
         if std::env::var_os(knobs::ENV_ANDERSEN_HYBRID_BITSETS_PROFILE).is_some() {
-            let (hash_sets, small_sets, dense_sets, dense_words) = solve.point_set_storage();
+            let (hash_sets, small_sets, sparse_sets, dense_sets, dense_words) =
+                solve.point_set_storage();
             eprintln!(
-                "pangs hybrid bitsets: hash_sets={hash_sets} small_sets={small_sets} dense_sets={dense_sets} dense_words={dense_words} dense_bytes={}",
+                "pangs hybrid bitsets: hash_sets={hash_sets} small_sets={small_sets} sparse_sets={sparse_sets} dense_sets={dense_sets} dense_words={dense_words} dense_bytes={}",
                 dense_words.saturating_mul(std::mem::size_of::<u64>())
             );
         }
@@ -4425,10 +4426,50 @@ fn hybrid_point_set_promotion() -> usize {
     })
 }
 
+fn hybrid_point_set_small_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var(knobs::ENV_ANDERSEN_HYBRID_SMALL_THRESHOLD)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+fn hybrid_point_set_max_bits_per_member() -> usize {
+    static BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        std::env::var(knobs::ENV_ANDERSEN_HYBRID_BITSET_MAX_BITS_PER_MEMBER)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(128)
+    })
+}
+
+fn dense_point_set_worthwhile(len: usize, max: Cell) -> bool {
+    if len <= hybrid_point_set_promotion() {
+        return false;
+    }
+    // Dense cells are indexed by module-wide Cell IDs, not by a set-local base. Bound
+    // both empty-word scanning and allocation relative to useful members. The default
+    // 128 bits/member permits at most two bitmap words per fact and is comparable to a
+    // conservative hash-table storage estimate.
+    let bitmap_bits = (max as usize / 64 + 1).saturating_mul(64);
+    bitmap_bits <= len.saturating_mul(hybrid_point_set_max_bits_per_member())
+}
+
 #[derive(Debug)]
 enum HybridPointSet {
     Small(Vec<Cell>),
-    Dense { words: Vec<u64>, len: usize },
+    Sparse {
+        cells: HashSet<Cell>,
+        max: Cell,
+    },
+    Dense {
+        words: Vec<u64>,
+        len: usize,
+        max: Cell,
+    },
 }
 
 #[derive(Debug)]
@@ -4440,6 +4481,7 @@ enum PointSet {
 enum PointSetIter<'a> {
     Hash(std::iter::Copied<std::collections::hash_set::Iter<'a, Cell>>),
     Small(std::iter::Copied<std::slice::Iter<'a, Cell>>),
+    Sparse(std::iter::Copied<std::collections::hash_set::Iter<'a, Cell>>),
     Dense(DensePointSetIter<'a>),
 }
 
@@ -4472,7 +4514,98 @@ impl Iterator for PointSetIter<'_> {
         match self {
             Self::Hash(iter) => iter.next(),
             Self::Small(iter) => iter.next(),
+            Self::Sparse(iter) => iter.next(),
             Self::Dense(iter) => iter.next(),
+        }
+    }
+}
+
+impl HybridPointSet {
+    fn promote_sparse_if_dense(&mut self) {
+        let should_promote = match self {
+            Self::Sparse { cells, max } => dense_point_set_worthwhile(cells.len(), *max),
+            _ => false,
+        };
+        if !should_promote {
+            return;
+        }
+        let Self::Sparse { cells, max } = std::mem::replace(self, Self::Small(Vec::new())) else {
+            unreachable!();
+        };
+        let mut words = vec![0u64; max as usize / 64 + 1];
+        let len = cells.len();
+        for member in cells {
+            words[member as usize / 64] |= 1u64 << (member % 64);
+        }
+        *self = Self::Dense { words, len, max };
+    }
+
+    fn demote_dense_with(&mut self, cell: Cell) {
+        let Self::Dense { words, len, .. } = std::mem::replace(self, Self::Small(Vec::new()))
+        else {
+            unreachable!();
+        };
+        let mut cells = HashSet::with_capacity(len.saturating_add(1));
+        for (word_index, mut word) in words.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                cells.insert((word_index * 64 + bit) as Cell);
+            }
+        }
+        cells.insert(cell);
+        let max = cells.iter().copied().max().unwrap_or(cell);
+        *self = Self::Sparse { cells, max };
+    }
+
+    fn insert(&mut self, cell: Cell) -> bool {
+        match self {
+            Self::Small(cells) => {
+                if cells.contains(&cell) {
+                    return false;
+                }
+                cells.push(cell);
+                if cells.len() > hybrid_point_set_small_limit() {
+                    let old = std::mem::take(cells);
+                    let max = old.iter().copied().max().unwrap_or(cell);
+                    *self = Self::Sparse {
+                        cells: old.into_iter().collect(),
+                        max,
+                    };
+                    self.promote_sparse_if_dense();
+                }
+                true
+            }
+            Self::Sparse { cells, max } => {
+                if !cells.insert(cell) {
+                    return false;
+                }
+                *max = (*max).max(cell);
+                self.promote_sparse_if_dense();
+                true
+            }
+            Self::Dense { words, len, max } => {
+                let word = cell as usize / 64;
+                if words
+                    .get(word)
+                    .is_some_and(|bits| bits & (1u64 << (cell % 64)) != 0)
+                {
+                    return false;
+                }
+                let new_len = len.saturating_add(1);
+                let new_max = (*max).max(cell);
+                if !dense_point_set_worthwhile(new_len, new_max) {
+                    self.demote_dense_with(cell);
+                    return true;
+                }
+                if words.len() <= word {
+                    words.resize(word + 1, 0);
+                }
+                words[word] |= 1u64 << (cell % 64);
+                *len = new_len;
+                *max = new_max;
+                true
+            }
         }
     }
 }
@@ -4498,39 +4631,7 @@ impl PointSet {
     fn insert(&mut self, cell: Cell) -> bool {
         match self {
             Self::Hash(set) => set.insert(cell),
-            Self::Hybrid(HybridPointSet::Small(cells)) => {
-                if cells.contains(&cell) {
-                    return false;
-                }
-                cells.push(cell);
-                let promotion = hybrid_point_set_promotion();
-                if cells.len() > promotion {
-                    let old = std::mem::take(cells);
-                    let max = old.iter().copied().max().unwrap_or(0) as usize;
-                    let mut words = vec![0u64; max / 64 + 1];
-                    for member in old {
-                        words[member as usize / 64] |= 1u64 << (member % 64);
-                    }
-                    *self = Self::Hybrid(HybridPointSet::Dense {
-                        words,
-                        len: promotion + 1,
-                    });
-                }
-                true
-            }
-            Self::Hybrid(HybridPointSet::Dense { words, len }) => {
-                let word = cell as usize / 64;
-                if words.len() <= word {
-                    words.resize(word + 1, 0);
-                }
-                let mask = 1u64 << (cell % 64);
-                if words[word] & mask != 0 {
-                    return false;
-                }
-                words[word] |= mask;
-                *len += 1;
-                true
-            }
+            Self::Hybrid(set) => set.insert(cell),
         }
     }
 
@@ -4539,6 +4640,7 @@ impl PointSet {
         match self {
             Self::Hash(set) => set.contains(cell),
             Self::Hybrid(HybridPointSet::Small(cells)) => cells.contains(cell),
+            Self::Hybrid(HybridPointSet::Sparse { cells, .. }) => cells.contains(cell),
             Self::Hybrid(HybridPointSet::Dense { words, .. }) => words
                 .get(*cell as usize / 64)
                 .is_some_and(|word| word & (1u64 << (*cell % 64)) != 0),
@@ -4549,6 +4651,7 @@ impl PointSet {
         match self {
             Self::Hash(set) => set.len(),
             Self::Hybrid(HybridPointSet::Small(cells)) => cells.len(),
+            Self::Hybrid(HybridPointSet::Sparse { cells, .. }) => cells.len(),
             Self::Hybrid(HybridPointSet::Dense { len, .. }) => *len,
         }
     }
@@ -4562,6 +4665,9 @@ impl PointSet {
             Self::Hash(set) => PointSetIter::Hash(set.iter().copied()),
             Self::Hybrid(HybridPointSet::Small(cells)) => {
                 PointSetIter::Small(cells.iter().copied())
+            }
+            Self::Hybrid(HybridPointSet::Sparse { cells, .. }) => {
+                PointSetIter::Sparse(cells.iter().copied())
             }
             Self::Hybrid(HybridPointSet::Dense { words, .. }) => {
                 PointSetIter::Dense(DensePointSetIter {
@@ -5327,15 +5433,20 @@ impl Solve {
         self.pts.values().map(PointSet::len).sum()
     }
 
-    fn point_set_storage(&self) -> (usize, usize, usize, usize) {
+    fn point_set_storage(&self) -> (usize, usize, usize, usize, usize) {
         self.pts.values().fold(
-            (0usize, 0usize, 0usize, 0usize),
-            |(hash, small, dense, words), set| match set {
-                PointSet::Hash(_) => (hash + 1, small, dense, words),
-                PointSet::Hybrid(HybridPointSet::Small(_)) => (hash, small + 1, dense, words),
+            (0usize, 0usize, 0usize, 0usize, 0usize),
+            |(hash, small, sparse, dense, words), set| match set {
+                PointSet::Hash(_) => (hash + 1, small, sparse, dense, words),
+                PointSet::Hybrid(HybridPointSet::Small(_)) => {
+                    (hash, small + 1, sparse, dense, words)
+                }
+                PointSet::Hybrid(HybridPointSet::Sparse { .. }) => {
+                    (hash, small, sparse + 1, dense, words)
+                }
                 PointSet::Hybrid(HybridPointSet::Dense {
                     words: set_words, ..
-                }) => (hash, small, dense + 1, words + set_words.len()),
+                }) => (hash, small, sparse, dense + 1, words + set_words.len()),
             },
         )
     }
@@ -5625,7 +5736,7 @@ mod tests {
 
     use super::{
         finish_andersen_controlled, solve_andersen, solve_andersen_with_overrides,
-        AndersenControls, ExternalRegion, HybridPointSet, PointSet, Refiner, Solve,
+        AndersenControls, Cell, ExternalRegion, HybridPointSet, PointSet, Refiner, Solve,
     };
     use crate::{solve_steensgaard, FieldLocation, PointsToMaterialization};
 
@@ -5642,9 +5753,26 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_point_set_uses_sparse_middle_tier() {
+        let mut set = PointSet::new(true);
+        let expected = (0..20)
+            .map(|cell| cell * 10_000 + 1)
+            .collect::<HashSet<_>>();
+        for &cell in &expected {
+            assert!(set.insert(cell));
+            assert!(!set.insert(cell));
+        }
+        assert!(matches!(
+            set,
+            PointSet::Hybrid(HybridPointSet::Sparse { .. })
+        ));
+        assert_eq!(set, expected);
+    }
+
+    #[test]
     fn hybrid_point_set_promotes_and_iterates_dense_members() {
         let mut set = PointSet::new(true);
-        let expected = (0..200).chain([4097]).collect::<HashSet<_>>();
+        let expected = (0..200).collect::<HashSet<_>>();
         for &cell in &expected {
             assert!(set.insert(cell));
             assert!(!set.insert(cell));
@@ -5652,6 +5780,27 @@ mod tests {
         assert!(matches!(
             set,
             PointSet::Hybrid(HybridPointSet::Dense { .. })
+        ));
+        assert_eq!(set, expected);
+    }
+
+    #[test]
+    fn hybrid_point_set_demotes_before_sparse_high_id_growth() {
+        let mut set = PointSet::new(true);
+        let mut expected = (0..200).collect::<HashSet<_>>();
+        for &cell in &expected {
+            assert!(set.insert(cell));
+        }
+        assert!(matches!(
+            set,
+            PointSet::Hybrid(HybridPointSet::Dense { .. })
+        ));
+
+        expected.insert(Cell::MAX - 1);
+        assert!(set.insert(Cell::MAX - 1));
+        assert!(matches!(
+            set,
+            PointSet::Hybrid(HybridPointSet::Sparse { .. })
         ));
         assert_eq!(set, expected);
     }

@@ -260,3 +260,38 @@ It therefore pays linear small-vector operations without receiving bitmap storag
 union benefits. On normally admitted instances, the current representation is broadly
 memory-neutral and only selectively faster; a production design should retain a hash or
 sparse middle tier between tiny vectors and density-qualified bitmaps.
+
+A follow-up after memoizing the compositional `va_list` forwarder proof completed two
+paired iterations for every Lua and SQLite variant. Baseline versus hybrid mean wall/RSS
+was 1.34/1.35 s and 139,948/140,062 KiB for executable Lua O0; 0.77/0.76 s and
+100,270/100,560 KiB for executable Lua O1; 1.48/1.53 s and 165,430/165,334 KiB for
+library Lua O0; 0.99/1.01 s and 124,666/124,628 KiB for library Lua O1; 20.26/20.38 s
+and 655,514/655,264 KiB for SQLite O0; and 12.95/12.96 s and 627,738/627,776 KiB for
+SQLite O1. Hybrid storage is effectively neutral on these bounded instances, and every
+pair had identical hashes for all five client-visible exports.
+
+### Three-tier hybrid points-to sets (2026-07-31)
+
+The hybrid representation now uses a tiny vector (eight members by default), a sparse
+`HashSet`, and a density-qualified bitmap. Dense promotion still requires more than 64
+members, but additionally requires no more than 128 bitmap address-space bits per member.
+An already-dense set demotes to sparse storage before a high-ID insertion could violate
+that bound. Environment knobs can override the tiny limit, dense cardinality threshold,
+and density bound.
+
+On the same normal-budget 49-module census, the 41 nonzero completed pairs totalled
+153.47 s baseline versus 143.73 s hybrid (-6.3%), with a 1.000 median ratio. Aggregate
+RSS was 6.419 GiB versus 6.399 GiB (-0.3%). All five client-visible export families were
+byte-identical for every completed pair. Absolute times varied materially between census
+runs, so the important result is structural: Placebo no longer regressed (34.84 s
+baseline versus 33.44 s hybrid, equal RSS), while YAPET O1 retained its benefit
+(1.37 s/84 MiB versus 0.92 s/64 MiB). Placebo ended with 24,823 tiny, 158 sparse, and
+zero dense sets; YAPET O1 had 2,307 tiny, five sparse, and 928 dense sets. The subsequent
+paired Lua/SQLite measurements above likewise showed effectively neutral hybrid cost on
+their bounded instances.
+
+Forced-admission spot checks retained the large-instance payoff: YAPET O0 improved from
+1.29 s/99 MiB to 1.07 s/84 MiB, chibicc O1 from 5.23 s/193 MiB to 3.96 s/150 MiB, and
+gifsicle O1 stayed near 102 s while falling from 1.10 GiB to 500 MiB. This is the intended
+disposition: sparse bounded instances avoid linear-vector overhead, while dense expensive
+instances still receive bitmap memory savings.
