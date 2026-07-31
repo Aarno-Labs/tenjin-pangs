@@ -169,3 +169,43 @@ unknown-caller half of the measured critical path. Reaching the 49/50 optimistic
 bound still requires a discriminator-sensitive producer proof for the tagged
 `eval_body*` operands. Registry-aware sorting callbacks and `stack`'s independent Ω
 escape remain separate work.
+
+## Hybrid points-to bitsets
+
+Phase 5 of `20260730_MEMCPY_HANDLING.md` was prototyped independently of the memcpy
+model. `PANGS_ANDERSEN_HYBRID_BITSETS=1` retains points-to sets in small vectors and
+promotes them to dense bitmaps after 64 facts by default. The threshold can be changed
+with `PANGS_ANDERSEN_HYBRID_BITSET_THRESHOLD`; 64--256 performed similarly, while
+always-dense storage was worse. `PANGS_ANDERSEN_HYBRID_BITSETS_PROFILE=1` reports the
+final storage mix.
+
+All 76 `pangs-solve` tests pass with both representations. Callgraph, ModRef, globals,
+audit, and stationarity exports were byte-identical between the untouched and hybrid
+solvers for forced full solves of YAPET O0, gifsicle O1, and chibicc O1.
+
+Measured release-build results:
+
+- YAPET O0: four interleaved pairs at threshold 128 reduced mean wall time from
+  1.263 s to 0.978 s (-22.6%), mean solve time from 1.161 s to 0.880 s (-24.2%),
+  and mean peak RSS from 102,433 KiB to 84,834 KiB (-17.2%). A separate twelve-pair
+  threshold-64 run measured a comparable 23.5% wall reduction.
+- chibicc O1: two forced-full-admission pairs reduced mean wall time from 5.285 s to
+  3.210 s (-39.3%) and mean peak RSS from 219,142 KiB to 144,792 KiB (-33.9%).
+- gifsicle O1: two threshold-128 hybrid runs averaged 82.6 s and 404,590 KiB, versus
+  101.7 s and 1,115,372 KiB across three untouched runs. Solver/SCC order makes this
+  case noisy, so the roughly 19% time reduction is indicative; the roughly 64% memory
+  reduction is the stronger result.
+
+At threshold 64, YAPET ended with 3,658 small and 2,250 dense sets; bitmap words
+occupied 3.9 MiB. At threshold 128, gifsicle ended with 6,431 small and 3,934 dense
+sets; bitmap words occupied 25.4 MiB.
+
+A follow-up converted each vector delta to a temporary bitmap before copy propagation
+and used wordwise dense-to-dense union. It did not measurably improve YAPET or gifsicle:
+reconstructing the temporary bitmap consumed the union savings. That part was removed.
+A useful wordwise implementation would store pending deltas natively as hybrid bitsets.
+
+The retained prototype remains opt-in. Dense sets are indexed by the module-wide cell
+ID, so a large, sparse module could allocate much more empty bitmap space than these
+corpora. A production default should either validate this shape across the corpus or use
+a sparse chunked/Roaring representation for promoted sets.

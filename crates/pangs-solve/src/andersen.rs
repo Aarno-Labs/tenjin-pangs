@@ -2544,6 +2544,13 @@ impl<'a> Refiner<'a> {
                 solve.scc_copy_edges_removed,
             );
         }
+        if std::env::var_os(knobs::ENV_ANDERSEN_HYBRID_BITSETS_PROFILE).is_some() {
+            let (hash_sets, small_sets, dense_sets, dense_words) = solve.point_set_storage();
+            eprintln!(
+                "pangs hybrid bitsets: hash_sets={hash_sets} small_sets={small_sets} dense_sets={dense_sets} dense_words={dense_words} dense_bytes={}",
+                dense_words.saturating_mul(std::mem::size_of::<u64>())
+            );
+        }
         let indirect_calls = self.emit_indirect_calls(
             &in_scope_sites,
             &activated,
@@ -2998,7 +3005,7 @@ impl<'a> Refiner<'a> {
                     .into_iter()
                     .flat_map(|points_to| points_to.iter())
                     .filter_map(|cell| {
-                        let root = solve.field_base.get(cell).copied().unwrap_or(*cell);
+                        let root = solve.field_base.get(&cell).copied().unwrap_or(cell);
                         self.fn_cell_to_index.get(&root).copied()
                     })
                     .filter(|function| envelope.contains(function))
@@ -3042,7 +3049,7 @@ impl<'a> Refiner<'a> {
                 .get(&site)
                 .map(|targets| targets.iter().copied().collect::<HashSet<_>>())
                 .unwrap_or_default();
-            for &cell in points_to {
+            for cell in points_to {
                 if solve
                     .external_region(cell)
                     .is_some_and(ExternalRegion::may_contain_function_pointer)
@@ -3352,7 +3359,7 @@ impl<'a> Refiner<'a> {
             if solve.points_to(cell).is_some_and(|points_to| {
                 points_to
                     .iter()
-                    .any(|pointee| solve.external_region(*pointee).is_some())
+                    .any(|pointee| solve.external_region(pointee).is_some())
             }) {
                 explicit_open[solve.canonical(cell) as usize] = true;
             }
@@ -3381,7 +3388,7 @@ impl<'a> Refiner<'a> {
                         continue;
                     }
                     add_dependency(edge.src.0, edge.dst.0);
-                    for &object in objects {
+                    for object in objects {
                         if solve.external_region(object).is_some() {
                             explicit_open[destination] = true;
                         } else {
@@ -3393,7 +3400,7 @@ impl<'a> Refiner<'a> {
                     let Some(objects) = solve.points_to(edge.dst.0) else {
                         continue;
                     };
-                    for &object in objects {
+                    for object in objects {
                         if solve.external_region(object).is_some() {
                             continue;
                         }
@@ -3407,7 +3414,7 @@ impl<'a> Refiner<'a> {
                     let Some(destinations) = solve.points_to(edge.dst.0) else {
                         continue;
                     };
-                    for &destination in destinations {
+                    for destination in destinations {
                         if solve.external_region(destination).is_some() {
                             continue;
                         }
@@ -3501,7 +3508,7 @@ impl<'a> Refiner<'a> {
         let mut external = false;
         let mut non_function = false;
         if let Some(points_to) = solve.points_to(operand.0) {
-            for &cell in points_to {
+            for cell in points_to {
                 if solve.external_region(cell).is_some() {
                     external = true;
                     continue;
@@ -3551,7 +3558,7 @@ impl<'a> Refiner<'a> {
                 .into_iter()
                 .flat_map(|points_to| points_to.iter())
                 .filter_map(|cell| {
-                    let root = solve.field_base.get(cell).copied().unwrap_or(*cell);
+                    let root = solve.field_base.get(&cell).copied().unwrap_or(cell);
                     self.fn_cell_to_index.get(&root).copied()
                 })
                 .collect::<BTreeSet<_>>()
@@ -3603,7 +3610,7 @@ impl<'a> Refiner<'a> {
                         continue;
                     };
                     let destination = functions_in(edge.dst.0);
-                    for &object in objects {
+                    for object in objects {
                         if solve.is_external(object) {
                             continue;
                         }
@@ -3627,7 +3634,7 @@ impl<'a> Refiner<'a> {
                         mark_open(source, &mut open);
                         continue;
                     }
-                    for &object in objects {
+                    for object in objects {
                         if solve.is_external(object) {
                             mark_open(source.clone(), &mut open);
                             continue;
@@ -3645,14 +3652,14 @@ impl<'a> Refiner<'a> {
                         continue;
                     };
                     let Some(destinations) = solve.points_to(edge.dst.0) else {
-                        for &source in sources {
+                        for source in sources {
                             mark_open(functions_in(source), &mut open);
                         }
                         continue;
                     };
-                    for &source in sources {
+                    for source in sources {
                         let copied = functions_in(source);
-                        for &destination in destinations {
+                        for destination in destinations {
                             if solve.is_external(destination) {
                                 mark_open(copied.clone(), &mut open);
                                 continue;
@@ -3729,7 +3736,7 @@ impl<'a> Refiner<'a> {
             let Some(points_to) = solve.points_to(cell) else {
                 continue;
             };
-            for &pointee in points_to {
+            for pointee in points_to {
                 let root = solve.field_base.get(&pointee).copied().unwrap_or(pointee);
                 if let Some(&function) = self.fn_cell_to_index.get(&root) {
                     open[function] = true;
@@ -3812,7 +3819,7 @@ impl<'a> Refiner<'a> {
                     .operand
                     .and_then(|operand| pts.points_to(operand.0))
                     .is_some_and(|set| {
-                        set.iter().any(|&cell| {
+                        set.iter().any(|cell| {
                             pts.external_region(cell)
                                 .is_some_and(ExternalRegion::may_contain_function_pointer)
                         })
@@ -3895,19 +3902,19 @@ impl<'a> Refiner<'a> {
             }
             let set = pts.points_to(node.id.0);
             let external = set
-                .map(|set| set.iter().any(|cell| pts.is_external(*cell)))
+                .map(|set| set.iter().any(|cell| pts.is_external(cell)))
                 .unwrap_or(false);
             let external_universal = set
-                .map(|set| set.iter().any(|cell| pts.is_universal_external(*cell)))
+                .map(|set| set.iter().any(|cell| pts.is_universal_external(cell)))
                 .unwrap_or(false);
             let reaches_function_pointer = set
                 .map(|set| {
                     set.iter().any(|cell| {
-                        pts.external_region(*cell)
+                        pts.external_region(cell)
                             .is_some_and(ExternalRegion::may_contain_function_pointer)
                             || self
                                 .fn_cell_to_index
-                                .contains_key(pts.field_base.get(cell).unwrap_or(cell))
+                                .contains_key(&pts.field_base.get(&cell).copied().unwrap_or(cell))
                     })
                 })
                 .unwrap_or(false);
@@ -3915,8 +3922,8 @@ impl<'a> Refiner<'a> {
                 .into_iter()
                 .flat_map(|set| set.iter())
                 .filter_map(|cell| {
-                    let root = pts.field_base.get(cell).unwrap_or(cell);
-                    self.global_of_cell.get(root)
+                    let root = pts.field_base.get(&cell).copied().unwrap_or(cell);
+                    self.global_of_cell.get(&root)
                 })
                 .map(|&idx| self.pir.globals[idx].key.clone())
                 .collect();
@@ -3958,7 +3965,7 @@ impl<'a> Refiner<'a> {
             if explain_label.as_deref() == Some(node.label.as_str()) {
                 let mut allocations = set
                     .into_iter()
-                    .flat_map(|set| set.iter().copied())
+                    .flat_map(|set| set.iter())
                     .map(|cell| {
                         if let Some(region) = pts.external_region(cell) {
                             return format!("external:{}", region.label());
@@ -4037,7 +4044,7 @@ impl<'a> Refiner<'a> {
                 let Some(set) = pts.points_to(cell) else {
                     continue;
                 };
-                for &o in set {
+                for o in set {
                     if pts.is_external(o) {
                         continue;
                     }
@@ -4408,13 +4415,178 @@ struct MemcpyDelta {
     new_sources: Vec<Cell>,
 }
 
+fn hybrid_point_set_promotion() -> usize {
+    static PROMOTION: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PROMOTION.get_or_init(|| {
+        std::env::var(knobs::ENV_ANDERSEN_HYBRID_BITSET_THRESHOLD)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(64)
+    })
+}
+
+#[derive(Debug)]
+enum HybridPointSet {
+    Small(Vec<Cell>),
+    Dense { words: Vec<u64>, len: usize },
+}
+
+#[derive(Debug)]
+enum PointSet {
+    Hash(HashSet<Cell>),
+    Hybrid(HybridPointSet),
+}
+
+enum PointSetIter<'a> {
+    Hash(std::iter::Copied<std::collections::hash_set::Iter<'a, Cell>>),
+    Small(std::iter::Copied<std::slice::Iter<'a, Cell>>),
+    Dense(DensePointSetIter<'a>),
+}
+
+struct DensePointSetIter<'a> {
+    words: &'a [u64],
+    word_index: usize,
+    remaining: u64,
+}
+
+impl Iterator for DensePointSetIter<'_> {
+    type Item = Cell;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.remaining != 0 {
+                let bit = self.remaining.trailing_zeros() as usize;
+                self.remaining &= self.remaining - 1;
+                return Some(((self.word_index - 1) * 64 + bit) as Cell);
+            }
+            self.remaining = *self.words.get(self.word_index)?;
+            self.word_index += 1;
+        }
+    }
+}
+
+impl Iterator for PointSetIter<'_> {
+    type Item = Cell;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Hash(iter) => iter.next(),
+            Self::Small(iter) => iter.next(),
+            Self::Dense(iter) => iter.next(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a PointSet {
+    type Item = Cell;
+    type IntoIter = PointSetIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl PointSet {
+    fn new(hybrid: bool) -> Self {
+        if hybrid {
+            Self::Hybrid(HybridPointSet::Small(Vec::new()))
+        } else {
+            Self::Hash(HashSet::new())
+        }
+    }
+
+    fn insert(&mut self, cell: Cell) -> bool {
+        match self {
+            Self::Hash(set) => set.insert(cell),
+            Self::Hybrid(HybridPointSet::Small(cells)) => {
+                if cells.contains(&cell) {
+                    return false;
+                }
+                cells.push(cell);
+                let promotion = hybrid_point_set_promotion();
+                if cells.len() > promotion {
+                    let old = std::mem::take(cells);
+                    let max = old.iter().copied().max().unwrap_or(0) as usize;
+                    let mut words = vec![0u64; max / 64 + 1];
+                    for member in old {
+                        words[member as usize / 64] |= 1u64 << (member % 64);
+                    }
+                    *self = Self::Hybrid(HybridPointSet::Dense {
+                        words,
+                        len: promotion + 1,
+                    });
+                }
+                true
+            }
+            Self::Hybrid(HybridPointSet::Dense { words, len }) => {
+                let word = cell as usize / 64;
+                if words.len() <= word {
+                    words.resize(word + 1, 0);
+                }
+                let mask = 1u64 << (cell % 64);
+                if words[word] & mask != 0 {
+                    return false;
+                }
+                words[word] |= mask;
+                *len += 1;
+                true
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn contains(&self, cell: &Cell) -> bool {
+        match self {
+            Self::Hash(set) => set.contains(cell),
+            Self::Hybrid(HybridPointSet::Small(cells)) => cells.contains(cell),
+            Self::Hybrid(HybridPointSet::Dense { words, .. }) => words
+                .get(*cell as usize / 64)
+                .is_some_and(|word| word & (1u64 << (*cell % 64)) != 0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Hash(set) => set.len(),
+            Self::Hybrid(HybridPointSet::Small(cells)) => cells.len(),
+            Self::Hybrid(HybridPointSet::Dense { len, .. }) => *len,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn iter(&self) -> PointSetIter<'_> {
+        match self {
+            Self::Hash(set) => PointSetIter::Hash(set.iter().copied()),
+            Self::Hybrid(HybridPointSet::Small(cells)) => {
+                PointSetIter::Small(cells.iter().copied())
+            }
+            Self::Hybrid(HybridPointSet::Dense { words, .. }) => {
+                PointSetIter::Dense(DensePointSetIter {
+                    words,
+                    word_index: 0,
+                    remaining: 0,
+                })
+            }
+        }
+    }
+}
+
+impl PartialEq<HashSet<Cell>> for PointSet {
+    fn eq(&self, other: &HashSet<Cell>) -> bool {
+        self.len() == other.len() && self.iter().all(|cell| other.contains(&cell))
+    }
+}
+
 struct Solve {
     next_field: Cell,
     /// Constraint-graph node representative. This canonicalizes where pointer contents are
     /// stored and propagated; cells appearing *inside* points-to sets remain allocation
     /// identities and are deliberately never canonicalized.
     representative: Vec<Cell>,
-    pts: HashMap<Cell, HashSet<Cell>>,
+    pts: HashMap<Cell, PointSet>,
     /// Points-to facts not yet propagated over the source's established copy edges.
     pending_pts: HashMap<Cell, Vec<Cell>>,
     external_sources: HashMap<Cell, BTreeSet<String>>,
@@ -4480,6 +4652,7 @@ struct Solve {
     scc_passes: usize,
     scc_nodes_collapsed: usize,
     scc_copy_edges_removed: usize,
+    hybrid_points_to: bool,
 }
 
 impl Solve {
@@ -4531,6 +4704,7 @@ impl Solve {
             scc_passes: 0,
             scc_nodes_collapsed: 0,
             scc_copy_edges_removed: 0,
+            hybrid_points_to: std::env::var_os(knobs::ENV_ANDERSEN_HYBRID_BITSETS).is_some(),
         }
     }
 
@@ -4545,7 +4719,7 @@ impl Solve {
         self.representative[cell as usize]
     }
 
-    fn points_to(&self, cell: Cell) -> Option<&HashSet<Cell>> {
+    fn points_to(&self, cell: Cell) -> Option<&PointSet> {
         self.pts.get(&self.canonical(cell))
     }
 
@@ -4608,7 +4782,11 @@ impl Solve {
             return;
         }
         let cell = self.canonical(cell);
-        let dst = self.pts.entry(cell).or_default();
+        let hybrid = self.hybrid_points_to;
+        let dst = self
+            .pts
+            .entry(cell)
+            .or_insert_with(|| PointSet::new(hybrid));
         let mut added = Vec::new();
         for &object in objects {
             if dst.insert(object) {
@@ -4754,7 +4932,6 @@ impl Solve {
             .get(&destination)
             .map(|set| {
                 set.iter()
-                    .copied()
                     .filter(|object| !join.seen_destinations.contains(object))
                     .collect::<Vec<_>>()
             })
@@ -4764,7 +4941,6 @@ impl Solve {
             .get(&source)
             .map(|set| {
                 set.iter()
-                    .copied()
                     .filter(|object| !join.seen_sources.contains(object))
                     .collect::<Vec<_>>()
             })
@@ -4774,7 +4950,7 @@ impl Solve {
         } else {
             self.pts
                 .get(&source)
-                .map(|set| set.iter().copied().collect())
+                .map(|set| set.iter().collect())
                 .unwrap_or_default()
         };
 
@@ -5004,12 +5180,15 @@ impl Solve {
         }
         let representatives = self.representative.clone();
 
-        let mut merged_pts = HashMap::<Cell, HashSet<Cell>>::new();
+        let mut merged_pts = HashMap::<Cell, PointSet>::new();
+        let hybrid_points_to = self.hybrid_points_to;
         for (cell, objects) in std::mem::take(&mut self.pts) {
-            merged_pts
+            let destination = merged_pts
                 .entry(representatives[cell as usize])
-                .or_default()
-                .extend(objects);
+                .or_insert_with(|| PointSet::new(hybrid_points_to));
+            for object in objects.iter() {
+                destination.insert(object);
+            }
         }
         self.pts = merged_pts;
 
@@ -5110,7 +5289,7 @@ impl Solve {
         self.pending_pts = self
             .pts
             .iter()
-            .map(|(&cell, objects)| (cell, objects.iter().copied().collect()))
+            .map(|(&cell, objects)| (cell, objects.iter().collect()))
             .collect();
         self.pending_external_sources = self
             .external_sources
@@ -5145,7 +5324,20 @@ impl Solve {
     }
 
     fn pts_facts(&self) -> usize {
-        self.pts.values().map(HashSet::len).sum()
+        self.pts.values().map(PointSet::len).sum()
+    }
+
+    fn point_set_storage(&self) -> (usize, usize, usize, usize) {
+        self.pts.values().fold(
+            (0usize, 0usize, 0usize, 0usize),
+            |(hash, small, dense, words), set| match set {
+                PointSet::Hash(_) => (hash + 1, small, dense, words),
+                PointSet::Hybrid(HybridPointSet::Small(_)) => (hash, small + 1, dense, words),
+                PointSet::Hybrid(HybridPointSet::Dense {
+                    words: set_words, ..
+                }) => (hash, small, dense + 1, words + set_words.len()),
+            },
+        )
     }
 
     fn copy_edges(&self) -> usize {
@@ -5240,7 +5432,7 @@ impl Solve {
                 let all_pts = self
                     .pts
                     .get(&n)
-                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .map(|set| set.iter().collect::<Vec<_>>())
                     .unwrap_or_default();
                 let all_external_sources = self
                     .external_sources
@@ -5274,7 +5466,7 @@ impl Solve {
                 let all_pts = self
                     .pts
                     .get(&n)
-                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .map(|set| set.iter().collect::<Vec<_>>())
                     .unwrap_or_default();
                 self.report_large_product("new-load", n, ps.len(), all_pts.len());
                 self.load_pairs_processed = self
@@ -5309,7 +5501,7 @@ impl Solve {
                 let all_pts = self
                     .pts
                     .get(&n)
-                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .map(|set| set.iter().collect::<Vec<_>>())
                     .unwrap_or_default();
                 self.report_large_product("new-store", n, qs.len(), all_pts.len());
                 self.store_pairs_processed = self
@@ -5344,7 +5536,7 @@ impl Solve {
                 let all_pts = self
                     .pts
                     .get(&n)
-                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .map(|set| set.iter().collect::<Vec<_>>())
                     .unwrap_or_default();
                 self.report_large_product("new-gep", n, gs.len(), all_pts.len());
                 self.gep_pairs_processed = self
@@ -5433,7 +5625,7 @@ mod tests {
 
     use super::{
         finish_andersen_controlled, solve_andersen, solve_andersen_with_overrides,
-        AndersenControls, ExternalRegion, Refiner, Solve,
+        AndersenControls, ExternalRegion, HybridPointSet, PointSet, Refiner, Solve,
     };
     use crate::{solve_steensgaard, FieldLocation, PointsToMaterialization};
 
@@ -5447,6 +5639,21 @@ mod tests {
         let pir = Pir::from_path(fixture(name)).unwrap();
         let pag = Pag::from_pir(&pir, &PagOpts::default());
         (pir, pag)
+    }
+
+    #[test]
+    fn hybrid_point_set_promotes_and_iterates_dense_members() {
+        let mut set = PointSet::new(true);
+        let expected = (0..200).chain([4097]).collect::<HashSet<_>>();
+        for &cell in &expected {
+            assert!(set.insert(cell));
+            assert!(!set.insert(cell));
+        }
+        assert!(matches!(
+            set,
+            PointSet::Hybrid(HybridPointSet::Dense { .. })
+        ));
+        assert_eq!(set, expected);
     }
 
     fn load_m1_4(name: &str) -> (Pir, Pag) {

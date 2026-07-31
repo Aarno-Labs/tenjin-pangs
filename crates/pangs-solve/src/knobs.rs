@@ -95,6 +95,17 @@ pub(crate) const STEENS_PROFILE_INTERVAL_CANDIDATE_PAIRS: u64 = 10_000_000;
 /// Enables Andersen solver profiling when present.
 pub(crate) const ENV_ANDERSEN_PROFILE: &str = "PANGS_ANDERSEN_PROFILE";
 
+/// Enables the experimental small-vector/dense-bitset points-to representation.
+pub(crate) const ENV_ANDERSEN_HYBRID_BITSETS: &str = "PANGS_ANDERSEN_HYBRID_BITSETS";
+
+/// Overrides the number of points-to facts retained in a small vector before promotion.
+pub(crate) const ENV_ANDERSEN_HYBRID_BITSET_THRESHOLD: &str =
+    "PANGS_ANDERSEN_HYBRID_BITSET_THRESHOLD";
+
+/// Reports the final small/dense points-to storage mix when hybrid bitsets are enabled.
+pub(crate) const ENV_ANDERSEN_HYBRID_BITSETS_PROFILE: &str =
+    "PANGS_ANDERSEN_HYBRID_BITSETS_PROFILE";
+
 /// Overrides the minimum number of copy edges between SCC passes.
 pub(crate) const ENV_ANDERSEN_COPY_SCC_MIN_EDGES: &str = "PANGS_ANDERSEN_COPY_SCC_MIN_EDGES";
 
