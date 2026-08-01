@@ -2661,7 +2661,7 @@ impl<'a> Refiner<'a> {
             worklist: solve.worklist.len(),
             queued: solve.queued.len(),
             pending_copy_seeds: solve.pending_succ.values().map(HashSet::len).sum(),
-            pending_pts_deltas: solve.pending_pts.values().map(Vec::len).sum(),
+            pending_pts_deltas: solve.pending_pts.values().map(PointSet::len).sum(),
             known_unbound_targets,
             activated_targets,
             scc_passes: solve.scc_passes,
@@ -4511,7 +4511,7 @@ fn dense_point_set_worthwhile(len: usize, max: Cell) -> bool {
     bitmap_bits <= len.saturating_mul(hybrid_point_set_max_bits_per_member())
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum HybridPointSet {
     Small(Vec<Cell>),
     Sparse {
@@ -4525,7 +4525,7 @@ enum HybridPointSet {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum PointSet {
     Hash(HashSet<Cell>),
     Hybrid(HybridPointSet),
@@ -4574,6 +4574,33 @@ impl Iterator for PointSetIter<'_> {
 }
 
 impl HybridPointSet {
+    fn from_dense_words(mut words: Vec<u64>, len: usize, max: Cell) -> Self {
+        if len == 0 {
+            return Self::Small(Vec::new());
+        }
+        words.truncate(max as usize / 64 + 1);
+        if dense_point_set_worthwhile(len, max) {
+            return Self::Dense { words, len, max };
+        }
+
+        let mut cells = Vec::with_capacity(len);
+        for (word_index, mut word) in words.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                cells.push((word_index * 64 + bit) as Cell);
+            }
+        }
+        if cells.len() <= hybrid_point_set_small_limit() {
+            Self::Small(cells)
+        } else {
+            Self::Sparse {
+                cells: cells.into_iter().collect(),
+                max,
+            }
+        }
+    }
+
     fn promote_sparse_if_dense(&mut self) {
         let should_promote = match self {
             Self::Sparse { cells, max } => dense_point_set_worthwhile(cells.len(), *max),
@@ -4661,6 +4688,116 @@ impl HybridPointSet {
             }
         }
     }
+
+    /// Join `source` into this set and return exactly the newly inserted members.
+    ///
+    /// Dense-to-dense joins stay wordwise. The returned delta retains a bitmap only when
+    /// the changed words are themselves dense enough; small overlap remainders return to
+    /// the tiny/sparse representations used by ordinary delta consumers.
+    fn union_delta(&mut self, source: &Self) -> Self {
+        if self.is_empty() {
+            *self = source.clone();
+            return source.clone();
+        }
+        if let (
+            Self::Dense {
+                words: destination_words,
+                len: destination_len,
+                max: destination_max,
+            },
+            Self::Dense {
+                words: source_words,
+                ..
+            },
+        ) = (&mut *self, source)
+        {
+            if destination_words.len() < source_words.len() {
+                destination_words.resize(source_words.len(), 0);
+            }
+            let mut changed_words = vec![0; source_words.len()];
+            let mut changed_len = 0usize;
+            let mut changed_max = 0;
+            for (word_index, &source_word) in source_words.iter().enumerate() {
+                let changed = source_word & !destination_words[word_index];
+                if changed == 0 {
+                    continue;
+                }
+                destination_words[word_index] |= source_word;
+                changed_words[word_index] = changed;
+                changed_len = changed_len.saturating_add(changed.count_ones() as usize);
+                changed_max = (word_index * 64 + (63 - changed.leading_zeros() as usize)) as Cell;
+            }
+            if changed_len == 0 {
+                return Self::Small(Vec::new());
+            }
+            *destination_len = destination_len.saturating_add(changed_len);
+            *destination_max = (*destination_max).max(changed_max);
+            return Self::from_dense_words(changed_words, changed_len, changed_max);
+        }
+
+        let mut added = Self::Small(Vec::new());
+        for cell in source.iter() {
+            if self.insert(cell) {
+                added.insert(cell);
+            }
+        }
+        added
+    }
+
+    /// Merge a delta whose members are known not to occur in this set.
+    fn union_disjoint(&mut self, source: Self) {
+        match (self, source) {
+            (destination, source) if destination.is_empty() => *destination = source,
+            (
+                Self::Dense {
+                    words: destination_words,
+                    len: destination_len,
+                    max: destination_max,
+                },
+                Self::Dense {
+                    words: source_words,
+                    len: source_len,
+                    max: source_max,
+                },
+            ) => {
+                if destination_words.len() < source_words.len() {
+                    destination_words.resize(source_words.len(), 0);
+                }
+                for (destination, source) in destination_words.iter_mut().zip(source_words) {
+                    debug_assert_eq!(*destination & source, 0);
+                    *destination |= source;
+                }
+                *destination_len = destination_len.saturating_add(source_len);
+                *destination_max = (*destination_max).max(source_max);
+            }
+            (destination, source) => {
+                for cell in source.iter() {
+                    let inserted = destination.insert(cell);
+                    debug_assert!(inserted);
+                }
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Small(cells) => cells.is_empty(),
+            Self::Sparse { cells, .. } => cells.is_empty(),
+            Self::Dense { len, .. } => *len == 0,
+        }
+    }
+
+    fn iter(&self) -> PointSetIter<'_> {
+        match self {
+            Self::Small(cells) => PointSetIter::Small(cells.iter().copied()),
+            Self::Sparse { cells, .. } => PointSetIter::Sparse(cells.iter().copied()),
+            Self::Dense { words, .. } => PointSetIter::Dense(DensePointSetIter {
+                words,
+                word_index: 0,
+                remaining: 0,
+            }),
+        }
+    }
 }
 
 impl<'a> IntoIterator for &'a PointSet {
@@ -4685,6 +4822,47 @@ impl PointSet {
         match self {
             Self::Hash(set) => set.insert(cell),
             Self::Hybrid(set) => set.insert(cell),
+        }
+    }
+
+    fn union_delta(&mut self, source: &Self) -> Self {
+        match (&mut *self, source) {
+            (Self::Hybrid(destination), Self::Hybrid(source)) => {
+                Self::Hybrid(destination.union_delta(source))
+            }
+            (Self::Hash(destination), _) => {
+                let mut added = HashSet::new();
+                for cell in source.iter() {
+                    if destination.insert(cell) {
+                        added.insert(cell);
+                    }
+                }
+                Self::Hash(added)
+            }
+            (Self::Hybrid(destination), _) => {
+                let mut added = HybridPointSet::Small(Vec::new());
+                for cell in source.iter() {
+                    if destination.insert(cell) {
+                        added.insert(cell);
+                    }
+                }
+                Self::Hybrid(added)
+            }
+        }
+    }
+
+    fn union_disjoint(&mut self, source: Self) {
+        match (self, source) {
+            (Self::Hybrid(destination), Self::Hybrid(source)) => {
+                destination.union_disjoint(source);
+            }
+            (Self::Hash(destination), Self::Hash(source)) => destination.extend(source),
+            (destination, source) => {
+                for cell in source.iter() {
+                    let inserted = destination.insert(cell);
+                    debug_assert!(inserted);
+                }
+            }
         }
     }
 
@@ -4716,19 +4894,7 @@ impl PointSet {
     fn iter(&self) -> PointSetIter<'_> {
         match self {
             Self::Hash(set) => PointSetIter::Hash(set.iter().copied()),
-            Self::Hybrid(HybridPointSet::Small(cells)) => {
-                PointSetIter::Small(cells.iter().copied())
-            }
-            Self::Hybrid(HybridPointSet::Sparse { cells, .. }) => {
-                PointSetIter::Sparse(cells.iter().copied())
-            }
-            Self::Hybrid(HybridPointSet::Dense { words, .. }) => {
-                PointSetIter::Dense(DensePointSetIter {
-                    words,
-                    word_index: 0,
-                    remaining: 0,
-                })
-            }
+            Self::Hybrid(set) => set.iter(),
         }
     }
 }
@@ -4747,7 +4913,7 @@ struct Solve {
     representative: Vec<Cell>,
     pts: HashMap<Cell, PointSet>,
     /// Points-to facts not yet propagated over the source's established copy edges.
-    pending_pts: HashMap<Cell, Vec<Cell>>,
+    pending_pts: HashMap<Cell, PointSet>,
     external_sources: HashMap<Cell, BTreeSet<String>>,
     /// External-origin facts not yet propagated over established copy edges.
     pending_external_sources: HashMap<Cell, Vec<String>>,
@@ -4986,18 +5152,51 @@ impl Solve {
             .pts
             .entry(cell)
             .or_insert_with(|| PointSet::new(hybrid));
-        let mut added = Vec::new();
+        let mut added = PointSet::new(hybrid);
         for &object in objects {
             if dst.insert(object) {
-                added.push(object);
+                added.insert(object);
             }
         }
         if !added.is_empty() {
             self.points_to_facts_inserted =
                 self.points_to_facts_inserted.saturating_add(added.len());
-            self.pending_pts.entry(cell).or_default().extend(added);
+            match self.pending_pts.entry(cell) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(added);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().union_disjoint(added);
+                }
+            }
             self.enqueue(cell);
         }
+    }
+
+    fn union_pts_delta(&mut self, cell: Cell, objects: &PointSet) {
+        if objects.is_empty() {
+            return;
+        }
+        let cell = self.canonical(cell);
+        let hybrid = self.hybrid_points_to;
+        let added = self
+            .pts
+            .entry(cell)
+            .or_insert_with(|| PointSet::new(hybrid))
+            .union_delta(objects);
+        if added.is_empty() {
+            return;
+        }
+        self.points_to_facts_inserted = self.points_to_facts_inserted.saturating_add(added.len());
+        match self.pending_pts.entry(cell) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(added);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().union_disjoint(added);
+            }
+        }
+        self.enqueue(cell);
     }
 
     fn add_external_sources(&mut self, cell: Cell, sources: &[String]) {
@@ -5722,7 +5921,7 @@ impl Solve {
         self.pending_pts = self
             .pts
             .iter()
-            .map(|(&cell, objects)| (cell, objects.iter().collect()))
+            .map(|(&cell, objects)| (cell, objects.clone()))
             .collect();
         self.pending_external_sources = self
             .external_sources
@@ -5849,7 +6048,10 @@ impl Solve {
             self.steps += 1;
             self.maybe_report_progress();
             self.queued.remove(&n);
-            let pts_delta = self.pending_pts.remove(&n).unwrap_or_default();
+            let pts_delta = self
+                .pending_pts
+                .remove(&n)
+                .unwrap_or_else(|| PointSet::new(self.hybrid_points_to));
             let external_delta = self.pending_external_sources.remove(&n).unwrap_or_default();
             let new_successors = self.pending_succ.remove(&n).unwrap_or_default();
 
@@ -5859,7 +6061,7 @@ impl Solve {
                     .copy_fact_pairs_processed
                     .saturating_add(pts_delta.len().saturating_mul(successors.len()));
                 for successor in successors {
-                    self.add_pts_batch(successor, &pts_delta);
+                    self.union_pts_delta(successor, &pts_delta);
                     self.add_external_sources(successor, &external_delta);
                 }
             }
@@ -5870,8 +6072,8 @@ impl Solve {
                 let all_pts = self
                     .pts
                     .get(&n)
-                    .map(|set| set.iter().collect::<Vec<_>>())
-                    .unwrap_or_default();
+                    .cloned()
+                    .unwrap_or_else(|| PointSet::new(self.hybrid_points_to));
                 let all_external_sources = self
                     .external_sources
                     .get(&n)
@@ -5881,7 +6083,7 @@ impl Solve {
                     .copy_fact_pairs_processed
                     .saturating_add(all_pts.len().saturating_mul(new_successors.len()));
                 for &successor in &new_successors {
-                    self.add_pts_batch(successor, &all_pts);
+                    self.union_pts_delta(successor, &all_pts);
                     self.add_external_sources(successor, &all_external_sources);
                 }
                 self.succ.entry(n).or_default().extend(new_successors);
@@ -5894,7 +6096,7 @@ impl Solve {
                     .load_pairs_processed
                     .saturating_add(ps.len().saturating_mul(pts_delta.len()));
                 for p in ps {
-                    for &o in &pts_delta {
+                    for o in &pts_delta {
                         self.note_direct_access(o);
                         self.add_copy(o, p);
                     }
@@ -5925,7 +6127,7 @@ impl Solve {
                     .store_pairs_processed
                     .saturating_add(qs.len().saturating_mul(pts_delta.len()));
                 for (q, omega_source) in qs {
-                    for &o in &pts_delta {
+                    for o in &pts_delta {
                         self.note_direct_access(o);
                         if self.is_external(q) {
                             self.add_pts_with_source(o, q, omega_source.as_deref());
@@ -5964,7 +6166,7 @@ impl Solve {
                     .gep_pairs_processed
                     .saturating_add(gs.len().saturating_mul(pts_delta.len()));
                 for (off, p) in gs {
-                    for &o in &pts_delta {
+                    for o in &pts_delta {
                         let f = self.field_of(o, off);
                         self.add_pts(p, f);
                     }
@@ -6130,6 +6332,47 @@ mod tests {
             PointSet::Hybrid(HybridPointSet::Sparse { .. })
         ));
         assert_eq!(set, expected);
+    }
+
+    #[test]
+    fn hybrid_point_set_union_delta_keeps_dense_changes_wordwise() {
+        let mut destination = PointSet::new(true);
+        let mut source = PointSet::new(true);
+        for cell in 0..200 {
+            destination.insert(cell);
+        }
+        for cell in 100..300 {
+            source.insert(cell);
+        }
+
+        let delta = destination.union_delta(&source);
+        assert!(matches!(
+            destination,
+            PointSet::Hybrid(HybridPointSet::Dense { .. })
+        ));
+        assert!(matches!(
+            delta,
+            PointSet::Hybrid(HybridPointSet::Dense { .. })
+        ));
+        assert_eq!(destination, (0..300).collect::<HashSet<_>>());
+        assert_eq!(delta, (200..300).collect::<HashSet<_>>());
+    }
+
+    #[test]
+    fn hybrid_point_set_union_delta_sparsifies_small_dense_remainder() {
+        let mut destination = PointSet::new(true);
+        let mut source = PointSet::new(true);
+        for cell in 0..200 {
+            destination.insert(cell);
+            source.insert(cell);
+        }
+        source.insert(200);
+        source.insert(201);
+
+        let delta = destination.union_delta(&source);
+        assert!(matches!(delta, PointSet::Hybrid(HybridPointSet::Small(_))));
+        assert_eq!(delta, [200, 201].into_iter().collect::<HashSet<_>>());
+        assert!(destination.union_delta(&source).is_empty());
     }
 
     fn load_m1_4(name: &str) -> (Pir, Pag) {
