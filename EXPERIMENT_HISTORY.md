@@ -369,3 +369,40 @@ copy-fact pairs from 13.88M to 33.50M, and load/store/GEP pairs from 294k/241k/1
 443 substitutions, six fanout groups). Memcpy work remains 6.084M pairs. All five client-visible
 exports were byte-identical in every pair. The O0 quotient therefore needs targeted profiling or
 admission-aware gating before it can be considered a general forced-solve optimization.
+
+### Incremental complete-copy biclique factoring (2026-07-31)
+
+`PANGS_ANDERSEN_COPY_BICLIQUES=1` isolates exact fanout factoring from the broader offline
+quotient. Sources are grouped only when their complete nonempty successor sets are identical and
+the replacement strictly reduces edges; an `S x D` group becomes `S -> union -> D`. The pass is
+rerun after every indirect-call activation batch, including resume rounds after propagation has
+already begun. New source-to-union edges therefore receive complete-set seeds under the existing
+pending-edge protocol, and later source deltas use ordinary semi-naive propagation. Synthetic
+union cells remain propagation-only and never appear as pointee identities. The offline quotient
+uses the same extracted pass, preserving its earlier behavior.
+
+On YAPET O1 the isolated pass found four groups, removed 218 edges, and added four union nodes. On
+fully admitted YAPET O0 it found six groups, removed 145 edges, and added six nodes. Ten
+interleaved release pairs pinned to one CPU used native hybrid deltas in both arms:
+
+| YAPET case | Baseline wall / user / RSS | Bicliques wall / user / RSS | Change |
+| --- | ---: | ---: | ---: |
+| O1, normal budget | 0.916 s / 0.892 s / 60,530 KiB | 0.963 s / 0.938 s / 60,279 KiB | wall +5.1%, RSS -0.4% |
+| O0, `u64::MAX` | 1.077 s / 1.038 s / 77,563 KiB | 1.088 s / 1.051 s / 77,140 KiB | wall +1.0%, RSS -0.5% |
+
+All five client-visible export families were byte-identical in every pair. Focused tests cover
+factoring after an already completed propagation, a second callback-like fanout expansion, later
+points-to facts traversing the rewired graph, non-pointee union cells, and rejection of partial
+fanout overlap. The isolated result is not a YAPET speedup: the edge reduction is real but does
+not amortize the extra propagation node and changed worklist/SCC schedule. The switch therefore
+remains default-off; its value in the earlier O1 quotient result cannot be separated from the
+larger equation simplification without a more controlled propagation schedule.
+
+### Copy-biclique standard-corpus profile (2026-07-31)
+
+With the standard admission budget and hybrid points-to sets disabled,
+copy bicliques had very little impact. 
+The corpus confirms that exact edge reduction does not offset the
+extra union-node propagation and changed SCC schedule under normal admission.
+Based on these results, the experiment has been discarded.
+It may need a propagation schedule designed to exploit the factored shape.
