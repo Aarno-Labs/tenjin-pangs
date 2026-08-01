@@ -406,3 +406,30 @@ The corpus confirms that exact edge reduction does not offset the
 extra union-node propagation and changed SCC schedule under normal admission.
 Based on these results, the experiment has been discarded.
 It may need a propagation schedule designed to exploit the factored shape.
+
+### Receiver-payload corpus profile after `mem2reg` (2026-08-01)
+
+`scripts/profile_receiver_payloads.py` used a fresh release binary and current
+`mem2reg`-transformed inputs, not cached results. It ran all 52 top-level corpus modules
+(including OpenSSL and both Vim inputs) at the normal 200,000 budget, plus a forced-full
+(`u64::MAX`) chibicc O1 pair. Hybrid points-to sets remained at their standard default
+(disabled); all other Andersen experiment variables were scrubbed, and both arms enabled only
+profiling while the experimental arm additionally set `PANGS_ANDERSEN_RECEIVER_PAYLOADS=1`.
+
+The prototype is not viable as a general opt-in. Of the 52 standard pairs, 44 completed in both
+arms. Across the 43 complete pairs with nonzero wall time, total wall rose from 71.96 to 520.17 s
+(+623%; geometric-mean ratio 1.675, median 1.333), and aggregate RSS rose from 5.23 to 54.43 GiB
+(+940%; geometric mean 3.44x, median 3.03x). Cairo O1 grew from 4.22 s/288 MiB to 382.70 s/5.96
+GiB, YAPET O1 from 1.36 s/82 MiB to 17.31 s/214 MiB, and mbedTLS from 1.08 s/103 MiB to 8.56
+s/479 MiB. The receiver arm timed out on Curl O1, FreeType, and Placebo; Vim (both variants),
+OpenSSL, and SQLite O0/O1 exposed resource failures or a baseline timeout. The OpenSSL and SQLite
+payload arms were terminated when their RSS reached 24 GiB and 22/8.7 GiB respectively, preventing
+further host-memory escalation.
+
+Precision also changed broadly: 10 complete pairs changed callgraph output, adding 400,983 and
+removing 552 indirect-call edges across 792 changed callsites. ModRef changed in nine pairs,
+stationarity in four, audit in three, and globals in one. Receiver summaries were inferred in ten
+complete modules; most had incomplete-origin payload rows. The forced-full chibicc O1 pair was the
+exceptional performance result (5.51 s/236 MiB baseline versus 1.02 s/174 MiB payload), but it
+also changed five indirect edges (one removed) and therefore does not rescue the general design.
+Keep this feature disabled pending a bounded-context design and precision validation.
