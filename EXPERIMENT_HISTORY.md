@@ -355,3 +355,17 @@ audit, and stationarity were byte-identical for every paired comparison. Focused
 chains, diamonds, static cycles, independent/late generators, load/store/GEP/memcpy closure,
 original client query IDs, and non-pointee synthetic fanout nodes; the full workspace test suite
 and formatting checks pass. The prototype remains default-off pending broader corpus evaluation.
+
+YAPET O0 behaves materially differently. Ten interleaved baseline/hash-versus-quotient pairs at
+the normal 200,000 budget each took 0.216 s on average, with 64,186 versus 64,253 KiB RSS and
+46.23 versus 45.76 ms solver time. Both retain the same 5,876-node oversize fallback. The quotient
+does run on the admitted residue (28 substitutions and two fanout groups), but cannot reach the
+dominant component and has no measurable end-to-end effect. With full admission (`u64::MAX`), ten
+pairs averaged 1.585 s/1.401 s solver/102,942 KiB baseline versus 1.549 s/1.370 s/101,884 KiB
+quotient (about 2% in each measure), but with wide 1.09--2.28 s and 1.26--1.75 s wall ranges. This
+is not evidence of a reliable win: a representative profile increased steps from 95,949 to 131,103,
+copy-fact pairs from 13.88M to 33.50M, and load/store/GEP pairs from 294k/241k/1.50M to
+698k/566k/3.20M, despite reducing the initial graph from 1,317 to 717 edges (six static-SCC merges,
+443 substitutions, six fanout groups). Memcpy work remains 6.084M pairs. All five client-visible
+exports were byte-identical in every pair. The O0 quotient therefore needs targeted profiling or
+admission-aware gating before it can be considered a general forced-solve optimization.
