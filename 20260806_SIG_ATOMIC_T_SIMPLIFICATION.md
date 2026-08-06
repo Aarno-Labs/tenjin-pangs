@@ -347,6 +347,55 @@ one-directional.
 exactly one reads outside the certificate; §3 deleted; one field where four
 stood.
 
+## S9. Do not redefine `word_sized_scalar` in this feature (third round)
+
+**Remove from scope:** the redefinition of `word_sized_scalar` (dropping the
+spelling condition), partial-detail retention at `value: false`, the `codes`
+failure vocabulary and its alignment-code split, the change to `Facts::validate`'s
+detail/value invariant, the `DISPOSITION.md` §2 fact-table amendment, the
+`spelling_recovered` certificate diagnostic, and the measurement re-baselining
+obligation. **Keep:** §A's walker, projecting the recovered spelling into the
+existing `type_spelling`.
+
+**Why it was never necessary.** The bore flag fails `word_sized_scalar` on the
+spelling condition *alone* — width 32, align 32, class integer, signed true are
+all already recovered correctly. §A's walk reports `type_spelling:
+"sig_atomic_t"` from the typedef beneath the `volatile` node, and the fact becomes
+true on its existing definition. The redefinition serves a **disjoint**
+population — globals with no recoverable spelling at all, from anonymous or
+nameless terminal types — which this feature never reaches, because §C requires
+positive typedef evidence before it will recognize a signal flag. Signal-flag mode
+therefore always has a spelling and never exercises the spelling-free path.
+
+**Two structural consequences.**
+
+1. **v5 changes no fact.** With §B out, the entire fact layer — `Facts`, its
+   validator, its schema definition, `not_word_sized`, and the
+   `DISPOSITION.md` §10.2 funnels — is untouched, and v5 becomes purely a
+   certificate-payload version. "This feature changes no fact" is a materially
+   stronger and simpler claim than "this feature changes one fact", and it
+   deletes two of the ten cross-document amendments outright.
+2. **The Phase-1 corpus predicate gets as tight as it can be.** Permitted
+   movement is confined to globals whose declared type is a *qualified typedef*,
+   attributable per-global to a chain a reviewer can read in the source. The
+   whole class of globals that would have gained `codes` and newly-visible
+   partial detail — noise around the handful that actually moved — stops
+   existing. And since a `volatile`-qualified typedef still fails
+   `volatile-access` at the detailed recipe, the movement is plausibly *empty* at
+   Phase 1; the bore flag itself does not move, it reaches class D.
+
+**What must not be lost.** The deferral is recorded as a Non-goal and in D3 with
+its own falsifier, and the deferred change is named with what it owns: the
+spelling-free population, the `codes` vocabulary, the alignment relaxation, and
+the re-baselining note. A test asserts the *current* behavior in both directions —
+a spelling-free aligned integer is still `word_sized_scalar: false` with no
+detail — so the deferral is a decision the suite records rather than an omission
+a later reader mistakes for a bug.
+
+**Net:** §2 of the schema freeze reduces to "the fact layer is unchanged"; the
+`codes` vocabulary, its ordering rules, and four scalar-fact tests go; golden
+class C becomes inert; two amendments disappear.
+
 ## Risk register
 
 1. **S2 (F1) is the one cut that changes a safety argument.** The claim is that F2's
@@ -370,3 +419,8 @@ stood.
    from "no mode recorded".** `kind: "plain"` states the first and the second is
    unrepresentable, which is the intent — but a future genuinely-optional variant
    would reopen it (D4b's falsifier).
+7. **S9 defers a real improvement, which means someone must actually write it.**
+   The deferred change is cheap and now well-specified, but a deferral with no
+   owner becomes a permanent gap that reads, in the code, as a fact that
+   inexplicably requires a source spelling. The Non-goal, D3, and the
+   both-directions test are the hooks; a follow-up note is the missing artifact.

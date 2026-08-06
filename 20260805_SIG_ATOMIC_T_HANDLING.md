@@ -52,28 +52,29 @@ The pipeline rejects it for two independent reasons, and misses a related fact:
 The correction has four parts:
 
 1. Preserve structured qualified-type evidence — typedef names and qualifiers —
-   rather than only the outer DWARF type name (§A).
-2. Stop making source type spelling a prerequisite for the semantic
-   `word_sized_scalar` fact; materializability is a separate question (§B).
-3. Keep rejecting arbitrary volatile accesses, but admit a narrowly certified
+   rather than only the outer DWARF type name, and project the recovered spelling
+   into the existing `type_spelling` (§A). This alone clears the coarse gate;
+   `word_sized_scalar` keeps its current definition (§B).
+2. Keep rejecting arbitrary volatile accesses, but admit a narrowly certified
    `volatile sig_atomic_t` access mode when every access lowers to
    target-guaranteed lock-free atomics (§C, §E).
-4. Recognize `__sysv_signal` as a signal registration, so the async-signal
+3. Recognize `__sysv_signal` as a signal registration, so the async-signal
    context and lock-free guard are real inputs to the certificate (§D).
 
 The expected disposition for this global is then `atomic`, not `unhandled`: on
 the observed APG bore module, coverage 25/26 → 26/26 and the atomic count 1 → 2,
 assuming the detailed access recipe passes unchanged.
 
-Three of the four parts are **not** local to this global:
+Two of the three parts are **not** local to this global:
 
-- Part 2 changes the meaning of a published fact — `word_sized_scalar` has a
-  schema invariant, a cascade-adjacent role, and a measurement funnel
-  (`DISPOSITION.md` §10.2) — so it is a schema change.
-- Part 4 changes module-wide facts: a newly recognized registration stops being
+- Part 3 changes module-wide facts: a newly recognized registration stops being
   an unresolved external effect for *every* global's phase analysis, so other
   globals' `phase_stationarity` results may move in the same run.
-- Part 3 is the only genuinely narrow part, and the one that must fail closed.
+- Part 2 carries the only schema change — the `atomic` certificate's payload, and
+  with it a version bump. **No fact changes**, so the fact layer, its validator,
+  and the disposition measurement funnels are untouched.
+- Part 2 is also the only genuinely narrow part, and the one that must fail
+  closed.
 
 The single-global coverage claim is therefore a consequence to verify, not the
 acceptance criterion; the criterion is the whole corpus disposition distribution
@@ -146,8 +147,8 @@ the top-level node, and a `DW_TAG_volatile_type` node has no name, so
 basic type — hence no spelling alongside correct integer/signedness facts. Any
 qualified typedef can lose its spelling this way.
 
-**2. `word_sized_scalar` mixes semantics and materialization.** It
-(`crates/pangs-clients/src/lib.rs:2322`) currently requires:
+**2. The coarse gate then fails on the missing spelling.** `word_sized_scalar`
+(`crates/pangs-clients/src/lib.rs:2322`) requires:
 
 ```text
 type spelling exists
@@ -157,13 +158,11 @@ scalar class exists
 integer/enum signedness is known
 ```
 
-Only the last four establish the machine-level scalar property; the spelling
-serves a source rewrite recipe, and its absence does not make an aligned `i32`
-non-scalar. The false fact also drops the known width, class, and signedness from
-the manifest, because `Facts::validate`
-(`crates/pangs-manifest/src/lib.rs:430`) *requires* detail presence to match the
-boolean exactly — so retaining partial evidence is a schema change, not a
-field-population change.
+The bore flag satisfies the last four and fails the first, so the whole rejection
+traces to defect 1. (Whether the spelling condition belongs in this fact at all is
+a separate question — the last four establish the machine-level scalar property
+and an absent spelling does not make an aligned `i32` non-scalar — but answering
+it is not needed here, and §B explains why it is deferred.)
 
 **3. Detailed atomic lowering rejects all volatile sites.**
 `atomic_access_recipe` (`crates/pangs-clients/src/lib.rs:1879`) rejects a site
@@ -269,53 +268,53 @@ IR operations, not volatile ones, and is a different case with a different
 recipe. `is_const` on a mutable global definition is contradictory evidence and
 likewise fails closed.
 
-### B. Separate scalar eligibility from source materializability
+### B. Recover the spelling; do not redefine the fact
 
-Redefine `word_sized_scalar.value` to mean only:
+§A's walker is the whole fix for the coarse gate. `word_sized_scalar`
+(`crates/pangs-clients/src/lib.rs:2322`) requires a type spelling among its five
+conditions, and the bore flag fails **only** that one — width, alignment, class,
+and signedness are already recovered correctly. Once the walk reports
+`type_spelling: "sig_atomic_t"` from the typedef beneath the `volatile` node, the
+fact becomes true on its existing definition and the global reaches detailed
+access lowering, where it fails on `volatile-access` until §E.
 
-```text
-known scalar class
-known required signedness
-nonzero supported width
-align_bits == size_bits          (unchanged from today)
-```
+**No fact changes meaning. This feature does not touch the manifest's fact
+layer.** A global whose debug metadata yields no spelling at all continues to
+fail the coarse gate exactly as it does today; that is unchanged behavior, not a
+new rejection.
 
-Do not require `type_spelling`. Preserve the observed `size_bits`, `class`, and
-`signed` even when the boolean is false, and record the decisive failure in a new
-`codes` array (closed vocabulary and emission order frozen in §"Schema v5" §2).
+An earlier draft went further — drop the spelling requirement from
+`word_sized_scalar` entirely, preserve `size_bits`/`class`/`signed` when the
+boolean is false, and add a closed `codes` vocabulary for the decisive failure.
+That is a real improvement and it is **deferred to its own change**, because it
+is a different change addressing a different population:
 
-**Keep the alignment condition as strict equality.** Relaxing it to "ABI
-alignment sufficient for the width" newly admits over-aligned globals
-(`__attribute__((aligned(64))) int`), whose declarations a materializer must then
-preserve or justify dropping; that widening moves the eligibility population in a
-way this note's corpus assertions cannot attribute, and belongs in its own change.
+- Its beneficiaries are globals with **no recoverable spelling at all** —
+  anonymous or nameless terminal types, absent metadata — which is disjoint from
+  the qualified-typedef population this feature repairs. Nothing here needs it:
+  §C requires positive typedef evidence before it will recognize a signal flag,
+  so signal-flag mode always has a spelling and never exercises the spelling-free
+  path.
+- It changes the meaning of a published fact carrying a schema invariant
+  (`Facts::validate`'s detail/value coupling,
+  `crates/pangs-manifest/src/lib.rs:430`), a cascade-adjacent role, and a
+  measurement funnel (`DISPOSITION.md` §10.2). The `not_word_sized` counter
+  (`crates/pangs-clients/src/lib.rs:452`) and the baselines in
+  `notes/disposition_atomic_perglobal_remeasurement_2026-07-17.md` and siblings
+  would stop being comparable and would need an explicit re-baselining note.
+- Bundled, the two make the Phase-1 corpus diff unattributable: every global
+  gaining `codes` and newly-visible partial detail would be noise around the
+  handful whose spelling was actually recovered.
+
+Kept separate, this feature's Phase-1 predicate is as tight as it gets: a global
+may move **only** if its declared type is a qualified typedef whose spelling the
+walk now recovers, and each movement is attributable to that global's own typedef
+chain. The separate change, when it is written, owns the population above, the
+`codes` vocabulary, the alignment-code split, and the re-baselining note.
 
 Rewritability stays in `source_materialization`
 (`crates/pangs-clients/src/lib.rs:1310`), which keys on `meta.file`/`meta.line`
 and returns `blocked` with `declaration-source-unmapped` when absent. Unchanged.
-
-A missing **type spelling** does not block: per M.0/M.3 no stage consumes
-`recipe.declaration.type_spelling`. Record its absence as a certificate
-diagnostic instead:
-
-```json
-{ "type_evidence": { "spelling_recovered": false,
-                     "detail": "qualified debug type carries no outer name" } }
-```
-
-A spelling-free scalar passing every other gate is therefore certified *and*
-materializable — a real coverage gain Phase 1's acceptance criterion expects. The
-`sig_atomic_t` path still requires positive typedef evidence; it must not infer
-signal safety from an aligned integer.
-
-Two consumers move with the redefinition: `Facts::validate`'s detail/value
-invariant (`pangs-manifest/src/lib.rs:430`) and `SCHEMA_VERSION`
-(`pangs-manifest/src/lib.rs:12`, → **5**); and the `not_word_sized` counter
-(`pangs-clients/src/lib.rs:452`) plus the would-be-eligibility funnel of
-`DISPOSITION.md` §10.2, whose historical values in
-`notes/disposition_atomic_perglobal_remeasurement_2026-07-17.md` and siblings
-stop being comparable — the re-measurement note must say so rather than silently
-re-baselining.
 
 ### C. Add a signal-atomic type fact
 
@@ -997,20 +996,22 @@ Everything above is design rationale; this section is the contract. The JSON in
 earlier sections is illustrative and, where it disagrees with this section,
 wrong. MUST/MUST NOT are normative; the field paths are exact.
 
-The v5 **fact-layer** delta is one field: `word_sized_scalar`. Everything else
-new lives inside the `atomic_eligibility` certificate payload.
+**The v5 fact-layer delta is empty.** Every change lives inside the
+`atomic_eligibility` certificate payload; `Facts`, its validator, and its schema
+definition are untouched. The version bump exists because that payload is
+restructured incompatibly (§4), not because any fact moved.
 
 ### 1. Encoding conventions
 
 Already the manifest's conventions, restated so the new fields do not invent
 alternatives.
 
-- **v5 is defined once, in Phase 1.** The *entire* v5 contract —
-  `word_sized_scalar` and every signal-flag payload and validator rule below —
-  lands with the version bump in Phase 1, **dormant**: types, schema definitions,
-  and validator rules all present, the signal-flag rules vacuously satisfied
-  because nothing emits the `signal_flag` variant until Phase 3, which then
-  changes emission only. This is what keeps Phase 1 independently shippable. **A
+- **v5 is defined once, in Phase 1.** The *entire* v5 contract — every
+  `atomic_mode` variant and validator rule below — lands with the version bump in
+  Phase 1, **dormant** where it is not yet exercised: types, schema definitions,
+  and validator rules all present, the `signal_flag` rules vacuously satisfied
+  because nothing emits that variant until Phase 3, which then changes emission
+  only. This is what keeps Phase 1 independently shippable. **A
   partially-introduced v5, in which two incompatible contracts both call
   themselves v5, is forbidden.**
 - **Absence, not null, for optional detail.** Every *new* optional detail field
@@ -1027,63 +1028,32 @@ alternatives.
   the existing vocabulary (`volatile-access`, `word-sized-scalar`). New enums are
   closed: an unlisted value is invalid, not forward-compatible.
 
-### 2. `facts.word_sized_scalar`
+### 2. The fact layer, unchanged
 
-| Field | v4 | v5 |
-|---|---|---|
-| `value` | bool, required | unchanged |
-| `type_spelling` | present iff `value` | **optional, independent of `value` in both directions** |
-| `size_bits` | present iff `value` | required iff `value` is true; optional when false |
-| `class` | present iff `value` | required iff `value` is true; optional when false |
-| `signed` | present iff `value` | required when `value` is true and `class ∈ {integer, enum}`; otherwise optional |
-| `codes` | — | **new**: `Vec<String>`, required non-empty iff `value` is false |
+`facts.word_sized_scalar` keeps its v4 definition exactly: five conditions
+including `type_spelling`, and `Facts::validate`'s detail/value coupling
+(`crates/pangs-manifest/src/lib.rs:429-441`) requiring detail presence to match
+the boolean. No `codes` array, no partial-detail retention, no change to
+`meta.type_spelling`, which remains required-but-nullable. §B states what a later
+change would do here and why it is not this one.
 
-The invariant replacing `crates/pangs-manifest/src/lib.rs:429-441`:
+What moves is what the *walker* reports into that unchanged field:
+`type_spelling` is now populated for a qualified typedef where it previously came
+back `None`. That is a value change on an existing field with an unchanged
+contract — visible in goldens (§7 class C/D), invisible to every validator.
 
-```text
-value == true   ⇒  size_bits present ∧ size_bits ≥ 1
-                ∧  class present
-                ∧  (class ∈ {integer, enum} ⇒ signed present)
-                ∧  codes absent or empty
-value == false  ⇒  codes present ∧ non-empty
-detail fields MAY be present when value is false   (the v4 prohibition is deleted)
-type_spelling is constrained by neither direction
-```
-
-`codes` reuses the certificate-slot noun rather than `diagnostics`, which is
-already an opaque `Value` on `Certificate::Failed`. **Closed vocabulary**,
-emitted in exactly this evaluation order, deduplicated, and **not sorted** —
-fixed evaluation order is what the existing `codes` arrays do, and it keeps
-golden diffs stable:
-
-```text
-unknown-scalar-class
-unknown-signedness
-zero-width
-unsupported-atomic-width
-unknown-alignment
-under-aligned
-over-aligned
-```
-
-The alignment codes are split rather than named `insufficient-alignment` because
-the gate is strict equality and therefore rejects **over**-alignment too:
-`over-aligned` means the equality gate, whose relaxation §B defers to a separate
-change; `under-aligned` means a packed or exotic declaration;
-`unknown-alignment` covers `align_bits: None`, which today falls into the same
-silent bucket because `None != Some(width)`.
-
-`meta.type_spelling` is unchanged and remains required-but-nullable. When both
-are present they are the same string; neither gates `value`.
+`facts.signal_context_access` is likewise unchanged, and gains one reader: §4's
+value coupling requires the certificate's mode variant to agree with it.
 
 ### 3. Version handling
 
 **There is one live contract.** No consumer reads a v4 manifest, so
-`Facts::validate` takes no `schema_version` parameter and there is no
-dual-invariant path: a document is validated against §2 or refused by the
-existing version gate (`crates/pangs-manifest/src/lib.rs:903-904`). v4 fixtures
-are regenerated, not grandfathered — a fixture validated under rules nothing
-emits is a test of a dead contract.
+`Facts::validate` keeps its current signature, there is no dual-invariant path,
+and a document is either validated or refused by the existing version gate
+(`crates/pangs-manifest/src/lib.rs:903-904`). Because the fact layer did not
+change, the only thing a v4 document would fail on is its certificate payload —
+which is reason enough to refuse it rather than to build a compatibility path for
+it. v4 fixtures are regenerated, not grandfathered.
 
 One rule survives, and it is about stage consistency within a run rather than
 compatibility across versions: **`pangs-dispose` never reads or writes `schema_version`.** It
@@ -1279,8 +1249,10 @@ Two further placement rules are load-bearing:
   `"source-mapped" | "blocked"`, `code` required iff blocked, and
   `declaration-source-unmapped` its only code. Spelling absence is a certificate
   diagnostic, not a status (M.0).
-- `certificate.type_evidence` is a new optional diagnostic object: advisory,
-  carrying no invariant, and MUST NOT be read by any guard.
+- There is no certificate-level `type_evidence` diagnostic. An earlier draft
+  added one to record spelling *absence*, which §B's deferral makes unreachable:
+  a certified atomic always has a spelling. `type_evidence` exists only as the
+  `signal_flag` variant's member, where it is proof rather than diagnosis.
 
 ### 5. Ordering, determinism, and two names that are not one name
 
@@ -1310,8 +1282,8 @@ Two further placement rules are load-bearing:
 
 | Artifact | Change |
 |---|---|
-| `schemas/disposition-manifest.schema.json` | the `word_sized_scalar` `oneOf` (lines 139-166) *is* the v4 invariant and must be replaced by §2; `signal_lock_free`'s definition **removed**; a discriminated `atomic_mode` definition added (`oneOf` on `kind`, so each variant's required members are schema-enforced); `run.analysis.target_probes` added as optional |
-| `crates/pangs-manifest/src/lib.rs` | `SCHEMA_VERSION = 5`; `WordSizedScalar.codes: Vec<String>` with `#[serde(default, skip_serializing_if = "Vec::is_empty")]`; `AtomicMode` as an internally-tagged enum, replacing `signal_lock_free`; `KNOWN_PROBES` beside `RECOGNIZED_SIGNAL_TYPEDEFS`; one validator for the §4 value coupling; `Facts::validate` keeps its current signature |
+| `schemas/disposition-manifest.schema.json` | the `word_sized_scalar` `oneOf` (lines 139-166) is **untouched**; `signal_lock_free`'s definition **removed**; a discriminated `atomic_mode` definition added (`oneOf` on `kind`, so each variant's required members are schema-enforced); `run.analysis.target_probes` added as optional |
+| `crates/pangs-manifest/src/lib.rs` | `SCHEMA_VERSION = 5`; `AtomicMode` as an internally-tagged enum, replacing `signal_lock_free`; `KNOWN_PROBES` beside `RECOGNIZED_SIGNAL_TYPEDEFS`; one validator for the §4 value coupling. `Facts` and `Facts::validate` are unchanged |
 | `crates/pangs-pir/src/lib.rs` | `Global.type_evidence: Option<ScalarTypeEvidence>` with `#[serde(default)]`, matching every other optional field there (lines 158-183), so existing PIR fixtures parse and re-serialize unchanged; plus `section` and `thread_local` in Phase 3 |
 | `crates/pangs-api/src/lib.rs:142` | `GlobalInfo` mirrors the same optional fields |
 | `schemas/globals.schema.json` | **unaffected, deliberately** — `additionalProperties: false` over a fixed key set, no type fields at all; it is not the type channel and MUST NOT gain one |
@@ -1334,22 +1306,31 @@ artifact a non-Rust consumer can check. The rest of the payload stays as it is.
 
 | Class | Condition | Permitted change |
 |---|---|---|
-| **A** | every manifest | `schema_version` 4 → 5 in the header. No per-global change follows from the bump alone |
-| **B** | `word_sized_scalar` was already true | **nothing changes** |
-| **C** | was false, still false | gains non-empty `codes`; gains the `size_bits`/`class`/`signed` detail that v4 suppressed |
-| **D** | false → true, still fails atomic later | class C's detail, plus `value: true`; `atomic_eligibility.codes` changes from `["word-sized-scalar"]` to the later decisive code; `diagnostics` changes from `access_lowering: skipped` to an observed-site count. Disposition unchanged |
-| **E** | false → true, now certifies | class D's changes, plus `atomic_eligibility` Failed → Certified with recipe and `source_materialization`; `cascade_chosen`/`chosen` → `atomic`; `cascade_trace` shortens; `run.dispose.measurement_report` moves |
+| **A** | every manifest | `schema_version` 4 → 5 in the header; every atomic certificate's `signal_lock_free` replaced by `atomic_mode`. **No fact changes**, and no per-global change follows from the bump alone |
+| **B** | `word_sized_scalar` was already true | class A only |
+| **C** | was false, and the walk recovers no spelling | class A only — the global still fails `word-sized-scalar`, with the same value and no new detail |
+| **D** | spelling recovered; still fails atomic later | class A, plus `word_sized_scalar.value` false → true with its `type_spelling`, `size_bits`, `class`, `signed` now populated per the **unchanged** v4 invariant; `atomic_eligibility.codes` changes from `["word-sized-scalar"]` to the later decisive code; `diagnostics` changes from `access_lowering: skipped` to an observed-site count. Disposition unchanged |
+| **E** | spelling recovered; now certifies | class D's changes, plus `atomic_eligibility` Failed → Certified with recipe, `atomic_mode`, and `source_materialization`; `cascade_chosen`/`chosen` → `atomic`; `cascade_trace` shortens; `run.dispose.measurement_report` moves |
 
 Class D is the bore flag's own Phase-1 diff: it clears the coarse gate and fails
-on `volatile-access` instead.
+on `volatile-access` instead. Class C is the population §B defers — visibly
+inert here, which is the point of deferring it.
+
+Phase 1 also switches the signal gate onto probes, so a sixth movement is
+possible and is **not** a class above: a signal-context global whose operations
+no probe covers goes `Certified → Failed[signal-atomic-not-lock-free]`. It is
+expected to be empty on the corpus (see §"Corpus-level acceptance") and is
+reviewed separately, because unlike A–E it is a coverage loss.
 
 The review rule is attribution, not line count: **every changed line must be
 attributable to its global's class, and every global must be in a class its facts
-justify.** Two defect signals a plausible-looking diff can carry: a class-B
-global changing at all, and a class-E global whose `word_sized_scalar` was false
-for a reason other than a missing spelling. Aggregate consistency is separate:
-`not_word_sized` must decrease by exactly |D| + |E|, and `measurement_report` may
-move only if |E| > 0.
+justify.** Three defect signals a plausible-looking diff can carry: a class-B or
+class-C global changing beyond the header, a class-D or class-E global whose
+declared type is *not* a qualified typedef (nothing else can have recovered a
+spelling), and any `word_sized_scalar` detail appearing at `value: false`, which
+would mean the deferred redefinition leaked in. Aggregate consistency is
+separate: `not_word_sized` must decrease by exactly |D| + |E|, and
+`measurement_report` may move only if |E| > 0 or the probe switch moved a global.
 
 ## Materialization contract
 
@@ -1373,12 +1354,14 @@ the rest concrete rather than adding a stage.
    certification guard**, which would create a second, divergeable definition of
    atomic eligibility.
 
-Consequently there is no `declaration-type-unspelled` blocked code. Under M.1–M.3
-a certified atomic with a null `type_spelling` is fully executable: the C→C stage
-plants a marker needing only the symbol and coordinates (already covered by
-`declaration-source-unmapped`), and the Rust stage derives the atomic type from
-`scalar_class`/`signed`/`size_bits`. Nothing consumes
-`recipe.declaration.type_spelling`; it is emitted for diagnosis only.
+Consequently there is no `declaration-type-unspelled` blocked code, and there is
+no need for one: `word_sized_scalar` keeps requiring a spelling (§B), so a
+certified atomic always has one. The observation that no stage would need it
+stands and is worth recording — the C→C stage plants a marker needing only the
+symbol and coordinates, and the Rust stage derives the atomic type from
+`scalar_class`/`signed`/`size_bits` (M.3), so nothing consumes
+`recipe.declaration.type_spelling` — but under this feature that is a *reason the
+deferred redefinition is safe to make later*, not a state this feature produces.
 
 ### M.1 Which stage removes `volatile`
 
@@ -1745,17 +1728,17 @@ nothing for the motivating case.
 Nothing here touches A′–D′ or any solver semantics; the changes are confined to
 PIR lowering, the F-layer fact scans, and the manifest schema.
 
-1. **`DISPOSITION.md` §2 (fact table)** — no fact is added. The `word_sized_scalar` row loses "type
-   spelling exists" and gains the statement that detail fields survive a false
-   value, becoming a machine-level fact with materializability split out. The
+1. **`DISPOSITION.md` §2 (fact table)** — **no row changes.** No fact is added,
+   and `word_sized_scalar` keeps its definition including the spelling condition
+   (§B); the deferred redefinition owns that row when it is written. The
    `signal_context_access` row is unchanged, but gains two sentences: that it is
    a *restricting* fact computed by a widening query and therefore never
    discharges a permitting conjunct, and that the `atomic` certificate's mode
    variant must agree with it — the one place a certificate reads a sibling fact.
    §1's guard-shape rule gains the general statement (rule 14).
-2. **`DISPOSITION.md` §3 / §3.2** — `schema_version: 5` per the freeze above: the
-   detail/value coupling invariant is replaced, `word_sized_scalar` gains
-   `codes`, and the `atomic_eligibility` certificate **replaces**
+2. **`DISPOSITION.md` §3 / §3.2** — `schema_version: 5` per the freeze above.
+   The fact layer and its detail/value coupling invariant are untouched; the sole
+   change is that the `atomic_eligibility` certificate **replaces**
    `signal_lock_free` with the tagged `atomic_mode`. v5 is not backward
    compatible with v4 payloads and does not claim to be; the schema-v4 sentence
    in §2 is replaced rather than extended, and §3.3's stage-ownership rule gains
@@ -1774,9 +1757,10 @@ PIR lowering, the F-layer fact scans, and the manifest schema.
    **`DESIGN.md` §8** takes the same assumption in its audited soundness
    inventory, phrased as the single residual, not as "volatile is replaced by
    Relaxed".
-5. **`DISPOSITION_PLAN.md` §1.5** — the evidenced/certificate encodings D1a's
-   golden test freezes; the scalar failure-diagnostic vocabulary belongs there,
-   not only here. `source_materialization`'s code list is unchanged.
+5. **`DISPOSITION_PLAN.md` §1.5** — the certificate encodings D1a's golden test
+   freezes gain `atomic_mode`. The evidenced-bool encodings and
+   `source_materialization`'s code list are unchanged, and no scalar
+   failure-diagnostic vocabulary is added (§B).
 6. **`DISPOSITION.md` §5.3 (stage actions)** — the `atomic` row is unchanged, but
    the section describes demotion as though every materialization failure had a
    channel. It should state that the Rust-side rewriter owns no manifest section,
@@ -1799,9 +1783,11 @@ PIR lowering, the F-layer fact scans, and the manifest schema.
    effect), so a reader does not infer that adding `__sysv_signal` summarizes an
    external call.
 10. **`HOWTO_MEASURE_DISPOSITION_COVERAGE.md` and the `notes/disposition_*`
-    baselines** — `not_word_sized` and the would-be-eligibility counters change
-    meaning at Phase 1; the re-measurement note must say so rather than
-    re-baselining silently.
+    baselines** — **no amendment.** `not_word_sized` and the would-be-eligibility
+    counters keep their meaning, so historical values stay comparable and only
+    their *values* move, by the attributable amount in §7. This is the direct
+    payoff of deferring §B; the separate change inherits the re-baselining
+    obligation.
 
 ## Implementation sequence
 
@@ -1813,14 +1799,13 @@ conjunction names a fact from each.
 - Add a bounded qualified-type walker in `pangs-pir`; preserve typedef chains and
   qualifiers in PIR/API metadata, populating `type_spelling` from
   `typedef_chain[0]`.
-- Split `word_sized_scalar` from source spelling/materialization, keeping the
-  alignment condition at equality, and emit granular scalar failure diagnostics
-  with partial evidence retained.
-- Record spelling absence as a certificate diagnostic, **not** a
-  `source_materialization` block (M.0); `declaration-source-unmapped` keeps its
-  meaning and remains the only blocked code.
+- **Do not touch `word_sized_scalar`, `Facts`, or `Facts::validate`** (§B). The
+  only fact-layer effect is that `type_spelling` is populated where the walk now
+  recovers it; the invariant it satisfies is the v4 one, unchanged.
+  `declaration-source-unmapped` keeps its meaning and remains the only blocked
+  `source_materialization` code.
 - Bump `SCHEMA_VERSION` to 5 and land the **complete** freeze — not only the
-  parts Phase 1 exercises: `word_sized_scalar.codes`; `AtomicMode` with all three
+  parts Phase 1 exercises: `AtomicMode` with all three
   variants and its discriminated schema definition; `KNOWN_PROBES`; the §4 value
   coupling validator; the exact-version requirement for stages that preserve
   earlier sections; and regenerated goldens. Phase 1 emits only
@@ -1948,27 +1933,28 @@ special volatile admission.
 
 ### Scalar-fact tests
 
-- An aligned supported integer with missing spelling is a semantic word-sized
-  scalar and — given a source-mapped declaration and a clean access recipe —
-  certifies `atomic` with `source_materialization: source-mapped`, carrying only
-  a `type_evidence` diagnostic.
+- A `volatile`-qualified aligned integer typedef becomes `word_sized_scalar:
+  true` where it was false, through spelling recovery alone — asserted alongside
+  the PIR test so the fact-level consequence of §A is pinned, not inferred.
+- **The fact's definition is unchanged**, pinned in both directions: an aligned
+  supported integer whose debug metadata yields *no* spelling is still
+  `word_sized_scalar: false`, and its record still carries no `size_bits`,
+  `class`, or `signed` detail. This is the deferred population (§B), and the test
+  exists so that deferral is a decision the suite records rather than an omission
+  someone later reads as a bug.
+- No `codes` array appears on any `word_sized_scalar` record, and
+  `Facts::validate` rejects one that carries detail at `value: false` — the v4
+  invariant, still live.
 - A certified global whose declaration has no file/line is certified with
   `source_materialization: blocked`, and the cascade still chooses `atomic`; a
   test asserts the cascade does not consult materialization status (M.0).
-- Unsupported width, unknown class, and unknown signedness receive distinct
-  codes. Alignment codes are distinguished: `align < size` → `under-aligned`,
-  `align > size` (e.g. `__attribute__((aligned(64))) int`) → `over-aligned`,
-  absent alignment → `unknown-alignment`; no case emits a code implying the wrong
-  direction.
-- Partial evidence remains visible when the boolean is false, and `codes` is
-  non-empty exactly then.
 
 ### Schema tests
 
-- A v5 document with `value: false` and no `codes` is rejected; one with detail
-  present at `value: false` is accepted. A v5 document is refused by a v4 reader
-  through the existing version gate, and a v4 document is refused by a v5 reader
-  the same way — there is no dual-invariant path to test.
+- A v5 document is refused by a v4 reader through the existing version gate, and
+  a v4 document is refused by a v5 reader the same way — there is no
+  dual-invariant path to test, and no `word_sized_scalar` behavior to test either,
+  since §2 changes nothing there.
 - A stage that preserves earlier sections refuses a document whose
   `schema_version` differs from its own, rather than re-emitting under the
   input's version.
@@ -1999,11 +1985,13 @@ special volatile admission.
   `signal_safe` modes and passes the full validator, which is demonstrably live
   (a hand-built bad `signal_flag` payload in the same run is rejected).
 - Golden classification (§7): a fixture corpus with one global of each class B–E
-  regenerates with exactly the permitted changes, and the two defect signals are
-  asserted to fail — a class-B global perturbed by one field, and a class-E
-  global whose prior failure code was `unsupported-atomic-width` rather than a
-  missing spelling. Aggregate: `not_word_sized` decreases by exactly |D| + |E|,
-  and `measurement_report` is byte-identical when |E| = 0.
+  regenerates with exactly the permitted changes, and the three defect signals are
+  asserted to fail — a class-B or class-C global perturbed beyond the header, a
+  class-E global whose prior failure code was `unsupported-atomic-width` rather
+  than a missing spelling, and any record carrying `word_sized_scalar` detail at
+  `value: false`. Aggregate: `not_word_sized` decreases by exactly |D| + |E|, and
+  `measurement_report` is byte-identical when |E| = 0 and the probe switch moved
+  nothing.
 - A signal-flag global that fails any check has `recipe: null` and a
   `diagnostics.signal_flag.status: "recipe-withheld"` record. An `atomic` pin on
   that slot is rejected `no-recipe` **with** `accept_risk = true`, not merely
@@ -2212,18 +2200,21 @@ materializer both pass; they must not be obtained by overriding failed guards.
 
 ### Corpus-level acceptance
 
-The bore assertions are necessary, not sufficient — two of the three parts change
-facts for every module, so acceptance is on the corpus distribution.
+The bore assertions are necessary, not sufficient — the registry repair changes
+facts for every module and the probe switch changes a gate for every
+signal-context global, so acceptance is on the corpus distribution.
 
-- After Phase 1 the distribution **may legitimately move**, in one direction and
-  for one reason: a global whose sole atomic failure was `word-sized-scalar`
-  caused by a missing spelling, and which passes every remaining gate including
-  the access recipe, now certifies and chooses `atomic`. The predicate is on
-  *cause*, not count:
+- After Phase 1 the distribution **may legitimately move** in two directions,
+  each with one cause: a global whose sole atomic failure was
+  `word-sized-scalar` caused by a spelling the §A walk now recovers, and which
+  passes every remaining gate including the access recipe, certifies and chooses
+  `atomic`; and a signal-context global whose operations no probe covers loses a
+  certificate it should not have had. The predicate is on *cause*, not count:
 
   ```text
-  permitted:  atomic_eligibility Failed[word-sized-scalar] → Certified,
-              with no other fact or code changing
+  permitted:  atomic_eligibility Failed[word-sized-scalar] → Certified, for a
+              global whose declared type is a qualified typedef and whose
+              spelling the §A walk now recovers, with no other fact changing
   permitted:  Certified → Failed[signal-atomic-not-lock-free], only for a global
               with signal_context_access: true whose recipe's operations are not
               covered by any probe — the gate switch correcting an unbacked claim
@@ -2231,7 +2222,16 @@ facts for every module, so acceptance is on the corpus distribution.
   defect:     any global moving IN for any other reason
   defect:     any change to a global whose word_sized_scalar was already true
               and whose signal_context_access is false
+  defect:     any word_sized_scalar record gaining codes or partial detail —
+              that is the deferred redefinition leaking in (§B)
   ```
+
+  Because the spelling gain is confined to qualified typedefs, and a
+  `volatile`-qualified one still fails `volatile-access` at the detailed recipe,
+  the first movement is expected to be **small and possibly empty** at Phase 1 —
+  the bore flag itself does not move, it reaches class D. That near-inertness is
+  the deliberate result of splitting §B out: what remains is attributable
+  per-global to a typedef chain a reviewer can read.
 
   The second permitted movement is expected to be **empty** on the current
   corpus: it is entirely `x86_64`, and both probes cover 8/16/32/64. A non-empty
@@ -2269,8 +2269,13 @@ facts for every module, so acceptance is on the corpus distribution.
 - Accepting non-lock-free atomic implementations in signal context.
 - Supporting arbitrary compound operations in the first implementation.
 - Weakening access-set completeness or Ω handling to improve this result.
+- Redefining `word_sized_scalar`. Dropping its spelling condition, retaining
+  partial detail at `value: false`, and adding a failure-code vocabulary are
+  worthwhile and deferred to their own change, which owns the population they
+  serve and the measurement re-baselining they cause (§B, D3).
 - Relaxing the `align_bits == size_bits` condition; over-aligned scalars are a
-  separate change with a separate population.
+  separate change with a separate population, and belong with the redefinition
+  above.
 - Replacing `supported_atomic_widths`, or populating the target profile with
   arches no test exercises.
 - Making the lock-free width table configurable at all: a new arch is a patch
@@ -2308,11 +2313,17 @@ than a silent weakening of their proof.
 is a bug report about the general atomic recipe and gets its own note; it does
 not retroactively justify migrating both lists here.
 
-**D3. Missing source spelling blocks nothing.** It makes `word_sized_scalar` true
-and is recorded as a certificate diagnostic, since no stage consumes
-`recipe.declaration.type_spelling` (M.0, M.3).
-*Falsifier:* a materializer stage that genuinely requires the C spelling — which
-would be a change to M.3's type mapping, not a discovery about this fact.
+**D3. This feature recovers the spelling; it does not redefine
+`word_sized_scalar`.** The bore flag fails that fact on the spelling condition
+alone, so §A's walker clears it without touching the fact's definition, its
+validator invariant, or its measurement funnel. Dropping the spelling requirement
+outright would serve a *disjoint* population — globals with no recoverable
+spelling at all — that this feature never reaches, since §C requires positive
+typedef evidence before recognizing a signal flag. Bundling them would make the
+Phase-1 corpus diff unattributable (§B).
+*Falsifier:* a `volatile sig_atomic_t` in the corpus whose typedef chain is
+present but whose spelling the positional rule still fails to recover. That would
+mean §A's walk is incomplete, and the repair is in the walk, not in the fact.
 
 **D4. The no-elision property gets an audit contract, not a guarantee**: a
 declared envelope of probes × widths × rustc floor × LLVM majors × opt levels, a
