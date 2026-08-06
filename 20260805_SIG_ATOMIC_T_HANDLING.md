@@ -152,7 +152,14 @@ Four findings, each of which changed a decision in this note:
    under C11 §7.14.1.1p5 — `exit_semaphore` is an ordinary static referred to
    from a handler — so this rejection costs nothing; F2 rejects some *defined*
    programs too, but not this one. The ordinary build certifies.
-4. **All three candidates use the save/restore idiom**, whose restore call
+4. **All three candidate handlers have empty or internal-only call closures**, so
+   F2b costs nothing on the observed population: bore's `sigint_handler_xjtr_0`
+   and openssl's `recsig` call nothing at all, and libusb's
+   `sighandler → request_exit` closure is two internal functions. The threaded
+   libusb build is the only one that calls out (`semaphore_give`), and it fails
+   both conjuncts. A handler that logs or exits would be rejected, which is the
+   intended scope of the idiom rather than an accident of the check.
+5. **All three candidates use the save/restore idiom**, whose restore call
    (`signal(sig, saved_handler)`) has a loaded operand and is therefore an
    unresolved registration. So `H`'s widening is live in **every** real instance,
    not as a corner case — which is why the FSA narrowing (§D) is a required part
@@ -640,7 +647,7 @@ the module's arch and the declaration's width are in
 every access satisfies the ordinary atomic recipe constraints
 the access set is complete and every site is in the admitted operation set
 the handler analysis yields a certified registration              (below)
-every h ∈ H_g is transitively confined to this flag alone         (F2, below)
+every h ∈ H_g is memory- and effect-confined to this flag alone   (F2, below)
 ```
 
 F2 is the *pattern condition*, derived under "Why dropping `volatile` is
@@ -823,11 +830,100 @@ otherwise untouched — same semantics, same widening computation, same consumer
 **F2. Handler-observer confinement** — a hard conjunct of certification:
 
 ```text
-F2(g)  ≡  ∀ h ∈ H_g :  transitive_static_accesses(h) ⊆ { g }
+F2(g)  ≡  ∀ h ∈ H_g :  F2a(h, g)  ∧  F2b(h)
+
+F2a(h, g)  ≡  transitive_static_accesses(h) ⊆ { g }        memory confinement
+F2b(h)     ≡  transitive_effects(h) = ∅                    effect confinement
 ```
 
-Failure code `signal-handler-access-not-confined`, witnessed by the offending
-function and object.
+Failure codes `signal-handler-access-not-confined` (F2a, witnessed by the
+offending function and object) and `signal-handler-effect-not-confined` (F2b,
+witnessed by the function and the offending operation).
+
+**Why memory confinement alone is not enough.** F2a bounds what a handler
+*touches*; the proof below needs a bound on what it *does*. A handler can be
+perfectly memory-confined and still be observable:
+
+```c
+static void h(int s) { write(2, "!", 1); flag = 1; }
+```
+
+`transitive_static_accesses(h) = { flag }`, so F2a passes. But the refinement
+argument breaks concretely. Under `volatile`, the poll loop reads the flag every
+iteration; under `Relaxed`, redundant-load elimination lets ordinary code run
+extra iterations before noticing. The source execution offered as the match is
+the one where the signal arrived later — and in *that* execution the handler's
+`write` also happens later, i.e. **after** those extra iterations, whereas the
+transformed execution has it before them. The traces differ, so no legal source
+execution corresponds and the transformation is unsound.
+
+The same hole admits `_exit`, `abort`, `raise`, `longjmp`, inline assembly, and
+any other externally visible act. None is a memory effect, so no `ModuleWide`
+summary catches any of them — "every other effect class shows up as `ModuleWide`
+and therefore fails F2a" is **not** a proof that could be given here, and F2b
+exists because it cannot be.
+
+**F2b, stated bluntly.** `transitive_effects(h) = ∅` means the transitive
+direct-and-indirect call closure of `h` over the final call graph contains:
+
+```text
+no call to an external or unmodeled function        (I/O, exit, abort, raise,
+                                                     longjmp, allocation, …)
+no inline assembly
+no indirect call that is not fully resolved         (else the closure is unbounded)
+no volatile or atomic access other than to g
+```
+
+External summaries are deliberately not consulted: a registry entry saying an
+external is pure or read-only bounds its *memory* effect, which is F2a's concern,
+and says nothing about observability. So F2b admits no external call at all,
+regardless of summary.
+
+This is coarse, and it is affordable because the idiom it certifies is a
+flag-setter. All three corpus candidates pass: bore's `sigint_handler_xjtr_0` and
+openssl's `recsig` have empty call closures, and libusb's
+`sighandler → request_exit` closure is two internal functions with no external
+call. libusb's threaded build fails F2b at `semaphore_give` as well as F2a at
+`exit_semaphore` — the two conjuncts agree there, which is the expected
+relationship rather than a redundancy to remove.
+
+F2b also makes F2a's computation well-founded: with no external or unresolved
+call in the closure, `transitive_static_accesses` never has to summarize one.
+
+**Why only the handler, and not the polling code.** F2 constrains handler
+executions and says nothing about ordinary code, which may do arbitrary I/O. That
+asymmetry is not an oversight — it is the shape of the refinement argument. When
+a permitted transformation delays ordinary code's *noticing* of the flag, the
+matching source execution is one with later signal delivery; in that execution
+ordinary code performs exactly the same extra work in exactly the same order, so
+its effects replay identically. Only the *handler's* effects move relative to
+everything else, because it is the handler whose position in the trace the
+delivery time determines. Constraining the poller would buy nothing; leaving the
+handler unconstrained loses the argument.
+
+**`transitive_static_accesses` is defined here, not assumed.** It is a *may* set
+over the transitive closure of `h` in the final call graph:
+
+| Case | In the set? |
+|---|---|
+| read or write of a module global, at any `Via` (`Direct`/`Aliased`/`Unknown`) | **yes** — a may-access counts |
+| function-scope `static` | **yes** — an ordinary global in LLVM, with no special case |
+| thread-local (`__thread`, `_Thread_local`) | **yes** — "static *or thread* storage duration" |
+| a synthetic backing object in some global's storage closure (`DISPOSITION.md` §3) | **yes**, under its owner's key |
+| access through a pointer whose points-to set contains any of the above | **yes** — ordinary mod/ref expansion |
+| taking the address of a static without dereferencing it | **yes** — counted as an access, see below |
+| heap memory reached *through* a global (`g_head->next->x`) | the heap cell is not static storage, but the `g_head` read is, so the access is caught by that read |
+| heap memory reached through a parameter or local only | no — not static storage, and F2b bounds how it could have been obtained |
+| `AffectedGlobals::ModuleWide` | treated as **every** static object, hence fails unless the module has only `g` |
+| effects of an external or unresolved call | **unreachable** — F2b rejects the handler before this set is consulted |
+
+Address-taking is counted even though it neither reads nor writes. The precise
+rule would be that a taken address is harmless unless it escapes to somewhere it
+can be dereferenced, and under F2b the only places it can go are internal
+functions already in the closure — but "counted" is one line, costs nothing on
+the corpus (no candidate handler takes an address), and removes a clause someone
+would otherwise have to reason about. Failing closed is the cheaper correct
+answer.
 
 **Both halves read the same may-summary, and both err toward rejection.** A
 handler enters `H_g` when its transitive access set *may* contain `g`, and is
@@ -920,9 +1016,12 @@ on both flags. The general argument:
   Other threads are not observers here because `volatile` never ordered the flag
   against anything they could see, so they were already unordered — see below.
 - A handler execution that reads or writes the flag has the flag in its
-  transitive access set, hence is in `H_g` by construction, and F2 forbids that
-  set from containing any other static-storage object — so it cannot correlate
-  the flag with anything else. The transitive reading is load-bearing at exactly
+  transitive access set, hence is in `H_g` by construction. F2a then forbids that
+  set from containing any other static-storage object, and F2b forbids the
+  execution from having any externally visible effect at all — so there is
+  nothing it could correlate the flag *with*. Both conjuncts are needed for this
+  step: F2a alone leaves a memory-confined handler that writes to a file
+  descriptor, whose position in the trace a permitted transformation would move. The transitive reading is load-bearing at exactly
   this step: under the earlier `A ∩ H` scoping it was simply false whenever the
   access sat one call below the handler, and F1's subsumption argument failed
   with it.
@@ -1658,9 +1757,10 @@ which §4.2 always permits without `accept_risk`.
 8. `Relaxed` does not preserve the number or relative order of accesses;
    redundant-load elimination, dead-store elimination, store-to-load forwarding,
    and coalescing are all permitted on `monotonic`. Certification therefore
-   requires F2 — transitive handler-observer confinement for every function that
-   may run as a handler *and* may reach this flag (`H_g`) — under which every
-   such transformation is behavior-refining, because the only observer that could
+   requires F2 — for every function that may run as a handler and may reach this
+   flag (`H_g`), transitive confinement of both its static-memory accesses (F2a)
+   and its externally visible effects (F2b) — under which every such
+   transformation is behavior-refining, because the only observer that could
    distinguish them is a handler execution that F2 forbids from touching anything
    else,
    and signal arrival timing is unconstrained. Without the pattern, dropping
@@ -1851,6 +1951,11 @@ special volatile admission.
   filtered-copy version is the obvious implementation and looks right. F2 is an
   admission conjunct, not a diagnostic: a failure yields `recipe: null`. F2 is
   per-global; no whole-program pass is required anywhere in this feature.
+- Land F2 as **two** conjuncts with distinct failure codes — F2a over
+  `transitive_static_accesses` per the §E table, F2b over the handler's
+  transitive call closure. F2b is not an add-on to F2a: a memory-confined handler
+  that calls `write` passes F2a and must fail F2b, and that fixture is the one to
+  write first.
 - Thread it into atomic access recipe construction, gated on the full §E
   conjunction — including the certified registration, **not**
   `signal_context_access`; the permissive-looking fact is the wrong one.
@@ -2013,6 +2118,26 @@ total (a permitting conjunct true for every global).
   doubles as a diagnostic for a pre-existing source bug. The multi-flag case is a
   separate fixture below, and is *not* pre-existing UB — the two must not be
   conflated into one "F2 catches broken programs" test.
+- **F2b: a memory-confined handler with an observable effect is rejected.** The
+  central fixture for effect confinement, because it passes F2a: a handler whose
+  only static access is the flag but which also calls `write(2, "!", 1)` fails
+  `signal-handler-effect-not-confined`. Companion fixtures, each memory-confined
+  and each rejected: a handler calling `_exit`, one containing inline assembly,
+  one making an unresolved indirect call, and one performing a volatile access to
+  a *different* object. A test asserting F2a passes on all five, alongside the F2
+  verdict failing, pins that F2b is doing independent work rather than shadowing
+  F2a.
+- **An external summary does not rescue F2b**: a handler calling an external that
+  the registry classifies pure/read-only is still rejected. A summary bounds
+  memory effects, not observability, and this test exists because "it's summarized
+  as pure, so it's harmless" is the plausible relaxation.
+- **`transitive_static_accesses` boundary cases**, one fixture each, all rejected:
+  a handler touching a function-scope `static`; a `__thread` object; a synthetic
+  backing object belonging to another global's storage closure; a static reached
+  only through a pointer with `Via::Unknown`; and a handler that merely takes
+  `&other_static` without dereferencing it. Their sibling — a handler reading heap
+  memory reached through a *parameter*, touching no global — passes, pinning that
+  the set is static storage and not "all memory".
 - **F2 is transitive — the libusb shape is the regression.** A handler that
   accesses no static itself but calls a non-address-taken helper writing both the
   flag and a second static **fails**. This is the exact case the earlier `A ∩ H`
@@ -2216,7 +2341,9 @@ facts for every module — so acceptance is on the corpus distribution.
 - Phase 3 must report an **F2 census**, because confinement is the conjunct most
   likely to make the feature inert unnoticed: per module, the number of
   signal-flag candidates, and per candidate the size of `H_g` and whether every
-  member is transitively confined. Report `|H|` beside `|H_g|`: a candidate whose
+  member is confined, split by which conjunct failed — an F2a-dominated census
+  means handlers touch other state, an F2b-dominated one means they call out, and
+  the two suggest different responses. Report `|H|` beside `|H_g|`: a candidate whose
   `H_g` equals the module-wide `H` means some handler has a `ModuleWide` summary
   and the relevance filter bought nothing, which is the shape that makes the
   feature inert. A corpus in which *most* candidates are rejected by F2
