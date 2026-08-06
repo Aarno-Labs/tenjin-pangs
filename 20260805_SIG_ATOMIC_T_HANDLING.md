@@ -11,22 +11,22 @@ preserves what the source relied on. It does **not** do so on its own —
 `Relaxed` permits transformations `volatile` forbids — and the condition that
 makes it sound is stated as an admission conjunct (F2), not as commentary.
 
-Two asymmetries recur and are stated once here:
+One asymmetry recurs and is stated once here. **Permitting vs. restricting
+facts.** A fact that *restricts* (kills a strategy, tightens a gate) is
+conservative when widened; a fact that *permits* is conservative only when
+narrowed. A permitting conjunct may never be discharged by a restricting fact's
+widening query (rule 10).
 
-- **Permitting vs. restricting facts.** A fact that *restricts* (kills a
-  strategy, tightens a gate) is conservative when widened; a fact that *permits*
-  is conservative only when narrowed. A permitting conjunct may never be
-  discharged by a restricting fact's widening query (rule 14).
-- **An over-broad registry entry is conservative in every consumer; an
-  over-broad lock-free width is the silent-deadlock gate.** They therefore get
-  opposite treatment: the registry is an ordinary extensible name table (§D),
-  while the lock-free width table has no configuration surface at all (§E).
+Rationale for rejected alternatives is recorded only where the rejected shape is
+the *obvious* implementation and would look correct — §E's filtered-copy access
+query, the materializer's count-and-residue reference check, and the removed
+whole-program sole-flag condition. Everything else that was considered and cut is
+simply absent; a design note is not a changelog.
 
-The simplification rationale for this revision — which conditions were removed,
-and the arguments licensing each removal — is recorded in
-[20260806_SIG_ATOMIC_T_SIMPLIFICATION.md](20260806_SIG_ATOMIC_T_SIMPLIFICATION.md).
-That note is the record of *why* the design is shaped this way; this note is the
-design.
+Two pieces of adjacent work were deliberately **not** folded into this feature
+and are enumerated in §"Spun-off work": the unbacked lock-free width heuristic
+that the general atomic recipe uses, and the `atomic` strategy's materialization
+contract. Neither is a prerequisite.
 
 ## Executive summary
 
@@ -49,17 +49,16 @@ The pipeline rejects it for two independent reasons, and misses a related fact:
    reports `signal_context_access: false` and treats registration as an
    unresolved external effect elsewhere in the analysis.
 
-The correction has four parts:
+The correction has three parts:
 
 1. Preserve structured qualified-type evidence — typedef names and qualifiers —
    rather than only the outer DWARF type name, and project the recovered spelling
    into the existing `type_spelling` (§A). This alone clears the coarse gate;
    `word_sized_scalar` keeps its current definition (§B).
-2. Keep rejecting arbitrary volatile accesses, but admit a narrowly certified
-   `volatile sig_atomic_t` access mode when every access lowers to
-   target-guaranteed lock-free atomics (§C, §E).
-3. Recognize `__sysv_signal` as a signal registration, so the async-signal
-   context and lock-free guard are real inputs to the certificate (§D).
+2. Recognize `__sysv_signal` as a signal registration, so the async-signal
+   context is a real input to the certificate (§D).
+3. Keep rejecting arbitrary volatile accesses, but admit a narrowly certified
+   `volatile sig_atomic_t` access mode (§C, §E).
 
 The expected disposition for this global is then `atomic`, not `unhandled`: on
 the observed APG bore module, coverage 25/26 → 26/26 and the atomic count 1 → 2,
@@ -67,18 +66,18 @@ assuming the detailed access recipe passes unchanged.
 
 Two of the three parts are **not** local to this global:
 
-- Part 3 changes module-wide facts: a newly recognized registration stops being
+- Part 2 changes module-wide facts: a newly recognized registration stops being
   an unresolved external effect for *every* global's phase analysis, so other
   globals' `phase_stationarity` results may move in the same run.
-- Part 2 carries the only schema change — the `atomic` certificate's payload, and
+- Part 3 carries the only schema change — the `atomic` certificate's payload, and
   with it a version bump. **No fact changes**, so the fact layer, its validator,
   and the disposition measurement funnels are untouched.
-- Part 2 is also the only genuinely narrow part, and the one that must fail
+- Part 3 is also the only genuinely narrow part, and the one that must fail
   closed.
 
 The single-global coverage claim is therefore a consequence to verify, not the
 acceptance criterion; the criterion is the whole corpus disposition distribution
-(§"Tests and acceptance criteria").
+(§"Corpus-level acceptance").
 
 ## Observed case
 
@@ -177,13 +176,13 @@ is `@__sysv_signal(i32 2, void (i32)* @sigint_handler_xjtr_0)`, and the built-in
 list in `effective_registry_apis` (`crates/pangs-api/src/lib.rs:4177`) contains
 `pthread_create`, `thrd_create`, `signal`, and `sigaction` only. So the handler
 is not classified through the signal registry; `g_interrupted` incorrectly has
-`signal_context_access: false`; the atomic certificate does not demand its signal
-lock-free gate; mutex eligibility is not rejected for the most direct reason; and
-phase analysis retains an unresolved external effect at registration
-(`crates/pangs-clients/src/phase_stationarity.rs:716,757,772` — only a *modeled*
-registry callsite escapes the `has_unknown` widening). Accepting the atomic
-strategy without repairing this would produce the desired answer without proving
-the signal context that makes the answer safety-sensitive.
+`signal_context_access: false`; mutex eligibility is not rejected for the most
+direct reason; and phase analysis retains an unresolved external effect at
+registration (`crates/pangs-clients/src/phase_stationarity.rs:716,757,772` —
+only a *modeled* registry callsite escapes the `has_unknown` widening).
+Accepting the atomic strategy without repairing this would produce the desired
+answer without proving the signal context that makes the answer
+safety-sensitive.
 
 Two properties of this registry constrain the repair:
 
@@ -195,7 +194,7 @@ Two properties of this registry constrain the repair:
   unresolved-effect widening change.
 - **It is name-keyed, and its error directions are not symmetric.** A false
   positive is conservative in every consumer — a spurious `signal_context_access`
-  kills `mutex` and tightens `atomic`'s lock-free gate. A false *negative* is not
+  kills `mutex` and tightens `atomic`'s gate. A false *negative* is not
   conservative at all for those same two consumers, which is why a registration
   the analysis cannot fully resolve stays a registration (§D).
 
@@ -242,15 +241,15 @@ type_spelling =
 The outermost typedef is the name the declaration site used: under
 `typedef sig_atomic_t my_flag_t;` it is `my_flag_t`, and `__sig_atomic_t` shows
 only if the programmer wrote it. A "first *public* typedef" rule is rejected
-because operationalizing it requires guessing at naming convention (no leading
-double underscore, no underscore-plus-capital), which misfires on legitimate
-project typedefs and makes the spelling depend on identifier style.
+because operationalizing it requires guessing at naming convention, which
+misfires on legitimate project typedefs and makes the spelling depend on
+identifier style.
 
 This is the same `type_spelling` the PIR and API globals already carry; the walk
 populates it in cases that previously yielded `None`, and adds the chain and
-qualifiers beside it. There is no second name concept. The certificate's
-`typedef` field (§C) is a different thing — the *recognized standard* name,
-matched anywhere in the chain — and §"Schema v5" §5 states the distinction.
+qualifiers beside it. There is no second name concept: §C recognizes a signal
+flag by testing the *chain*, and the certificate records the chain, so no
+"recognized name" field is introduced anywhere.
 
 Three properties keep consumers from over-reading this shape:
 
@@ -312,39 +311,45 @@ walk now recovers, and each movement is attributable to that global's own typede
 chain. The separate change, when it is written, owns the population above, the
 `codes` vocabulary, the alignment-code split, and the re-baselining note.
 
+**This splitting rule is applied uniformly in this note**, and is the reason the
+lock-free width repair is also spun off (§"Spun-off work"): a change that moves a
+gate for a population this feature does not serve makes this feature's corpus
+diff unreadable, whatever its independent merit.
+
 Rewritability stays in `source_materialization`
 (`crates/pangs-clients/src/lib.rs:1310`), which keys on `meta.file`/`meta.line`
 and returns `blocked` with `declaration-source-unmapped` when absent. Unchanged.
 
-### C. Add a signal-atomic type fact
+### C. Signal-flag type evidence
 
-Signal-atomic `type_evidence` is a **type fact**, derived from debug type
-metadata alone; target
-capability and program context are admission conditions (§E), and mixing them
-reproduces the fact/policy conflation §B corrects. Derive it only when:
+Signal-flag type evidence is a **type fact**, derived from debug type metadata
+alone; target capability and program context are admission conditions (§E), and
+mixing them reproduces the fact/policy conflation §B corrects. Derive it only
+when:
 
 ```text
-typedef chain contains the implementation's standard sig_atomic_t typedef
+typedef chain contains a member of RECOGNIZED_SIGNAL_TYPEDEFS  ( = {"sig_atomic_t"} )
 qualifier chain includes volatile
 qualifier chain includes neither _Atomic nor const
 scalar class is integer
 width and alignment are known and mutually consistent
 ```
 
-Payload (normative placement in §"Schema v5" §4). It is the `type_evidence`
-member of the certificate's `atomic_mode` object; width and alignment are **not**
-repeated here — they live once, in `recipe.declaration`:
+The evidence recorded in the certificate is the chain itself and nothing else
+(normative placement in §"Schema v5"):
 
 ```json
-{ "typedef": "sig_atomic_t",
-  "typedef_chain": ["sig_atomic_t", "__sig_atomic_t"],
-  "volatile": true }
+{ "typedef_chain": ["sig_atomic_t", "__sig_atomic_t"] }
 ```
 
-Recognition allows platform-internal typedefs beneath the public `sig_atomic_t`,
-but the public name must be present unless a frontend supplies an equivalent
-explicit semantic tag. Do not maintain an open-ended heuristic list of names
-resembling `sig_atomic_t`.
+There is no `typedef: "sig_atomic_t"` field naming which member licensed
+recognition, and no `volatile: true` field. `RECOGNIZED_SIGNAL_TYPEDEFS` has one
+member, so the first would be a constant; and the variant does not exist unless
+the qualifier chain included `volatile`, so the second is one too. The chain is
+the evidence; the variant's existence is the claim. Recognition allows
+platform-internal typedefs beneath the public name, but the public name must be
+present unless a frontend supplies an equivalent explicit semantic tag. Do not
+maintain an open-ended heuristic list of names resembling `sig_atomic_t`.
 
 **What recognition is and is not.** This is a string match against a typedef
 chain, so a user's own `typedef int sig_atomic_t;` passes it. **Safety does not
@@ -353,23 +358,14 @@ enumerated §E conjuncts — integer scalar of a lock-free width, whole-object
 direct loads and stores only, complete access set, proven signal participation,
 handler-observer confinement, internal linkage, ordinary storage. A shadowing
 typedef satisfying all of those describes an object the transformation handles
-correctly. The typedef match is an **intent signal**, not a proof obligation.
+correctly. The typedef match is an **intent signal**, not a proof obligation, and
+therefore carries no provenance test: an earlier draft rejected repo-local
+typedef declarations, which is a guard on an intent signal and defends nothing
+the §E conjuncts do not already defend.
 
-Provenance narrows accidental recognition and is cheap (`DW_TAG_typedef` nodes
-carry a file; `RepoRoots::relative_source` distinguishes repo-local from external
-paths). Reject only on positive contrary evidence:
-
-```text
-typedef declared outside the analyzed repository  -> accepted (system header)
-typedef file unknown or unrecorded                -> accepted (no contrary evidence)
-typedef positively declared inside the repository -> rejected, code
-                                                     signal-typedef-shadowed
-```
-
-The fact is carried **inside the certificate's `atomic_mode` object**, its only
-consumer, which holds the schema-v5 fact-layer surface to the
-`word_sized_scalar` change alone. Promotion to a fact slot when a second consumer
-appears is schema v6 (D1).
+The evidence is carried **inside the certificate's `atomic_mode` object**, its
+only consumer, which holds the schema-v5 fact-layer surface to zero. Promotion to
+a fact slot when a second consumer appears is schema v6 (D1).
 
 ### D. Recognize `__sysv_signal` as a signal registration
 
@@ -383,41 +379,84 @@ Add one exact-name entry to the built-in table, with the same entry operand as
 ```
 
 Candidates such as `bsd_signal` are added the same way, each with a regression
-fixture. `RegistryApi`, `RegistryEntryResolution`, and `resolve_registry_entries`
-are otherwise unchanged.
+fixture. `RegistryEntryResolution` and `resolve_registry_entries` are otherwise
+unchanged.
 
-**A declaration precondition, not a signature check.** The entry applies only when
-the callee is an **external declaration**. A *defined internal* function named
-`signal` is not libc's, and the analysis already models its body; if that function
-forwards to libc, the inner call is itself a name match against an external
-declaration. This precondition is silent — nothing is unverified, so a diagnostic
-would be noise.
+**A declaration precondition.** The entry applies only when the callee is an
+**external declaration**. A *defined internal* function named `signal` is not
+libc's, and the analysis already models its body; if that function forwards to
+libc, the inner call is itself a name match against an external declaration. This
+precondition is silent — nothing is unverified, so a diagnostic would be noise.
 
-**No signature shape checking.** An earlier revision proposed a `RegistryShape`
-type checked against `Callsite.sig` and `Node.value_kind`. It is not worth its
-surface:
+#### Shapes are internal and built-in only
 
-- `AbiClass` cannot distinguish a pointer from an integer — both `int` and
-  `void (*)(int)` are `AbiClass::Integer` (`pangs-pir/src/lib.rs:640`), and under
-  opaque pointers no LLVM type inspection recovers the difference. The check's
-  real discriminating power is arity, `vararg`, and `cc`.
-- Its stated job is to stop a name collision from being read as libc's `signal`.
-  But a false positive is conservative in **every** consumer that reads
-  `signal_context_access`: phase analysis keeps its widening, `mutex` loses
-  eligibility, `atomic` tightens its lock-free gate.
-- The one consumer for which a false positive would *not* be conservative — §E's
-  volatile admission — does not read the registration at all. It reads the
-  certified positive access path (§E): the operand's *precise* pointees must
-  contain a function with a direct-call chain to a `Via::Direct` access on this
-  flag. For a spurious `signal` to admit a volatile access, its argument 1 would
-  have to point at a function that directly writes the candidate flag. That is
-  not a misconfiguration; that is a signal handler.
+The three signal entries carry a **shape** — arity and non-varargness, checked
+against `Callsite.sig`:
 
-Should a collision ever be observed, the minimal repair is an arity check on the
-entry operand's index, which needs no type representation.
+```text
+BUILTIN_SIGNAL_SHAPES         (a private constant in pangs-api)
+  signal          arity 2, not vararg
+  __sysv_signal   arity 2, not vararg
+  sigaction       arity 3, not vararg
+```
 
-**Resolution stays two-valued, and a mismatch is never a deletion.** Dropping a
-signal registration is not uniformly conservative:
+Four properties define the mechanism, and the first two are what make it cheap:
+
+- **It is not a field on `RegistryApi`.** The shapes live in a separate private
+  table keyed by name, so `RegistryApi` — the type `--registry-config`
+  deserializes — is genuinely unchanged and there is no serde field that could
+  leak into the configuration schema by accident. `RegistryShape` as a public,
+  configurable type is a non-goal until a real user-defined alias needs one.
+- **User-provided entries stay unchecked**, retaining exactly their current
+  conservative behavior. This is not an oversight to be tidied later. A built-in
+  entry is applied to every module without the operator asserting anything, so
+  the analysis is the party making the claim and should check what it can; a
+  `--registry-config` entry *is* the operator's assertion about their own
+  program, and that channel already means "I know my target". The asymmetry
+  follows from who is claiming what.
+- **A user entry replacing a built-in by name replaces its shape too** — that is,
+  the replacement is unchecked. This is the escape hatch: an operator whose
+  platform declares `signal` with a shape the table does not expect re-declares
+  the entry and gets the unchecked path, with no code change and no new flag.
+- **Arity and vararg only.** `AbiClass` cannot distinguish a pointer from an
+  integer — both `int` and `void (*)(int)` are `AbiClass::Integer`
+  (`pangs-pir/src/lib.rs:640`) — and under opaque pointers no LLVM type
+  inspection recovers the difference, so parameter *types* are not available to
+  check and never will be through this channel. Calling convention is
+  deliberately excluded: `cc` variation on these three libc names is a
+  portability trap rather than a discriminator.
+
+**Scope: signal entries only.** `pthread_create` and `thrd_create` stay unshaped.
+The reason is not that spawn collisions are less likely but that the two failure
+directions differ. Dropping a spurious *signal* registration loses only
+restricting facts, and the cost of keeping one is the documented over-conservatism
+D6's falsifier names (a global losing `mutex` eligibility to an unrelated
+`signal` symbol); the one consumer for which a false positive would *not* be
+conservative, §E's volatile admission, is independently protected by the
+certified-path requirement. Dropping a spurious *spawn* registration instead
+weakens a certificate — phase-stationarity's thread-writer kill rule — with no
+independent backstop, for no observed benefit. If a spawn-name collision is ever
+observed, the extension is one more row in the same private table.
+
+**A shape mismatch is not a registration.** This is the one place a name match is
+refused, and it must be read against the never-delete rule below, which it does
+not contradict:
+
+| Situation | What it means | Treatment |
+|---|---|---|
+| built-in name, shape matches, operand unresolved | it **is** libc's `signal`; we do not know the handler | registration, unresolved (never deleted) |
+| built-in name, shape mismatches | it is **not** libc's `signal` — a different function wearing the name | not a registration, with a diagnostic |
+| user-configured name, any shape | the operator asserted it | registration, unchecked |
+
+Deleting on operand unresolution would discard a real registration; declining on
+shape mismatch discards one that was never there. The residual risk is the table
+being wrong for some platform: bounded by three names whose shapes are fixed by
+C89 and POSIX and stable across targets, made visible by the diagnostic rather
+than silent, and recoverable through `--registry-config`. That combination is why
+the check can afford to be refusing rather than merely marking.
+
+**Resolution stays two-valued, and an unresolved operand is never a deletion.**
+Dropping a signal registration is not uniformly conservative:
 
 | Consumer | Effect of dropping the registration | Direction |
 |---|---|---|
@@ -426,8 +465,9 @@ signal registration is not uniformly conservative:
 | `atomic_eligibility` | skips the signal lock-free gate | **unsafe** |
 | §E volatile admission | conjunct fails, access rejected | safe |
 
-So a name match on an external declaration **is** a registration, and the only
-remaining question is whether its handler operand resolves — which
+So a name match on an external declaration of the expected shape **is** a
+registration, and the only remaining question is whether its handler operand
+resolves — which
 `resolve_registry_entries` already answers as
 `unresolved: external || !targeted` (`crates/pangs-api/src/lib.rs:4303`). An
 unresolved registration still sets `signal_context_access` and still widens
@@ -449,10 +489,8 @@ was never taken cannot be a registration operand. **FSA-compatible functions**
 (`void (*)(int)`) would be tighter and remains a defensible future refinement.
 
 After this fix, accesses reachable from `sigint_handler_xjtr_0` set
-`signal_context_access: true`; the atomic certificate must then require and
-record target-guaranteed lock-free operations for the width, and mutex must
-remain unavailable because a signal handler cannot safely take the proposed
-mutex.
+`signal_context_access: true`, and mutex remains unavailable because a signal
+handler cannot safely take the proposed mutex.
 
 The fix also has a module-wide effect that must be measured rather than assumed
 benign: the registration becomes a modeled registry call in phase analysis, so
@@ -467,18 +505,16 @@ Keep the existing `volatile-access` failure as the default. In
 following holds:
 
 ```text
-the global has positive signal-atomic type evidence                (§C)
-the global has a certified positive access path from a resolved
-  signal registration                                              (below)
-the global has internal linkage                                    (M.8)
+the global has signal-flag type evidence                          (§C)
+the global has internal linkage                                   (M.3)
 the global is ordinary storage: no section, not thread-local,
-  not alias-exposed                                                (below)
-one target probe covers this module's arch, the declaration's
-  width, and every operation the recipe emits                      (below)
+  no aliased global in the module                                 (below)
+the module's arch and the declaration's width are in
+  SIGNAL_FLAG_LOCK_FREE                                           (below)
 every access satisfies the ordinary atomic recipe constraints
 the access set is complete and every site is in the admitted operation set
-every function that both accesses this global and may run as
-  a handler accesses no other static-storage object            (F2, below)
+the handler analysis yields a certified registration              (below)
+every function in A ∩ H accesses no other static-storage object   (F2, below)
 ```
 
 F2 is the *pattern condition*, derived under "Why dropping `volatile` is
@@ -486,7 +522,7 @@ admissible". It is not hygiene: `Relaxed` does not preserve access count or
 relative order, and the argument that this is harmless holds only for a flag
 whose sole role is to convey signal arrival.
 
-The resolved-registration conjunct is what makes the C standard's `sig_atomic_t`
+The certified-registration conjunct is what makes the C standard's `sig_atomic_t`
 guarantee the *operative* reason the object is volatile, rather than an
 incidental type choice in front of some other access contract; §C alone would
 admit a `volatile sig_atomic_t` no handler ever touches. Requiring it costs a
@@ -500,11 +536,12 @@ ordinary-storage predicate instead.
 For v1, admission additionally requires:
 
 ```text
-is_definition == true ∧ constant initializer present   (already required by D3)
-linkage == internal                                    (M.8)
+is_definition == true ∧ constant initializer present   (already required by the
+                                                        atomic eligibility pass)
+linkage == internal                                    (M.3)
 no explicit section attribute                          (needs a new PIR fact)
 not thread-local                                       (needs a new PIR fact)
-not alias-exposed                                      (needs a new PIR fact)
+module has no aliased global                           (needs a new PIR fact)
 ```
 
 Phase 3 adds `section: Option<String>` and `thread_local: bool` to
@@ -531,114 +568,171 @@ for alias in aliases {
 
 Nothing records that this alias pointed at *this* global — the taint string names
 the alias, not its target — so "no external-linkage alias targets the global" is
-not a predicate over any fact that exists (rule 15). Nor does `bump_tainted` gate
+not a predicate over any fact that exists (rule 11). Nor does `bump_tainted` gate
 anything: it writes `LoweringStats::tainted_counts`, a metrics counter
 (`crates/pangs-pir/src/lib.rs:479`) read only by assertions in
 `crates/pangs-pir/tests/llvm_lowering.rs`. `violation_taint` is unrelated —
 module-wide it is `module_violation_tainted`, testing for inline assembly
 (`crates/pangs-solve/src/lib.rs:1222`); per-global it comes from violation
-findings (`crates/pangs-clients/src/lib.rs:209-210`). This matters because M.8
+findings (`crates/pangs-clients/src/lib.rs:209-210`). This matters because M.3
 rejects external linkage to prevent mixed atomic/non-atomic access across a TU
 boundary, and an external-linkage alias re-exports that storage under another
 name — the same hazard through a back door.
 
-**The fix — decided, not measured: an alias-exposure inventory in PIR.** Move
+**The fix — one module-level bool.** Move
 `constant_symbol_name(LLVMAliasGetAliasee(*alias))` above the interposability
-check; when it names a known global and the alias is not internal-linkage, record
-it in a new `LoweringStats` field
-`alias_exposed_globals: BTreeMap<String, BTreeSet<String>>` (`#[serde(default)]`).
-The §E clause becomes `alias_exposed_globals.get(key).is_none()`. Two properties:
-**resolution is separated from modelling** — the alias is still dropped from
-`AliasMap` exactly as today, so nothing about points-to, escape, or the Ω
-boundary moves; and **an unresolvable aliasee counts as exposure of nothing, not
-of everything** — `constant_symbol_name` returning `None` adds no entry.
+check. Set a new `LoweringStats::alias_exposes_global: bool` (`#[serde(default)]`)
+when any non-internal alias resolves to a known **global**, *or* when any
+aliasee fails to resolve at all. The §E clause is `!alias_exposes_global`.
 
-That second property is a real gap rather than a conservative default, so it is
-closed bluntly and narrowly: **an `alias_unresolved:` lowering taint blocks
-signal-flag mode for every global in the module.** A module-wide fallback keyed on
-*any* `alias_`-prefixed taint was considered and rejected — it would disable the
-feature whenever a module contains an ordinary external alias to an unrelated
-function, and the inventory is a few lines. What must **not** happen is a third
-option: a target-specific predicate no fact can evaluate, which an implementer
-would most plausibly discharge by writing `false`.
+Three properties:
 
-The registry work is a hard prerequisite: without it the bore flag has
+- **Resolution is separated from modelling** — the alias is still dropped from
+  `AliasMap` exactly as today, so nothing about points-to, escape, or the Ω
+  boundary moves.
+- **An unresolvable aliasee sets the bool**, so the gap is closed by the same
+  fact rather than by a second rule; there is no `alias_unresolved:` special case.
+- **A function alias does not set it.** Blocking the feature on *any*
+  `alias_`-prefixed taint was rejected for exactly this reason — external aliases
+  to unrelated functions are ordinary — and this is the cheapest predicate that
+  distinguishes them.
+
+A per-global `BTreeMap<String, BTreeSet<String>>` inventory would be more precise
+and is not worth its surface: it buys signal-flag mode in a module that contains
+an aliased *global* unrelated to the flag, which no corpus module exhibits. What
+must **not** happen is a third option: a clause no fact can evaluate, which an
+implementer would most plausibly discharge by writing `false`.
+
+The registry work (§D) is a hard prerequisite: without it the bore flag has
 `signal_context_access: false` and is correctly rejected. That is the desired
 failure mode — the idiom is admitted only where the analysis can see the signal
 context that gives it meaning.
 
-#### The certified positive access path
+#### Handler analysis: `A`, `H`, the certified registration, and F2
 
-`signal_context_access` is one `EvidencedBool`
-(`crates/pangs-manifest/src/lib.rs:400`, `DISPOSITION.md` §2), true for resolved
-*and* unresolved registrations alike, and computed by a widening query. It is
-exactly right as a **restricting** fact and unusable as a permitting one.
+The certified access path and F2 need the same two sets, and are computed by
+**one pass**, not two queries:
 
-`signal_context_access` comes from `transitive_accesses`, whose per-payload target
-set is `AffectedGlobals::ModuleWide` whenever the access is through a pointer with
-no finite candidate set (`crates/pangs-api/src/lib.rs:2093-2096`), and
-`registry_access_facts` then sets the mask on **every global in the module**
-(`crates/pangs-clients/src/lib.rs:848-852`). **Cloning that computation for the
-permitting conjunct would be a soundness hole**: one handler with an unresolved
-transitive effect would satisfy §E's conjunct for every global in the module for
-free. `ModuleWide` is **orthogonal to `unresolved`** — it comes from the handler's
-own transitive summary, not from the registration operand — so restricting to
-resolved registrations does not avoid it. The restriction must be on the access
-path.
+```text
+A  =  functions containing an admitted access site on the flag
+      (from access_sites_for_global; exact, every site via == Via::Direct)
 
-**Certified positive access path.** True for a global `g` only when there exists
-a path `f₀ → f₁ → … → fₙ` (n ≥ 0) where `f₀` is a **precise** target of a
-**resolved** signal registration (not a member of §D's widening); every edge is
-a `Stmt::CallDirect` to a defined internal function; and `fₙ` contains an
-`AccessSite` on `g` with `via == Via::Direct`. Everything weaker is rejected:
+H  =  registry handler targets over ALL registrations
+      (precise targets for resolved ones, plus §D's frozen widening
+       for unresolved ones)
+
+R  =  { f ∈ H : f is a PRECISE target of a RESOLVED registration }
+```
+
+The pass yields three things: the certified registration (below), `A ∩ H` (F2's
+domain, recorded as `observers`), and the F2 verdict.
+
+**The certified registration.** The conjunct holds for a global `g` when there
+exists a path `f₀ → f₁ → … → fₙ` (n ≥ 0) where `f₀ ∈ R`, every edge is a
+`Stmt::CallDirect` to a defined internal function, and `fₙ ∈ A`. Everything
+weaker is rejected:
 
 | Provenance | Sets `signal_context_access` | Satisfies the §E conjunct |
 |---|---|---|
-| `Via::Direct` site, direct-call path from a precise resolved target | yes | **yes** |
+| `Via::Direct` site, direct-call path from a member of `R` | yes | **yes** |
 | `Via::Aliased` / `Via::Unknown` site (pointer access, finite candidate set) | yes | no — a *may* set is not positive proof |
 | `AffectedGlobals::ModuleWide` | yes | **no** — the case the rule exists for |
 | any indirect-call edge on the path | yes | no — the call graph over-approximates exactly there |
 | target from the address-taken widening | yes | no — the widening is a guess at who the handler is |
 
-The direct-call restriction keeps the evidence exhibitable: the witness *is* the
-path, and a reviewer can read it in the source. **This costs less than it
-appears**: the admitted access set already requires `via == Via::Direct` at every
-site, since `atomic_access_recipe` fails `address-access-not-lowerable` otherwise
-(`crates/pangs-clients/src/lib.rs:1891`). The rule aligns the *conjunct* with a
-restriction the *recipe* already enforced. For bore the path has length zero —
-`sigint_handler_xjtr_0` is a precise target of the resolved `signal(2, …)` and
-contains a `Via::Direct` store to the flag.
+**Why this is its own query and not a filtered `signal_context_access`.**
+`signal_context_access` is one `EvidencedBool`
+(`crates/pangs-manifest/src/lib.rs:400`, `DISPOSITION.md` §2), true for resolved
+*and* unresolved registrations alike, computed by a widening query. It comes from
+`transitive_accesses`, whose per-payload target set is
+`AffectedGlobals::ModuleWide` whenever the access is through a pointer with no
+finite candidate set (`crates/pangs-api/src/lib.rs:2093-2096`), and
+`registry_access_facts` then sets the mask on **every global in the module**
+(`crates/pangs-clients/src/lib.rs:848-852`). Cloning that computation for the
+permitting conjunct would be a soundness hole: one handler with an unresolved
+transitive effect would satisfy §E's conjunct for every global in the module for
+free. `ModuleWide` is **orthogonal to `unresolved`** — it comes from the handler's
+own transitive summary, not from the registration operand — so restricting to
+resolved registrations does not avoid it. The restriction must be on the access
+path, which is why `A` is built from `access_sites_for_global`
+(`crates/pangs-api/src/lib.rs:2012`), carrying `via` and `func` per site, and
+walked backwards over direct-call edges (D2). This is the one place in the design
+where the obvious implementation is the wrong one, and a code comment at the query
+should say so.
 
-**An API gap this exposes.** `AffectedGlobals::Finite` is returned both for
-`GlobalTarget::Name(g)` — one element, exact — and for `GlobalTarget::Unknown(_)`
-with a finite candidate set, which may also be one element
-(`crates/pangs-api/src/lib.rs:2091-2097`), so the tiers are indistinguishable
-through `transitive_accesses`. The conjunct must therefore be computed from
-`access_sites_for_global` (`crates/pangs-api/src/lib.rs:2012`), which carries
-`via` and `func` per site, walked backwards over direct-call edges to the
-registration targets — **a different query, not a filtered version of the old
-one** (D8).
+`AffectedGlobals::Finite` is returned both for `GlobalTarget::Name(g)` — one
+element, exact — and for `GlobalTarget::Unknown(_)` with a finite candidate set,
+which may also be one element (`crates/pangs-api/src/lib.rs:2091-2097`), so the
+tiers are indistinguishable through `transitive_accesses` in any case.
+
+**This costs less than it appears.** The admitted access set already requires
+`via == Via::Direct` at every site, since `atomic_access_recipe` fails
+`address-access-not-lowerable` otherwise (`crates/pangs-clients/src/lib.rs:1891`).
+The rule aligns the *conjunct* with a restriction the *recipe* already enforced.
+For bore the path has length zero — `sigint_handler_xjtr_0` is a precise target
+of the resolved `signal(2, …)` and contains a `Via::Direct` store to the flag.
 
 The predicate is **existential over resolved registrations**, not universal: a
 global reached by one resolved and three unresolved registrations is admissible,
 because one resolved registration fully supplies the positive proof and
-additional unresolved ones widen the handler set without undermining evidence
-that already exists.
+additional unresolved ones widen `H` without undermining evidence that already
+exists.
 
-**Where the result lives.** In the certificate, as
-`atomic_mode.certified_path`, not as a new fact slot. `atomic` is a
-certificate-backed strategy, so `DISPOSITION.md` §1's guard-shape rule puts this
-inside the pass's certificate — the cascade reads one slot, and D3 internally
-requires its preconditions, exactly as D4 does for reentrancy. This is the same
-call D1 makes for the type evidence, applied uniformly, and it holds the v5
-fact-layer delta to `word_sized_scalar` alone. Promotion to a fact slot when a
-second consumer appears is schema v6.
+**What is recorded, and its determinism.** The certificate carries the triple
+`{ callsite, file, line, handler: f₀, accessor: fₙ }` — not the intermediate
+path, which is recomputable from the fixed call graph and whose storage would
+force a shortest-path tie-breaking rule for no consumer. Determinism: the
+resolved registration with the lowest callsite id, then the lowest accessor
+function id. `signal_context_access` keeps its existing first-wins witness and is
+otherwise untouched — same semantics, same widening computation, same consumers.
 
-**Witness determinism**: record the resolved registration with the lowest
-callsite id, and among paths from it the shortest, ties broken by callee order
-within each caller. `signal_context_access` keeps its existing first-wins
-witness and is otherwise untouched — same semantics, same widening computation,
-same consumers.
+**F2. Handler-observer confinement** — a hard conjunct of certification. Require
+that every function in `A ∩ H` accesses no object with static or thread storage
+duration other than the flag. Failure code
+`signal-handler-access-not-confined`, witnessed by the function and the offending
+object.
+
+The two sets over-approximate in **opposite directions**: `H` is widened (more
+candidate handlers ⇒ harder to pass), while `A` is the recipe's own exact,
+`Via::Direct` site list. A widened `A` would be unsound, with the same
+`ModuleWide` hazard as above. The "accesses no other static-storage object" half
+is the one place a widened set is *safe*, being a restrictive test: `ModuleWide`
+there means "may touch everything", which fails F2 and rejects, so that half can
+read the ordinary transitive summary.
+
+The intersection makes this sound and affordable: a function that never touches
+the flag cannot correlate its order with anything, and a function not in `H`
+cannot run as a handler. For functions in both, F2 is C11 §7.14.1.1p5 restated —
+a handler referring to any static-storage object other than by assigning to a
+`volatile sig_atomic_t` is already undefined behavior — so the condition rejects
+only programs that were broken before translation.
+
+**Why F2 is the only pattern condition.** An earlier revision added F1: at most
+one certified flag per program, because with two, the interrupted code can
+observe an ordering the compiler no longer preserves — `flag_a = 1; flag_b = 1;`
+in a handler, read in the other order by the main loop. F2 already excludes that
+program: the handler writes two static-storage objects, so it fails confinement
+on both flags. The general argument:
+
+- A reordering of the flag's accesses is observable only by an execution that
+  *reads the flag*.
+- The only asynchronous observer is a signal handler (the interrupted thread does
+  the writes; other threads were already unordered — see below).
+- A handler that reads or writes the flag is in `A ∩ H`, and F2 forbids it from
+  touching any other static-storage object — so it cannot correlate the flag with
+  anything else.
+
+The converse cases are vacuous. *Main writes both flags, one handler reads one*:
+comparing would require the handler to touch the second, which F2 forbids. *Two
+flags with disjoint confined handlers*: neither handler can see the other's
+object, and between two independent deliveries there is no program order to
+preserve. *Flag plus an ordinary object published by ordinary code*: again the
+observer must read both, and F2 rejects it. So F2 subsumes F1, at finer
+granularity — two independently confined flags in one module both certify, where
+F1 rejected both without picking a winner. It is recorded here because F1 is a
+plausible-looking condition someone will re-propose, and because removing it
+removed the design's only whole-program pass and only cross-global validator
+clause.
 
 #### Admitted operations
 
@@ -653,17 +747,6 @@ mismatched-width or partial accesses; `memcpy`, `memset`, or byte-wise access;
 general volatile objects lacking `sig_atomic_t` evidence; or objects that may be
 memory-mapped I/O.
 
-The certificate marks the mode with one tagged object (normative nesting in
-§"Schema v5" §4). There is no second place where the mode is recorded:
-
-```json
-{ "recipe": { "ordering": "relaxed", … },
-  "atomic_mode": { "kind": "signal_flag",
-                   "probe": "x86_64.ldst.v1",
-                   "operations": ["load", "store"],
-                   … } }
-```
-
 Relaxed ordering matches the flag's narrow role: it communicates a scalar stop
 condition and does not publish other memory. A future case that uses the flag to
 publish payload state needs a separate synchronization proof and must not inherit
@@ -671,122 +754,68 @@ acquire/release semantics from this rule. The materializer lowers the declaratio
 and every certified access as one consistent atomic representation, never mixing
 volatile raw accesses and atomic accesses to the same storage.
 
-#### The lock-free gate needs a real target fact
+#### Lock-free width: a checked-in constant, not the existing heuristic
 
-The existing gate reads `target.supported_atomic_widths`, which
+The existing signal gate reads `target.supported_atomic_widths`, which
 `module_target_info` (`crates/pangs-pir/src/llvm_sys.rs:407`) computes as
 `[8, 16, 32]` plus 64 when the pointer is 64-bit — a pointer-width heuristic that
 asserts 8/16/32-bit atomics on every target regardless of whether the target has
 them, and says nothing about lock-freedom versus an `__atomic_*` libcall. Using
-it as the async-signal safety gate (`crates/pangs-clients/src/lib.rs:1113,1217`)
-states a guarantee the value does not carry.
+it as an async-signal safety gate (`crates/pangs-clients/src/lib.rs:1113,1217`)
+states a guarantee the value does not carry. **That is a real defect, it predates
+this feature, it affects every signal-context global rather than signal-flag ones,
+and repairing it is spun off (§"Spun-off work") under §B's splitting rule.**
 
-The replacement is a **target probe**: a triple of `(arch, widths, operations)`
-backed by a checked-in codegen regression, named by id, which the certificate
-cites. The operation set is part of the probe rather than an assumption about it,
-because lock-freedom is not uniform across operations — Rust exposes
-`target_has_atomic_load_store` separately from `target_has_atomic` precisely
-because load/store lock-freedom is much more widely satisfied than lock-free RMW.
-A certificate is admissible only when **one** probe covers every operation its
-recipe emits, so a load/store proof can never be silently reused for an RMW
-recipe. `supported_atomic_widths` is untouched.
+Signal-flag mode does not rely on it. It carries its own closed constant:
 
-That coverage rule closes a hole this design had while the gate was a width list.
-The signal gate fires for every signal-context global, not only signal-flag ones,
-so narrowing it to a load/store guarantee would have certified a signal-context
-*RMW* recipe against a proof of something weaker. With probes the mismatch is a
-rejection rather than a silent widening, and v1 ships an RMW probe for `x86_64`
-so the current corpus does not lose coverage to the repair.
-
-Replacing both lists with one profile would be a cliff: `word_sized_scalar` reads
-`supported_atomic_widths` (`crates/pangs-clients/src/lib.rs:2337`), the coarse
-gate for every global, so an unlisted triple would zero atomic eligibility
-module-wide — undetectable by the bore regression, which is
-`x86_64-unknown-linux-gnu`. The deeper reason is the failure modes:
-
-| Fact | If it is wrong | Detected by |
-|---|---|---|
-| `supported_atomic_widths` | the recipe names a Rust atomic type that does not exist for the width | **compile error** in the Rust output — `DISPOSITION.md` §7's structural gift |
-| a target probe | a signal handler takes a lock, or an access is not indivisible | **nothing** — silent deadlock or torn access at runtime |
-
-Migrating `supported_atomic_widths` is a **separate, evidence-gated follow-up**:
-derive the probe table, diff it against the heuristic across the triples the
-corpus contains, then decide. Agreement makes it a rename that can land any time;
-disagreement is a bug report about the general atomic recipe and deserves its own
-note.
-
-#### Target probes
-
-**Key.** The normalized architecture component of `TargetInfo.triple`, already
-captured (`crates/pangs-pir/src/llvm_sys.rs:412`). Lock-freedom is an ISA
-property, so vendor, OS, and environment are ignored; normalization is the arch
-component plus a small alias map (`amd64`, `x86_64h` → `x86_64`). An absent or
-unparsable triple resolves to no probe, hence no signal-context atomic.
-
-**Rows in v1: exactly two, both `x86_64`.**
-
-| id | arch | widths | operations |
-|---|---|---|---|
-| `x86_64.ldst.v1` | `x86_64` | 8, 16, 32, 64 | `load`, `store` |
-| `x86_64.rmw.v1` | `x86_64` | 8, 16, 32, 64 | `load`, `store`, `rmw` |
-
-Everything else is absent → fail closed. The corpus is 71 modules and 100%
-`x86_64-*-linux-*`, and a row no test exercises is a liability. A signal-flag
-certificate always cites `x86_64.ldst.v1`, since §E admits loads and stores only;
-`x86_64.rmw.v1` exists so an ordinary signal-context global with an RMW recipe
-keeps the coverage it has today, under a proof that actually covers RMW. The arch
-omissions are decisions: `arm`/`thumb`, where 64-bit lock-free load/store depends
-on sub-arch (`ldrexd`) the arch component does not determine; `riscv32`/`riscv64`,
-where atomics come from the `A` extension, a feature rather than an implication of
-the arch string; and 32-bit x86, where 64-bit lock-free load/store needs i586+
-(`cmpxchg8b`/x87), so `i386` and `i686` cannot share a row.
-
-**A certificate cites exactly one probe.** Two probes are never combined to cover
-an operation set between them: a proof assembled from parts is a proof no single
-regression asserts.
-
-**CPU features are not consulted.** A probe lists only widths lock-free on the
-arch's *baseline* subtarget; enabling features can add lock-freedom but never
-remove it, so ignoring them errs closed, and an arch with an ambiguous baseline
-gets no probe rather than an optimistic one. Per-function `target-features`
-attributes are deliberately not read: they are per-function, frequently absent in
-`-O0` bitcode, and would make a module-global fact depend on which function
-carried an attribute.
-
-**Authority** is the Rust target definition, not LLVM's, since the consumer is
-generated Rust: `rustc --print cfg --target <triple>`, reading
-`target_has_atomic_load_store` for a load/store probe and `target_has_atomic` for
-an RMW one. Check the table in with the rustc version it was derived from, plus a
-test that re-derives it when `rustc` is available and skips otherwise.
-
-**The table has no configuration surface.** There is no `--target-profile` flag,
-no narrowing, and no evidence-bundle mechanism. A probe is admissible **only** if
-the codegen regression below covers it, and the regression is in-tree; so the only
-way to add a probe is to add it beside its regression, in a reviewed patch. A
-configuration path whose honest use is "re-run the in-tree regression and paste
-its output" is the same act with the review removed, and for a gate whose failure
-mode is a silent handler deadlock, "audited" is not a substitute for "tested".
-If the regression fails for a probe, the probe is removed, every certificate
-citing it stops being emittable, and signal-context atomics on that target fall
-back to `unhandled`.
-
-**Reproducibility.** Record the resolution in `run.analysis` (analysis-owned
-under `DISPOSITION.md` §3.3), so a manifest names what was available to it. This
-is a run record, **not a validator operand**: no per-global clause reads it, and
-its absence is not a validation failure.
-
-```json
-"target_probes": {
-  "triple": "x86_64-unknown-linux-gnu", "arch": "x86_64",
-  "available": ["x86_64.ldst.v1", "x86_64.rmw.v1"],
-  "supported_atomic_widths": [8, 16, 32, 64]
-}
+```text
+SIGNAL_FLAG_LOCK_FREE : arch -> widths          (load and store only)
+  x86_64 -> { 8, 16, 32, 64 }
 ```
 
+- **Key.** The normalized architecture component of `TargetInfo.triple`, already
+  captured (`crates/pangs-pir/src/llvm_sys.rs:412`). Lock-freedom is an ISA
+  property, so vendor, OS, and environment are ignored; normalization is the arch
+  component plus a small alias map (`amd64`, `x86_64h` → `x86_64`). An absent,
+  unparsable, or unlisted arch fails closed.
+- **One row in v1.** The corpus is 71 modules and 100% `x86_64-*-linux-*`, and a
+  row no test exercises is a liability. The arch omissions are decisions:
+  `arm`/`thumb`, where 64-bit lock-free load/store depends on sub-arch (`ldrexd`)
+  the arch component does not determine; `riscv32`/`riscv64`, where atomics come
+  from the `A` extension, a feature rather than an implication of the arch
+  string; and 32-bit x86, where 64-bit lock-free load/store needs i586+
+  (`cmpxchg8b`/x87), so `i386` and `i686` cannot share a row.
+- **Load and store only.** The table makes no RMW claim because §E admits no RMW
+  operation. A later RMW extension adds its own table with its own regression;
+  the two are never combined to cover an operation set between them.
+- **CPU features are not consulted.** The row lists only widths lock-free on the
+  arch's *baseline* subtarget; enabling features can add lock-freedom but never
+  remove it, so ignoring them errs closed, and an arch with an ambiguous baseline
+  gets no row rather than an optimistic one. Per-function `target-features`
+  attributes are deliberately not read: they are per-function, frequently absent
+  in `-O0` bitcode, and would make a module-global fact depend on which function
+  carried an attribute.
+- **Authority** is the Rust target definition, not LLVM's, since the consumer is
+  generated Rust: `rustc --print cfg --target <triple>`, reading
+  `target_has_atomic_load_store`.
+- **No configuration surface.** There is no flag, no narrowing, and no
+  evidence-bundle mechanism. A row is admissible **only** if the in-tree codegen
+  regression below covers it, so the only way to add an arch is to add it beside
+  its regression, in a reviewed patch. A configuration path whose honest use is
+  "re-run the in-tree regression and paste its output" is the same act with the
+  review removed, and for a gate whose failure mode is a silent handler deadlock,
+  "audited" is not a substitute for "tested".
+
+**The certificate records no target member.** The arch and width are properties
+of the run and the declaration, not of the mode: the width lives once in
+`recipe.declaration.size_bits`, and the arch appears in the ledger record (below)
+and in `run.analysis`. The auditable chain is certificate → ledger record →
+in-tree regression, and it does not need an id in the certificate to be followed.
+
 **The bore case.** `x86_64-unknown-linux-gnu` normalizes to `x86_64`, the flag's
-recipe emits loads and stores at 32 bits, and `x86_64.ldst.v1` covers it. No
-corpus module exercises the empty default; the fail-closed path is asserted by a
-synthetic fixture with an unlisted triple.
+recipe emits loads and stores at 32 bits, and the row covers it. No corpus module
+exercises the empty default; the fail-closed path is asserted by a synthetic
+fixture with an unlisted triple.
 
 #### Why dropping `volatile` is admissible, and what remains assumed
 
@@ -795,7 +824,7 @@ gives the third only as a compiler property, and does not give the second:
 
 | | `volatile` | `Relaxed` / `monotonic` |
 |---|---|---|
-| **(i)** indivisibility of a width-appropriate access | not guaranteed by C; supplied here by `sig_atomic_t` + the lock-free gate | guaranteed |
+| **(i)** indivisibility of a width-appropriate access | not guaranteed by C; supplied here by `sig_atomic_t` + the lock-free row | guaranteed |
 | **(ii)** preservation of access *count* and of relative order among qualified accesses | guaranteed | **not** guaranteed — RLE, DSE, store-to-load forwarding and coalescing are all permitted |
 | **(iii)** no *unbounded* elision — the access is re-executed on each loop iteration | guaranteed | not an abstract-machine guarantee; in LLVM, LICM hoisting and promotion require `isUnordered()`, which `monotonic` is not |
 
@@ -823,66 +852,15 @@ polling loop yields an execution in which the signal is never observed at all,
 which is not "delivered later" but "never delivered". That is (iii), the one
 genuine residual.
 
-**F2. Handler-observer confinement** — a hard conjunct of certification. Let `A`
-be the functions containing an enumerated access to the flag — known exactly,
-since access-set completeness is already a conjunct and every site is
-`Via::Direct` or the recipe already failed — and `H` the handler set over **all**
-registrations: precise targets for resolved ones, plus §D's frozen widening for
-unresolved ones. Require that every function in `A ∩ H` accesses no object with
-static or thread storage duration other than the flag. Failure code
-`signal-handler-access-not-confined`, witnessed by the function and the offending
-object.
-
-The two sets over-approximate in **opposite directions**: `H` is widened (more
-candidate handlers ⇒ harder to pass), while `A` is the recipe's own exact,
-`Via::Direct` site list. A widened `A` would be unsound, with the same
-`ModuleWide` hazard as above, so `A` must be evaluated against
-`access_sites_for_global`, never the registry's transitive mask. The "accesses no
-other static-storage object" half is the one place a widened set is *safe*, being
-a restrictive test: `ModuleWide` there means "may touch everything", which fails
-F2 and rejects, so that half can read the ordinary transitive summary.
-
-The intersection makes this sound and affordable: a function that never touches
-the flag cannot correlate its order with anything, and a function not in `H`
-cannot run as a handler. For functions in both, F2 is C11 §7.14.1.1p5 restated —
-a handler referring to any static-storage object other than by assigning to a
-`volatile sig_atomic_t` is already undefined behavior — so the condition rejects
-only programs that were broken before translation.
-
-**Why F2 is the only pattern condition.** An earlier revision added F1: at most
-one certified flag per program, because with two, the interrupted code can
-observe an ordering the compiler no longer preserves — `flag_a = 1; flag_b = 1;`
-in a handler, read in the other order by the main loop. F2 already excludes that
-program: the handler writes two static-storage objects, so it fails confinement
-on both flags. The general argument:
-
-- A reordering of the flag's accesses is observable only by an execution that
-  *reads the flag*.
-- The only asynchronous observer is a signal handler (the interrupted thread does
-  the writes; other threads were already unordered, per the paragraph above).
-- A handler that reads or writes the flag is in `A ∩ H`, and F2 forbids it from
-  touching any other static-storage object — so it cannot correlate the flag with
-  anything else.
-
-The converse cases are vacuous. *Main writes both flags, one handler reads one*:
-comparing would require the handler to touch the second, which F2 forbids. *Two
-flags with disjoint confined handlers*: neither handler can see the other's
-object, and between two independent deliveries there is no program order to
-preserve. *Flag plus an ordinary object published by ordinary code*: again the
-observer must read both, and F2 rejects it. So F2 subsumes F1, at finer
-granularity — two independently confined flags in one module both certify, where
-F1 rejected both without picking a winner.
-
 **The single residual assumption.** After F2, exactly one thing is assumed: *a
 `monotonic` load or store inside a loop is re-executed on each iteration — the
 compiler does not hoist, sink, or promote it out.* C11 §7.17.3 and the Rust
 memory model only say a relaxed store *should* become visible in finite time, so
 this is a quality-of-implementation property; in LLVM it holds because LICM's
 hoist and promotion paths require `isUnordered()`. Reducing the residual to this
-one statement is the point: it is a property a codegen regression can assert, per
-probe, in both directions. It is still an assumption, and belongs in the
-audited soundness inventory (`DESIGN.md` §8); Phase 4's dynamic SIGINT test
-exercises it.
+one statement is the point: it is a property a codegen regression can assert, in
+both directions. It is still an assumption, and belongs in the audited soundness
+inventory (`DESIGN.md` §8); Phase 4's dynamic SIGINT test exercises it.
 
 Two hard requirements follow for the materializer: it must not "optimize" a
 certified access back to a plain non-atomic read even when it can prove the flag
@@ -900,19 +878,14 @@ and leaves one existentially checkable property behind.
 
 #### Audit contract for the no-elision assumption
 
-**Who records it.** `AuditRecord::regenerate_id`
-(`crates/pangs-manifest/src/lib.rs:1392`) hashes the whole record, so its content
-must be deterministic — and analysis, which emits the ledger, does not know what
-Rust toolchain will compile the output. So **analysis emits the envelope** from a
-checked-in evidence table (repo constants, so the id is stable), and **the Rust
-stage enforces it**, comparing the actual toolchain against the recorded envelope
-before rewriting and failing loudly when outside (M.7 gives it the channel).
-
 **Record shape.** No audit-schema change is required: `kind` is a free string and
 the schema is `additionalProperties: true`, so the payload rides in
-`AuditRecord.extra`. One run-scoped record, emitted only when at least one global
-certifies in signal-flag mode, plus one `scope: global` record per such global.
-Rows are self-contained and do not cross-reference.
+`AuditRecord.extra`. `AuditRecord::regenerate_id`
+(`crates/pangs-manifest/src/lib.rs:1392`) hashes the whole record, so its content
+is drawn from repo constants and the module's own target facts, keeping the id
+stable. One run-scoped record, emitted only when at least one global certifies in
+signal-flag mode, plus one `scope: global` record per such global. Rows are
+self-contained and do not cross-reference.
 
 ```jsonc
 {
@@ -920,32 +893,29 @@ Rows are self-contained and do not cross-reference.
   "kind": "signal-flag-codegen-assumption",
   "scope": { "kind": "run" },
   "source": "analysis",
-  "text": "Certified signal-flag atomics assume the Rust backend does not hoist, sink, or promote a Relaxed atomic load or store out of a loop, and lowers load/store of the certified width without a library call. Bounded transformations that Relaxed permits (redundant-load elimination, dead-store elimination, coalescing) are not assumed against; certification requires the F2 confinement condition, under which they are behavior-refining. This is a quality-of-implementation property, not an abstract-machine guarantee.",
-  "envelope": {
-    "probe": "x86_64.ldst.v1",
+  "text": "Certified signal-flag atomics assume the Rust backend does not hoist, sink, or promote a Relaxed atomic load or store out of a loop, and lowers load/store of the certified width without a library call. Bounded transformations that Relaxed permits (redundant-load elimination, dead-store elimination, coalescing) are not assumed against; certification requires the F2 confinement condition, under which they are behavior-refining. This is a quality-of-implementation property, not an abstract-machine guarantee, and it is asserted by the in-tree codegen regression for this arch rather than proven.",
+  "context": {
     "triple": "x86_64-unknown-linux-gnu", "arch": "x86_64",
     "widths": [32], "operations": ["load", "store"],
-    "rustc_min": "1.XX.0", "llvm_major": [17, 18, 19],
-    "opt_levels": ["0", "1", "2", "3"]
+    "regression": "tests/codegen/signal_flag_x86_64"
   }
 }
 ```
 
-`envelope.probe` is the id a certificate cites, so the chain reads certificate →
-ledger record → the in-tree regression that gates the probe's existence. An
-opaque id nobody can follow would be worse than none; this one names the artifact
-an auditor re-runs.
+`context` names the artifact an auditor re-runs. It is **not** a machine-checked
+envelope: an earlier draft added `rustc_min`, an LLVM-major allowlist, and opt
+levels, plus a Rust-stage check refusing any toolchain outside them. That is
+dropped, because the enforcement is not what makes the property true and its
+practical failure mode is builds refusing on a newer toolchain that is fine. The
+in-tree regression runs on whatever toolchain is present, which is the actual
+detector; the assumption is one every Rust program that polls an atomic in a loop
+already depends on. See D4's falsifier for what would reopen this.
 
-**Declared scope, and no extrapolation.** The assumption is asserted for exactly
-`{probes} × {widths in the probe} × {rustc ≥ floor, LLVM in list} × {opt levels}`
-and nothing else. A toolchain outside it is outside the audited envelope, and the
-Rust stage refuses.
-
-**Codegen regression, per probe.** A probe can be compiled for without being
-runnable on, so the per-probe gate is an artifact check and execution is a
-host-only addition. The audited property is *absence of unbounded elision*, not
-preservation of access count, so the assertions are positional. For every declared
-probe × width × opt level, compile fixtures and assert:
+**Codegen regression, per arch row.** The audited property is *absence of
+unbounded elision*, not preservation of access count, so the assertions are
+positional. For the declared arch at opt levels `{0,1,2,3}` (one width — elision
+is one LICM code path and does not vary with the integer width), compile fixtures
+and assert:
 
 1. **No library call.** No reference to any `__atomic_*` symbol, and no call in
    the loop other than the fixture's own opaque `work()`/`step()`.
@@ -962,13 +932,6 @@ probe × width × opt level, compile fixtures and assert:
    Both stores survive. This is the bounded-DSE boundary: deletion of the first
    store *with nothing in between* is permitted and not asserted against;
    deletion across a call that may deliver a signal is not.
-5. **Asm cross-check** on probes where the loop structure is recognizable: a
-   memory operand naming the static appears between the loop label and its
-   backedge, for both fixtures.
-
-An RMW probe adds one assertion — the fetch-and-modify fixture lowers to a single
-locked instruction with no `__atomic_*` reference — and asserts nothing about
-elision, which is a load/store property this design does not extend to RMW.
 
 Then, host-only, the Phase 4 SIGINT test: a hoisted load makes the loop never
 terminate, so the property is observed rather than inspected. It is a liveness
@@ -1001,19 +964,17 @@ wrong. MUST/MUST NOT are normative; the field paths are exact.
 definition are untouched. The version bump exists because that payload is
 restructured incompatibly (§4), not because any fact moved.
 
+**The bump lands in Phase 3, not Phase 1.** Phase 1 is the §A walker and changes
+no schema at all; it moves values on existing fields under unchanged invariants.
+There is therefore no dormant contract, no "v5 must land whole" requirement, and
+no window in which two shapes both call themselves v5 — the version changes in
+the same phase that changes the payload.
+
 ### 1. Encoding conventions
 
 Already the manifest's conventions, restated so the new fields do not invent
 alternatives.
 
-- **v5 is defined once, in Phase 1.** The *entire* v5 contract — every
-  `atomic_mode` variant and validator rule below — lands with the version bump in
-  Phase 1, **dormant** where it is not yet exercised: types, schema definitions,
-  and validator rules all present, the `signal_flag` rules vacuously satisfied
-  because nothing emits that variant until Phase 3, which then changes emission
-  only. This is what keeps Phase 1 independently shippable. **A
-  partially-introduced v5, in which two incompatible contracts both call
-  themselves v5, is forbidden.**
 - **Absence, not null, for optional detail.** Every *new* optional detail field
   uses `#[serde(skip_serializing_if)]`
   (`crates/pangs-manifest/src/lib.rs:321-328`); `null` is reserved for a *slot*
@@ -1040,7 +1001,7 @@ change would do here and why it is not this one.
 What moves is what the *walker* reports into that unchanged field:
 `type_spelling` is now populated for a qualified typedef where it previously came
 back `None`. That is a value change on an existing field with an unchanged
-contract — visible in goldens (§7 class C/D), invisible to every validator.
+contract — visible in goldens (§6 class C/D), invisible to every validator.
 
 `facts.signal_context_access` is likewise unchanged, and gains one reader: §4's
 value coupling requires the certificate's mode variant to agree with it.
@@ -1050,18 +1011,17 @@ value coupling requires the certificate's mode variant to agree with it.
 **There is one live contract.** No consumer reads a v4 manifest, so
 `Facts::validate` keeps its current signature, there is no dual-invariant path,
 and a document is either validated or refused by the existing version gate
-(`crates/pangs-manifest/src/lib.rs:903-904`). Because the fact layer did not
-change, the only thing a v4 document would fail on is its certificate payload —
-which is reason enough to refuse it rather than to build a compatibility path for
-it. v4 fixtures are regenerated, not grandfathered.
+(`crates/pangs-manifest/src/lib.rs:903-904`). v4 fixtures are regenerated, not
+grandfathered.
 
 One rule survives, and it is about stage consistency within a run rather than
-compatibility across versions: **`pangs-dispose` never reads or writes `schema_version`.** It
-parses a `Manifest`, fills its own sections, and re-serializes, preserving
-whatever version the input declared — so a v5 dispose fed a v4 analysis manifest
-today emits a document *labelled v4* containing v5-shaped dispose sections. Since
-`DISPOSITION.md` §3.3 requires earlier stages' sections to survive semantically
-unchanged, a stage MUST NOT silently upgrade or inherit:
+compatibility across versions: **`pangs-dispose` never reads or writes
+`schema_version`.** It parses a `Manifest`, fills its own sections, and
+re-serializes, preserving whatever version the input declared — so a v5 dispose
+fed a v4 analysis manifest today emits a document *labelled v4* containing
+v5-shaped dispose sections. Since `DISPOSITION.md` §3.3 requires earlier stages'
+sections to survive semantically unchanged, a stage MUST NOT silently upgrade or
+inherit:
 
 ```text
 a stage that preserves an earlier stage's sections MUST require
@@ -1086,27 +1046,17 @@ facts.atomic_eligibility
     ├── source_materialization { status, code?, detail? }
     └── atomic_mode                        ← the sole mode discriminant
         │
-        ├── kind: "plain"                  — not signal-context accessed.
+        ├── kind: "plain"                  — every atomic that is not an
+        │                                    admitted signal flag.
         │                                    No further members.
         │
-        ├── kind: "signal_safe"            — signal-context accessed, ordinary
-        │   ├── probe: "x86_64.rmw.v1"       (non-volatile) accesses
-        │   └── operations: ["load", "store", "rmw"]
-        │
         └── kind: "signal_flag"            — signal-context accessed, volatile
-            ├── probe: "x86_64.ldst.v1"      accesses admitted under §E
-            ├── operations: ["load", "store"]
-            ├── type_evidence
-            │   ├── typedef: "sig_atomic_t"
-            │   ├── typedef_chain: ["sig_atomic_t", "__sig_atomic_t"]
-            │   └── volatile: true
-            ├── certified_path
-            │   ├── registration { callsite, file, line }
-            │   ├── handler: "sigint_handler_xjtr_0"
-            │   ├── path: ["sigint_handler_xjtr_0"]   // f₀ … fₙ, direct-call only
-            │   └── access { via: "direct", file, line }
-            ├── handler_accesses_confined: bool                   (F2)
-            └── observers[]                                       (witness: A ∩ H)
+            ├── typedef_chain: ["sig_atomic_t", "__sig_atomic_t"]     (§C)
+            ├── registration                                          (§E)
+            │   ├── callsite, file, line
+            │   ├── handler:  "sigint_handler_xjtr_0"   // f₀ ∈ R
+            │   └── accessor: "sigint_handler_xjtr_0"   // fₙ ∈ A
+            └── observers[]                             // A ∩ H, F2's domain
                 ├── function: "sigint_handler_xjtr_0"
                 └── via: "resolved" | "address-taken-widening"
 ```
@@ -1121,28 +1071,30 @@ coupling in v5**; it was the cost of encoding one fact four times.
 **`signal_lock_free` is deleted, not moved.** Its three members were a duplicated
 fact, a constant, and a copy: `required` was `facts.signal_context_access`;
 `target_guaranteed` is `true` in every certificate where it means anything, since
-a false value means the global failed `signal-atomic-not-lock-free` and produced
-no certificate; and `width` was `recipe.declaration.size_bits`. It also emitted
-`{required: false, width: null}` on every ordinary atomic — an inhabited state
-asserting nothing. `kind` carries the first, the variant's existence carries the
-second, and the declaration carries the third.
+a false value means the global produced no certificate; and `width` was
+`recipe.declaration.size_bits`. It also emitted `{required: false, width: null}`
+on every ordinary atomic — an inhabited state asserting nothing.
+
+**The same principle is applied to the new variant, not just the old field.**
+`signal_flag` records no `volatile: true`, no `typedef: "sig_atomic_t"` naming
+which chain member licensed recognition, no `operations: ["load","store"]`, no
+`handler_accesses_confined: true`, no `access.via: "direct"`, and no target/probe
+id. Each would be a constant wherever the variant exists, and a validator clause
+checking a constant defends against the emitter contradicting itself, which is
+better prevented than detected. What remains is exactly the three things that
+vary and that an auditor cannot re-derive from the certificate alone: the typedef
+chain, which registration was certified, and which functions F2 was evaluated
+over.
 
 **Width, alignment, class, and signedness are emitted once**, in
-`recipe.declaration`, and `atomic_mode` re-states none of them. A validator that
-re-checks copies of one number is defending against the emitter contradicting
-itself, which is better prevented than detected.
-
-**`operations` is a member of the mode, not of the probe reference**, because it
-states what *this recipe* emits; the probe states what the target guarantees. The
-admission rule is that one probe covers the operations — which is checkable, and
-is what stops a load/store proof from being reused for an RMW recipe.
+`recipe.declaration`, and `atomic_mode` re-states none of them.
 
 Two further placement rules are load-bearing:
 
 - **Signal-flag proofs are certified-only, structurally.** `Certificate::Failed`
   (`crates/pangs-manifest/src/lib.rs:350`) has `codes`, `witnesses`, `recipe`,
   and `diagnostics` and **no certificate-level payload**, so a failed slot has
-  nowhere to put `atomic_mode` at all. Rule 18 — a signal-flag atomic exists only
+  nowhere to put `atomic_mode` at all. Rule 14 — a signal-flag atomic exists only
   as a complete certified proof — therefore stops being a rule someone must
   enforce and becomes a property of the type. This is why the discriminant lives
   at certificate level and not in `recipe`: `recipe` is a field on the failed
@@ -1158,12 +1110,12 @@ Two further placement rules are load-bearing:
   override your way into an unproven signal-handler atomic" is structural rather
   than a policy rule someone must remember. Every failure code reachable in
   signal-flag mode — `signal-atomic-not-lock-free`, `volatile-access`,
-  `address-access-not-lowerable`, `access-site-unmapped`, the `rmw-*` codes,
+  `address-access-not-lowerable`, `access-site-unmapped`,
   `signal-flag-external-linkage`, `signal-handler-access-not-confined` — means
   the rewrite cannot be executed correctly, so none is §4.2's honorable "evidence
   failed, recipe present" case. The confinement code belongs in that list because
   it looks like advisory hygiene, and waiving it would override the condition
-  that makes dropping `volatile` sound at all (rule 12).
+  that makes dropping `volatile` sound at all (rule 8).
 
   Suppression stays diagnosable through `diagnostics`, which is opaque and
   load-bearing for nothing:
@@ -1173,121 +1125,113 @@ Two further placement rules are load-bearing:
                      "reason": "signal-flag mode requires certification" } }
   ```
 
-- **The mode is read from the certificate, not the recipe.** M.5's rewrite
-  instruction is `atomic_mode.kind`; `recipe` carries the accesses and the
-  ordering, which is what the materializer needs positionally. Splitting the mode
-  across both is what created the coupling this section no longer has.
+- **The mode is read from the certificate, not the recipe.** The materializer's
+  rewrite instruction is `atomic_mode.kind`; `recipe` carries the accesses and the
+  ordering, which is what it needs positionally.
 
 - **Value coupling.** With one discriminant there is nothing left to check about
-  *presence*; what remains is that the variant's own members are the ones that
-  licensed admission. The validator MUST require:
+  *presence*. What remains is six clauses:
 
   ```text
   the mode agrees with the fact layer          (the one cross-section clause)
-    kind ∈ {signal_safe, signal_flag}  ⟺  facts.signal_context_access.value
-
-  the operation claim is backed                (both signal variants)
-    probe ∈ KNOWN_PROBES
-    operations non-empty, and exactly the operation kinds recipe.accesses emits
-    every member of operations is covered by probe, at recipe.declaration.size_bits
+    kind == "signal_flag"  ⇒  facts.signal_context_access.value
 
   signal-flag mode's admission conjuncts are reflected
-    operations                        == ["load", "store"]
-    recipe.ordering                   == "relaxed"
-    recipe.declaration.scalar_class   == "integer"
-    recipe.declaration.linkage        == "internal"                  (M.8)
-    type_evidence.volatile            == true
-    type_evidence.typedef             ∈ type_evidence.typedef_chain
-    type_evidence.typedef             ∈ RECOGNIZED_SIGNAL_TYPEDEFS   ( = {"sig_atomic_t"} )
-    certified_path present  ∧  certified_path.access.via == "direct"
-    handler_accesses_confined         == true
-    observers                         non-empty
+    typedef_chain ∩ RECOGNIZED_SIGNAL_TYPEDEFS   ≠ ∅
+    recipe.ordering                              == "relaxed"
+    recipe.declaration.scalar_class              == "integer"
+    recipe.declaration.linkage                   == "internal"        (M.3)
+    registration present  ∧  observers non-empty
   ```
 
-  `KNOWN_PROBES` and `RECOGNIZED_SIGNAL_TYPEDEFS` are closed constants in
-  `pangs-manifest`, so both are local checks. The fact-layer clause is the only
-  one reading outside the certificate, and it is kept because its failing
-  direction is the unsafe one: a `plain` claim on a signal-context global skips
-  the probe requirement entirely.
+  `RECOGNIZED_SIGNAL_TYPEDEFS` is a closed constant in `pangs-manifest`, so that
+  clause is local. The fact-layer clause is the only one reading outside the
+  certificate, and it is kept in the unsafe direction only: a `signal_flag` claim
+  on a non-signal global would mean the certified registration was fabricated.
+  The converse — a signal-context global carrying `kind: "plain"` — is the
+  ordinary, correct state for every signal-context global with non-volatile
+  accesses, and asserts nothing.
 
-  Clauses that would re-check one producer against itself are deliberately
-  absent: `align_bits == size_bits` belongs to `word_sized_scalar`, which is
-  already a conjunct of every atomic certificate, and the width appears in
-  exactly one place, so there is nothing to compare it to.
-
-  The pattern boolean is written out rather than implied by the variant's
-  presence so a certificate can be audited against the source without re-deriving
-  why `Relaxed` needed it. `observers` carries the witness that makes F2 auditable
-  at all: F2 is a claim about a specific set of functions (`A ∩ H`), and a
-  certificate asserting it without naming them is checkable only by the analysis
-  that produced it. It is non-empty because `certified_path` already names a
-  handler that accesses the global. `certified_path.access.via` is recorded
-  explicitly, so a reader can see the rejection rule was applied rather than
-  assume it.
+  `ordering`, `scalar_class`, and `linkage` are checked despite being emitter
+  outputs because the *materializer* reads them and a wrong value there is
+  silent; `registration`/`observers` are checked for presence because they are
+  the audit evidence and an empty one would make F2 uncheckable.
 
   **Every clause is per-global, and all but one are per-certificate.** Nothing in
   v5 requires a validator to compare two globals, and nothing requires it to read
-  the run header: `run.analysis.target_probes` is a reproducibility record, not a
-  validator operand, so its absence is never a validation failure and the
-  present/absent rules an earlier draft needed are gone with it. Only
-  `facts.signal_context_access` is threaded in, the same way `Manifest::validate`
-  already reaches a global's facts.
+  the run header.
 
-  The rejected alternative — giving `Certificate::Failed` a proof-envelope field
-  so a partial proof could be recorded — would add a second separately-validated
-  shape whose only reachable content is a partial proof of something that did not
-  hold, for a case §4.2 already refuses to honor.
-
-- **Scope.** All of the above constrains the two signal variants only; ordinary
+- **Scope.** All of the above constrains the `signal_flag` variant only; ordinary
   atomic, mutex, and once-lock slots keep §4.2's honorable accepted-risk case.
-- **`kind` is a closed enum with three members and no default.** An ordinary
+- **`kind` is a closed enum with two members and no default.** An ordinary
   atomic certificate carries `{"kind": "plain"}`, not an absent object: the mode
   is always stated, so "no mode recorded" is not a state a reader must interpret.
-- `operations` is a closed set (`load`, `store`, `rmw`), emitted in that order.
-  Extending it bumps the schema and requires a probe that covers the addition.
+  `atomic_mode` is also the extension point the spun-off lock-free repair will
+  use, which is why it is a tagged union rather than an optional object.
 - `source_materialization` is **unchanged**: `status` remains
   `"source-mapped" | "blocked"`, `code` required iff blocked, and
-  `declaration-source-unmapped` its only code. Spelling absence is a certificate
-  diagnostic, not a status (M.0).
-- There is no certificate-level `type_evidence` diagnostic. An earlier draft
-  added one to record spelling *absence*, which §B's deferral makes unreachable:
-  a certified atomic always has a spelling. `type_evidence` exists only as the
-  `signal_flag` variant's member, where it is proof rather than diagnosis.
+  `declaration-source-unmapped` its only code. Spelling absence is not a status:
+  `word_sized_scalar` keeps requiring a spelling (§B), so a certified atomic
+  always has one, and there is no `declaration-type-unspelled` code.
 
-### 5. Ordering, determinism, and two names that are not one name
+### 5. Ordering and determinism
 
 - `typedef_chain` is in **outer-to-inner declaration order**, neither sorted nor
   deduplicated: it is a path, and its order is the evidence.
-- `type_evidence.typedef` is the **recognized standard typedef** — the name
-  that licensed the certificate — and MUST be a member of `typedef_chain`, but is
-  *not* necessarily `typedef_chain[0]`: under `typedef sig_atomic_t my_flag_t;`
-  the chain is `["my_flag_t", "sig_atomic_t", "__sig_atomic_t"]` and recognition
-  matches at position 1.
-- `type_spelling` (§A) is positionally `typedef_chain[0]`. The two coincide only
-  when the declaration names the standard typedef directly — the common case and
-  the bore case — and MUST NOT be conflated: one answers "what did the source
-  say", the other "what proved this certificate".
-- When exactly one chain member is a recognized standard name, `typedef` is that
-  member; two cannot occur, since recognition matches a single spelling.
 - Exceeding `DEBUG_TYPE_RECURSION_LIMIT` yields **no certificate**, never a
   truncated chain. Same for cycles and malformed metadata.
-- `certified_path.path` is the shortest direct-call path from the resolved
-  registration with the lowest callsite id, ties broken by callee order within
-  each caller. Specified because a handler can reach a flag by several chains, and
-  an arbitrary choice would churn manifests across unrelated inlining changes.
-- `codes`, `operations`, `typedef_chain`, and `observers` are deterministic under
-  re-emission; a golden diff that reorders any of them is a defect.
+- `registration` is the resolved registration with the lowest callsite id, then
+  the lowest accessor function id. Specified because a handler can reach a flag
+  by several chains, and an arbitrary choice would churn manifests across
+  unrelated inlining changes. The intermediate call path is **not** recorded: it
+  is recomputable from the fixed call graph, and storing it would force a
+  shortest-path tie-breaking rule no consumer needs.
+- `codes`, `typedef_chain`, and `observers` are deterministic under re-emission;
+  a golden diff that reorders any of them is a defect.
 
-### 6. Freeze points, and an honest note about rigor
+### 6. The permitted golden diff
+
+**Phase 1** (walker only, no schema change, no header change):
+
+| Class | Condition | Permitted change |
+|---|---|---|
+| **B** | `word_sized_scalar` was already true | none |
+| **C** | was false, and the walk recovers no spelling | none — the global still fails `word-sized-scalar`, with the same value and no new detail |
+| **D** | spelling recovered; still fails atomic later | `word_sized_scalar.value` false → true with its `type_spelling`, `size_bits`, `class`, `signed` now populated per the **unchanged** v4 invariant; `atomic_eligibility.codes` changes from `["word-sized-scalar"]` to the later decisive code; `diagnostics` changes from `access_lowering: skipped` to an observed-site count. Disposition unchanged |
+| **E** | spelling recovered; now certifies | class D's changes, plus `atomic_eligibility` Failed → Certified with recipe and `source_materialization`; `cascade_chosen`/`chosen` → `atomic`; `cascade_trace` shortens; `run.dispose.measurement_report` moves |
+
+Class D is the bore flag's own Phase-1 diff: it clears the coarse gate and fails
+on `volatile-access` instead. Class C is the population §B defers — visibly
+inert here, which is the point of deferring it. There is no class touching every
+manifest, because Phase 1 does not bump the schema.
+
+**Phase 3** (schema bump + signal-flag mode):
+
+| Class | Condition | Permitted change |
+|---|---|---|
+| **F** | every manifest | `schema_version` 4 → 5 in the header; every atomic certificate's `signal_lock_free` replaced by `atomic_mode: {"kind": "plain"}`. **No fact changes**, and no per-global change follows from the bump alone |
+| **G** | an admitted signal flag | class F, plus `atomic_eligibility` Failed[`volatile-access`] → Certified with `atomic_mode: {"kind": "signal_flag", …}`; `chosen` → `atomic`; ledger records appear |
+
+The review rule is attribution, not line count: **every changed line must be
+attributable to its global's class, and every global must be in a class its facts
+justify.** Three defect signals a plausible-looking diff can carry: a class-B or
+class-C global changing at all in Phase 1, a class-D or class-E global whose
+declared type is *not* a qualified typedef (nothing else can have recovered a
+spelling), and any `word_sized_scalar` detail appearing at `value: false`, which
+would mean the deferred redefinition leaked in. Aggregate consistency is
+separate: `not_word_sized` must decrease by exactly |D| + |E|, and
+`measurement_report` may move at Phase 1 only if |E| > 0.
+
+### 7. Freeze points, and an honest note about rigor
 
 | Artifact | Change |
 |---|---|
-| `schemas/disposition-manifest.schema.json` | the `word_sized_scalar` `oneOf` (lines 139-166) is **untouched**; `signal_lock_free`'s definition **removed**; a discriminated `atomic_mode` definition added (`oneOf` on `kind`, so each variant's required members are schema-enforced); `run.analysis.target_probes` added as optional |
-| `crates/pangs-manifest/src/lib.rs` | `SCHEMA_VERSION = 5`; `AtomicMode` as an internally-tagged enum, replacing `signal_lock_free`; `KNOWN_PROBES` beside `RECOGNIZED_SIGNAL_TYPEDEFS`; one validator for the §4 value coupling. `Facts` and `Facts::validate` are unchanged |
-| `crates/pangs-pir/src/lib.rs` | `Global.type_evidence: Option<ScalarTypeEvidence>` with `#[serde(default)]`, matching every other optional field there (lines 158-183), so existing PIR fixtures parse and re-serialize unchanged; plus `section` and `thread_local` in Phase 3 |
+| `schemas/disposition-manifest.schema.json` | the `word_sized_scalar` `oneOf` (lines 139-166) is **untouched**; `signal_lock_free`'s definition **removed**; a discriminated `atomic_mode` definition added (`oneOf` on `kind`, so each variant's required members are schema-enforced) |
+| `crates/pangs-manifest/src/lib.rs` | `SCHEMA_VERSION = 5`; `AtomicMode` as an internally-tagged enum, replacing `signal_lock_free`; `RECOGNIZED_SIGNAL_TYPEDEFS`; one validator for the §4 value coupling. `Facts` and `Facts::validate` are unchanged |
+| `crates/pangs-pir/src/lib.rs` | `Global.type_evidence: Option<ScalarTypeEvidence>` with `#[serde(default)]`, matching every other optional field there (lines 158-183), so existing PIR fixtures parse and re-serialize unchanged; plus `section` and `thread_local` in Phase 3; `LoweringStats::alias_exposes_global` |
 | `crates/pangs-api/src/lib.rs:142` | `GlobalInfo` mirrors the same optional fields |
 | `schemas/globals.schema.json` | **unaffected, deliberately** — `additionalProperties: false` over a fixed key set, no type fields at all; it is not the type channel and MUST NOT gain one |
-| D1a golden manifests | regenerated; the permitted diff is classified per global in §7 |
+| D1a golden manifests | regenerated; the permitted diff is classified per global in §6 |
 
 `type_spelling`, `scalar_class`, and `signed` are **retained** on the PIR and API
 globals, not replaced; when `type_evidence` is present they are its projections.
@@ -1302,66 +1246,19 @@ signal-flag additions is therefore *new* rigor, justified by the asymmetry state
 in §Status: these fields gate a silent failure, and the JSON schema is the only
 artifact a non-Rust consumer can check. The rest of the payload stays as it is.
 
-### 7. The permitted golden diff
-
-| Class | Condition | Permitted change |
-|---|---|---|
-| **A** | every manifest | `schema_version` 4 → 5 in the header; every atomic certificate's `signal_lock_free` replaced by `atomic_mode`. **No fact changes**, and no per-global change follows from the bump alone |
-| **B** | `word_sized_scalar` was already true | class A only |
-| **C** | was false, and the walk recovers no spelling | class A only — the global still fails `word-sized-scalar`, with the same value and no new detail |
-| **D** | spelling recovered; still fails atomic later | class A, plus `word_sized_scalar.value` false → true with its `type_spelling`, `size_bits`, `class`, `signed` now populated per the **unchanged** v4 invariant; `atomic_eligibility.codes` changes from `["word-sized-scalar"]` to the later decisive code; `diagnostics` changes from `access_lowering: skipped` to an observed-site count. Disposition unchanged |
-| **E** | spelling recovered; now certifies | class D's changes, plus `atomic_eligibility` Failed → Certified with recipe, `atomic_mode`, and `source_materialization`; `cascade_chosen`/`chosen` → `atomic`; `cascade_trace` shortens; `run.dispose.measurement_report` moves |
-
-Class D is the bore flag's own Phase-1 diff: it clears the coarse gate and fails
-on `volatile-access` instead. Class C is the population §B defers — visibly
-inert here, which is the point of deferring it.
-
-Phase 1 also switches the signal gate onto probes, so a sixth movement is
-possible and is **not** a class above: a signal-context global whose operations
-no probe covers goes `Certified → Failed[signal-atomic-not-lock-free]`. It is
-expected to be empty on the corpus (see §"Corpus-level acceptance") and is
-reviewed separately, because unlike A–E it is a coverage loss.
-
-The review rule is attribution, not line count: **every changed line must be
-attributable to its global's class, and every global must be in a class its facts
-justify.** Three defect signals a plausible-looking diff can carry: a class-B or
-class-C global changing beyond the header, a class-D or class-E global whose
-declared type is *not* a qualified typedef (nothing else can have recovered a
-spelling), and any `word_sized_scalar` detail appearing at `value: false`, which
-would mean the deferred redefinition leaked in. Aggregate consistency is
-separate: `not_word_sized` must decrease by exactly |D| + |E|, and
-`measurement_report` may move only if |E| > 0 or the probe switch moved a global.
-
-## Materialization contract
+## Materialization
 
 `DISPOSITION.md` §5.3 already assigns `atomic` its stage split — the C→C tool
-does **exemption + definition-site marker**, and nothing else. This section makes
-the rest concrete rather than adding a stage.
+does **exemption + definition-site marker**, and nothing else.
 
-### M.0 "Certified but blocked" is a decided policy, not a new one
-
-1. **The separation already exists.** `atomic_source_materialization`
-   (`crates/pangs-clients/src/lib.rs:1310`) returns
-   `{ status: "blocked", code: "declaration-source-unmapped" }` inside a
-   certified payload today, and `DISPOSITION.md` §9's D4 entry states the same
-   rule for mutex: static certification is distinct from source readiness.
-2. **The cascade guard is certificate-only.** Slot 3 reads one thing: is
-   `atomic_eligibility` certified. A certified slot whose
-   `source_materialization.status` is `blocked` still selects `atomic`.
-3. **Execution failure is corrected downstream**, by C→C demotion (§5.3) or
-   Rust-stage loud failure (M.7) — never by weakening the certificate.
-4. **Therefore blocked materialization MUST NOT be folded back into the
-   certification guard**, which would create a second, divergeable definition of
-   atomic eligibility.
-
-Consequently there is no `declaration-type-unspelled` blocked code, and there is
-no need for one: `word_sized_scalar` keeps requiring a spelling (§B), so a
-certified atomic always has one. The observation that no stage would need it
-stands and is worth recording — the C→C stage plants a marker needing only the
-symbol and coordinates, and the Rust stage derives the atomic type from
-`scalar_class`/`signed`/`size_bits` (M.3), so nothing consumes
-`recipe.declaration.type_spelling` — but under this feature that is a *reason the
-deferred redefinition is safe to make later*, not a state this feature produces.
+**Most of what a materializer needs here is not specific to this feature.** Type
+mapping from `recipe.declaration`, initializer translation from
+`initializer_ir`, the access rewrite forms, marker consumption, and the
+post-rewrite validation are the contract for translating *any* `atomic`-disposed
+global; that contract does not exist yet and is not this note's to write (see
+§"Spun-off work"). This section states only what is specific: which stage removes
+`volatile`, why external linkage is rejected, and the three requirements this
+feature places on that contract.
 
 ### M.1 Which stage removes `volatile`
 
@@ -1401,29 +1298,9 @@ static int search(void) {
 }
 ```
 
-Translated Rust, before the rewrite — the C `volatile` accesses arrive as
-`read_volatile`/`write_volatile` calls on the static's address, which is the
-property that makes them findable:
-
-```rust
-static mut g_interrupted: __sig_atomic_t = 0;
-
-unsafe extern "C" fn sigint_handler(_sig: c_int) {
-    ::core::ptr::write_volatile(&mut g_interrupted as *mut __sig_atomic_t, 1);
-}
-
-unsafe fn search() -> c_int {
-    while work_remaining() != 0 {
-        if ::core::ptr::read_volatile(&g_interrupted as *const __sig_atomic_t) != 0 {
-            return 1;
-        }
-        step();
-    }
-    0
-}
-```
-
-After the rewrite:
+The C `volatile` accesses arrive in translated Rust as `read_volatile` /
+`write_volatile` calls on the static's address, which is the property that makes
+them findable. After the rewrite:
 
 ```rust
 static g_interrupted: ::core::sync::atomic::AtomicI32 =
@@ -1448,163 +1325,7 @@ unsafe fn search() -> c_int {
 dropping `mut` turns every missed access into a compile error rather than a
 silent survival — the structural gift `DISPOSITION.md` §7 relies on.
 
-### M.3 Type mapping
-
-Keyed on `recipe.declaration.{scalar_class, signed, size_bits}`:
-
-| `scalar_class` | `signed` | `size_bits` | Rust type |
-|---|---|---|---|
-| `integer` | true | 8 / 16 / 32 / 64 | `AtomicI8` / `I16` / `I32` / `I64` |
-| `integer` | false | 8 / 16 / 32 / 64 | `AtomicU8` / `U16` / `U32` / `U64` |
-| `enum` | per `signed` | as above | as the integer rows |
-| `boolean` | — | 8 | `AtomicBool` |
-| `pointer` | — | — | **out of scope in v1** — a signal flag is an integer, and `AtomicPtr<T>` needs a pointee type this recipe does not carry |
-
-`size_bits` must be covered by the cited probe, which D3 guarantees; a
-mismatch is a rewriter error, not a demotion. All paths are written fully
-qualified (`::core::sync::atomic::…`) so the rewriter never manages `use`
-statements or collides with an existing import.
-
-### M.4 Initializer
-
-`recipe.declaration.initializer_ir` is a typed LLVM constant (`i32 0` for the
-bore flag), and `AtomicI32::new` is `const fn`, so the result is valid in a
-`static`.
-
-**Translation is bit-vector semantics, not decimal copying.** LLVM prints integer
-constants with a *signed* interpretation of the type's bit width, so
-`unsigned char x = 255;` appears as `i8 -1`; copying that decimal into
-`AtomicU8::new(-1)` does not compile, and a naive `abs`-style repair would
-silently produce `1`.
-
-```text
-1. parse "iN <decimal>"  ->  (N, signed value v)
-2. require N == recipe.declaration.size_bits
-3. bits := v reduced mod 2^N        (two's-complement pattern, N bits)
-4. emit the literal in the TARGET type's signedness:
-     AtomicIN::new(<bits interpreted as signed N-bit>)
-     AtomicUN::new(<bits interpreted as unsigned N-bit>)
-```
-
-| `initializer_ir` | `signed` | Emitted |
-|---|---|---|
-| `i32 0` | true | `AtomicI32::new(0)` |
-| `i32 -1` | true | `AtomicI32::new(-1)` |
-| `i8 -1` | **false** | `AtomicU8::new(255)` |
-| `i8 -1` | true | `AtomicI8::new(-1)` |
-| `i32 -2147483648` | true | `AtomicI32::new(-2147483648)` |
-| `i32 -2147483648` | false | `AtomicU32::new(2147483648)` |
-| `zeroinitializer` | either | `AtomicIN::new(0)` / `AtomicUN::new(0)` |
-
-**Boolean initialization.** A C `_Bool` global has `scalar_class: "boolean"` but
-is stored as `i8`, so both spellings are accepted and every other bit pattern
-rejected — `AtomicBool::new` takes a `bool` and has no representation for
-anything else:
-
-```text
-"i1 false" | "i8 0" | "zeroinitializer"  ->  AtomicBool::new(false)
-"i1 true"  | "i8 1"                      ->  AtomicBool::new(true)
-any other value at boolean class         ->  rewriter error
-```
-
-`undef` and `poison` are rejected: a C definition always has an initializer, so
-their appearance means the recipe and the module disagree. An address-valued,
-aggregate, or non-constant initializer cannot reach this path, since D3's coarse
-gate requires a scalar class and an empty storage closure.
-
-### M.5 Access rewrite forms
-
-The recipe's `accesses` entries carry C coordinates, which the Rust stage does
-not use; it matches structurally, on uses of the identified static:
-
-```text
-read_volatile(&G as *const T)          ->  G.load(Ordering::Relaxed)
-read_volatile(&raw const G)            ->  G.load(Ordering::Relaxed)
-write_volatile(&mut G as *mut T, v)    ->  G.store(v, Ordering::Relaxed)
-write_volatile(&raw mut G, v)          ->  G.store(v, Ordering::Relaxed)
-plain read of G                        ->  G.load(Ordering::Relaxed)
-plain assignment G = v                 ->  G.store(v, Ordering::Relaxed)
-```
-
-The ordering comes from `recipe.ordering`, which is `"relaxed"` and MUST NOT be
-inferred. Both `&raw` and `as *const`/`as *mut` spellings are accepted because
-translator versions differ. The surrounding `unsafe` block is left alone: an
-access that no longer needs it is a lint, not an error.
-
-Anything else naming the static — an address taken into a variable, a cast, a
-pointer passed to a function, a `memcpy` — is a rewriter error. D3's recipe
-already rejects those shapes, so encountering one means the recipe and the
-translated source disagree, which must be loud.
-
-### M.6 Marker interaction
-
-1. Read `materialization.marker_inventory`; find the `disposition_atomic` row for
-   the key and confirm its embedded strategy matches the manifest disposition.
-2. Resolve the row to the translated `static` item — by symbol name normally, by
-   the marker when translation renamed it.
-3. Rewrite declaration and accesses.
-4. Delete the marker call, the generated constructor wrapper, and the
-   `pangs_markers.h` include.
-
-A surviving `pangs_*` symbol is a build error by design, and a manifest `atomic`
-disposition whose marker is absent from the translated source is a loud failure —
-both existing `DISPOSITION.md` §5.2 rules, inherited unchanged.
-
-### M.7 Validation and failure
-
-**The primary check is an exhaustive reference inventory**, not a count. A
-count-plus-residue check does not catch a translated form that launders the
-address:
-
-```rust
-let p = &g_interrupted as *const _ as *const i32;
-let v = ::core::ptr::read_volatile(p);
-```
-
-That reference is not one of M.5's forms, so it is not rewritten and the count is
-unaffected; the surviving `read_volatile` does not syntactically name the static,
-so a residue check misses it; and it **compiles**, because the raw-pointer cast
-erases the type distinction that was supposed to be the safety net. The result
-reads the atomic non-atomically — soundness rule 5 violated silently. So the rule
-is closure over references, not detection of known-bad ones:
-
-1. **Inventory.** Enumerate *every* path-expression reference to the static item
-   in the translated crate and classify each. After rewriting, the only permitted
-   references are receivers of `load`/`store` calls with the frozen ordering.
-   Every other reference — `&G`, `addr_of!(G)`, a cast, an argument, a mention in
-   another item's initializer, any other method — is a build failure naming the
-   site. Unknown classification is failure, never default-allow.
-2. **Macro and `cfg` closure.** A reference the rewriter cannot see is not one it
-   may ignore: if it operates before macro expansion, any macro invocation whose
-   token stream mentions the symbol and which it cannot expand is a failure, and
-   `cfg`-disabled code mentioning the symbol is likewise a failure, since another
-   feature set would compile it. c2rust output is macro-light in practice, which
-   makes this cheap, not unnecessary.
-3. **Count cross-check.** Rewritten site count equals `recipe.accesses.len()` —
-   retained because it catches the opposite error: the inventory catches
-   references the *analysis* did not classify, the count catches accesses the
-   *rewriter* did not find.
-4. **Type.** The static's type is the mapped atomic type and the item is no
-   longer `static mut`.
-5. **Marker.** The inventory row is consumed and the symbol is gone.
-6. **The compiler, as a backstop for the type-visible subset only.** Anything
-   expecting `i32` where `AtomicI32` now sits fails to typecheck; raw-pointer
-   paths defeat it, which is why check 1 is mandatory.
-
-**Demotion.** `DISPOSITION.md` §5.3 gives the demotion channel to the C→C tool,
-which owns a manifest section. The Rust stage owns none, so it cannot demote:
-
-| Stage | Failure | Behavior |
-|---|---|---|
-| C→C | cannot plant the marker (definition inside an unrewritable macro) | ordinary §5.3 demotion to `unhandled` |
-| Rust | unmappable type, untranslatable or out-of-range initializer, unclassifiable reference, unexpandable macro mentioning the symbol, count mismatch, missing marker, toolchain outside the recorded envelope | **loud build failure** |
-
-The operator's recourse for a Rust-stage failure is to pin the global
-`disposition = "unhandled"`, which §4.2 always permits without `accept_risk`, and
-re-run. Giving the Rust stage its own demotion channel would mean giving it a
-manifest section, reopening `DISPOSITION.md` §3.3's stage-ownership rule.
-
-### M.8 External linkage is rejected in signal-flag mode
+### M.3 External linkage is rejected in signal-flag mode
 
 **Layout compatibility is not the question.** If one TU is translated and another
 is not, the storage is accessed as a Rust atomic from one side and as a
@@ -1614,7 +1335,7 @@ the same location a data race and therefore undefined behavior
 (`std::sync::atomic` module documentation); identical layout only guarantees the
 two sides disagree about the same bytes. For a signal flag the concurrent case is
 not a corner — asynchronous access from outside ordinary control flow is the
-object's entire purpose. Soundness rule 5 applies across a TU boundary just as
+object's entire purpose. Soundness rule 4 applies across a TU boundary just as
 within one.
 
 A layout argument would also be overstated on its own terms: `AtomicI32`
@@ -1636,8 +1357,8 @@ gate whose failure mode is silent UB, the redundancy is the point.
 **`global.meta.linkage` is not sufficient on its own**, which is why §E carries a
 separate alias clause: an `__attribute__((alias))` definition with external
 linkage re-exports an internal global under a second name, so the symbol is
-externally accessible while `linkage` still reads `internal`. The alias-exposure
-inventory in §E closes it.
+externally accessible while `linkage` still reads `internal`. The
+`alias_exposes_global` bool in §E closes it.
 
 Lifting the restriction requires a **whole-program certificate**: proof that
 every TU accessing the symbol is transformed in one run, so no non-atomic
@@ -1645,79 +1366,127 @@ accessor survives. No such certificate exists, and v1 does not reason about a
 half-translated program. The bore flag is `static`, so the restriction costs
 nothing for the motivating case.
 
+### M.4 What this feature requires of the atomic materialization contract
+
+Three requirements, stated here because they are consequences of §E's argument
+and will not be re-derived by whoever writes that contract:
+
+1. **No re-optimization back to a plain read.** The materializer must not
+   "optimize" a certified access to a non-atomic read even when it can prove the
+   flag loop-invariant in its own view of the program: the handler write is
+   invisible to that proof. Nor may it substitute a `Cell`, a `static mut` read,
+   or an `UnsafeCell` shim for the atomic representation.
+2. **The ordering is read, never inferred.** It comes from `recipe.ordering`,
+   which is `"relaxed"`. A signal flag used as a payload-publication protocol
+   gains no acquire/release claim from this certificate.
+3. **Post-rewrite validation must be closure over references, not a count plus a
+   residue scan.** This is the one place the obvious implementation is unsound,
+   so it is stated in full below.
+
+**The reference-inventory requirement.** A count-plus-residue check does not
+catch a translated form that launders the address:
+
+```rust
+let p = &g_interrupted as *const _ as *const i32;
+let v = ::core::ptr::read_volatile(p);
+```
+
+That reference is not one of the expected rewrite forms, so it is not rewritten
+and the count is unaffected; the surviving `read_volatile` does not syntactically
+name the static, so a residue check misses it; and it **compiles**, because the
+raw-pointer cast erases the type distinction that was supposed to be the safety
+net. The result reads the atomic non-atomically — soundness rule 4 violated
+silently. So the rule is:
+
+> Enumerate *every* path-expression reference to the static item in the
+> translated crate and classify each. After rewriting, the only permitted
+> references are receivers of `load`/`store` calls with the frozen ordering.
+> Every other reference — `&G`, `addr_of!(G)`, a cast, an argument, a mention in
+> another item's initializer, any other method — is a build failure naming the
+> site. Unknown classification is failure, never default-allow. A reference the
+> rewriter cannot see is not one it may ignore: a macro invocation whose token
+> stream mentions the symbol and which it cannot expand is a failure, and
+> `cfg`-disabled code mentioning the symbol is likewise a failure, since another
+> feature set would compile it.
+
+A rewritten-site count equal to `recipe.accesses.len()` is retained as a
+*cross-check*, not the gate: the inventory catches references the analysis did
+not classify, the count catches accesses the rewriter did not find, and the
+compiler is a backstop for the type-visible subset only.
+
+**Demotion.** `DISPOSITION.md` §5.3 gives the demotion channel to the C→C tool,
+which owns a manifest section. The Rust stage owns none, so it cannot demote: a
+C→C failure (marker unplantable, e.g. a definition inside an unrewritable macro)
+is an ordinary §5.3 demotion to `unhandled`, while any Rust-stage failure is a
+loud build failure whose operator recourse is a `disposition = "unhandled"` pin,
+which §4.2 always permits without `accept_risk`.
+
 ## Soundness rules
 
-1. Missing or incomplete typedef/qualifier metadata never proves
-   `signal_atomic_type`.
+1. Missing or incomplete typedef/qualifier metadata never proves signal-flag type
+   evidence.
 2. A generic volatile access remains a hard atomic-eligibility failure.
-3. A signal-context atomic must cite one probe covering the declaration's width
-   and **every** operation its recipe emits; a library-based fallback is
-   forbidden in an async-signal handler, and an arch with no probe is not
-   lock-free. Probes are never combined to cover an operation set between them.
-4. Every access to the global must be enumerated and lowered; an incomplete
-   access set fails closed.
-5. No mixed atomic/non-atomic or atomic/volatile representation is emitted —
+3. Every access to the global must be enumerated and lowered; an incomplete
+   access set fails closed. Width, alignment, and signedness must match the
+   declaration and every access.
+4. No mixed atomic/non-atomic or atomic/volatile representation is emitted —
    **including across a translation-unit boundary**. Conflicting atomic and
    non-atomic access to the same storage is undefined behavior under Rust's
-   memory model, and identical layout does not make it defined (M.8).
-6. Width, alignment, and signedness must match the declaration and every access.
-7. A name-matched external declaration in the registry **is** a registration; an
-   operand the solver cannot resolve downgrades it to unresolved rather than
-   deleting it. Only a *resolved* registration with a certified positive path may
-   satisfy a permitting conjunct.
-8. Unknown handler targets or unknown signal-context accesses retain the
+   memory model, and identical layout does not make it defined (M.3).
+5. A signal-flag atomic requires an arch and width listed in
+   `SIGNAL_FLAG_LOCK_FREE`, which is backed by an in-tree codegen regression and
+   has no configuration surface. A library-based (`__atomic_*`) fallback is
+   forbidden in an async-signal handler, and an arch with no row is not lock-free.
+6. An external declaration matching a registry name **is** a registration; for a
+   built-in signal entry it must also match that entry's internal shape, since a
+   different arity means a different function rather than an unresolvable one. An
+   operand the solver cannot resolve downgrades a registration to unresolved
+   rather than deleting it. Only a *resolved* registration with a certified
+   positive path may satisfy a permitting conjunct.
+7. Unknown handler targets or unknown signal-context accesses retain the
    appropriate conservative facts, and "conservative" is direction-dependent: for
    a *restricting* fact it means widening (`signal_context_access` sets every
    global on a `ModuleWide` effect, which is correct); for a *permitting*
    conjunct it means the opposite — no widened, aliased, or may-set access path
    may establish it.
-9. The certificate provides scalar atomicity only. It does not certify
-   publication of unrelated memory and does not model the interleaving between
-   handler and interrupted code; it certifies that each individual access remains
-   indivisible. It is **not** the whole of what the source relied on — the source
-   also relied on `volatile`'s preservation of access count and relative order,
-   which rule 12 discharges.
-10. Volatile admission requires proven signal-handler participation, evidenced by
-    at least one *resolved* registration. Type evidence alone never admits a
-    volatile access, and neither does an unresolved registration.
-11. Recognizing a registration alias never relaxes the Ω boundary at that call:
-    it adds spawn/signal facts and removes a phase-analysis unresolved-effect
-    widening, leaving every points-to, mod/ref, and escape consequence unchanged.
-12. `Relaxed` does not preserve the number or relative order of accesses;
-    redundant-load elimination, dead-store elimination, store-to-load forwarding,
-    and coalescing are all permitted on `monotonic`. Certification therefore
-    requires F2 — handler-observer confinement for every function that both
-    accesses the flag and may run as a handler — under which every such
-    transformation is behavior-refining, because the only observer that could
-    distinguish them is a handler that F2 forbids from touching anything else,
-    and signal arrival timing is unconstrained. Without the pattern, dropping
-    `volatile` is unsound, not merely optimistic.
-13. The only residual assumption in signal-flag mode is the absence of
-    *unbounded* elision: a `monotonic` load or store in a loop is re-executed
-    each iteration. It is asserted per probe by positional codegen
-    assertions on both the load and store side, never by access-count equality,
-    which would reject a legal RLE and accept a store sunk past a loop.
-14. Every conjunct that *permits* something requires a finite, exhibitable
+8. `Relaxed` does not preserve the number or relative order of accesses;
+   redundant-load elimination, dead-store elimination, store-to-load forwarding,
+   and coalescing are all permitted on `monotonic`. Certification therefore
+   requires F2 — handler-observer confinement for every function that both
+   accesses the flag and may run as a handler — under which every such
+   transformation is behavior-refining, because the only observer that could
+   distinguish them is a handler that F2 forbids from touching anything else,
+   and signal arrival timing is unconstrained. Without the pattern, dropping
+   `volatile` is unsound, not merely optimistic.
+9. The only residual assumption in signal-flag mode is the absence of *unbounded*
+   elision: a `monotonic` load or store in a loop is re-executed each iteration.
+   It is asserted by positional codegen assertions on both the load and store
+   side, never by access-count equality, which would reject a legal RLE and
+   accept a store sunk past a loop.
+10. Every conjunct that *permits* something requires a finite, exhibitable
     positive path: an exact global root (`Via::Direct`), reached from a precise
     target of a resolved registration over direct-call edges only.
     `AffectedGlobals::ModuleWide`, a finite may-set, an aliased or unknown
     access, an indirect call edge, and a target drawn from the address-taken
     widening each set the restrictive fact and none of them satisfies the
     permitting conjunct.
-15. Every conjunct in an admission predicate must be evaluable from a fact that
-    exists, and the note must name it. A clause phrased over a relation the
+11. Every conjunct in an admission predicate must be evaluable from a fact that
+    exists, and this note must name it. A clause phrased over a relation the
     pipeline does not compute — "no external-linkage alias targets the global",
     when the alias's target is never resolved — is worse than an absent clause:
     it reads as a guard, is cited as one, and an implementer will most plausibly
     discharge it by evaluating it to `false`. Where the fact does not exist, the
     design must either add it or state the blunter fact that stands in for it.
-16. The redefined `word_sized_scalar` never becomes a certificate by itself. It
-    is a coarse gate; certification still requires the complete access recipe,
-    and source readiness never feeds back into the certification guard (M.0).
-17. The C→C stage never removes `volatile` or alters an access: between the two
+12. The certificate provides scalar atomicity only. It does not certify
+    publication of unrelated memory and does not model the interleaving between
+    handler and interrupted code. Recognizing a registration alias never relaxes
+    the Ω boundary at that call: it adds spawn/signal facts and removes a
+    phase-analysis unresolved-effect widening, leaving every points-to, mod/ref,
+    and escape consequence unchanged.
+13. The C→C stage never removes `volatile` or alters an access: between the two
     stages the program must remain a correct C program, and a declaration
     stripped of `volatile` before an atomic exists in its place is not one.
-18. A signal-flag atomic exists only as a complete certified proof. There is no
+14. A signal-flag atomic exists only as a complete certified proof. There is no
     partial, failed, or overridden form: a failed proof emits no recipe, and no
     override can supply one. This is enforced by shape rather than by a check —
     `atomic_mode` is a certificate-level member and `Certificate::Failed` has no
@@ -1730,12 +1499,11 @@ PIR lowering, the F-layer fact scans, and the manifest schema.
 
 1. **`DISPOSITION.md` §2 (fact table)** — **no row changes.** No fact is added,
    and `word_sized_scalar` keeps its definition including the spelling condition
-   (§B); the deferred redefinition owns that row when it is written. The
-   `signal_context_access` row is unchanged, but gains two sentences: that it is
-   a *restricting* fact computed by a widening query and therefore never
-   discharges a permitting conjunct, and that the `atomic` certificate's mode
-   variant must agree with it — the one place a certificate reads a sibling fact.
-   §1's guard-shape rule gains the general statement (rule 14).
+   (§B). The `signal_context_access` row gains two sentences: that it is a
+   *restricting* fact computed by a widening query and therefore never discharges
+   a permitting conjunct, and that the `atomic` certificate's mode variant must
+   agree with it — the one place a certificate reads a sibling fact. §1's
+   guard-shape rule gains the general statement (rule 10).
 2. **`DISPOSITION.md` §3 / §3.2** — `schema_version: 5` per the freeze above.
    The fact layer and its detail/value coupling invariant are untouched; the sole
    change is that the `atomic_eligibility` certificate **replaces**
@@ -1743,86 +1511,65 @@ PIR lowering, the F-layer fact scans, and the manifest schema.
    compatible with v4 payloads and does not claim to be; the schema-v4 sentence
    in §2 is replaced rather than extended, and §3.3's stage-ownership rule gains
    the exact-version requirement.
-3. **`DISPOSITION.md` §3.2 / §3.3 (`run.analysis`)** — the run header gains
-   `target_probes`, optional, documented explicitly as a reproducibility record
-   that no validator reads, so a reader does not take its absence for a defect or
-   its presence for a guarantee.
-4. **`DISPOSITION.md` §7 (soundness matrix)** — the `atomic` row's "no additional
+3. **`DISPOSITION.md` §7 (soundness matrix)** — the `atomic` row's "no additional
    relational failure for defined source behavior" needs a signal-flag
    qualification: what makes the substitution behavior-preserving is F2 plus the
-   unconstrained timing of signal arrival (rule 12), and what remains assumed is
-   only the absence of unbounded elision (rule 13) — the first as a stated
+   unconstrained timing of signal arrival (rule 8), and what remains assumed is
+   only the absence of unbounded elision (rule 9) — the first as a stated
    precondition of the row, the second as a recorded assumption. Add the
-   dynamic-audit cell (Phase 4's SIGINT test) and the per-row codegen assertions.
+   dynamic-audit cell (Phase 4's SIGINT test) and the codegen assertions.
    **`DESIGN.md` §8** takes the same assumption in its audited soundness
    inventory, phrased as the single residual, not as "volatile is replaced by
    Relaxed".
-5. **`DISPOSITION_PLAN.md` §1.5** — the certificate encodings D1a's golden test
+4. **`DISPOSITION_PLAN.md` §1.5** — the certificate encodings D1a's golden test
    freezes gain `atomic_mode`. The evidenced-bool encodings and
    `source_materialization`'s code list are unchanged, and no scalar
    failure-diagnostic vocabulary is added (§B).
-6. **`DISPOSITION.md` §5.3 (stage actions)** — the `atomic` row is unchanged, but
+5. **`DISPOSITION.md` §5.3 (stage actions)** — the `atomic` row is unchanged, but
    the section describes demotion as though every materialization failure had a
    channel. It should state that the Rust-side rewriter owns no manifest section,
    therefore fails loudly rather than demoting, and that the `unhandled` pin is
-   the operator's recourse (M.7). A pre-existing gap this feature surfaces.
-7. **Audit ledger kinds** — `signal-flag-codegen-assumption` (§E). Analysis-
+   the operator's recourse (M.4). A pre-existing gap this feature surfaces.
+6. **Audit ledger kinds** — `signal-flag-codegen-assumption` (§E). Analysis-
    sourced, so `DISPOSITION.md` §3.3's rule applies (dispose regenerates only
    `source: "override"` records). **No change to
    `schemas/disposition-audit.schema.json` is required**: `kind` is a free string
    and the schema is `additionalProperties: true`. Document the kind in
    `DISPOSITION_PLAN.md` §1.4 alongside the deterministic-id rule.
-8. **`pangs-pir` lowering docs (`LoweringStats`)** — `alias_exposed_globals` is a
+7. **`pangs-pir` lowering docs (`LoweringStats`)** — `alias_exposes_global` is a
    *fact*, not a metric, and belongs documented apart from the `*_counts` maps
    beside it. Add a sentence stating that `tainted_counts`, `skipped_counts`, and
-   `modeled_counts` are observability counters read by no guard — with the one
-   exception that an `alias_unresolved:` taint blocks signal-flag mode (§E).
-9. **`DESIGN_lite.md` §2A** — the registry paragraph describes only the Ω
+   `modeled_counts` are observability counters read by no guard, and that the new
+   bool is not one of them.
+8. **`DESIGN_lite.md` §2A** — the registry paragraph describes only the Ω
    external-summary registry. Add one sentence distinguishing the spawn/signal
    disposition registry (name-keyed, conservative-on-false-positive, no Ω
    effect), so a reader does not infer that adding `__sysv_signal` summarizes an
    external call.
-10. **`HOWTO_MEASURE_DISPOSITION_COVERAGE.md` and the `notes/disposition_*`
-    baselines** — **no amendment.** `not_word_sized` and the would-be-eligibility
-    counters keep their meaning, so historical values stay comparable and only
-    their *values* move, by the attributable amount in §7. This is the direct
-    payoff of deferring §B; the separate change inherits the re-baselining
-    obligation.
+9. **`HOWTO_MEASURE_DISPOSITION_COVERAGE.md` and the `notes/disposition_*`
+   baselines** — **no amendment.** `not_word_sized` and the would-be-eligibility
+   counters keep their meaning, so historical values stay comparable and only
+   their *values* move, by the attributable amount in §6. This is the direct
+   payoff of deferring §B; the separate change inherits the re-baselining
+   obligation.
 
 ## Implementation sequence
 
 Phases 1 and 2 are independent; Phase 3 depends on both, because its admission
-conjunction names a fact from each.
+conjunction names a fact from each. Phase 4 depends on the spun-off atomic
+materialization contract and is not required to measure Phases 1–3.
 
-### Phase 1: diagnostics and type normalization
+### Phase 1: type normalization
 
 - Add a bounded qualified-type walker in `pangs-pir`; preserve typedef chains and
   qualifiers in PIR/API metadata, populating `type_spelling` from
   `typedef_chain[0]`.
-- **Do not touch `word_sized_scalar`, `Facts`, or `Facts::validate`** (§B). The
-  only fact-layer effect is that `type_spelling` is populated where the walk now
-  recovers it; the invariant it satisfies is the v4 one, unchanged.
-  `declaration-source-unmapped` keeps its meaning and remains the only blocked
-  `source_materialization` code.
-- Bump `SCHEMA_VERSION` to 5 and land the **complete** freeze — not only the
-  parts Phase 1 exercises: `AtomicMode` with all three
-  variants and its discriminated schema definition; `KNOWN_PROBES`; the §4 value
-  coupling validator; the exact-version requirement for stages that preserve
-  earlier sections; and regenerated goldens. Phase 1 emits only
-  `{"kind": "plain"}` and `{"kind": "signal_safe", …}` — the latter wherever a
-  signal-context global certifies today, carrying the probe that covers its
-  existing recipe.
-- Land the probe table and its codegen regressions, and switch the signal gate
-  (`crates/pangs-clients/src/lib.rs:1113,1217`) from `supported_atomic_widths`
-  onto probe coverage. This belongs here, not in Phase 3: `signal_safe` is a
-  required v5 variant with a required probe member, so the table is part of the
-  contract §1 requires Phase 1 to land whole, and it depends on nothing in
-  Phases 2–3. `supported_atomic_widths` and its derivation are untouched, and the
-  regression lands *before* the probe it justifies, RMW included.
-- The `signal_flag` variant ships **dormant**: nothing emits it until Phase 3, so
-  its clauses are unreachable rather than vacuously true. A test asserts exactly
-  that — the validator is live, every Phase-1 manifest passes it, and a
-  hand-written `signal_flag` fixture with a broken member is rejected.
+- **Do not touch `word_sized_scalar`, `Facts`, `Facts::validate`, or the schema
+  version** (§B). The only fact-layer effect is that `type_spelling` is populated
+  where the walk now recovers it; the invariant it satisfies is the v4 one,
+  unchanged. `declaration-source-unmapped` keeps its meaning and remains the only
+  blocked `source_materialization` code.
+- Regenerate goldens; the permitted diff is §6's Phase-1 table.
 
 This phase makes the manifest accurately say that `g_interrupted` is an aligned
 signed 32-bit scalar while still rejecting its volatile access recipe. The
@@ -1834,6 +1581,13 @@ not waivable by `accept_risk`.
 
 - Validate first with `--registry-config` on the bore module: no code change,
   observable fact delta. Then add `__sysv_signal` to the built-in table.
+- Land `BUILTIN_SIGNAL_SHAPES` and the mismatch diagnostic (§D). Note the
+  ordering wrinkle: the validation run above goes through the *unchecked* user
+  path, so promoting the entry to a built-in newly subjects bore's
+  `__sysv_signal(i32, ptr)` call to the arity-2 check. Confirm the promoted entry
+  still resolves — a fact delta between the config run and the built-in run would
+  mean the shape table is wrong, and it is the one thing the config-first
+  validation cannot observe.
 - Confirm the handler resolves to `sigint_handler_xjtr_0`, and that
   `bore_search_cleanup`'s restore call
   (`signal(2, g_prev_sigint_handler_xjtr_0)`) remains an unresolved registration
@@ -1852,67 +1606,51 @@ special volatile admission.
 
 ### Phase 3: narrow signal-flag atomic recipe
 
-- Emit the `signal_flag` variant. The probe table, the gate switch, and the
-  codegen regressions landed in Phase 1; nothing about the target model changes
-  here.
-- Emit the `signal-flag-codegen-assumption` ledger records from the checked-in
-  evidence table, and add the Rust-stage toolchain-envelope check. These are
-  signal-*flag* obligations — Phase 1's `signal_safe` certificates rest on probe
-  coverage alone, since the no-elision assumption is a property of replacing
-  `volatile`, which only this variant does.
+- Bump `SCHEMA_VERSION` to 5: `AtomicMode` with both variants and its
+  discriminated schema definition, `RECOGNIZED_SIGNAL_TYPEDEFS`, the §4 value
+  coupling validator, the exact-version requirement for stages that preserve
+  earlier sections, `signal_lock_free` deleted, and regenerated goldens.
 - Add `section: Option<String>` and `thread_local: bool` to `pangs_pir::Global`
   (both `#[serde(default)]`) and surface them through the API, so the
   ordinary-storage predicate is checkable at all.
-- Land `LoweringStats::alias_exposed_globals` and the reordering of
-  `collect_alias_map`, plus the `alias_unresolved:` module block (§E). The clause
-  must be backed by a fact that exists (rule 15).
-- Add signal-atomic type-evidence certification, including typedef provenance.
-- Land the **certified positive access path** query: walk
-  `access_sites_for_global` back over direct-call edges to the precise targets of
-  resolved registrations, recording the path as the witness. It is **not** a
-  filtered copy of `registry_access_facts` — that version would inherit
+- Land `LoweringStats::alias_exposes_global` and the reordering of
+  `collect_alias_map` (§E). The clause must be backed by a fact that exists
+  (rule 11).
+- Add signal-flag type-evidence certification (§C).
+- Land `SIGNAL_FLAG_LOCK_FREE` and its codegen regression. The regression lands
+  *before* the row it justifies. The existing signal gate's
+  `supported_atomic_widths` read is **not** touched (§"Spun-off work").
+- Land the **handler analysis** as one pass producing `A`, `H`, `A ∩ H`, the
+  certified registration, and the F2 verdict. It is **not** a filtered copy of
+  `registry_access_facts` — that version would inherit
   `AffectedGlobals::ModuleWide` and mark every global positively
   signal-accessed — and a code comment at the query should say so, because the
-  filtered-copy version is the obvious implementation and looks right.
-- Add the F2 check and emit the `signal_flag` variant: group the recipe's access list
-  by enclosing function to get `A`, intersect it with the registry target set
-  including §D's widening to get `A ∩ H`, and query each survivor's
-  static-storage access set. It is an admission conjunct, not a diagnostic — a
-  failure yields `recipe: null`. F2 is per-global; no whole-program pass is
-  required anywhere in this feature.
+  filtered-copy version is the obvious implementation and looks right. F2 is an
+  admission conjunct, not a diagnostic: a failure yields `recipe: null`. F2 is
+  per-global; no whole-program pass is required anywhere in this feature.
 - Thread it into atomic access recipe construction, gated on the full §E
-  conjunction — including the certified path, **not** `signal_context_access`;
-  the permissive-looking fact is the wrong one.
+  conjunction — including the certified registration, **not**
+  `signal_context_access`; the permissive-looking fact is the wrong one.
 - Admit only direct whole-object volatile loads/stores, on internal-linkage
-  globals only (M.8), and emit the `certified-signal-flag` recipe mode with its
-  operation set. **No schema or validator change belongs in this phase** — both
-  landed in Phase 1. If Phase 3 finds it needs one, that is a defect in the
-  freeze, to be fixed before Phase 1 ships rather than by amending a released v5.
-- Record the no-elision assumption in the audited soundness inventory per §E's
-  audit contract, with the run-scoped and per-global records.
+  globals only (M.3), and emit the `signal_flag` variant.
+- Emit the `signal-flag-codegen-assumption` ledger records and record the
+  no-elision assumption in the audited soundness inventory.
 
 ### Phase 4: end-to-end materialization
 
-- C→C: confirm `atomic` globals reach the definition-site marker path with the
-  declaration and every access byte-identical to the input.
-- Rust: type mapping (M.3), initializer translation (M.4), the access forms in
-  M.5, marker consumption and deletion (M.6).
-- Land M.7's **exhaustive reference inventory** — the load-bearing check, and the
-  one piece of Phase 4 that is not mechanical: enumerate every path-expression
-  reference to the static, classify each, permit only receivers of `load`/`store`
-  with the frozen ordering, and treat unknown classification as failure. Include
-  the macro and `cfg` closure. A count-and-residue implementation instead passes
-  the laundered-pointer case, compiles, and silently reads the atomic
-  non-atomically — soundness rule 5 violated with every check green.
-- Land the remaining M.7 checks as what they are: **count** as a cross-check,
-  **type**, **marker consumption**, and the compiler as a backstop for the
-  type-visible subset only.
-- Land the loud-failure behavior with the `unhandled` override as the documented
-  recourse — the Rust stage owns no manifest section and cannot demote.
-- Compile and run signal-interruption tests under the transformed program, and
-  add dynamic confirmation that SIGINT changes the flag and terminates the search
-  path without locks or allocation in the handler — the test that exercises the
-  no-elision assumption.
+Depends on the spun-off atomic materialization contract; the assertions specific
+to this feature are:
+
+- C→C: the declaration and every access are **byte-identical** to the input, with
+  only the marker include and constructor added (M.1).
+- Rust: the M.2 before/after program round-trips through the fixture translator
+  and the rewriter.
+- The reference inventory (M.4) is the gate, with the laundered-pointer case
+  rejected.
+- Compile and run signal-interruption tests under the transformed program: SIGINT
+  changes the flag and terminates the search path, with no locks or allocation in
+  the handler — the test that exercises the no-elision assumption, under a
+  timeout so a hoisted load fails as a hang rather than hanging CI.
 
 ## Tests and acceptance criteria
 
@@ -1926,9 +1664,8 @@ special volatile admission.
   declaration, `my_flag_t` under `typedef sig_atomic_t my_flag_t;`,
   `__sig_atomic_t` only when the source names it directly. With no typedef it is
   the terminal type's name (`int`); with an anonymous enum it is absent.
-- Under `typedef sig_atomic_t my_flag_t;` the certificate's `typedef` is
-  `sig_atomic_t` while `type_spelling` is `my_flag_t`, asserted separately so a
-  regression cannot collapse them.
+- Under `typedef sig_atomic_t my_flag_t;` the flag still certifies: recognition
+  tests the *chain*, not `type_spelling`, and the certificate records the chain.
 - Malformed and over-depth metadata fail without certification.
 
 ### Scalar-fact tests
@@ -1947,7 +1684,7 @@ special volatile admission.
   invariant, still live.
 - A certified global whose declaration has no file/line is certified with
   `source_materialization: blocked`, and the cascade still chooses `atomic`; a
-  test asserts the cascade does not consult materialization status (M.0).
+  test asserts the cascade does not consult materialization status.
 
 ### Schema tests
 
@@ -1961,47 +1698,24 @@ special volatile admission.
 - **The mode is a discriminated union at the schema level**: a `signal_flag`
   object missing any required member is rejected by
   `schemas/disposition-manifest.schema.json` alone, before the Rust validator
-  runs. A `plain` object carrying a `certified_path` is rejected as an
-  unexpected member of its variant. There is no combination of members that
-  half-asserts the mode, which is the property that replaced the presence
-  coupling — asserted by construction, i.e. by there being no such test to write.
+  runs. A `plain` object carrying a `registration` is rejected as an unexpected
+  member of its variant. There is no combination of members that half-asserts the
+  mode, which is the property that replaced the presence coupling — asserted by
+  construction, i.e. by there being no such test to write.
 - Each §4 **value** coupling clause is rejected independently, one test per
-  clause, on a payload well-formed except for a single wrong value: `probe` not
-  in `KNOWN_PROBES`; `operations` containing a kind the probe does not cover;
-  `operations` disagreeing with what `recipe.accesses` emits; `operations` ≠
-  `["load","store"]` in `signal_flag`; `typedef` not in `typedef_chain`;
-  `typedef` not in `RECOGNIZED_SIGNAL_TYPEDEFS`; `volatile: false`;
-  `scalar_class` ≠ `"integer"`; `linkage: "external"`; `ordering` ≠ `"relaxed"`;
-  `certified_path.access.via` ≠ `"direct"`; `handler_accesses_confined: false`;
+  clause, on a payload well-formed except for a single wrong value:
+  `typedef_chain` containing no recognized name; `ordering` ≠ `"relaxed"`;
+  `scalar_class` ≠ `"integer"`; `linkage: "external"`; `registration` absent;
   `observers` empty.
-- **The fact-layer clause, both directions**: `kind: "plain"` on a global with
-  `signal_context_access: true` is rejected (the unsafe direction — it skips the
-  probe requirement), and `kind: "signal_safe"` on a global with
-  `signal_context_access: false` is rejected too.
-- **`run.analysis.target_probes` is not a validator operand**: a manifest with
-  signal-flag certificates and no `target_probes` block is **valid**, asserted so
-  that nobody reintroduces the cross-section read.
-- The dormant-contract test: a Phase-1 manifest carries only `plain` and
-  `signal_safe` modes and passes the full validator, which is demonstrably live
-  (a hand-built bad `signal_flag` payload in the same run is rejected).
-- Golden classification (§7): a fixture corpus with one global of each class B–E
-  regenerates with exactly the permitted changes, and the three defect signals are
-  asserted to fail — a class-B or class-C global perturbed beyond the header, a
-  class-E global whose prior failure code was `unsupported-atomic-width` rather
-  than a missing spelling, and any record carrying `word_sized_scalar` detail at
-  `value: false`. Aggregate: `not_word_sized` decreases by exactly |D| + |E|, and
-  `measurement_report` is byte-identical when |E| = 0 and the probe switch moved
-  nothing.
-- A signal-flag global that fails any check has `recipe: null` and a
-  `diagnostics.signal_flag.status: "recipe-withheld"` record. An `atomic` pin on
-  that slot is rejected `no-recipe` **with** `accept_risk = true`, not merely
-  without it. An ordinary atomic, mutex, or once-lock slot is unaffected, proving
-  the rule is scoped.
+- **The fact-layer clause**: `kind: "signal_flag"` on a global with
+  `signal_context_access: false` is rejected. Its converse is asserted *not* to
+  be a rule: `kind: "plain"` on a signal-context global is **valid**, being the
+  ordinary state of every signal-context global with non-volatile accesses.
 - A failed slot cannot carry `atomic_mode` — asserted as a type-level property
   (`Certificate::Failed` has no such member) rather than as a validator test, and
   the schema is checked to reject a hand-written failed slot that adds one.
-- Re-emission is byte-identical: `codes`, `operations`, `typedef_chain`, and
-  `observers` ordering is stable across runs.
+- Re-emission is byte-identical: `codes`, `typedef_chain`, and `observers`
+  ordering is stable across runs.
 
 ### Registry tests
 
@@ -2009,89 +1723,65 @@ special volatile admission.
 - A *defined internal* function named `signal` is not a registration
   (`external_only`); an internal wrapper named `signal` forwarding to libc still
   yields a registration, recognized at the inner external call.
+- **Shape check, built-in only.** An external declaration `int signal(int)` —
+  right name, wrong arity — is **not** a registration and emits the mismatch
+  diagnostic; the flag behind it is not admitted. A vararg declaration of the
+  same name is rejected the same way. A correctly-shaped `sigaction` (arity 3) is
+  a registration and an arity-2 one is not.
+- **A shape mismatch is refused, an unresolved operand is not.** One fixture
+  carries both: a wrong-arity `signal` (dropped, no `signal_context_access`
+  contribution) and a correctly-shaped `signal` whose handler operand comes from
+  an external return (kept, unresolved, still widening). The two outcomes must be
+  distinguishable in the diagnostics.
+- **User entries stay unchecked**: a `--registry-config` entry naming an arity-1
+  `my_register_handler` is honored with no shape check, and a config entry
+  **replacing** `signal` by name disables the built-in shape check for that name
+  — the documented escape hatch, asserted so a later "tidy-up" that applies
+  built-in shapes to user entries fails the suite.
+- **Spawn entries are unshaped**: an external `pthread_create` with an unexpected
+  arity is still a spawn registration, so `thread_visible` and
+  phase-stationarity's thread-writer kill are unaffected. This is the scope
+  decision in D6, pinned so that extending shapes to spawn names is a deliberate
+  act rather than a refactor's side effect.
 - An unresolved registration (operand external or untargeted) still sets
   `signal_context_access`, still leaves `phase_stationarity`'s unknown effect in
   place, and widens to precise targets ∪ internal address-taken functions; a
   function that is neither is not made signal-context-accessed. A
   `volatile sig_atomic_t` behind only such a registration stays rejected.
 - Bore's restore call is the regression fixture for the unresolved case: it is
-  unresolved on every run and must not disturb the resolved registration's
-  facts.
+  unresolved on every run and must not disturb the resolved registration's facts.
 - A global reached by both a resolved and an unresolved registration is
-  **admitted** (the existential predicate), and its certified path witnesses the
+  **admitted** (the existential predicate), and its certificate witnesses the
   lowest-callsite-id resolved registration, stably and independently of how many
   unresolved ones exist.
 
-**Certified-path provenance tests** — the sharpest in the note, because the
-failure they guard against is silent and total (a permitting conjunct true for
-every global).
+### Handler-analysis tests
+
+The sharpest in the note, because the failure they guard against is silent and
+total (a permitting conjunct true for every global).
 
 - **The `ModuleWide` case.** A handler with one unanalyzable pointer store (so
   its transitive summary is `ModuleWide`) plus a `Via::Direct` store to the flag:
   every global gets `signal_context_access: true`, and **exactly one** — the flag
-  — has a certified positive path; an unrelated `volatile sig_atomic_t` in the
+  — has a certified registration; an unrelated `volatile sig_atomic_t` in the
   same module is not admitted. Asserted as a count, so the test fails loudly if
   the query is ever reimplemented as a filtered copy of `registry_access_facts`.
 - The same fixture with a **fully resolved** registration still yields exactly
   one positive global, pinning that `ModuleWide` is orthogonal to `unresolved`.
 - A handler whose only access to the flag is through a pointer with a finite
-  two-element candidate set has no certified path; the flag is not admitted and
-  also fails `address-access-not-lowerable`, so the two rejections agree.
-- A path `handler → helper → flag` over `CallDirect` edges is accepted with
-  witness `path: [handler, helper]`; the same shape with an indirect middle edge
-  is rejected even when the call graph resolves it to exactly one callee.
+  two-element candidate set has no certified registration; the flag is not
+  admitted and also fails `address-access-not-lowerable`, so the two rejections
+  agree.
+- A path `handler → helper → flag` over `CallDirect` edges is accepted, recording
+  `handler: handler, accessor: helper`; the same shape with an indirect middle
+  edge is rejected even when the call graph resolves it to exactly one callee.
 - A handler reached **only** through the address-taken widening sets
-  `signal_context_access` and yields no certified path.
-- Witness determinism: two direct-call paths of different lengths record the
-  shorter; equal lengths record callee-order-first; the manifest is
-  byte-identical across runs.
-- Every certified path implies `signal_context_access` on the same global,
-  checked over the whole corpus as an invariant rather than a fixture.
-
-### Atomic-recipe tests
-
-- Direct volatile loads/stores of certified `sig_atomic_t` succeed; an ordinary
-  `volatile int` still fails `volatile-access`; a `volatile sig_atomic_t`
-  **never accessed in signal context** still fails `volatile-access`; a
-  `volatile _Atomic`-qualified or `const volatile` chain fails.
-- A repo-local `typedef int sig_atomic_t;` used as a signal flag fails
-  `signal-typedef-shadowed`; the same declaration with the typedef in a system
-  header succeeds; an unrecorded typedef file succeeds (polarity rule).
-- A `__thread volatile sig_atomic_t` flag fails, and so does a flag with an
-  explicit `section` attribute.
-- An internal global re-exported by an external-linkage alias fails, closing the
-  M.8 back door. The fixture must be an actual
-  `@pub_alias = alias i32, ptr @g_flag` with external linkage, not a hand-written
-  PIR fixture asserting the fact: the defect was that `collect_alias_map` never
-  resolves such an alias's target
-  (`crates/pangs-pir/src/llvm_sys.rs:3573`), so a fixture starting from the fact
-  would pass against the broken lowering. An external alias to an unrelated
-  *function* does **not** reject, and `alias_exposed_globals` names the flag only
-  in the aliased case.
-- An alias whose aliasee is not a resolvable constant symbol blocks signal-flag
-  mode for the whole module via the `alias_unresolved:` taint.
-- A `volatile sig_atomic_t` on an arch with no probe fails
-  `signal-atomic-not-lock-free`; an unknown triple fails the same way rather than
-  inheriting a default width list. Both need a synthetic fixture with an unlisted
-  triple, since the corpus is entirely `x86_64`.
-- **Probe coverage is per-operation and probes do not combine**: a
-  signal-context global whose recipe emits RMW certifies citing `x86_64.rmw.v1`
-  and is **rejected** when only `x86_64.ldst.v1` is available; a fixture claiming
-  `x86_64.ldst.v1` for an RMW recipe is rejected by the validator even though
-  both probes exist in the table. This is the clause that keeps a load/store
-  proof from being reused, and it has no analogue in the old width-list gate.
-- A non-signal global's atomic eligibility is **unchanged** by the probe table: a
-  fixture on an unlisted triple still certifies `atomic` with
-  `{"kind": "plain"}` through `supported_atomic_widths`, proving the two are not
-  coupled.
-- Address escape, indirect access, partial-width access, bulk memory access, and
-  volatile RMW all fail.
-- An **external-linkage** `volatile sig_atomic_t` satisfying every other conjunct
-  fails `signal-flag-external-linkage`, in both executable and library mode,
-  including when `access_set_complete` is true — the case the redundancy exists
-  for. An ordinary external-linkage atomic is unaffected.
-- A signal flag used as a payload-publication protocol gains no acquire/release
-  claim from this certificate.
+  `signal_context_access` and yields no certified registration.
+- Witness determinism: two resolved registrations record the lower callsite id;
+  two accessors record the lower function id; the manifest is byte-identical
+  across runs.
+- Every certified registration implies `signal_context_access` on the same
+  global, checked over the whole corpus as an invariant rather than a fixture.
 - **F2**: a handler that assigns the flag *and* touches any other static-storage
   object fails `signal-handler-access-not-confined`, witnessed by the function
   and the offending object; a handler touching only the flag plus locals and
@@ -2118,64 +1808,64 @@ every global).
   operand comes from an external return — still certifies. Its companion fixture
   asserts the unresolved registration still widens `H`, pulling in an
   address-taken flag-poller so that F2 then fails.
+
+### Atomic-recipe tests
+
+- Direct volatile loads/stores of a certified `sig_atomic_t` succeed; an ordinary
+  `volatile int` still fails `volatile-access`; a `volatile sig_atomic_t`
+  **never accessed in signal context** still fails `volatile-access`; a
+  `volatile _Atomic`-qualified or `const volatile` chain fails.
+- A repo-local `typedef int sig_atomic_t;` used as a genuine signal flag
+  **certifies** — recognition is an intent signal and safety comes from the §E
+  conjuncts (§C). The test exists so the removed provenance check is not
+  reintroduced as a bug fix.
+- A `__thread volatile sig_atomic_t` flag fails, and so does a flag with an
+  explicit `section` attribute.
+- An internal global re-exported by an external-linkage alias fails, closing the
+  M.3 back door. The fixture must be an actual
+  `@pub_alias = alias i32, ptr @g_flag` with external linkage, not a hand-written
+  PIR fixture asserting the fact: the defect was that `collect_alias_map` never
+  resolves such an alias's target (`crates/pangs-pir/src/llvm_sys.rs:3573`), so a
+  fixture starting from the fact would pass against the broken lowering. An
+  external alias to an unrelated *function* does **not** set
+  `alias_exposes_global`; an alias whose aliasee is not a resolvable constant
+  symbol **does**.
+- A `volatile sig_atomic_t` on an arch with no `SIGNAL_FLAG_LOCK_FREE` row fails
+  `signal-atomic-not-lock-free`; an unknown or unparsable triple fails the same
+  way rather than inheriting a default width list. Both need a synthetic fixture
+  with an unlisted triple, since the corpus is entirely `x86_64`.
+- A non-signal global's atomic eligibility is **unchanged** by the new table: a
+  fixture on an unlisted triple still certifies `atomic` with
+  `{"kind": "plain"}` through `supported_atomic_widths`, proving the two are not
+  coupled and that the spun-off repair is genuinely spun off.
+- Address escape, indirect access, partial-width access, bulk memory access, and
+  volatile RMW all fail.
+- An **external-linkage** `volatile sig_atomic_t` satisfying every other conjunct
+  fails `signal-flag-external-linkage`, in both executable and library mode,
+  including when `access_set_complete` is true — the case the redundancy exists
+  for. An ordinary external-linkage atomic is unaffected.
+- A signal flag used as a payload-publication protocol gains no acquire/release
+  claim from this certificate.
 - An `atomic` override on a Phase-1-state global (failed slot, `recipe: null`) is
-  rejected `no-recipe` even with `accept_risk = true`.
+  rejected `no-recipe` even with `accept_risk = true`. An ordinary atomic, mutex,
+  or once-lock slot is unaffected, proving the rule is scoped.
 
-### Codegen and audit-envelope tests
+### Codegen and audit tests
 
-- For every declared probe × width × opt level `{0,1,2,3}`: no `__atomic_*`
-  reference; a `load atomic monotonic` remains in the polling loop body with the
-  exit condition depending on it; a `store atomic monotonic` remains in the
-  storing loop's body with none migrated to the exit block; both stores of
-  `flag = 1; work(); flag = 0;` survive. An RMW probe adds the single-locked-
-  instruction assertion and asserts nothing about elision.
+- For the declared arch at opt levels `{0,1,2,3}`: no `__atomic_*` reference; a
+  `load atomic monotonic` remains in the polling loop body with the exit
+  condition depending on it; a `store atomic monotonic` remains in the storing
+  loop's body with none migrated to the exit block; both stores of
+  `flag = 1; work(); flag = 0;` survive.
 - The assertions are positional, not count-based, proven by a negative test: a
   fixture with two adjacent loads and nothing between them, legally collapsed to
   one, **passes**.
-- A probe whose codegen regression is absent or failing is rejected by the probe
-  table's own test — evidence and probe land together, and there is no
-  configuration path by which a probe can exist without one.
+- A `SIGNAL_FLAG_LOCK_FREE` row whose codegen regression is absent or failing is
+  rejected by the table's own test — evidence and row land together, and there is
+  no configuration path by which a row can exist without one.
 - Ledger records are deterministic (two runs produce byte-identical `ar-` ids),
   appear only when a global certifies in signal-flag mode, and carry one
   `scope: global` row per such global.
-- The Rust stage refuses a toolchain outside the recorded envelope — below the
-  rustc floor, unlisted LLVM major, or a triple with no row — and fails loudly.
-- The host SIGINT test runs under a timeout, so a hoisted load fails as a hang
-  rather than hanging CI indefinitely.
-
-### Materialization tests
-
-These extend `DISPOSITION.md` §9's round-trip marker harness, which already
-validates the repository boundary with a fixture translator.
-
-- The M.2 before/after program is a golden fixture: C source → C→C output →
-  fixture-translated Rust → rewritten Rust, diffed at each step. The C→C output's
-  declaration and access lines are byte-identical to the input; only the include
-  and the marker constructor are added.
-- Both `&raw` and `as *const`/`as *mut` spellings rewrite identically.
-- Signed and unsigned widths map per M.3; a `pointer` class is rejected.
-- Initializer bit-vector semantics: `i8 -1` emits `AtomicU8::new(255)` at
-  `signed: false` and `AtomicI8::new(-1)` at `signed: true`; `i32 -2147483648`
-  emits both forms correctly; an `iN` whose width differs from `size_bits` fails;
-  a non-constant initializer, `undef`, and `poison` fail.
-- Boolean initialization: `i8 0`/`i1 false`/`zeroinitializer` →
-  `AtomicBool::new(false)`, `i8 1`/`i1 true` → `true`, and `i8 2` at boolean
-  class **fails** rather than being coerced.
-- The laundered-pointer case is rejected: `&G as *const _ as *const i32` followed
-  by `read_volatile(p)` fails the reference inventory, even though it passes the
-  count check, passes a residue scan for `read_volatile(&G)`, and compiles.
-- Every non-`load`/`store` reference fails the inventory: `&G`, `addr_of!(G)`,
-  passing `G` as an argument, mentioning `G` in another item's initializer.
-- **The inventory is asserted to be the gate, not a redundant one**: a fixture
-  constructed to pass count, type, marker, and `rustc` while failing only the
-  inventory must fail the build. Without this test, an implementation that
-  quietly skipped step 1 would show a fully green suite.
-- A macro invocation mentioning the symbol that the rewriter cannot expand fails;
-  so does a `cfg`-disabled reference. Count mismatch and missing marker each fail
-  the build rather than demoting.
-- The rewritten output contains no `pangs_*` symbol, and a deliberately
-  un-rewritten access fails to compile, confirming the `static mut` → `static`
-  safety net.
 
 ### APG bore regression
 
@@ -2183,75 +1873,63 @@ For `exe-apg_bore-O0.bc` in executable/application mode, with Andersen and no
 overrides:
 
 - `g_interrupted_xjtr_0` has `signal_context_access: true` and a certified
-  positive path, witnessed by the zero-length path `["sigint_handler_xjtr_0"]`
-  with `via: "direct"`;
-- **no other global in the module** has a certified positive path, asserted as a
+  registration whose `handler` and `accessor` are both
+  `sigint_handler_xjtr_0`;
+- **no other global in the module** has a certified registration, asserted as a
   count. The module has a second, unresolvable registration
   (`bore_search_cleanup`'s `signal(2, g_prev_sigint_handler_xjtr_0)`), so this is
   a live check that the widening does not leak into the permitting conjunct;
-- its type evidence names `sig_atomic_t` and records `volatile`;
+- its `typedef_chain` names `sig_atomic_t`;
 - its atomic certificate is certified in signal-flag mode;
 - its chosen disposition is `atomic`;
 - `unhandled` decreases from 1 to 0, `atomic` increases from 1 to 2, and overall
   disposition coverage increases from 25/26 to 26/26.
 
-These are regression assertions only after the detailed access recipe and
-materializer both pass; they must not be obtained by overriding failed guards.
+These are regression assertions only after the detailed access recipe passes;
+they must not be obtained by overriding failed guards.
 
 ### Corpus-level acceptance
 
 The bore assertions are necessary, not sufficient — the registry repair changes
-facts for every module and the probe switch changes a gate for every
-signal-context global, so acceptance is on the corpus distribution.
+facts for every module — so acceptance is on the corpus distribution.
 
-- After Phase 1 the distribution **may legitimately move** in two directions,
-  each with one cause: a global whose sole atomic failure was
-  `word-sized-scalar` caused by a spelling the §A walk now recovers, and which
-  passes every remaining gate including the access recipe, certifies and chooses
-  `atomic`; and a signal-context global whose operations no probe covers loses a
-  certificate it should not have had. The predicate is on *cause*, not count:
+- **After Phase 1**, the distribution may move in exactly one direction with
+  exactly one cause: a global whose sole atomic failure was `word-sized-scalar`
+  caused by a spelling the §A walk now recovers, and which passes every remaining
+  gate including the access recipe, certifies and chooses `atomic`. The predicate
+  is on *cause*, not count:
 
   ```text
   permitted:  atomic_eligibility Failed[word-sized-scalar] → Certified, for a
               global whose declared type is a qualified typedef and whose
               spelling the §A walk now recovers, with no other fact changing
-  permitted:  Certified → Failed[signal-atomic-not-lock-free], only for a global
-              with signal_context_access: true whose recipe's operations are not
-              covered by any probe — the gate switch correcting an unbacked claim
-  defect:     any other global moving OUT of a strategy
+  defect:     any global moving OUT of a strategy — Phase 1 removes no gate
   defect:     any global moving IN for any other reason
   defect:     any change to a global whose word_sized_scalar was already true
-              and whose signal_context_access is false
   defect:     any word_sized_scalar record gaining codes or partial detail —
               that is the deferred redefinition leaking in (§B)
+  defect:     any schema_version change — Phase 1 does not bump it
   ```
 
   Because the spelling gain is confined to qualified typedefs, and a
   `volatile`-qualified one still fails `volatile-access` at the detailed recipe,
-  the first movement is expected to be **small and possibly empty** at Phase 1 —
-  the bore flag itself does not move, it reaches class D. That near-inertness is
-  the deliberate result of splitting §B out: what remains is attributable
-  per-global to a typedef chain a reviewer can read.
+  the movement is expected to be **small and possibly empty** — the bore flag
+  itself does not move, it reaches class D. That near-inertness is the deliberate
+  result of splitting §B out: what remains is attributable per-global to a
+  typedef chain a reviewer can read.
 
-  The second permitted movement is expected to be **empty** on the current
-  corpus: it is entirely `x86_64`, and both probes cover 8/16/32/64. A non-empty
-  result means a signal-context global emits an operation neither probe covers,
-  which is a finding to report rather than absorb — the old gate was asserting
-  lock-freedom for it on a pointer-width heuristic.
-
-  A certified global whose `source_materialization` is `blocked` still counts as
-  `atomic` (M.0); its execution is the materializer's problem, corrected by
-  demotion if it arises. The bore flag does not move at Phase 1 — it reaches the
-  detailed recipe and fails on `volatile-access`.
-- After Phase 2, any global that moves is either newly `signal_context_access`
+- **After Phase 2**, any global that moves is either newly `signal_context_access`
   (expected: loses `mutex`, tightens `atomic`) or newly `once-lock` from the
   removed unresolved effect (expected: strictly more precise). Any other movement
   is a defect to explain before Phase 3 lands. Phase 2 changes no schema and no
   manifest field of its own.
-- After Phase 3, movement is **one-directional**: *into* `atomic` for a certified
-  signal flag, and nothing else. The gate switch already happened at Phase 1, so
-  a global moving *out* at Phase 3 is a defect, as is any movement by a global
-  without `signal_context_access`.
+
+- **After Phase 3**, movement is **one-directional**: *into* `atomic` for a
+  certified signal flag, and nothing else. A global moving *out* is a defect, as
+  is any movement by a global without `signal_context_access`. The schema bump
+  changes `signal_lock_free` → `atomic_mode` in every atomic certificate and
+  nothing else.
+
 - Phase 3 must report an **F2 census**, because confinement is the conjunct most
   likely to make the feature inert unnoticed: per module, the number of
   signal-flag candidates, and per candidate the size of `A ∩ H` and whether every
@@ -2265,116 +1943,181 @@ signal-context global, so acceptance is on the corpus distribution.
 - Treating all volatile integers as safe atomics.
 - Modeling memory-mapped I/O through Rust atomics.
 - Turning `sig_atomic_t` into a general thread-synchronization primitive.
-- Inferring the typedef from symbol names, use patterns, or integer width alone.
+- Inferring the typedef from symbol names, use patterns, or integer width alone;
+  equally, testing where the typedef was *declared* — provenance guards an intent
+  signal and defends nothing the §E conjuncts do not (§C).
 - Accepting non-lock-free atomic implementations in signal context.
 - Supporting arbitrary compound operations in the first implementation.
 - Weakening access-set completeness or Ω handling to improve this result.
-- Redefining `word_sized_scalar`. Dropping its spelling condition, retaining
-  partial detail at `value: false`, and adding a failure-code vocabulary are
-  worthwhile and deferred to their own change, which owns the population they
-  serve and the measurement re-baselining they cause (§B, D3).
-- Relaxing the `align_bits == size_bits` condition; over-aligned scalars are a
-  separate change with a separate population, and belong with the redefinition
-  above.
-- Replacing `supported_atomic_widths`, or populating the target profile with
-  arches no test exercises.
+- Redefining `word_sized_scalar`, or relaxing its `align_bits == size_bits`
+  condition. Both are worthwhile and deferred to their own change (§B).
+- Repairing `supported_atomic_widths` or the general signal lock-free gate
+  (§"Spun-off work"), or populating `SIGNAL_FLAG_LOCK_FREE` with arches no test
+  exercises.
 - Making the lock-free width table configurable at all: a new arch is a patch
   beside its codegen regression, not a flag.
-- Signature-shape checking in the spawn/signal registry, which `AbiClass` cannot
-  perform meaningfully and which no consumer needs (§D).
+- Machine-enforcing a toolchain envelope for the no-elision assumption (D4).
+- Writing the `atomic` strategy's general materialization contract
+  (§"Spun-off work").
+- A **public** `RegistryShape` configuration surface. Shapes are a private table
+  covering the three built-in signal entries; user-provided entries stay
+  unchecked, and promotion waits for a real user-defined alias that needs one
+  (§D).
+- Shape-checking the spawn entries, or checking parameter *types* anywhere —
+  `AbiClass` cannot distinguish a pointer from an integer, so arity and vararg
+  are the whole of the available discriminating power (§D).
 - Admitting `_Atomic` globals, which are a different lowering with a different
   recipe.
 - Signal flags with external linkage, absent a whole-program certificate that
-  every accessing TU is transformed (M.8).
+  every accessing TU is transformed (M.3).
+
+## Spun-off work
+
+Two adjacent changes are deliberately **not** in this note. Both are real, both
+are independently justified, and folding either in would make this feature's
+corpus diff unreadable — §B's splitting rule, applied to itself.
+
+**S1. The general signal lock-free gate is unbacked.** The existing gate reads
+`target.supported_atomic_widths` (`crates/pangs-clients/src/lib.rs:1113,1217`), a
+pointer-width heuristic (`llvm_sys.rs:407`) that asserts 8/16/32-bit atomics on
+every target and says nothing about lock-freedom versus an `__atomic_*` libcall.
+It therefore states, for every signal-context global, a guarantee the value does
+not carry. Repairing it is a change of population (every signal-context global,
+not just volatile signal flags), of direction (it can *remove* certificates a
+global has today — the only coverage-losing movement anywhere near this area),
+and of scope (it must cover RMW recipes, which this feature admits none of).
+Its own note owns: a regression-backed table with per-operation coverage, whether
+`supported_atomic_widths` should be replaced or merely superseded at this gate,
+the corpus diff of table-versus-heuristic across the triples present, and the
+`atomic_mode` variant or member that records the result. `atomic_mode` is a
+tagged union precisely so that change is additive.
+
+**S2. The `atomic` strategy has no materialization contract.** Type mapping from
+`recipe.declaration`, initializer translation from `initializer_ir` (including
+LLVM's signed printing of unsigned constants — `i8 -1` must become
+`AtomicU8::new(255)`, not `AtomicU8::new(-1)` and not `1`), the access rewrite
+forms for both `&raw` and `as *const` spellings, marker consumption, and the
+post-rewrite validation apply to *every* `atomic`-disposed global and exist
+nowhere. M.4 states the three requirements this feature places on that contract;
+the contract itself is a separate note, and Phase 4 depends on it.
+
+Neither is a prerequisite for Phases 1–3, which is the property that made
+splitting them affordable.
 
 ## Decisions
 
 No design question here is open. Each decision is normative and carries its
 **falsifier** — the observation that must be made before it may be changed.
 
-**D1. Typedef/qualifier evidence and the certified signal path live inside the
+**D1. Typedef evidence and the certified registration live inside the
 `atomic_eligibility` certificate** (paths frozen in §"Schema v5" §4), not as
-first-class facts, holding the v5 fact-layer surface to the `word_sized_scalar`
-change alone. `atomic` is a certificate-backed strategy, so `DISPOSITION.md` §1's
-guard-shape rule puts its preconditions inside the pass.
+first-class facts, holding the v5 fact-layer delta to zero. `atomic` is a
+certificate-backed strategy, so `DISPOSITION.md` §1's guard-shape rule puts its
+preconditions inside the pass.
 *Falsifier:* a second consumer of either. Promotion to a fact slot is then schema
 v6, additive, and forced by nothing else.
 
-**D2. `supported_atomic_widths` is unchanged; the signal gate moves to
-regression-backed probes, and a certificate cites exactly one.** The general
-list's failure mode is a Rust compile error, the signal gate's a silent handler
-deadlock; only the second warrants authoritative evidence, and replacing both
-would zero the coarse atomic gate on any unlisted triple. A probe carries its
-operation set because lock-freedom is not uniform across operations, which is
-also what makes the gate's narrowing safe for signal-context RMW recipes rather
-than a silent weakening of their proof.
-*Falsifier:* the probe table and the pointer-width heuristic
-(`llvm_sys.rs:407`) disagreeing for a width on a triple the corpus contains. That
-is a bug report about the general atomic recipe and gets its own note; it does
-not retroactively justify migrating both lists here.
+**D2. A permitting conjunct is computed by its own query, not by filtering a
+restricting one** (rule 10). The certified registration requires a `Via::Direct`
+access reached over direct-call edges from a precise target of a resolved
+registration; restricting `registry_access_facts` to resolved registrations is
+*not* sufficient on its own, because `ModuleWide` originates in the handler's
+transitive summary rather than in the registration operand. The rejected
+alternative is the obvious implementation and would make the conjunct true for
+every global in any module containing one handler with an unanalyzable pointer
+store, silently deleting it. F2 and the path conjunct share one pass because they
+share `A` and `H`.
+*Falsifier:* a module where the flag's handler reaches it only through a pointer
+or an indirect call, so the path requirement rejects a genuine signal flag. This
+is bounded: `atomic_access_recipe` already requires `Via::Direct` at every
+admitted site (`crates/pangs-clients/src/lib.rs:1891`), so such a global could
+not have certified regardless — the falsifier must show the *conjunct* is the
+binding constraint, not the recipe.
 
 **D3. This feature recovers the spelling; it does not redefine
-`word_sized_scalar`.** The bore flag fails that fact on the spelling condition
-alone, so §A's walker clears it without touching the fact's definition, its
-validator invariant, or its measurement funnel. Dropping the spelling requirement
-outright would serve a *disjoint* population — globals with no recoverable
-spelling at all — that this feature never reaches, since §C requires positive
-typedef evidence before recognizing a signal flag. Bundling them would make the
-Phase-1 corpus diff unattributable (§B).
+`word_sized_scalar`, and Phase 1 bumps no schema.** The bore flag fails that fact
+on the spelling condition alone, so §A's walker clears it without touching the
+fact's definition, its validator invariant, or its measurement funnel. Dropping
+the spelling requirement outright would serve a *disjoint* population — globals
+with no recoverable spelling at all — that this feature never reaches, since §C
+requires positive typedef evidence before recognizing a signal flag.
 *Falsifier:* a `volatile sig_atomic_t` in the corpus whose typedef chain is
 present but whose spelling the positional rule still fails to recover. That would
 mean §A's walk is incomplete, and the repair is in the walk, not in the fact.
 
-**D4. The no-elision property gets an audit contract, not a guarantee**: a
-declared envelope of probes × widths × rustc floor × LLVM majors × opt levels, a
-per-probe codegen regression that is a precondition for the probe existing, a
-ledger record whose own text states the limit, and a Rust-stage check refusing
-toolchains outside the envelope. The table has no configuration surface, so
-"the probe exists" and "the regression covers it" cannot come apart, and the
-certificate cites the probe by the id the ledger record names.
-*Falsifier:* a codegen regression failure for a probe. The response is mechanical
-and already specified — remove the probe, every certificate citing it stops being
-emittable, signal-context atomics on that target fall back to `unhandled`. No
-manual override.
+**D4. The no-elision property gets an audit record and an in-tree regression, not
+a machine-enforced envelope.** The ledger record states the limit in its own
+text, the codegen regression asserts the property positionally on whatever
+toolchain is present, and the lock-free table has no configuration surface, so
+"the arch is admitted" and "the regression covers it" cannot come apart. An
+earlier draft added a declared envelope of rustc floor × LLVM majors × opt levels
+plus a Rust-stage check refusing anything outside it; that is dropped, because
+enforcement is not what makes the property true, an LLVM-major allowlist goes
+stale by construction, and the practical failure mode is a build refusing on a
+newer toolchain that is fine. The assumption is one every Rust program polling an
+atomic in a loop already depends on.
+*Falsifier:* a codegen regression failure, or an observed toolchain that hoists a
+`monotonic` load out of a loop. The response to the first is mechanical — remove
+the arch row, every certificate citing it stops being emittable, signal-flag
+atomics on that target fall back to `unhandled`. The second would justify
+reinstating the envelope, and would be a finding about the Rust backend far
+larger than this feature.
 
-**D4b. The certificate carries one tagged `atomic_mode`, and `signal_lock_free`
-is deleted.** Its members were a duplicated fact (`required`), a value that is
-`true` wherever it is meaningful (`target_guaranteed`), and a copy of
-`recipe.declaration.size_bits` (`width`); and the mode itself was spread across
-four fields kept in agreement by a four-way biconditional. One discriminant makes
-the disagreeing states unrepresentable instead of detected, and — because
-`Certificate::Failed` has no certificate-level payload — makes rule 18 a property
-of the type rather than a rule to enforce. v5 is not backward compatible with v4
-payloads, which is what makes deletion available rather than only extension.
+**D5. The certificate records only what varies and cannot be re-derived.**
+`signal_lock_free` is deleted (a duplicated fact, a constant, and a copy), and
+the replacing `signal_flag` variant does not reintroduce the same shape: no
+`volatile: true`, no `typedef` naming the matched chain member, no `operations`,
+no `handler_accesses_confined`, no `access.via`, no target id. Each is a constant
+wherever the variant exists, and a validator clause checking a constant defends
+against the emitter contradicting itself. What remains — the typedef chain, the
+certified registration, and `observers` — is the evidence an auditor cannot
+reconstruct from the certificate alone. Because `Certificate::Failed` has no
+certificate-level payload, this also makes rule 14 a property of the type rather
+than a rule to enforce.
 *Falsifier:* a consumer that needs to distinguish "no lock-free claim required"
 from "no mode recorded". There is none — `kind: "plain"` states the first and the
 second does not exist — but a future variant that is genuinely optional would
 reopen it.
 
-**D5. Signal aliases are unconditional exact-name registry entries, with an
-`external_only` precondition and no signature shape check.** `AbiClass` cannot
-distinguish a pointer from an integer, so a shape check reduces to arity; a false
-positive is conservative in every consumer that reads `signal_context_access`;
-and the one non-conservative consumer, §E's volatile admission, does not read the
-registration but the certified positive path, which a spurious entry cannot
-manufacture. `--registry-config` covers the per-target case.
-*Falsifier:* an observed program where an unrelated external `signal`/`sigaction`
-symbol costs a global its `mutex` eligibility. The response is an arity check on
-the entry operand's index — five lines, no type representation — not a
-`RegistryShape` subsystem.
+**D6. Signal aliases are exact-name registry entries with an `external_only`
+precondition and an internal, built-in-only shape check.** The shape is arity and
+non-varargness, held in a private table keyed by name rather than as a field on
+`RegistryApi`, so the configuration schema gains nothing; parameter types are not
+checkable at all, since `AbiClass` cannot distinguish a pointer from an integer.
+User-provided entries retain their current unchecked, conservative behavior,
+because a `--registry-config` entry is the operator's own assertion about their
+own program while a built-in is a claim the analysis makes unprompted — and a
+user entry replacing a built-in by name is the escape hatch for a platform whose
+declaration differs. A mismatch means a different function, so the call is not a
+registration; that is consistent with never deleting on an *unresolved operand*,
+which is a registration whose handler is unknown. Spawn entries stay unshaped:
+dropping one would weaken phase-stationarity's thread-writer kill with no
+independent backstop, where dropping a spurious signal registration loses only
+restricting facts.
+*Falsifier, for the private-table decision:* a user-defined registration alias
+whose name collides with an unrelated symbol in the same program, so the operator
+needs a shape they cannot express. The response is then to promote `RegistryShape`
+into the config schema — the mechanism already exists and only its visibility
+changes.
+*Falsifier, for the check itself:* an observed platform declaring one of the three
+names with an unexpected arity, costing a genuine registration. The diagnostic
+makes this visible rather than silent, and the immediate recourse is
+`--registry-config`; a second occurrence would argue for marking the mismatch
+unresolved instead of declining it.
 
-**D6. Signal-handler participation is a hard conjunct of volatile admission**,
+**D7. Signal-handler participation is a hard conjunct of volatile admission**,
 satisfied only by a *resolved* registration with a certified positive access
 path. It establishes that the `sig_atomic_t` guarantee is the operative reason
 the object is volatile; MMIO and special-section storage are excluded separately
-by the ordinary-storage predicate.
+by the ordinary-storage predicate, and the typedef match is an intent signal
+carrying no provenance test of its own (§C).
 *Falsifier:* a corpus program with an otherwise-certifiable
 `volatile sig_atomic_t` rejected solely because its registration alias is
 unrecognized, *and* for which `--registry-config` is impractical. Both halves
 must hold — the documented recourse existing is what makes the strict reading
 affordable.
 
-**D7. `volatile` is replaced by `Relaxed` *plus* handler-observer confinement
+**D8. `volatile` is replaced by `Relaxed` *plus* handler-observer confinement
 (F2), and F2 is the only pattern condition.** `Relaxed` supplies indivisibility
 and (as an LLVM property) absence of unbounded elision, but not `volatile`'s
 preservation of access count and relative order. F2 makes the permitted
@@ -2383,7 +2126,7 @@ that no observer can correlate the flag with anything else — signal arrival
 timing being unconstrained. A sole-flag-per-program condition (F1) was
 considered and removed: the program it excludes, a handler writing two flags,
 already fails F2 on both, and F1 additionally rejected two independently confined
-flags for no reason. Removing it also removes the only whole-program pass and the
+flags for no reason. Removing it also removed the only whole-program pass and the
 only cross-global validator clause in the design.
 *Falsifier:* an execution in which a reordering of a certified flag's accesses is
 observed by something other than a handler that touches a second static-storage
@@ -2392,21 +2135,16 @@ corpus program rejected solely by F2 where the pattern is nonetheless
 demonstrably safe; such a program is already undefined behavior under C11
 §7.14.1.1p5, and the right response is to fix the source.
 
-**D8. A permitting conjunct is computed by its own query, not by filtering a
-restricting one** (rule 14). The certified positive path requires a `Via::Direct`
-access reached over direct-call edges from a precise target of a resolved
-registration; restricting `registry_access_facts` to resolved registrations is
-*not* sufficient on its own, because `ModuleWide` originates in the handler's
-transitive summary rather than in the registration operand. The rejected
-alternative is the obvious implementation and would make the conjunct true for
-every global in any module containing one handler with an unanalyzable pointer
-store, silently deleting it.
-*Falsifier:* a module where the flag's handler reaches it only through a pointer
-or an indirect call, so the path requirement rejects a genuine signal flag. This
-is bounded: `atomic_access_recipe` already requires `Via::Direct` at every
-admitted site (`crates/pangs-clients/src/lib.rs:1891`), so such a global could
-not have certified regardless — the falsifier must show the *conjunct* is the
-binding constraint, not the recipe.
+**D9. The alias hazard is closed by one module-level bool, not a per-global
+inventory.** `alias_exposes_global` is set by any non-internal alias resolving to
+a known global, and by any unresolvable aliasee, so the gap and the hazard are
+closed by the same fact. A `BTreeMap<String, BTreeSet<String>>` would buy
+signal-flag mode in a module containing an aliased global unrelated to the flag;
+a taint-prefix check would lose it in a module containing an ordinary external
+alias to a function. Neither trade is worth its surface.
+*Falsifier:* a corpus module containing both an aliased global and an otherwise
+certifiable signal flag. The repair is then the inventory, which is a few lines
+and does not change any other clause.
 
 The remaining unknowns are measurements, not decisions, and are enumerated under
 §"Corpus-level acceptance": whether other modules contain `volatile sig_atomic_t`
