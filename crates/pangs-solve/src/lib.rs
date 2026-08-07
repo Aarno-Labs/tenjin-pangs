@@ -2652,6 +2652,7 @@ mod tests {
                     Stmt::Store {
                         address: "%f::scalar.addr".into(),
                         value: "7".into(),
+                        volatile: false,
                         access_bytes: Some(8),
                         loc: None,
                     },
@@ -2665,18 +2666,21 @@ mod tests {
                     Stmt::Store {
                         address: "%f::pointer.addr".into(),
                         value: "@target".into(),
+                        volatile: false,
                         access_bytes: Some(8),
                         loc: None,
                     },
                     Stmt::Load {
                         dest: "%f::scalar".into(),
                         address: "%f::scalar.addr".into(),
+                        volatile: false,
                         access_bytes: Some(8),
                         loc: None,
                     },
                     Stmt::Load {
                         dest: "%f::pointer".into(),
                         address: "%f::pointer.addr".into(),
+                        volatile: false,
                         access_bytes: Some(8),
                         loc: None,
                     },
@@ -3096,6 +3100,7 @@ mod tests {
                 owner: pangs_pag::Owner::Module,
                 access_bytes: None,
                 access_extent_unknown: false,
+                volatile: false,
                 loc: None,
             },
             pangs_pag::Edge {
@@ -3106,6 +3111,7 @@ mod tests {
                 owner: pangs_pag::Owner::Module,
                 access_bytes: None,
                 access_extent_unknown: false,
+                volatile: false,
                 loc: None,
             },
             pangs_pag::Edge {
@@ -3119,6 +3125,7 @@ mod tests {
                 owner: pangs_pag::Owner::Module,
                 access_bytes: None,
                 access_extent_unknown: false,
+                volatile: false,
                 loc: None,
             },
         ];

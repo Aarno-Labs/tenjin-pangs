@@ -374,14 +374,27 @@ unsafe fn lower_module(module: LLVMModuleRef, repo_roots: Option<&RepoRoots>) ->
                 ),
                 is_definition: LLVMIsDeclaration(*global) == 0,
                 linkage: symbol_linkage(LLVMGetLinkage(*global)),
+                section: {
+                    let section = LLVMGetSection(*global);
+                    (!section.is_null())
+                        .then(|| CStr::from_ptr(section).to_string_lossy().into_owned())
+                        .filter(|section| !section.is_empty())
+                },
+                thread_local: LLVMIsThreadLocal(*global) != 0,
                 type_spelling: debug.as_ref().and_then(|debug| debug.type_spelling.clone()),
                 scalar_type_evidence: debug
                     .as_ref()
                     .and_then(|debug| debug.scalar_type_evidence.clone()),
                 size_bits: Some(LLVMABISizeOfType(ctx.data_layout, ty).saturating_mul(8)),
-                align_bits: Some(
-                    u64::from(LLVMABIAlignmentOfType(ctx.data_layout, ty)).saturating_mul(8),
-                ),
+                align_bits: Some({
+                    let explicit = LLVMGetAlignment(*global);
+                    let bytes = if explicit == 0 {
+                        LLVMABIAlignmentOfType(ctx.data_layout, ty)
+                    } else {
+                        explicit
+                    };
+                    u64::from(bytes).saturating_mul(8)
+                }),
                 path_error: debug.as_ref().and_then(|debug| debug.path_error.clone()),
                 scalar_class: debug.as_ref().and_then(|debug| debug.scalar_class),
                 signed: debug.as_ref().and_then(|debug| debug.signed),
@@ -1314,6 +1327,7 @@ unsafe fn lower_instruction(
             body.push(Stmt::Load {
                 dest: dest.clone(),
                 address: fctx.operand_key(address),
+                volatile: LLVMGetVolatile(inst) != 0,
                 access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(inst))),
                 loc: loc(inst),
             });
@@ -1349,6 +1363,7 @@ unsafe fn lower_instruction(
             body.push(Stmt::Store {
                 address: fctx.operand_key(address),
                 value: fctx.operand_key(value),
+                volatile: LLVMGetVolatile(inst) != 0,
                 access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(value))),
                 loc: loc(inst),
             });
@@ -1869,6 +1884,7 @@ unsafe fn lower_cmpxchg(
     body.push(Stmt::Load {
         dest: format!("{}.old", fctx.local_key(inst)),
         address: fctx.operand_key(address),
+        volatile: LLVMGetVolatile(inst) != 0,
         access_bytes: Some(type_size_key(
             ctx.data_layout,
             LLVMTypeOf(LLVMGetOperand(inst, 1)),
@@ -1878,6 +1894,7 @@ unsafe fn lower_cmpxchg(
     body.push(Stmt::Store {
         address: fctx.operand_key(address),
         value: fctx.operand_key(replacement),
+        volatile: LLVMGetVolatile(inst) != 0,
         access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(replacement))),
         loc: loc(inst),
     });
@@ -1902,12 +1919,14 @@ unsafe fn lower_atomicrmw(
     body.push(Stmt::Load {
         dest: fctx.local_key(inst),
         address: fctx.operand_key(address),
+        volatile: LLVMGetVolatile(inst) != 0,
         access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(inst))),
         loc: loc(inst),
     });
     body.push(Stmt::Store {
         address: fctx.operand_key(address),
         value: fctx.operand_key(value),
+        volatile: LLVMGetVolatile(inst) != 0,
         access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(value))),
         loc: loc(inst),
     });
@@ -2143,6 +2162,7 @@ unsafe fn lower_global_initializer_value(
         body.push(Stmt::Store {
             address: address.to_string(),
             value: value.clone(),
+            volatile: false,
             access_bytes: Some(type_size_key(ctx.data_layout, LLVMTypeOf(constant))),
             loc: None,
         });

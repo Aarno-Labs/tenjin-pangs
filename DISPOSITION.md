@@ -150,13 +150,15 @@ per-fact evidenced polarity, witness records, the certificate-slot union, the
 localization verdict, and cascade skip reasons — are fixed in `DISPOSITION_PLAN.md`
 §1.5 and are part of what D1a's golden test freezes. Schema v3 made unknown mod/ref
 candidate scope explicit so an abbreviated finite set could not be mistaken for
-module-wide Ω; schema v4 adds owner storage closures and the auxiliary synthetic-global
-inventory.
+module-wide Ω; schema v4 added owner storage closures and the auxiliary synthetic-global
+inventory. Schema v5 adds the explicit ordinary/signal atomic recipe mode and ordering
+contract from `20260805_SIG_ATOMIC_T_HANDLING.md`, and requires exact-version matching
+at manifest-preserving boundaries.
 
 ## 3. The manifest
 
 One versioned JSON document per analyzed program — **`pangs-manifest.json`,
-`schema_version: 4`** — superseding and subsuming `ONCELOCK.md` §2's standalone schema
+`schema_version: 5`** — superseding and subsuming `ONCELOCK.md` §2's standalone schema
 (which becomes the `facts.phase_stationarity` sub-object; see §8). It is the single
 artifact consumed by *both* toolchain stages and referenced by override files.
 
@@ -220,7 +222,7 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
 
 ```jsonc
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "run": {
     "analysis": {                        // analysis-owned (§3.3): provenance fields
       "entry_spine": { ... },            //   (pangs git, input hash, opts) +
@@ -647,7 +649,7 @@ None of these amendments change A′–D′ or any solver semantics.
 Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
 
 - **D1 — manifest + policy stage (implemented).** Fact-vector assembly from existing
-  scans; cascade evaluation with trace; schema v4 emission; run-header reproducibility
+  scans; cascade evaluation with trace; schema v5 emission; run-header reproducibility
   fields. No new analysis.
 - **D2 — override machinery (implemented).** TOML parsing, §4.2 validation, override
   report, soundness-inventory append for accepted risks, CI exit-code discipline.
@@ -656,7 +658,8 @@ Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
   resolution for joint strategies.
 - **D3 — atomic eligibility pass (implemented).** Produces a per-global certificate
   only after scalar-width, bounded-access, relevant-violation, source-mapped
-  load/store/RMW recipe, and signal lock-free checks pass. A failed coarse gate emits its
+  load/store/RMW recipe, and the applicable ordinary or signal-flag-v1 checks pass. A
+  certified recipe records its mode and required ordering. A failed coarse gate emits its
   decisive witness and a bounded `access_lowering: skipped` diagnostic; D3 does not
   enumerate redundant per-access rewrite failures once certification is impossible.
 - **D4 — mutex eligibility pass (implemented).** Reuses access-set completeness and

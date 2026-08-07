@@ -130,6 +130,8 @@ volatile signal_alias nested;
 const volatile sig_atomic_t const_flag;
 atomic_int named_atomic;
 _Atomic int bare_atomic;
+_Thread_local int tls_global;
+int sectioned_global __attribute__((section(".pangs_test")));
 "#,
     )
     .unwrap();
@@ -183,6 +185,88 @@ _Atomic int bare_atomic;
     assert!(bare_atomic.qualifiers.is_atomic);
     assert_eq!(bare_atomic.class, Some(ScalarTypeClass::Integer));
     assert_eq!(bare_atomic.signed, Some(true));
+
+    let tls = pir
+        .globals
+        .iter()
+        .find(|global| global.key == "tls_global")
+        .unwrap();
+    assert!(tls.thread_local);
+    assert!(tls.section.is_none());
+    let sectioned = pir
+        .globals
+        .iter()
+        .find(|global| global.key == "sectioned_global")
+        .unwrap();
+    assert_eq!(sectioned.section.as_deref(), Some(".pangs_test"));
+    assert!(!sectioned.thread_local);
+}
+
+#[test]
+fn lowers_volatile_on_direct_local_gep_and_pointer_memory_operations() {
+    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
+    let temp = TempDir::new().unwrap();
+    let source_path = temp.path().join("volatile-shapes.c");
+    let bitcode_path = temp.path().join("volatile-shapes.bc");
+    fs::write(
+        &source_path,
+        r#"
+volatile int direct_global;
+struct Box { volatile int field; };
+int direct_read(void) { return direct_global; }
+int local_read(void) { volatile int local = 1; return local; }
+int field_read(struct Box *box) { return box->field; }
+int pointer_read(volatile int *pointer) { return *pointer; }
+int plain_read(int *pointer) { return *pointer; }
+"#,
+    )
+    .unwrap();
+    assert!(Command::new(CLANG_14)
+        .args(["-std=c11", "-O0", "-g", "-emit-llvm", "-c"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&bitcode_path)
+        .status()
+        .unwrap()
+        .success());
+    let pir = Pir::from_path(&bitcode_path).unwrap();
+    let function = |name: &str| {
+        pir.functions
+            .iter()
+            .find(|function| function.key == name)
+            .unwrap()
+    };
+    assert!(function("direct_read")
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Load { volatile: true, .. })));
+    assert!(function("local_read")
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Store { volatile: true, .. })));
+    assert!(function("local_read")
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Load { volatile: true, .. })));
+    assert!(function("field_read")
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Gep { .. })));
+    assert!(function("field_read")
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Load { volatile: true, .. })));
+    assert!(function("pointer_read")
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Load { volatile: true, .. })));
+    assert!(function("plain_read").body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Load {
+            volatile: false,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -624,6 +708,22 @@ fn lowers_volatile_and_atomic_global_accesses_from_ll() {
     assert_eq!(pir.lowering.modeled_counts["atomic_load"], 1);
     assert_eq!(pir.lowering.modeled_counts["global_mod"], 2);
     assert_eq!(pir.lowering.modeled_counts["global_ref"], 2);
+    assert_eq!(
+        touch
+            .body
+            .iter()
+            .filter(|stmt| matches!(stmt, Stmt::Store { volatile: true, .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        touch
+            .body
+            .iter()
+            .filter(|stmt| matches!(stmt, Stmt::Load { volatile: true, .. }))
+            .count(),
+        1
+    );
     assert_eq!(
         touch
             .body

@@ -1096,6 +1096,7 @@ pub fn write_artifact_pair_to(
     manifest: &Manifest,
     ledger: &[AuditRecord],
 ) -> Result<(), DisposeError> {
+    manifest.validate()?;
     let manifest_bytes = to_canonical_json(manifest)?;
     let ledger_bytes = to_canonical_json(&ledger)?;
     let ledger_dir = ledger_path.parent().unwrap_or_else(|| Path::new("."));

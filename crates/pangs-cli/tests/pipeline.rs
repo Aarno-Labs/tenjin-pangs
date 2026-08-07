@@ -2074,7 +2074,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
     );
     let disposition: Value =
         serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
-    assert_eq!(disposition["schema_version"], 4);
+    assert_eq!(disposition["schema_version"], 5);
     let counter = disposition["globals"]
         .as_array()
         .unwrap()
@@ -2142,7 +2142,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "15259cddcdbc4f3b73e07f4d6cc77f86d6c04e8e58a2d9a62fbda8345a0c7419"
+        "756939b663cba4fa01ded6d1dcb217ab99bc3bc3dcefd4fc1518b8c8faae4741"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(
