@@ -1247,7 +1247,12 @@ fn assemble_atomic_eligibility(
         }
 
         let sites = &access_by_global[gid.0 as usize];
-        let (access_recipe, access_failures) = atomic_access_recipe(analysis, sites);
+        let (access_recipe, access_failures) = atomic_access_recipe(
+            analysis,
+            sites,
+            analysis.globals()[gid].scalar_type_evidence.as_ref(),
+            &global.key.to_string(),
+        );
         let mut fail = |code: &str, witness: Witness| {
             codes.push(code.to_owned());
             witnesses.push(witness);
@@ -1862,7 +1867,23 @@ fn mutex_unknown_callee_witness(
 fn atomic_access_recipe(
     analysis: &Analysis,
     sites: &[&pangs_api::AccessSite],
+    type_evidence: Option<&pangs_pir::ScalarTypeEvidence>,
+    global: &str,
 ) -> (Option<Vec<Value>>, Vec<(String, Witness)>) {
+    if type_evidence.is_some_and(|evidence| evidence.qualifiers.is_atomic) {
+        return (
+            None,
+            vec![(
+                "source-atomic-unsupported".into(),
+                atomic_witness(
+                    "source-atomic-unsupported",
+                    Some(global.into()),
+                    None,
+                    Some("source _Atomic ordering is not preserved by the current PIR".into()),
+                ),
+            )],
+        );
+    }
     let mut ordered = sites.to_vec();
     ordered.sort_by_key(|site| (site.func, site.statement_index, site.access, site.via));
     let mut failures = Vec::new();
@@ -4269,6 +4290,58 @@ mod tests {
         assert!(witnesses
             .iter()
             .any(|witness| witness.kind == "atomic-volatile-access"));
+    }
+
+    #[test]
+    fn source_atomic_qualifier_blocks_atomic_eligibility() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        pir.globals[0].type_spelling = Some("atomic_int".into());
+        pir.globals[0].scalar_type_evidence = Some(pangs_pir::ScalarTypeEvidence {
+            type_spelling: Some("atomic_int".into()),
+            typedef_chain: vec!["atomic_int".into()],
+            qualifiers: pangs_pir::TypeQualifiers {
+                is_atomic: true,
+                ..pangs_pir::TypeQualifiers::default()
+            },
+            class: Some(pangs_pir::ScalarTypeClass::Integer),
+            signed: Some(true),
+        });
+        pir.globals[0].size_bits = Some(32);
+        pir.globals[0].align_bits = Some(32);
+        pir.globals[0].scalar_class = Some(pangs_pir::ScalarTypeClass::Integer);
+        pir.globals[0].signed = Some(true);
+        pir.globals[0].initializer_ir = Some("i32 0".into());
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+
+        let Some(Certificate::Failed {
+            codes,
+            witnesses,
+            recipe,
+            ..
+        }) = &manifest.globals[0].facts.atomic_eligibility
+        else {
+            panic!("a source _Atomic global must fail atomic eligibility")
+        };
+        assert!(manifest.globals[0].facts.word_sized_scalar.value);
+        assert_eq!(codes, &["source-atomic-unsupported"]);
+        assert_eq!(witnesses[0].kind, "source-atomic-unsupported");
+        assert!(recipe.is_none());
     }
 
     #[test]

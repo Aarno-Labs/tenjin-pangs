@@ -2,10 +2,11 @@
 
 ## Status
 
-Design proposal. Nothing here is implemented yet. This is deliberately the
-smallest useful v1: it recognizes one common signal-flag representation on
-`x86_64`. It gives up coverage whenever the functions that access the flag are
-not equally simple and records the two residual assumptions explicitly. The
+Design proposal with Phase 1 implemented. Phases 2 and 3 remain future work.
+This is deliberately the smallest useful v1: it recognizes one common
+signal-flag representation on `x86_64`. It gives up coverage whenever the
+functions that access the flag are not equally simple and records the two
+residual assumptions explicitly. The
 corpus contains several source declarations on that architecture; "architecture"
 does not mean one declaration, project, or program shape.
 
@@ -465,6 +466,8 @@ with an explicit `unhandled` pin.
 ## 9. Implementation sequence
 
 ### Phase 1: qualified type normalization
+
+Implemented 2026-08-07.
 
 1. Add the bounded debug-type walker and `ScalarTypeEvidence` to PIR/API globals.
 2. Project its results into the existing scalar fields.
