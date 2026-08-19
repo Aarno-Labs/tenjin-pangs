@@ -219,6 +219,13 @@ impl ViolationRelevance {
             Self::Unresolved => "unresolved",
         }
     }
+
+    pub fn is_hard(self) -> bool {
+        matches!(
+            self,
+            Self::AddressRelevant | Self::AccessShapeRelevant | Self::Unresolved
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -422,6 +429,16 @@ impl Facts {
         self.omega_escaped_address
             .validate("omega_escaped_address", true)?;
         self.violation_taint.validate("violation_taint", true)?;
+        let has_hard_violation = self
+            .violation_relevance
+            .iter()
+            .any(|diagnostic| diagnostic.classification.is_hard());
+        if self.violation_taint.value != has_hard_violation {
+            return Err(Error::InvalidInvariant(
+                "violation_taint must equal the presence of a hard violation_relevance diagnostic"
+                    .into(),
+            ));
+        }
         self.thread_visible.validate("thread_visible", true)?;
         self.signal_context_access
             .validate("signal_context_access", true)?;

@@ -3163,6 +3163,33 @@ fn steens_detects_vararg_function_pointers_through_local_values() {
 }
 
 #[test]
+fn vararg_hidden_callback_blocks_context_rewrite_independently_of_violation_taint() {
+    let pir = Pir::from_path(m1_5_fixture("vararg_hidden_callback_localization.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let target = analysis.lookup_func("target").unwrap();
+    assert!(analysis.callers(target).any(unknown_caller));
+    let global = analysis.lookup_global("G").unwrap();
+    let field = analysis
+        .context_rewrite_plan()
+        .fields
+        .iter()
+        .find(|field| field.global == global)
+        .expect("mutable global participates in context rewrite planning");
+    assert!(field.blockers.iter().any(|blocker| {
+        blocker.kind == "unknown-caller-taint" && blocker.function == Some(target)
+    }));
+}
+
+#[test]
 fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
     let pir = Pir::from_path(m1_6_fixture("aliased_unknown_modref.pir.json")).unwrap();
     let conservative = Analysis::run(

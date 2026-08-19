@@ -89,14 +89,20 @@ strategy: for example, phase-stationarity does not prove atomic access-shape
 compatibility or mutex reentrancy safety. "First applicable" is sound because every
 entry evaluates its own guard; order affects preference only.
 
-One fact gates the whole cascade rather than any single entry: **every strategy guard
-implicitly conjoins `¬violation_taint`**. A tainted global's fact vector was computed
-under violated analysis assumptions, so no certificate about it is trustworthy; it
-falls through to `unhandled` with every configured strategy skipped as
-`guard-failed: violation_taint`. Any override pinned onto a tainted global is a
-contradiction under §4.2 and requires `accept_risk`. If the skip histogram (§10.2)
-shows taint dominating the `unhandled` bucket, the remedy is analysis-side (narrow the
-violation), never a policy-side exception.
+Violation taint gates the four access-property strategies: every `immutable`,
+`once-lock`, `atomic`, and `mutex` guard implicitly conjoins `¬violation_taint`. A
+tainted global's access-property facts and certificates were computed under violated
+analysis assumptions and cannot justify those representations. `localize` instead
+fails when any hard `violation_relevance` diagnostic has a finding kind other than
+`fnptr_varargs_internal_unmodeled`; an exempt-only tainted global may proceed when its
+independent localization verdict is OK. The exemption and its supported-program
+contract are specified in `20260818_LOCALIZATION_VIOLATION_TAINT_v3.md`.
+
+The manifest validates the load-bearing completeness invariant
+`violation_taint.value == violation_relevance.any(hard)`. Missing diagnostics therefore
+fail artifact validation rather than silently satisfying the filtered localization
+guard. If the skip histogram (§10.2) shows taint dominating the `unhandled` bucket for
+the four access-property strategies, the remedy remains analysis-side narrowing.
 
 Two knobs, both policy-level (never analysis-level):
 
@@ -131,7 +137,7 @@ Per-global facts, with producers:
 |---|---|---|---|
 | `written` | evidenced bool, *may-runtime-written* semantics; static initializer stores are excluded (witness when true: a runtime write site, or the external escape that prevents ruling writes out — `DISPOSITION_PLAN.md` §1.9) | F runtime `writers(o)` scan | implemented |
 | `omega_escaped_address` | evidenced bool (witness when true: the escape site) | Ω machinery | implemented |
-| `violation_taint` | evidenced bool (witness when true: an address-relevant, access-shape-relevant, or unresolved violation finding) — gates every strategy, §1; value-only/unrelated findings remain diagnostics | A′ relevance routing | implemented |
+| `violation_taint` | evidenced bool (witness when true: an address-relevant, access-shape-relevant, or unresolved violation finding) — gates `immutable`, `once-lock`, `atomic`, and `mutex`; `localize` filters the complete `violation_relevance` list by the single exempt kind in §1; value-only/unrelated findings remain diagnostics | A′ relevance routing | implemented |
 | `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) — **reporting fact, not a guard**: thread visibility alone defeats no strategy (thread readers are a primary OnceLock use case; the thread-*writer* kill rule lives inside the phase-stationarity certificate) | F scan over spawn sites | implemented |
 | `signal_context_access` | evidenced bool (true iff accessed under a registered signal handler; witness when true: registration site + accessing function) | F scan over Ω escape sites of handlers | implemented |
 | `access_set_complete` | evidenced bool (true iff analysis bounds every possible accessor; **witness when false**: module-wide Ω, address escape, or library name reachability) | F scan | implemented; bounded indirect/rewrite compatibility is diagnosed separately for D3/D4 |
@@ -402,7 +408,8 @@ vector. Three outcomes:
    facts/certificate): honored,
    `provenance: "override"`.
 2. **Contradicting facts** (e.g., `atomic` for a global with
-   `access_set_complete: false`, or any pin on a `violation_taint` global): honored
+   `access_set_complete: false`, or a pin to any of the four access-property strategies
+   on a `violation_taint` global): honored
    **only if** `accept_risk = true`, with `provenance: "override-accepted-risk"` *and*
    a corresponding entry appended to the audited soundness inventory (`DESIGN.md` §8)
    — an accepted-risk pin is an assumption of exactly the same standing as a
@@ -414,6 +421,12 @@ vector. Three outcomes:
    The user's v1 recourse is to pin the whole group. Group-membership overrides are not
    part of the v1 override grammar; adding them later requires an explicit
    accepted-risk record because membership is an analysis fact.
+
+A `localize` pin whose only hard violation diagnostics are
+`fnptr_varargs_internal_unmodeled` and whose localization verdict is OK is outcome 1,
+not an accepted-risk override. It operates under the run-independent supported-program
+contract and accepted-risk inventory entry in
+`20260818_LOCALIZATION_VIOLATION_TAINT_v3.md`.
 
 ### 4.3 Override report
 
@@ -607,7 +620,7 @@ in the Rust output — the silent failure classes are all *relational*, not site
 | `once-lock` | compile error | post-P write missed → `set` panics; read-before-set → `get` panics | loud | post-P store logging (`ONCELOCK.md` §3.4.3), stop-ship on any hit |
 | `atomic` | compile error | incompatible or missed access lowering | no additional relational failure for defined source behavior | none |
 | `mutex` | compile error | reentrant access path → deadlock; signal-context access → deadlock/UB | loud-ish (liveness, not corruption) | lock-cycle detection under the program's test suite |
-| `localize` | n/a | FN call edge → wrong routing → silent corruption | **silent** | unchanged from `DESIGN.md` §9 |
+| `localize` | n/a | FN call edge or hidden callback → wrong routing; lifecycle access or insufficient context lifetime → invalid relocated storage | **silent** | unknown-caller blocker plus the supported-program contract and accepted-risk inventory in `20260818_LOCALIZATION_VIOLATION_TAINT_v3.md` |
 
 The silent cells for `immutable` and `localize` get the investment described above.
 Atomic eligibility is per-global and requires no co-update audit under the

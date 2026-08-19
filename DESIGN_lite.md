@@ -434,10 +434,13 @@ With an exhaustive materialized solution, every client is a scan, not a query en
   `immutable`, `once-lock`, `atomic`, `mutex`, and application-only `localize`, falling
   back to `unhandled` with accumulated witnesses. Coupling-group support, overrides,
   accepted-risk records, source-materialization recipes, and the marker inventory are
-  emitted in the shared manifest. Violation taint gates every strategy unless an
-  explicit accepted-risk override is recorded. Localization consumes only globals assigned
-  `localize`; the older mutability lattice is a reporting summary, not the strategy
-  decision procedure.
+  emitted in the shared manifest. Violation taint gates the four access-property
+  strategies. Localization may ignore hard `fnptr_varargs_internal_unmodeled`
+  diagnostics when no other hard finding remains and its independent verdict is OK,
+  under the supported-program contract in
+  `20260818_LOCALIZATION_VIOLATION_TAINT_v3.md`. Localization consumes only globals
+  assigned `localize`; the older mutability lattice is a reporting summary, not the
+  strategy decision procedure.
 
 Post-passes over one materialized result are also far easier to test than interleaved
 demand queries: golden-file the whole solution on small inputs, diff across changes.
@@ -478,11 +481,20 @@ soundness-regression tripwires around the one authoritative lite pipeline.
 | Typed heap clones + conservatism dial | Back-propagation pass, clone⁄site duality, per-client mode switch | Heap objects coarser by type. Hurts heap-heavy alias precision; mutable-*globals* client is the least heap-dependent client we have. |
 | KallGraph per-query parallelism | Read-only query pool, shared caches | None at this scale — `DESIGN.md` §1 already called it "overkill insurance" below 1 MLoC. Kahlon partitions leave a clean parallelization seam, but the current D' solve is sequential. |
 
-**Not cut, anywhere:** Ω boundary model, int↔ptr violation
-detection → Ω-taint, FSA envelope, KELP safe-fallback discipline, byte-offset field
-sensitivity. Bounded domains always pair retained positive facts with an explicit
-incomplete/unknown bit and route overflow to a conservative fallback. Soundness is the
-hard constraint, subject to the explicit paired-subtraction input contract below.
+**Not cut, anywhere:** Ω boundary model, int↔ptr violation detection → Ω-taint, FSA
+envelope, KELP safe-fallback discipline, byte-offset field sensitivity. Bounded domains
+always pair retained positive facts with an explicit incomplete/unknown bit and route
+overflow to a conservative fallback. Soundness is the hard constraint, subject to the
+explicit supported-program contracts below. One policy exception does not clear Ω or
+violation taint: `localize` may filter the single internal-unmodeled-vararg finding kind
+as specified in `20260818_LOCALIZATION_VIOLATION_TAINT_v3.md`.
+
+For localization, the supported program must not invoke a callback after passing that
+callback, directly or through an aggregate, as a variadic actual to an internal vararg
+consumer whose consumption is unmodeled. Such a hidden invocation can retain the old ABI
+after the callback's signature is context-threaded. The existing vararg Ω-seed → escape
+→ `unknown_callers` → planner-blocker chain remains a regression guard, but it is not a
+proof obligation for programs outside this contract.
 
 `ptrtoint` validation is use-sensitive and fails closed. A raw integer address is exempt from the
 Ω seed only when its complete SSA use graph terminates in supported comparisons, or when it is one

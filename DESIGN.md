@@ -333,6 +333,28 @@ runtime) is so much larger than the cost of freezing one more component.
 
 ## 8. Soundness inventory (explicit, since output drives code transformation)
 
+**Supported-program contract — internal unmodeled varargs.** A supported program does
+not invoke a callback after passing that callback, directly or through an aggregate, as
+a variadic actual to an internal vararg consumer whose consumption is unmodeled. The
+localization disposition may ignore hard `fnptr_varargs_internal_unmodeled` diagnostics
+when every hard diagnostic has that exact kind and the independent localization verdict
+is OK. For in-contract programs the received values are data and relocation preserves
+their uses. Programs that hide callback invocation behind this boundary require explicit
+vararg modeling or must remain outside the localization contract.
+
+**Standing accepted risk — localization kind exemption.** The implementation still
+relies defensively on the vararg Ω-seed → escape → `unknown_callers` →
+`unknown-caller-taint` chain, although its audit/PAG predicates are duplicated and an
+experimental closed-consumer refinement can edit `unknown_callers`. A contract-violating
+hidden callback can therefore corrupt the ABI silently if that defensive chain also
+fails; not every aggregate-carried callback shape is covered by the current chain. In
+addition, constructor/destructor access and a context whose storage duration is
+shorter than the original global are pre-existing localization hazards that become
+reachable for newly exempted globals. These lifecycle and storage-duration risks are
+accepted for this change; the remedies are lifecycle-entry blockers and a materializer
+rule enforcing static-like context storage. Accepted 2026-08-19; design authority:
+`20260818_LOCALIZATION_VIOLATION_TAINT_v3.md`.
+
 - Incomplete programs / libraries / dlopen: sound via Ω (PIP). This is *stronger* than
   cclyzer, KELP, CORAL, KallGraph defaults.
 - int↔ptr: sound via PIP's provenance rules (fixes KallGraph's known FN source).

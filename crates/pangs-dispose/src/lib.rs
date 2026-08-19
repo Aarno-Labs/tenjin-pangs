@@ -1125,8 +1125,31 @@ enum GuardResult {
     NotComputed(&'static str),
 }
 
+const LOCALIZE_EXEMPT_VIOLATION_KIND: &str = "fnptr_varargs_internal_unmodeled";
+
+fn violation_taint_blocks(strategy: Strategy, facts: &Facts) -> bool {
+    if strategy != Strategy::Localize {
+        return facts.violation_taint.value;
+    }
+
+    let mut saw_hard = false;
+    for diagnostic in &facts.violation_relevance {
+        if !diagnostic.classification.is_hard() {
+            continue;
+        }
+        saw_hard = true;
+        if diagnostic.finding_kind != LOCALIZE_EXEMPT_VIOLATION_KIND {
+            return true;
+        }
+    }
+
+    // Facts::validate() rejects this mismatch at artifact boundaries. Keep the evaluator
+    // independently fail-closed because it is also used directly in unit and policy code.
+    facts.violation_taint.value && !saw_hard
+}
+
 fn evaluate(strategy: Strategy, facts: &Facts) -> GuardResult {
-    if facts.violation_taint.value {
+    if violation_taint_blocks(strategy, facts) {
         let mut failed = vec!["violation_taint".to_owned()];
         match strategy {
             Strategy::Immutable => {
@@ -1215,7 +1238,8 @@ fn failed_result(failed: Vec<String>) -> GuardResult {
 mod tests {
     use pangs_manifest::{
         AnalysisRun, AuditRecord, CouplingGroup, EvidencedBool, GlobalRecord, GroupStrategySupport,
-        Linkage, Localization, Manifest, Meta, RunHeader, UnkeyedGlobal, WordSizedScalar,
+        Linkage, Localization, LocalizationBlocker, Manifest, Meta, RunHeader, UnkeyedGlobal,
+        ViolationRelevance, ViolationRelevanceDiagnostic, WordSizedScalar,
     };
     use serde_json::json;
 
@@ -1258,6 +1282,32 @@ mod tests {
     fn certified() -> Certificate {
         Certificate::Certified {
             certificate: json!({}),
+            extra: Extra::new(),
+        }
+    }
+
+    fn violation_diagnostic(
+        classification: ViolationRelevance,
+        finding_kind: &str,
+    ) -> ViolationRelevanceDiagnostic {
+        ViolationRelevanceDiagnostic {
+            classification,
+            finding_kind: finding_kind.into(),
+            witness: Witness {
+                kind: "violation-test".into(),
+                site: None,
+                symbol: Some("g".into()),
+                note: None,
+                extra: Extra::new(),
+            },
+        }
+    }
+
+    fn ok_localization() -> Localization {
+        Localization {
+            component: "comp-1".into(),
+            verdict: LocalizationVerdict::Ok,
+            blockers: Vec::new(),
             extra: Extra::new(),
         }
     }
@@ -1313,6 +1363,106 @@ mod tests {
             };
             assert_eq!(failed.first().map(String::as_str), Some("violation_taint"));
         }
+    }
+
+    #[test]
+    fn localize_ignores_only_exempt_hard_vararg_diagnostics() {
+        let mut facts = base_facts();
+        facts.violation_taint.value = true;
+        facts.violation_relevance.push(violation_diagnostic(
+            ViolationRelevance::AddressRelevant,
+            LOCALIZE_EXEMPT_VIOLATION_KIND,
+        ));
+        facts.localization = Some(ok_localization());
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Localize],
+        };
+        assert_eq!(cascade(&facts, &config).unwrap().0, Strategy::Localize);
+
+        facts.violation_relevance.push(violation_diagnostic(
+            ViolationRelevance::Unresolved,
+            "dlopen_dlsym",
+        ));
+        let (chosen, trace) = cascade(&facts, &config).unwrap();
+        assert_eq!(chosen, Strategy::Unhandled);
+        assert!(matches!(
+            &trace[0].reason,
+            SkipReason::GuardFailed { failed, .. }
+                if failed.first().map(String::as_str) == Some("violation_taint")
+        ));
+    }
+
+    #[test]
+    fn localize_exemption_remains_fail_closed_for_missing_diagnostics() {
+        let mut facts = base_facts();
+        facts.violation_taint.value = true;
+        facts.localization = Some(ok_localization());
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Localize],
+        };
+        assert_eq!(cascade(&facts, &config).unwrap().0, Strategy::Unhandled);
+    }
+
+    #[test]
+    fn manifest_validates_taint_diagnostic_equivalence() {
+        let mut facts = base_facts();
+        facts.violation_taint.value = true;
+        facts.violation_taint.witness = Some(Witness {
+            kind: "violation-address-relevant".into(),
+            site: None,
+            symbol: Some("g".into()),
+            note: None,
+            extra: Extra::new(),
+        });
+        assert!(facts.validate().is_err());
+
+        facts.violation_relevance.push(violation_diagnostic(
+            ViolationRelevance::AddressRelevant,
+            LOCALIZE_EXEMPT_VIOLATION_KIND,
+        ));
+        assert!(facts.validate().is_ok());
+
+        facts.violation_taint.value = false;
+        facts.violation_taint.witness = None;
+        assert!(facts.validate().is_err());
+    }
+
+    #[test]
+    fn exempt_taint_does_not_override_blocked_localization_verdict() {
+        let mut facts = base_facts();
+        facts.violation_taint.value = true;
+        facts.violation_relevance.push(violation_diagnostic(
+            ViolationRelevance::AccessShapeRelevant,
+            LOCALIZE_EXEMPT_VIOLATION_KIND,
+        ));
+        facts.localization = Some(Localization {
+            component: "comp-1".into(),
+            verdict: LocalizationVerdict::Blocked,
+            blockers: vec![LocalizationBlocker {
+                code: "unknown-caller-taint".into(),
+                witness: Witness {
+                    kind: "unknown-caller-taint".into(),
+                    site: None,
+                    symbol: Some("target".into()),
+                    note: None,
+                    extra: Extra::new(),
+                },
+                extra: Extra::new(),
+            }],
+            extra: Extra::new(),
+        });
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Localize],
+        };
+        let (chosen, trace) = cascade(&facts, &config).unwrap();
+        assert_eq!(chosen, Strategy::Unhandled);
+        assert!(matches!(
+            &trace[0].reason,
+            SkipReason::GuardFailed { failed, .. } if failed == &["localization"]
+        ));
     }
 
     #[test]
