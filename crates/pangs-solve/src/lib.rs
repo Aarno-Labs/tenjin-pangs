@@ -625,8 +625,11 @@ fn allocation_isolation(
         reached
     };
 
-    // An integer-forged pointer that reaches a write or opaque call can designate any
-    // allocation, so no allocation-specific no-write certificate is available in that case.
+    // Keep forged-pointer provenance separate from allocation-address provenance.  A forged
+    // pointer defeats the certificate for a particular allocation only when the two
+    // address-preserving closures meet.  In particular, `flow` deliberately contains no Load
+    // edge: loading a pointer stored in a global follows the global's contents, not an address
+    // derived from the global's storage.
     let forged_seeds = pag
         .omega_seeds
         .iter()
@@ -640,23 +643,6 @@ fn allocation_isolation(
         })
         .collect::<Vec<_>>();
     let forged = closure(&forged_seeds);
-    let forged_write = pag.edges.iter().any(|edge| {
-        matches!(
-            edge.kind,
-            pangs_pag::EdgeKind::Store | pangs_pag::EdgeKind::Memcpy { .. }
-        ) && forged[edge.dst.0 as usize]
-    }) || pag.callsites.iter().any(|callsite| {
-        (callsite.external_boundary || unsafe_indirect_sites.contains(&callsite.id))
-            && callsite.args.iter().any(|arg| forged[arg.0 as usize])
-    }) || pag.omega_seeds.iter().any(|seed| match seed.target {
-        SeedTarget::Node(node) => {
-            seed.kind == OmegaSeedKind::UnknownOperandEscape && forged[node.0 as usize]
-        }
-        SeedTarget::Callsite(_) => false,
-    });
-    if forged_write {
-        return AllocationIsolation::default();
-    }
 
     let runtime_direct_writes = pir
         .functions
@@ -678,8 +664,13 @@ fn allocation_isolation(
             continue;
         };
         let reached = closure(&[object]);
-        let mut address_isolated = true;
-        let mut write_isolated = !runtime_direct_writes.contains(global.key.as_str());
+        let intersects_forged = reached
+            .iter()
+            .zip(&forged)
+            .any(|(&address_reached, &forged_reached)| address_reached && forged_reached);
+        let mut address_isolated = !intersects_forged;
+        let mut write_isolated =
+            !intersects_forged && !runtime_direct_writes.contains(global.key.as_str());
 
         for edge in &pag.edges {
             match edge.kind {

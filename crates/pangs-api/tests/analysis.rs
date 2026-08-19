@@ -1927,6 +1927,40 @@ fn allocation_provenance_keeps_dynamic_gep_write_and_escape_fail_closed() {
 }
 
 #[test]
+fn allocation_provenance_isolates_forged_pointer_effects_per_global() {
+    let pir = Pir::from_path(m1_4_fixture(
+        "allocation_isolation_forged_per_global.pir.json",
+    ))
+    .unwrap();
+    for stage in [Stage::Steens, Stage::Andersen] {
+        let analysis = Analysis::run(
+            &pir,
+            &Opts {
+                stage,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+
+        let bad = analysis.lookup_global("@Bad").unwrap();
+        let good = analysis.lookup_global("@Good").unwrap();
+        let holder = analysis.lookup_global("@Holder").unwrap();
+
+        assert!(analysis.globals()[bad].address_escaped);
+        assert!(analysis.globals()[bad].runtime_written);
+
+        assert!(!analysis.globals()[good].address_escaped);
+        assert!(!analysis.globals()[good].runtime_written);
+
+        // The value loaded from Holder may designate arbitrary storage, but Load is not an
+        // address-preserving derivation from Holder's own storage address.
+        assert!(!analysis.globals()[holder].address_escaped);
+        assert!(analysis.globals()[holder].runtime_written);
+    }
+}
+
+#[test]
 fn steens_ptrtoint_marks_only_the_pointee_global_as_external() {
     let pir = Pir::from_path(m1_4_fixture("ptrtoint_escape.pir.json")).unwrap();
     let analysis = Analysis::run(
