@@ -911,14 +911,24 @@ entry:
             .count()
             >= 4
     );
-    assert!(flow
-        .body
-        .iter()
-        .any(|stmt| matches!(stmt, Stmt::PtrToInt { .. })));
-    assert!(flow
-        .body
-        .iter()
-        .any(|stmt| matches!(stmt, Stmt::IntToPtr { .. })));
+    assert!(flow.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::PtrToInt {
+            integer_bits: Some(64),
+            pointer_bits: Some(64),
+            pointer_address_space: Some(0),
+            ..
+        }
+    )));
+    assert!(flow.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::IntToPtr {
+            integer_bits: Some(64),
+            pointer_bits: Some(64),
+            pointer_address_space: Some(0),
+            ..
+        }
+    )));
     assert!(flow
         .body
         .iter()
@@ -1101,14 +1111,24 @@ entry:
             .count()
             >= 4
     );
-    assert!(flow
-        .body
-        .iter()
-        .any(|stmt| matches!(stmt, Stmt::PtrToInt { .. })));
-    assert!(flow
-        .body
-        .iter()
-        .any(|stmt| matches!(stmt, Stmt::IntToPtr { .. })));
+    assert!(flow.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::PtrToInt {
+            integer_bits: Some(64),
+            pointer_bits: Some(64),
+            pointer_address_space: Some(0),
+            ..
+        }
+    )));
+    assert!(flow.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::IntToPtr {
+            integer_bits: Some(64),
+            pointer_bits: Some(64),
+            pointer_address_space: Some(0),
+            ..
+        }
+    )));
     assert!(flow
         .body
         .iter()

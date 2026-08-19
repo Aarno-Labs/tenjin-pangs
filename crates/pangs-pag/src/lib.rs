@@ -729,6 +729,103 @@ enum SymbolKind {
     Function,
 }
 
+/// Recognize only the literal SSA round trip represented by
+/// `p -> ptrtoint -> inttoptr -> q`. All uses of the integer result must be compatible
+/// `inttoptr` operations; a store, arithmetic operation, call, return, or unknown use keeps the
+/// original fail-closed seeds. Address-space equality is intentionally stricter than attempting
+/// to infer target-specific equivalence between distinct spaces.
+fn collect_lossless_pointer_round_trips(
+    pir: &Pir,
+    scope: usize,
+    body: &[Stmt],
+    safe_ptrtoint: &mut BTreeSet<(usize, usize)>,
+    safe_inttoptr: &mut BTreeMap<(usize, usize), String>,
+) {
+    let Some(target) = pir.target.as_ref() else {
+        return;
+    };
+    let non_integral = target
+        .data_layout
+        .split('-')
+        .find_map(|part| part.strip_prefix("ni:"))
+        .into_iter()
+        .flat_map(|spaces| spaces.split(':'))
+        .filter_map(|space| space.parse::<u32>().ok())
+        .collect::<BTreeSet<_>>();
+
+    let mut definitions = BTreeMap::new();
+    let mut multiply_defined = BTreeSet::new();
+    let mut uses_by_operand: BTreeMap<&str, Vec<(usize, &Stmt)>> = BTreeMap::new();
+    for (index, stmt) in body.iter().enumerate() {
+        if let Some(dest) = stmt_destination(stmt) {
+            if definitions.insert(dest, index).is_some() {
+                multiply_defined.insert(dest);
+            }
+        }
+        for operand in stmt_input_operands(stmt) {
+            uses_by_operand
+                .entry(operand)
+                .or_default()
+                .push((index, stmt));
+        }
+    }
+
+    for (ptr_index, ptr_stmt) in body.iter().enumerate() {
+        let Stmt::PtrToInt {
+            dest: integer,
+            source: pointer,
+            integer_bits: Some(integer_bits),
+            pointer_bits: Some(source_pointer_bits),
+            pointer_address_space: Some(source_space),
+            ..
+        } = ptr_stmt
+        else {
+            continue;
+        };
+        if integer_bits != source_pointer_bits || non_integral.contains(source_space) {
+            continue;
+        }
+
+        let Some(uses) = uses_by_operand.get(integer.as_str()) else {
+            continue;
+        };
+        if multiply_defined.contains(integer.as_str()) {
+            continue;
+        }
+
+        let mut round_trips = Vec::new();
+        let all_lossless = uses.iter().all(|(int_index, stmt)| {
+            let Stmt::IntToPtr {
+                source,
+                integer_bits: Some(destination_integer_bits),
+                pointer_bits: Some(destination_pointer_bits),
+                pointer_address_space: Some(destination_space),
+                ..
+            } = stmt
+            else {
+                return false;
+            };
+            let compatible = source == integer
+                && *int_index > ptr_index
+                && definitions.get(source.as_str()) == Some(&ptr_index)
+                && destination_integer_bits == integer_bits
+                && destination_pointer_bits == integer_bits
+                && destination_space == source_space
+                && !non_integral.contains(destination_space);
+            if compatible {
+                round_trips.push(*int_index);
+            }
+            compatible
+        });
+        if all_lossless {
+            safe_ptrtoint.insert((scope, ptr_index));
+            for int_index in round_trips {
+                safe_inttoptr.insert((scope, int_index), pointer.clone());
+            }
+        }
+    }
+}
+
 struct Builder<'a> {
     pir: &'a Pir,
     opts: &'a PagOpts,
@@ -743,6 +840,10 @@ struct Builder<'a> {
     positional_vararg_functions: BTreeSet<String>,
     vararg_call_proof: VarargCallProof<'a>,
     callsite_ordinals: BTreeMap<usize, u32>,
+    /// Statement-indexed proofs. The value on an `inttoptr` row is the original pointer
+    /// operand whose representation survived the integer detour unchanged.
+    lossless_inttoptr: BTreeMap<(usize, usize), String>,
+    lossless_ptrtoint: BTreeSet<(usize, usize)>,
 }
 
 impl<'a> Builder<'a> {
@@ -760,6 +861,24 @@ impl<'a> Builder<'a> {
             .map(|(index, func)| (func.key.clone(), index))
             .collect();
         let positional_vararg_functions = positionally_modeled_vararg_functions(pir, opts);
+        let mut lossless_inttoptr = BTreeMap::new();
+        let mut lossless_ptrtoint = BTreeSet::new();
+        for (func_index, func) in pir.functions.iter().enumerate() {
+            collect_lossless_pointer_round_trips(
+                pir,
+                func_index,
+                &func.body,
+                &mut lossless_ptrtoint,
+                &mut lossless_inttoptr,
+            );
+        }
+        collect_lossless_pointer_round_trips(
+            pir,
+            usize::MAX,
+            &pir.global_init,
+            &mut lossless_ptrtoint,
+            &mut lossless_inttoptr,
+        );
         Self {
             pir,
             opts,
@@ -774,6 +893,8 @@ impl<'a> Builder<'a> {
             positional_vararg_functions,
             vararg_call_proof: VarargCallProof::new(pir),
             callsite_ordinals: BTreeMap::new(),
+            lossless_inttoptr,
+            lossless_ptrtoint,
         }
     }
 
@@ -972,10 +1093,11 @@ impl<'a> Builder<'a> {
                 source,
                 comparison_only,
                 loc,
+                ..
             } => {
                 let src = self.operand_node(func_index, owner_scope(&owner), source);
                 self.value_node(func_index, owner_scope(&owner), dest);
-                if !comparison_only {
+                if !comparison_only && !self.lossless_ptrtoint.contains(&(func_index, stmt_index)) {
                     self.add_seed(
                         OmegaSeedKind::PtrToInt,
                         SeedTarget::Node(src),
@@ -985,16 +1107,27 @@ impl<'a> Builder<'a> {
                     );
                 }
             }
-            Stmt::IntToPtr { dest, source, loc } => {
+            Stmt::IntToPtr {
+                dest, source, loc, ..
+            } => {
                 self.operand_node(func_index, owner_scope(&owner), source);
                 let dst = self.value_node(func_index, owner_scope(&owner), dest);
-                self.add_seed(
-                    OmegaSeedKind::IntToPtr,
-                    SeedTarget::Node(dst),
-                    Some(owner),
-                    loc.clone(),
-                    Some(dest.clone()),
-                );
+                if let Some(original) = self
+                    .lossless_inttoptr
+                    .get(&(func_index, stmt_index))
+                    .cloned()
+                {
+                    let src = self.operand_node(func_index, owner_scope(&owner), &original);
+                    self.add_edge(EdgeKind::Assign, src, dst, owner, loc.clone());
+                } else {
+                    self.add_seed(
+                        OmegaSeedKind::IntToPtr,
+                        SeedTarget::Node(dst),
+                        Some(owner),
+                        loc.clone(),
+                        Some(dest.clone()),
+                    );
+                }
             }
             Stmt::VarArg { dest, .. } => {
                 // Direct callsites add the proven actual-to-result edges. Keeping node creation
@@ -3219,5 +3352,92 @@ mod tests {
             panic!("ptrtoint seed must target the source node")
         };
         assert_eq!(pag.nodes[node.0 as usize].label, "sym:global:g");
+    }
+
+    #[test]
+    fn lossless_integral_pointer_round_trip_is_an_assignment_not_omega() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"pointer-round-trip",
+                "target":{"triple":"x86_64","data_layout":"e-p:64:64","supported_atomic_widths":[8,16,32,64]},
+                "globals":[{"key":"g","mutable":true}],
+                "functions":[{"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                    {"kind":"assign","dest":"p","sources":["g"]},
+                    {"kind":"ptr_to_int","dest":"i","source":"p","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"q","source":"i","integer_bits":64,"pointer_bits":64,"pointer_address_space":0}
+                ]}]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        assert!(!pag
+            .omega_seeds
+            .iter()
+            .any(|seed| matches!(seed.kind, OmegaSeedKind::PtrToInt | OmegaSeedKind::IntToPtr)));
+        let p = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:main:p")
+            .unwrap()
+            .id;
+        let q = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:main:q")
+            .unwrap()
+            .id;
+        assert!(pag
+            .edges
+            .iter()
+            .any(|edge| { edge.kind == EdgeKind::Assign && edge.src == p && edge.dst == q }));
+    }
+
+    #[test]
+    fn pointer_round_trip_proof_fails_closed_on_unsafe_variants() {
+        for (name, data_layout, ptr_bits, destination_space, extra) in [
+            ("width", "e-p:64:64", 32, 0, ""),
+            ("address-space", "e-p:64:64-p1:64:64", 64, 1, ""),
+            ("non-integral", "e-p:64:64-ni:0", 64, 0, ""),
+            (
+                "integer-storage",
+                "e-p:64:64",
+                64,
+                0,
+                r#",{"kind":"store","address":"slot","value":"i"}"#,
+            ),
+            (
+                "integer-arithmetic",
+                "e-p:64:64",
+                64,
+                0,
+                r#",{"kind":"scalar_op","dest":"changed","op":"add","lhs":"i","rhs":"1"}"#,
+            ),
+        ] {
+            let json = format!(
+                r#"{{
+                    "module":"{name}",
+                    "target":{{"triple":"test","data_layout":"{data_layout}","supported_atomic_widths":[]}},
+                    "functions":[{{"key":"main","sig":{{"ret":{{"class":"void"}},"params":[]}},"body":[
+                        {{"kind":"ptr_to_int","dest":"i","source":"p","integer_bits":64,"pointer_bits":64,"pointer_address_space":0}},
+                        {{"kind":"int_to_ptr","dest":"q","source":"i","integer_bits":64,"pointer_bits":{ptr_bits},"pointer_address_space":{destination_space}}}{extra}
+                    ]}}]
+                }}"#
+            );
+            let pir: Pir = serde_json::from_str(&json).unwrap();
+            let pag = Pag::from_pir(&pir, &PagOpts::default());
+            assert!(
+                pag.omega_seeds
+                    .iter()
+                    .any(|seed| seed.kind == OmegaSeedKind::PtrToInt),
+                "{name}"
+            );
+            assert!(
+                pag.omega_seeds
+                    .iter()
+                    .any(|seed| seed.kind == OmegaSeedKind::IntToPtr),
+                "{name}"
+            );
+        }
     }
 }

@@ -4302,6 +4302,9 @@ mod tests {
             pangs_pir::Stmt::PtrToInt {
                 dest: "%fp_bits".into(),
                 source: "%fp".into(),
+                integer_bits: None,
+                pointer_bits: None,
+                pointer_address_space: None,
                 comparison_only: false,
                 loc: None,
             },
@@ -4313,6 +4316,9 @@ mod tests {
             pangs_pir::Stmt::PtrToInt {
                 dest: "%mixed_bits".into(),
                 source: "%mixed".into(),
+                integer_bits: None,
+                pointer_bits: None,
+                pointer_address_space: None,
                 comparison_only: false,
                 loc: None,
             },

@@ -12,7 +12,7 @@ use llvm_sys::ir_reader::LLVMParseIRInContext;
 use llvm_sys::prelude::*;
 use llvm_sys::target::{
     LLVMABIAlignmentOfType, LLVMABISizeOfType, LLVMGetModuleDataLayout, LLVMOffsetOfElement,
-    LLVMPointerSize, LLVMTargetDataRef,
+    LLVMPointerSize, LLVMPointerSizeForAS, LLVMTargetDataRef,
 };
 use llvm_sys::{
     LLVMAtomicOrdering, LLVMDLLStorageClass, LLVMLinkage, LLVMOpcode, LLVMTypeKind, LLVMVisibility,
@@ -1447,9 +1447,14 @@ unsafe fn lower_instruction(
         }
         LLVMOpcode::LLVMPtrToInt => {
             let source = LLVMGetOperand(inst, 0);
+            let source_ty = LLVMTypeOf(source);
+            let address_space = LLVMGetPointerAddressSpace(source_ty);
             body.push(Stmt::PtrToInt {
                 dest: fctx.local_key(inst),
                 source: fctx.operand_key(source),
+                integer_bits: Some(LLVMGetIntTypeWidth(LLVMTypeOf(inst))),
+                pointer_bits: Some(LLVMPointerSizeForAS(ctx.data_layout, address_space) * 8),
+                pointer_address_space: Some(address_space),
                 // `comparison_only` is the legacy serialized spelling for a conversion whose
                 // integer use has been proved non-address-observing. The structured classifier
                 // lives in its own module; retaining the field avoids a PIR schema break.
@@ -1461,9 +1466,14 @@ unsafe fn lower_instruction(
         }
         LLVMOpcode::LLVMIntToPtr => {
             let source = LLVMGetOperand(inst, 0);
+            let destination_ty = LLVMTypeOf(inst);
+            let address_space = LLVMGetPointerAddressSpace(destination_ty);
             body.push(Stmt::IntToPtr {
                 dest: fctx.local_key(inst),
                 source: fctx.operand_key(source),
+                integer_bits: Some(LLVMGetIntTypeWidth(LLVMTypeOf(source))),
+                pointer_bits: Some(LLVMPointerSizeForAS(ctx.data_layout, address_space) * 8),
+                pointer_address_space: Some(address_space),
                 loc: loc(inst),
             });
             lowering.bump_modeled("inttoptr");
@@ -2505,6 +2515,15 @@ unsafe fn lower_constant_expr_value_inner(
                 body.push(Stmt::PtrToInt {
                     dest: dest.clone(),
                     source,
+                    integer_bits: Some(LLVMGetIntTypeWidth(LLVMTypeOf(constant))),
+                    pointer_bits: {
+                        let ty = LLVMTypeOf(LLVMGetOperand(constant, 0));
+                        let address_space = LLVMGetPointerAddressSpace(ty);
+                        Some(LLVMPointerSizeForAS(ctx.data_layout, address_space) * 8)
+                    },
+                    pointer_address_space: Some(LLVMGetPointerAddressSpace(LLVMTypeOf(
+                        LLVMGetOperand(constant, 0),
+                    ))),
                     comparison_only: false,
                     loc: None,
                 });
@@ -2513,11 +2532,24 @@ unsafe fn lower_constant_expr_value_inner(
                 dest
             }
             LLVMOpcode::LLVMIntToPtr => {
-                let source = value_string(LLVMGetOperand(constant, 0));
+                let operand = LLVMGetOperand(constant, 0);
+                let source = lower_constant_expr_value_inner(
+                    ctx,
+                    operand,
+                    body,
+                    temp_ordinal,
+                    lowering,
+                    path,
+                    depth + 1,
+                );
                 let dest = global_init_temp(temp_ordinal);
+                let address_space = LLVMGetPointerAddressSpace(LLVMTypeOf(constant));
                 body.push(Stmt::IntToPtr {
                     dest: dest.clone(),
                     source,
+                    integer_bits: Some(LLVMGetIntTypeWidth(LLVMTypeOf(operand))),
+                    pointer_bits: Some(LLVMPointerSizeForAS(ctx.data_layout, address_space) * 8),
+                    pointer_address_space: Some(address_space),
                     loc: None,
                 });
                 lowering.bump_modeled("global_init_inttoptr");

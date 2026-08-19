@@ -506,7 +506,15 @@ or across an unanalyzed boundary. Under C's defined-execution semantics the form
 operands within one array object, so recovering a common allocation root in LLVM IR adds complexity
 without strengthening the contract needed by the current points-to, mod/ref, call-graph, and
 disposition clients. Mixed raw-address uses and unmatched conversions retain the normal violation
-and Ω treatment, and a locally visible `inttoptr` remains independently audited.
+and Ω treatment. A narrower exception recognizes a literal `ptrtoint`/`inttoptr` SSA round trip as
+an address-preserving assignment when the integer and pointer widths match, both conversions use
+the same integral pointer address space, and every use of the intermediate integer is one of those
+compatible reconstructions. The PAG then copies the original pointer into the reconstructed value
+without either integer-conversion Ω seed. Missing target or conversion metadata, arithmetic,
+integer storage, width or address-space changes, non-integral pointers, and externally sourced
+integers all retain the fail-closed behavior. Function-pointer conversion findings are still
+emitted when the preserved incoming pointer may actually denote a function; ordinary data-pointer
+round trips do not acquire that label merely from the conversion syntax.
 
 This contract has a narrow theoretical soundness hole: low-level code may deliberately compute a
 relative function-address integer and later reconstruct and call the function, either locally or

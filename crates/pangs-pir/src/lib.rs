@@ -357,6 +357,14 @@ pub enum Stmt {
     PtrToInt {
         dest: String,
         source: String,
+        /// Widths and address space captured from LLVM. Missing facts (including legacy PIR)
+        /// are deliberately insufficient to prove a lossless pointer round trip.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        integer_bits: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pointer_bits: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pointer_address_space: Option<u32>,
         /// Legacy serialized spelling for a conversion whose integer use was proved innocuous:
         /// either a closed comparison computation or one operand of a relocation-invariant
         /// pointer difference with a common structural provenance root.
@@ -368,6 +376,12 @@ pub enum Stmt {
     IntToPtr {
         dest: String,
         source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        integer_bits: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pointer_bits: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pointer_address_space: Option<u32>,
         #[serde(default)]
         loc: Option<Loc>,
     },

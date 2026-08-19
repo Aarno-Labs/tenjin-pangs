@@ -86,6 +86,9 @@ fn add_disconnected_and_connected_audits(pir: &mut Pir) {
         Stmt::PtrToInt {
             dest: "%fp_bits".into(),
             source: "%fp".into(),
+            integer_bits: None,
+            pointer_bits: None,
+            pointer_address_space: None,
             comparison_only: false,
             loc: None,
         },
@@ -97,6 +100,9 @@ fn add_disconnected_and_connected_audits(pir: &mut Pir) {
         Stmt::PtrToInt {
             dest: "%mixed_bits".into(),
             source: "%mixed".into(),
+            integer_bits: None,
+            pointer_bits: None,
+            pointer_address_space: None,
             comparison_only: false,
             loc: None,
         },
@@ -2012,6 +2018,115 @@ fn steens_inttoptr_keeps_unknown_indirect_callee_without_concrete_targets() {
         edge.kind == pangs_api::CallKind::Indirect
             && matches!(edge.callee, pangs_api::Callee::Unknown(_))
     }));
+}
+
+#[test]
+fn steens_lossless_fnptr_round_trip_preserves_target_without_universal_omega() {
+    let mut pir = Pir::from_path(m1_5_fixture("fnptr_int_punning.pir.json")).unwrap();
+    pir.target = Some(pangs_pir::TargetInfo {
+        triple: "x86_64-unknown-linux-gnu".into(),
+        data_layout: "e-p:64:64".into(),
+        supported_atomic_widths: vec![8, 16, 32, 64],
+    });
+    let driver = pir
+        .functions
+        .iter_mut()
+        .find(|function| function.key == "driver")
+        .unwrap();
+    for stmt in &mut driver.body {
+        match stmt {
+            Stmt::PtrToInt {
+                integer_bits,
+                pointer_bits,
+                pointer_address_space,
+                ..
+            }
+            | Stmt::IntToPtr {
+                integer_bits,
+                pointer_bits,
+                pointer_address_space,
+                ..
+            } => {
+                *integer_bits = Some(64);
+                *pointer_bits = Some(64);
+                *pointer_address_space = Some(0);
+            }
+            _ => {}
+        }
+    }
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let cb = analysis.lookup_func("cb").unwrap();
+    assert!(analysis
+        .call_edges()
+        .iter()
+        .any(|edge| edge.callee == pangs_api::Callee::Func(cb)));
+    assert!(!analysis
+        .call_edges()
+        .iter()
+        .any(|edge| matches!(edge.callee, pangs_api::Callee::Unknown(_))));
+    // These remain function-pointer diagnostics because the incoming value really is `cb`.
+    assert!(analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "fnptr_ptrtoint"));
+    assert!(analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| finding.kind == "fnptr_inttoptr"));
+}
+
+#[test]
+fn steens_data_pointer_round_trip_is_not_a_function_pointer_conversion() {
+    let mut pir = Pir::from_path(m1_4_fixture("ptrtoint_escape.pir.json")).unwrap();
+    pir.target = Some(pangs_pir::TargetInfo {
+        triple: "x86_64-unknown-linux-gnu".into(),
+        data_layout: "e-p:64:64".into(),
+        supported_atomic_widths: vec![8, 16, 32, 64],
+    });
+    let body = &mut pir.functions[0].body;
+    let Stmt::PtrToInt {
+        integer_bits,
+        pointer_bits,
+        pointer_address_space,
+        ..
+    } = &mut body[1]
+    else {
+        panic!("fixture must contain ptrtoint")
+    };
+    *integer_bits = Some(64);
+    *pointer_bits = Some(64);
+    *pointer_address_space = Some(0);
+    body.push(Stmt::IntToPtr {
+        dest: "%q".into(),
+        source: "%bits".into(),
+        integer_bits: Some(64),
+        pointer_bits: Some(64),
+        pointer_address_space: Some(0),
+        loc: None,
+    });
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+    let global = analysis.lookup_global("@G").unwrap();
+    assert_eq!(analysis.escape(global), EscapeStatus::Module);
+    assert!(analysis.globals()[global].never_written);
+    assert!(!analysis
+        .audit_findings()
+        .iter()
+        .any(|finding| { matches!(finding.kind.as_str(), "fnptr_ptrtoint" | "fnptr_inttoptr") }));
 }
 
 #[test]
