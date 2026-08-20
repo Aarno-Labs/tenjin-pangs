@@ -13,7 +13,7 @@ pub const DEFAULT_BUILD_MODE: crate::BuildMode = crate::BuildMode::Library;
 /// partition to the Andersen refinement tier.
 pub const DEFAULT_PARTITION_BUDGET: u64 = 200_000;
 
-/// Enable exact stationary-initializer indirect-call resolution by default.
+/// Enable exact initval-stable initializer indirect-call resolution by default.
 pub const DEFAULT_ENABLE_B1_INITVAL: bool = true;
 
 /// Enable bounded simple-flow indirect-call resolution by default.

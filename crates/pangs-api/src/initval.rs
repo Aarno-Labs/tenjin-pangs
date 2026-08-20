@@ -9,7 +9,7 @@ use crate::{CallsiteId, InitValDiagnostic};
 pub(crate) struct InitValReport {
     pub resolutions: BTreeMap<CallsiteId, SimpleIcallResolution>,
     pub complete_globals: BTreeSet<String>,
-    pub stationary_globals: BTreeSet<String>,
+    pub initval_stable_globals: BTreeSet<String>,
     pub diagnostics: BTreeMap<String, Vec<InitValDiagnostic>>,
 }
 
@@ -28,21 +28,21 @@ struct SlotValue {
 pub(crate) fn resolve_initval_icalls(
     module: &Pir,
     queries: &[SimpleIcallQuery],
-    stationary_globals: &BTreeSet<String>,
+    initval_stable_globals: &BTreeSet<String>,
 ) -> InitValReport {
     let mut resolver = InitValResolver::new(module);
     resolver.build_init_slots();
     let complete_globals = resolver.complete_globals();
     let mut resolutions = BTreeMap::new();
     for query in queries {
-        if let Some(resolution) = resolver.resolve_query(query, stationary_globals) {
+        if let Some(resolution) = resolver.resolve_query(query, initval_stable_globals) {
             resolutions.insert(query.callsite, resolution);
         }
     }
     InitValReport {
         resolutions,
         complete_globals,
-        stationary_globals: stationary_globals.clone(),
+        initval_stable_globals: initval_stable_globals.clone(),
         diagnostics: resolver.diagnostics,
     }
 }
@@ -152,13 +152,13 @@ impl<'a> InitValResolver<'a> {
     fn resolve_query(
         &self,
         query: &SimpleIcallQuery,
-        stationary_globals: &BTreeSet<String>,
+        initval_stable_globals: &BTreeSet<String>,
     ) -> Option<SimpleIcallResolution> {
         let value = self.resolve_function_value(
             query.func_index,
             query.stmt_index,
             &query.operand,
-            stationary_globals,
+            initval_stable_globals,
             &mut HashSet::new(),
         )?;
         if value.targets.is_empty() {
@@ -178,7 +178,7 @@ impl<'a> InitValResolver<'a> {
         func_index: usize,
         before_stmt: usize,
         value: &str,
-        stationary_globals: &BTreeSet<String>,
+        initval_stable_globals: &BTreeSet<String>,
         visiting: &mut HashSet<(usize, String)>,
     ) -> Option<SlotValue> {
         let key = (func_index, value.to_string());
@@ -195,12 +195,12 @@ impl<'a> InitValResolver<'a> {
                 func_index,
                 stmt_index,
                 sources,
-                stationary_globals,
+                initval_stable_globals,
                 visiting,
             ),
             Stmt::Load { address, .. } => {
                 let place = self.function_place(func_index, stmt_index, address)?;
-                if !stationary_globals.contains(&place.root) {
+                if !initval_stable_globals.contains(&place.root) {
                     None
                 } else {
                     self.init_slots.get(&place).cloned()
@@ -217,7 +217,7 @@ impl<'a> InitValResolver<'a> {
         func_index: usize,
         before_stmt: usize,
         sources: &[String],
-        stationary_globals: &BTreeSet<String>,
+        initval_stable_globals: &BTreeSet<String>,
         visiting: &mut HashSet<(usize, String)>,
     ) -> Option<SlotValue> {
         if sources.is_empty() {
@@ -229,7 +229,7 @@ impl<'a> InitValResolver<'a> {
                 func_index,
                 before_stmt,
                 source,
-                stationary_globals,
+                initval_stable_globals,
                 visiting,
             )?;
             out.targets.extend(value.targets);

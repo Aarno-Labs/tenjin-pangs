@@ -3358,7 +3358,7 @@ pub fn report(outdir: &Path) -> Result<String> {
     let audit_kind_summary = jsonl_histogram(outdir, "audit.jsonl", &["kind"])?;
     let audit_effect_summary = jsonl_histogram(outdir, "audit.jsonl", &["effect"])?;
     Ok(format!(
-        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\ncall edges by tier: {}\nconfined functions: {}\ninitval complete globals: {}\nstationary globals: {}\nstationarity reasons: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\naudit kinds: {}\naudit effects: {}\nmutable globals rewritable: {}/{}\ncomponent sizes: {}\nlargest frozen components: {}\ncomponent taints: {}\ncomponent blockers: {}\npipeline wall: {} ms\nanalysis wall: {} us\nsetup scan: {} us\npreanalysis: {} us\npag build: {} us\nsolve: {} us\nsolver postprocess: {} us\npointer modref: {} us\ncallgraph dedup: {} us\nmodref dedup: {} us\nstationarity: {} us\ninitval reapply: {} us\ntransitive modref: {} us\nfindings dedup: {} us\ncomponents: {} us\nmetrics bookkeeping: {} us\n",
+        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\ncall edges by tier: {}\nconfined functions: {}\ninitval complete globals: {}\ninitval-stable globals: {}\nstationarity reasons: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\naudit kinds: {}\naudit effects: {}\nmutable globals rewritable: {}/{}\ncomponent sizes: {}\nlargest frozen components: {}\ncomponent taints: {}\ncomponent blockers: {}\npipeline wall: {} ms\nanalysis wall: {} us\nsetup scan: {} us\npreanalysis: {} us\npag build: {} us\nsolve: {} us\nsolver postprocess: {} us\npointer modref: {} us\ncallgraph dedup: {} us\nmodref dedup: {} us\nstationarity: {} us\ninitval reapply: {} us\ntransitive modref: {} us\nfindings dedup: {} us\ncomponents: {} us\nmetrics bookkeeping: {} us\n",
         metrics.functions,
         metrics.globals,
         metrics.call_edges,
@@ -3370,7 +3370,7 @@ pub fn report(outdir: &Path) -> Result<String> {
         format_histogram(&callgraph_summary),
         metrics.confined_functions,
         metrics.globals_with_complete_initval,
-        metrics.stationary_globals,
+        metrics.initval_stable_globals,
         format_histogram(&stationarity_summary),
         metrics.oversize_fallbacks,
         metrics.oversize_fallback_max_size,
@@ -3754,7 +3754,7 @@ struct GlobalRecord<'a> {
     never_written: bool,
     escape: pangs_api::EscapeStatus,
     mutable: bool,
-    stationary: bool,
+    initval_stable: bool,
 }
 
 impl<'a> From<&'a pangs_api::GlobalInfo> for GlobalRecord<'a> {
@@ -3768,7 +3768,7 @@ impl<'a> From<&'a pangs_api::GlobalInfo> for GlobalRecord<'a> {
             never_written: info.never_written,
             escape: info.escape,
             mutable: info.mutable,
-            stationary: info.stationary,
+            initval_stable: info.initval_stable,
         }
     }
 }
@@ -5632,7 +5632,7 @@ int call_reader(void) { return read_pointer(&target); }
         assert!(text.contains("call edges by tier: "));
         assert!(text.contains("confined functions: "));
         assert!(text.contains("initval complete globals: "));
-        assert!(text.contains("stationary globals: "));
+        assert!(text.contains("initval-stable globals: "));
         assert!(text.contains("stationarity reasons: "));
         assert!(text.contains("oversize fallbacks: "));
         assert!(text.contains("audit kinds: "));

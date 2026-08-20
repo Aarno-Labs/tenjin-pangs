@@ -62,7 +62,7 @@
     "icalls_unknown",
     "confined_functions",
     "globals_with_complete_initval",
-    "stationary_globals",
+    "initval_stable_globals",
     "analysis_wall_us",
     "setup_scan_us",
     "preanalysis_us",
@@ -408,7 +408,7 @@
       "type": "integer",
       "minimum": 0
     },
-    "stationary_globals": {
+    "initval_stable_globals": {
       "type": "integer",
       "minimum": 0
     },

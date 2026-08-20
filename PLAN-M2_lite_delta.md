@@ -237,7 +237,7 @@ M2 step. Delete the row from the schedule.
 - `metrics.json` gains flat per-provenance icall counts
   (`icalls_simple`, `icalls_andersen`, `icalls_fsa`, …) and B1/B2 coverage stats
   (`simple_icalls`, `confined_functions`, `globals_with_complete_initval`,
-  `stationary_globals`). No cascade/certificate fields.
+  `initval_stable_globals`). No cascade/certificate fields.
 - `manifest.json` `opts` records the M2 controls: B1 enabled, B2 enabled, B3 enabled,
   and the B2 context-depth cap.
 - `stationarity.jsonl` records one stationarity verdict per global for the M2.5 audit:

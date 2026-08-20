@@ -78,7 +78,7 @@ The current exports already contain the main M3 inputs:
 - `components.json`: component members, mutable globals in each component, frozen bit,
   and taint reasons.
 - `callgraph.jsonl`: call edges with `kind` and `tier`.
-- `globals.jsonl`: mutable/const/stationary/escape/never-written facts.
+- `globals.jsonl`: mutable/const/initval-stable/escape/never-written facts.
 - `stationarity.jsonl`: B1 InitVal/stationarity verdicts and runtime writers.
 - `audit.jsonl`: unsupported/boundary findings that can induce Ω taint.
 - `manifest.json`: command options, input hash, and pipeline wall time.

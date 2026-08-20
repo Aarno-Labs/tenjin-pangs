@@ -433,13 +433,13 @@ fn m2_4_initval_stationary_dispatch_table_resolves_exactly() {
 
     assert_single_simple_target(&analysis, "other");
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
-    assert_eq!(analysis.metrics().stationary_globals, 1);
+    assert_eq!(analysis.metrics().initval_stable_globals, 1);
     assert_eq!(analysis.metrics().mutable_globals_total, 0);
     assert_eq!(analysis.metrics().in_rewritable_components, 0);
 
     let table = analysis.lookup_global("@Table").unwrap();
     assert!(analysis.globals()[table].mutable);
-    assert!(analysis.globals()[table].stationary);
+    assert!(analysis.globals()[table].initval_stable);
     let verdict = analysis
         .stationarity_verdicts()
         .iter()
@@ -506,7 +506,7 @@ fn m2_4_runtime_write_blocks_initval_exact_dispatch_resolution() {
     .unwrap();
 
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
-    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().initval_stable_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);
     assert!(analysis.call_edges().iter().any(|edge| {
         edge.kind == pangs_api::CallKind::Indirect && edge.tier == pangs_api::Tier::Andersen
@@ -531,7 +531,7 @@ fn m2_4_alias_write_blocks_initval_stationarity() {
 
     let table = analysis.lookup_global("@Table").unwrap();
     assert!(analysis.globals()[table].mutable);
-    assert!(!analysis.globals()[table].stationary);
+    assert!(!analysis.globals()[table].initval_stable);
     let verdict = analysis
         .stationarity_verdicts()
         .iter()
@@ -542,7 +542,7 @@ fn m2_4_alias_write_blocks_initval_stationarity() {
     assert_eq!(verdict.reason, StationarityReason::RuntimeWriter);
     assert!(!verdict.runtime_writers.is_empty());
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
-    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().initval_stable_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);
     assert!(analysis.call_edges().iter().any(|edge| {
         edge.kind == pangs_api::CallKind::Indirect && edge.tier == pangs_api::Tier::Andersen
@@ -563,7 +563,7 @@ fn m2_4_unknown_initializer_poisons_initval() {
     .unwrap();
 
     let table = analysis.lookup_global("@Table").unwrap();
-    assert!(!analysis.globals()[table].stationary);
+    assert!(!analysis.globals()[table].initval_stable);
     let verdict = analysis
         .stationarity_verdicts()
         .iter()
@@ -577,7 +577,7 @@ fn m2_4_unknown_initializer_poisons_initval() {
         .any(|diagnostic| diagnostic.reason == "store_value_unresolved"
             && diagnostic.witness.as_deref() == Some("global_init#3")));
     assert_eq!(analysis.metrics().globals_with_complete_initval, 0);
-    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().initval_stable_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);
 }
 
@@ -598,7 +598,7 @@ fn m2_4_dynamic_initializer_gep_poisons_initval() {
     .unwrap();
 
     let table = analysis.lookup_global("@Table").unwrap();
-    assert!(!analysis.globals()[table].stationary);
+    assert!(!analysis.globals()[table].initval_stable);
     let verdict = analysis
         .stationarity_verdicts()
         .iter()
@@ -610,7 +610,7 @@ fn m2_4_dynamic_initializer_gep_poisons_initval() {
         .any(|diagnostic| diagnostic.reason == "dynamic_initializer_gep"
             && diagnostic.witness.as_deref() == Some("global_init#1")));
     assert_eq!(analysis.metrics().globals_with_complete_initval, 0);
-    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().initval_stable_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);
 }
 
@@ -630,8 +630,8 @@ fn m2_4_scalar_pointer_global_initializer_is_complete_and_stationary() {
 
     let sep = analysis.lookup_global("@Sep").unwrap();
     let slash = analysis.lookup_global("@Slash").unwrap();
-    assert!(analysis.globals()[sep].stationary);
-    assert!(!analysis.globals()[slash].stationary);
+    assert!(analysis.globals()[sep].initval_stable);
+    assert!(!analysis.globals()[slash].initval_stable);
 
     let verdict = analysis
         .stationarity_verdicts()
@@ -644,7 +644,7 @@ fn m2_4_scalar_pointer_global_initializer_is_complete_and_stationary() {
     assert!(verdict.runtime_writers.is_empty());
     assert!(verdict.initval_diagnostics.is_empty());
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
-    assert_eq!(analysis.metrics().stationary_globals, 1);
+    assert_eq!(analysis.metrics().initval_stable_globals, 1);
 }
 
 #[test]
@@ -665,7 +665,7 @@ fn m2_4_scalar_pointer_global_runtime_write_blocks_stationarity() {
     .unwrap();
 
     let sep = analysis.lookup_global("@Sep").unwrap();
-    assert!(!analysis.globals()[sep].stationary);
+    assert!(!analysis.globals()[sep].initval_stable);
     let verdict = analysis
         .stationarity_verdicts()
         .iter()
@@ -679,7 +679,7 @@ fn m2_4_scalar_pointer_global_runtime_write_blocks_stationarity() {
         .iter()
         .any(|writer| writer.witness.as_deref() == Some("writer@m2_4_scalar_ptr.c:5:3#0")));
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
-    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().initval_stable_globals, 0);
 }
 
 #[test]
@@ -701,7 +701,7 @@ fn m2_4_value_escape_does_not_block_scalar_pointer_global_stationarity() {
 
     let sep = analysis.lookup_global("@Sep").unwrap();
     assert_eq!(analysis.globals()[sep].escape, EscapeStatus::External);
-    assert!(analysis.globals()[sep].stationary);
+    assert!(analysis.globals()[sep].initval_stable);
     let verdict = analysis
         .stationarity_verdicts()
         .iter()
@@ -747,7 +747,7 @@ fn m2_4_external_unknown_store_without_global_pointees_does_not_block_stationari
     assert_eq!(verdict.reason, StationarityReason::Stationary);
     assert!(verdict.runtime_writers.is_empty());
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
-    assert_eq!(analysis.metrics().stationary_globals, 1);
+    assert_eq!(analysis.metrics().initval_stable_globals, 1);
 }
 
 #[test]
@@ -768,7 +768,7 @@ fn m2_4_unknown_runtime_mod_blocks_stationarity() {
 
     let table = analysis.lookup_global("@Table").unwrap();
     assert!(analysis.globals()[table].mutable);
-    assert!(!analysis.globals()[table].stationary);
+    assert!(!analysis.globals()[table].initval_stable);
     let verdict = analysis
         .stationarity_verdicts()
         .iter()
@@ -781,7 +781,7 @@ fn m2_4_unknown_runtime_mod_blocks_stationarity() {
         .iter()
         .any(|writer| matches!(writer.global, pangs_api::GlobalTarget::Unknown(_))));
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
-    assert_eq!(analysis.metrics().stationary_globals, 0);
+    assert_eq!(analysis.metrics().initval_stable_globals, 0);
     assert_eq!(analysis.metrics().icalls_simple, 0);
     assert!(analysis.modrefs().iter().any(|mr| {
         mr.access == Access::Mod
@@ -850,8 +850,8 @@ fn absence_only_initval_is_stationary_without_runtime_writers() {
         .initval_diagnostics
         .iter()
         .any(|diagnostic| diagnostic.reason == "no_modeled_pointer_initializer"));
-    assert!(analysis.globals()[global].stationary);
-    assert_eq!(analysis.metrics().stationary_globals, 1);
+    assert!(analysis.globals()[global].initval_stable);
+    assert_eq!(analysis.metrics().initval_stable_globals, 1);
     assert_eq!(analysis.metrics().mutable_globals_total, 0);
     assert!(analysis
         .component(analysis.component_of(reader))
@@ -1020,9 +1020,9 @@ fn m2_7_ablation_toggles_isolate_b2_and_b1_effects() {
         .find(|variant| variant.mode == M2AblationMode::B1Only)
         .unwrap();
     assert_eq!(baseline.globals_with_complete_initval, 0);
-    assert_eq!(baseline.stationary_globals, 0);
+    assert_eq!(baseline.initval_stable_globals, 0);
     assert_eq!(b1_only.globals_with_complete_initval, 1);
-    assert_eq!(b1_only.stationary_globals, 1);
+    assert_eq!(b1_only.initval_stable_globals, 1);
     assert_eq!(b1_only.icalls_simple, 1);
 }
 
@@ -4001,7 +4001,7 @@ fn steens_alias_rows_increase_rewritable_coverage_over_conservative() {
     let steens_component = steens.component(steens.component_of(worker_steens));
     assert!(!steens_component.frozen);
     assert!(steens_component.mutable_globals.is_empty());
-    assert!(steens.globals()[g_steens].stationary);
+    assert!(steens.globals()[g_steens].initval_stable);
     assert_eq!(steens.metrics().mutable_globals_total, 0);
     assert_eq!(steens.metrics().in_rewritable_components, 0);
 }
@@ -4048,8 +4048,8 @@ fn steens_alias_rows_improve_split_component_coverage_over_conservative() {
     let steens_worker_component = steens.component(steens.component_of(worker_steens));
     assert!(!steens_worker_component.frozen);
     assert!(steens_worker_component.mutable_globals.is_empty());
-    assert!(!steens.globals()[frozen_steens].stationary);
-    assert!(steens.globals()[rewrite_steens].stationary);
+    assert!(!steens.globals()[frozen_steens].initval_stable);
+    assert!(steens.globals()[rewrite_steens].initval_stable);
     assert!(steens.modrefs().iter().any(|mr| {
         mr.func == worker_steens
             && mr.global == pangs_api::GlobalTarget::Name(rewrite_steens)

@@ -49,7 +49,7 @@ oversize_fallbacks=3
 oversize_fallback_max_size=5012
 pointer_modref_max_fact_fanout=318
 globals_with_complete_initval=0
-stationary_globals=0
+initval_stable_globals=0
 ```
 
 With `--partition-budget 10000000`, `file_pathsep` still appears and one large fallback
@@ -304,7 +304,7 @@ jq '{oversize_fallbacks, oversize_fallback_max_size,
      pointer_modref_max_fact_fanout,
      pointer_modref_rows_unique,
      globals_with_complete_initval,
-     stationary_globals}' \
+     initval_stable_globals}' \
   /tmp/omp_tree_analysis/metrics.json
 ```
 
@@ -416,7 +416,7 @@ Final OMP metrics snapshot:
 ```json
 {
   "globals_with_complete_initval": 32,
-  "stationary_globals": 36,
+  "initval_stable_globals": 36,
   "mutable_globals_total": 86,
   "pointer_modref_high_fanout_fallbacks": 890,
   "pointer_modref_high_fanout_fallback_rows": 24920,

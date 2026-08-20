@@ -238,7 +238,7 @@ fn analyze_exports_m2_4_initval_dispatch_table_resolution() {
         serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
     assert_eq!(metrics["icalls_simple"], 1);
     assert_eq!(metrics["globals_with_complete_initval"], 1);
-    assert_eq!(metrics["stationary_globals"], 1);
+    assert_eq!(metrics["initval_stable_globals"], 1);
     assert_eq!(metrics["mutable_globals_total"], 0);
     assert_eq!(metrics["in_rewritable_components"], 0);
 
@@ -248,7 +248,7 @@ fn analyze_exports_m2_4_initval_dispatch_table_resolution() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(globals.iter().any(|row| {
-        row["key"] == "@Table" && row["mutable"] == true && row["stationary"] == true
+        row["key"] == "@Table" && row["mutable"] == true && row["initval_stable"] == true
     }));
     let stationarity: Vec<Value> = fs::read_to_string(out.join("stationarity.jsonl"))
         .unwrap()
@@ -331,7 +331,7 @@ fn analyze_exports_scalar_pointer_initval_stationarity() {
     let metrics: Value =
         serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
     assert_eq!(metrics["globals_with_complete_initval"], 1);
-    assert_eq!(metrics["stationary_globals"], 1);
+    assert_eq!(metrics["initval_stable_globals"], 1);
 
     let stationarity: Vec<Value> = fs::read_to_string(out.join("stationarity.jsonl"))
         .unwrap()

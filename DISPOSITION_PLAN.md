@@ -733,7 +733,7 @@ Split for independent landing:
   **Historical repository-readiness audit (2026-07-15; gaps now closed):** D1b was
   *not* pure assembly over
   currently exported facts. `GlobalInfo` (`crates/pangs-api/src/lib.rs`) today
-  carries only `is_const`/`mutable`/`stationary`/`never_written`/`escape` — no
+  carries only `is_const`/`mutable`/`initval_stable`/`never_written`/`escape` — no
   linkage, no C type spelling or size, **no definition-vs-declaration bit**, and no
   spawn-reachability, signal-context, or access-completeness scans exist anywhere in
   phase F yet — and keys are raw symbol names from lowering (`value_name`), not the

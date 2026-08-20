@@ -11,7 +11,7 @@
     "never_written",
     "escape",
     "mutable",
-    "stationary"
+    "initval_stable"
   ],
   "properties": {
     "key": {
@@ -42,7 +42,7 @@
     "mutable": {
       "type": "boolean"
     },
-    "stationary": {
+    "initval_stable": {
       "type": "boolean"
     }
   }

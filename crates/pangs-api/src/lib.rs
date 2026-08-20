@@ -128,7 +128,10 @@ pub struct GlobalInfo {
     pub line: Option<u32>,
     pub is_const: bool,
     pub mutable: bool,
-    pub stationary: bool,
+    /// The B1 init-value analysis proved this global has no modeled runtime writers,
+    /// so loads may use its static initializer. This is not a phase-stationarity
+    /// publication certificate.
+    pub initval_stable: bool,
     pub never_written: bool,
     /// Runtime store reachability, excluding static-initializer stores. Retained for
     /// in-process disposition fact assembly; ordinary analysis JSON remains unchanged.
@@ -637,7 +640,7 @@ pub struct Metrics {
     pub icalls_unknown: usize,
     pub confined_functions: usize,
     pub globals_with_complete_initval: usize,
-    pub stationary_globals: usize,
+    pub initval_stable_globals: usize,
     pub analysis_wall_us: u64,
     pub setup_scan_us: u64,
     pub preanalysis_us: u64,
@@ -672,7 +675,7 @@ pub struct M2AblationVariant {
     pub icalls_unknown: usize,
     pub confined_functions: usize,
     pub globals_with_complete_initval: usize,
-    pub stationary_globals: usize,
+    pub initval_stable_globals: usize,
     pub oversize_fallbacks: usize,
     pub oversize_fallback_max_size: usize,
     pub mutable_globals_total: usize,
@@ -928,7 +931,7 @@ impl Analysis {
                 line: global.line,
                 is_const: global.is_const,
                 mutable: global.mutable && !global.is_const,
-                stationary: false,
+                initval_stable: false,
                 never_written: true,
                 runtime_written: false,
                 escape: if exported {
@@ -1665,7 +1668,7 @@ impl Analysis {
         let modref_dedup_us = modref_dedup_started.elapsed().as_micros() as u64;
 
         let stationarity_started = Instant::now();
-        let (stationary_globals, stationarity) = if opts.stage == Stage::Conservative {
+        let (initval_stable_globals, stationarity) = if opts.stage == Stage::Conservative {
             conservative_stationarity_verdicts(module, &global_lookup)
         } else {
             stationarity_verdicts_from_modrefs(
@@ -1681,12 +1684,12 @@ impl Analysis {
         let stationarity_us = stationarity_started.elapsed().as_micros() as u64;
         let initval_reapply_started = Instant::now();
         let initval_report = if opts.enable_b1_initval {
-            resolve_initval_icalls(module, &simple_icall_queries, &stationary_globals)
+            resolve_initval_icalls(module, &simple_icall_queries, &initval_stable_globals)
         } else {
             Default::default()
         };
         for global in &mut globals {
-            global.stationary = initval_report.stationary_globals.contains(&global.key);
+            global.initval_stable = initval_report.initval_stable_globals.contains(&global.key);
         }
         apply_initval_exact_call_edges(
             &mut call_edges,
@@ -1752,7 +1755,7 @@ impl Analysis {
         );
         let mutable_globals_total = globals
             .iter()
-            .filter(|g| g.mutable && !g.stationary)
+            .filter(|g| g.mutable && !g.initval_stable)
             .count();
         let in_rewritable_components = components
             .iter()
@@ -1804,7 +1807,7 @@ impl Analysis {
             icalls_unknown,
             confined_functions: confined_functions.len(),
             globals_with_complete_initval: initval_report.complete_globals.len(),
-            stationary_globals: initval_report.stationary_globals.len(),
+            initval_stable_globals: initval_report.initval_stable_globals.len(),
             audit_findings: findings.len(),
             mutable_globals_total,
             in_rewritable_components,
@@ -2162,7 +2165,7 @@ impl M2AblationVariant {
             icalls_unknown: metrics.icalls_unknown,
             confined_functions: metrics.confined_functions,
             globals_with_complete_initval: metrics.globals_with_complete_initval,
-            stationary_globals: metrics.stationary_globals,
+            initval_stable_globals: metrics.initval_stable_globals,
             oversize_fallbacks: metrics.oversize_fallbacks,
             oversize_fallback_max_size: metrics.oversize_fallback_max_size,
             mutable_globals_total: metrics.mutable_globals_total,
@@ -2452,7 +2455,7 @@ fn stationarity_verdicts_from_modrefs(
         (BTreeMap::new(), BTreeMap::new())
     };
 
-    let mut stationary_globals = BTreeSet::new();
+    let mut initval_stable_globals = BTreeSet::new();
     let mut verdicts = Vec::new();
     for global in &module.globals {
         let Some(&gid) = global_lookup.get(&global.key) else {
@@ -2498,7 +2501,7 @@ fn stationarity_verdicts_from_modrefs(
             writers = known_writers.clone();
             StationarityReason::RuntimeWriter
         } else {
-            stationary_globals.insert(global.key.clone());
+            initval_stable_globals.insert(global.key.clone());
             StationarityReason::Stationary
         };
         verdicts.push(StationarityVerdict {
@@ -2515,7 +2518,7 @@ fn stationarity_verdicts_from_modrefs(
             .key
             .cmp(&module.globals[right.global.0 as usize].key)
     });
-    (stationary_globals, verdicts)
+    (initval_stable_globals, verdicts)
 }
 
 fn collect_targeted_stationarity_writers(
@@ -5749,7 +5752,7 @@ fn compute_context_rewrite_plan(
     let mut fields = Vec::new();
     for (index, field_accessors) in rewrite_roots.iter().enumerate() {
         let info = &globals[index];
-        if !info.mutable || info.stationary {
+        if !info.mutable || info.initval_stable {
             continue;
         }
         if field_accessors.is_empty() {
@@ -6072,7 +6075,7 @@ fn compute_components(
                 for mr in &modrefs_by_func[member.0 as usize] {
                     if let GlobalTarget::Name(gid) = mr.global {
                         let global = &globals[gid.0 as usize];
-                        if global.mutable && !global.stationary {
+                        if global.mutable && !global.initval_stable {
                             mutable_globals.insert(gid);
                         }
                     }
@@ -7010,7 +7013,7 @@ mod component_tests {
             line: None,
             is_const: false,
             mutable: true,
-            stationary: false,
+            initval_stable: false,
             never_written: false,
             runtime_written: true,
             escape: EscapeStatus::Module,
@@ -7261,7 +7264,7 @@ mod component_tests {
 
         assert!(!analysis.globals()[global].address_escaped);
         assert!(!analysis.globals()[global].never_written);
-        assert!(!analysis.globals()[global].stationary);
+        assert!(!analysis.globals()[global].initval_stable);
         assert!(
             analysis.modrefs().iter().any(|row| {
                 row.global == GlobalTarget::Name(global)
