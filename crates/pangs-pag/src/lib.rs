@@ -479,6 +479,239 @@ pub struct Node {
     /// deserialize as `Unknown` and therefore retain the conservative behavior.
     #[serde(default)]
     pub value_kind: ValueKind,
+    /// True only for the canonical pointer-null operand emitted by PIR lowering.  This is kept
+    /// explicit so allocation-root proofs never infer nullness from a user-controlled label.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub canonical_pointer_null: bool,
+}
+
+pub fn is_canonical_pointer_null(node: &Node) -> bool {
+    node.canonical_pointer_null
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StorageRoot {
+    Global {
+        object_node: NodeId,
+        pir_global_index: usize,
+        canonical_key: String,
+    },
+    LocalAlloca {
+        object_node: NodeId,
+    },
+}
+
+impl StorageRoot {
+    pub fn object_node(&self) -> NodeId {
+        match self {
+            Self::Global { object_node, .. } | Self::LocalAlloca { object_node } => *object_node,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "state", content = "root", rename_all = "snake_case")]
+pub enum StorageRootState {
+    #[default]
+    Unknown,
+    ProvenNull,
+    Root(StorageRoot),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StorageRoots {
+    pub states: Vec<StorageRootState>,
+    pub global_objects: BTreeMap<NodeId, usize>,
+    /// Globals whose AddrOf value did not satisfy the sole-producer invariant.
+    pub force_exposed_globals: BTreeSet<usize>,
+    /// False when PIR/PAG global identity is missing or ambiguous.  Consumers must disable
+    /// exposure filtering rather than attempting a heuristic recovery.
+    pub global_identity_valid: bool,
+}
+
+fn canonical_global_key(key: &str) -> &str {
+    key.strip_prefix('@').unwrap_or(key)
+}
+
+fn same_semantic_scope(lhs: &NodeKind, rhs: &NodeKind) -> bool {
+    fn scope(kind: &NodeKind) -> (&str, Option<&str>) {
+        match kind {
+            NodeKind::Value {
+                scope: Scope::Function(func),
+            }
+            | NodeKind::Param { func, .. }
+            | NodeKind::Return { func } => ("function", Some(func)),
+            NodeKind::Value {
+                scope: Scope::Module,
+            } => ("module", None),
+            NodeKind::Value {
+                scope: Scope::GlobalInit,
+            } => ("global_init", None),
+            NodeKind::Object {
+                owner: Some(owner), ..
+            } => ("function", Some(owner)),
+            NodeKind::Object { owner: None, .. } => ("module", None),
+        }
+    }
+    scope(lhs) == scope(rhs)
+}
+
+/// Prove allocation roots using the deliberately small address-preserving grammar shared by
+/// solver filtering and API ModRef attribution.
+pub fn allocation_storage_roots(pir: &Pir, pag: &Pag) -> StorageRoots {
+    let mut by_key = BTreeMap::<String, Vec<usize>>::new();
+    for (index, global) in pir.globals.iter().enumerate() {
+        by_key
+            .entry(canonical_global_key(&global.key).to_string())
+            .or_default()
+            .push(index);
+    }
+    let mut object_roots = BTreeMap::<NodeId, StorageRoot>::new();
+    let mut global_objects = BTreeMap::new();
+    let mut global_identity_valid = by_key.values().all(|indices| indices.len() == 1);
+    for node in &pag.nodes {
+        let NodeKind::Object { object, key, .. } = &node.kind else {
+            continue;
+        };
+        match object {
+            ObjectKind::Global => match by_key.get(canonical_global_key(key)).map(Vec::as_slice) {
+                Some([index]) => {
+                    global_objects.insert(node.id, *index);
+                    object_roots.insert(
+                        node.id,
+                        StorageRoot::Global {
+                            object_node: node.id,
+                            pir_global_index: *index,
+                            canonical_key: canonical_global_key(&pir.globals[*index].key)
+                                .to_string(),
+                        },
+                    );
+                }
+                _ => global_identity_valid = false,
+            },
+            ObjectKind::Alloca => {
+                object_roots.insert(
+                    node.id,
+                    StorageRoot::LocalAlloca {
+                        object_node: node.id,
+                    },
+                );
+            }
+            ObjectKind::Function | ObjectKind::ExternalReadonly => {}
+        }
+    }
+
+    // Construct the complete value-producer table before seeding AddrOf destinations.  Store
+    // destinations and memcpy operands are consumers, not producers.
+    let mut producers = vec![Vec::<&Edge>::new(); pag.nodes.len()];
+    for edge in &pag.edges {
+        if matches!(
+            edge.kind,
+            EdgeKind::AddrOf | EdgeKind::Assign | EdgeKind::Load | EdgeKind::Gep { .. }
+        ) {
+            if let Some(incoming) = producers.get_mut(edge.dst.0 as usize) {
+                incoming.push(edge);
+            }
+        }
+    }
+
+    let mut states = pag
+        .nodes
+        .iter()
+        .map(|node| {
+            is_canonical_pointer_null(node)
+                .then_some(StorageRootState::ProvenNull)
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let mut force_exposed_globals = BTreeSet::new();
+    for (destination, incoming) in producers.iter().enumerate() {
+        let addr_of = incoming
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::AddrOf)
+            .collect::<Vec<_>>();
+        if addr_of.is_empty() {
+            continue;
+        }
+        if incoming.len() == 1 {
+            if let Some(root) = object_roots.get(&addr_of[0].src) {
+                states[destination] = StorageRootState::Root(root.clone());
+            }
+        } else {
+            for edge in addr_of {
+                if let Some(StorageRoot::Global {
+                    pir_global_index, ..
+                }) = object_roots.get(&edge.src)
+                {
+                    force_exposed_globals.insert(*pir_global_index);
+                }
+            }
+            states[destination] = StorageRootState::Unknown;
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for (destination, incoming) in producers.iter().enumerate() {
+            if !matches!(states[destination], StorageRootState::Unknown) || incoming.is_empty() {
+                continue;
+            }
+            let candidate = match incoming[0].kind {
+                EdgeKind::Gep { .. } if incoming.len() == 1 => {
+                    match &states[incoming[0].src.0 as usize] {
+                        StorageRootState::Root(root) => StorageRootState::Root(root.clone()),
+                        // Pointer arithmetic on null is not a canonical null constant.
+                        StorageRootState::ProvenNull => continue,
+                        StorageRootState::Unknown => continue,
+                    }
+                }
+                EdgeKind::Assign
+                    if incoming.iter().all(|edge| {
+                        edge.kind == EdgeKind::Assign
+                            && same_semantic_scope(
+                                &pag.nodes[edge.src.0 as usize].kind,
+                                &pag.nodes[edge.dst.0 as usize].kind,
+                            )
+                    }) =>
+                {
+                    let mut common: Option<&StorageRoot> = None;
+                    let mut has_unknown = false;
+                    let mut mixed = false;
+                    for edge in incoming {
+                        match &states[edge.src.0 as usize] {
+                            StorageRootState::Unknown => has_unknown = true,
+                            StorageRootState::ProvenNull => {}
+                            StorageRootState::Root(root) => match common {
+                                None => common = Some(root),
+                                Some(first) if first == root => {}
+                                Some(_) => mixed = true,
+                            },
+                        }
+                    }
+                    if has_unknown || mixed {
+                        continue;
+                    }
+                    common
+                        .cloned()
+                        .map(StorageRootState::Root)
+                        .unwrap_or(StorageRootState::ProvenNull)
+                }
+                _ => continue,
+            };
+            states[destination] = candidate;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    StorageRoots {
+        states,
+        global_objects,
+        force_exposed_globals,
+        global_identity_valid,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1499,6 +1732,11 @@ impl<'a> Builder<'a> {
             label,
             kind,
             value_kind,
+            canonical_pointer_null: matches!(
+                &key,
+                NodeKey::FunctionValue(_, value) | NodeKey::GlobalInitValue(value)
+                    if value == "null" && value_kind == ValueKind::Pointer
+            ),
         });
         self.node_ids.insert(key, id);
         id
@@ -2817,10 +3055,12 @@ fn is_exported_global(marked: bool, key: &str, opts: &PagOpts) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        direct_vararg_call_is_benign, EdgeKind, NodeKind, ObjectKind, OmegaSeedKind, Pag, PagOpts,
-        SeedTarget, VarargCallProof,
+        allocation_storage_roots, direct_vararg_call_is_benign, Edge, EdgeId, EdgeKind, NodeKind,
+        ObjectKind, OmegaSeedKind, Owner, Pag, PagOpts, SeedTarget, StorageRoot, StorageRootState,
+        VarargCallProof,
     };
-    use pangs_pir::{Global, Pir};
+    use pangs_pir::{Global, Pir, Stmt, ValueKind};
+    use std::collections::BTreeSet;
 
     #[test]
     fn printf_format_proof_decodes_literals_and_fails_closed() {
@@ -3446,6 +3686,114 @@ mod tests {
                     .any(|seed| seed.kind == OmegaSeedKind::IntToPtr),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn storage_roots_preserve_gep_and_same_root_or_canonical_null_join() {
+        let mut pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"storage-roots",
+                "globals":[{"key":"g","mutable":true}],
+                "functions":[{"key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                    {"kind":"gep","dest":"elt","base":"@g"},
+                    {"kind":"assign","dest":"maybe","sources":["elt","null"]},
+                    {"kind":"assign","dest":"both-null","sources":["null","null"]},
+                    {"kind":"gep","dest":"bad-null-gep","base":"null","byte_off":8}
+                ]}]
+            }"#,
+        )
+        .unwrap();
+        pir.lowering
+            .semantic_value_kinds
+            .insert("null".into(), ValueKind::Pointer);
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let roots = allocation_storage_roots(&pir, &pag);
+        let state = |label: &str| {
+            let id = pag
+                .nodes
+                .iter()
+                .find(|node| node.label == label)
+                .unwrap()
+                .id;
+            &roots.states[id.0 as usize]
+        };
+        assert!(matches!(
+            state("val:f:elt"),
+            StorageRootState::Root(StorageRoot::Global { .. })
+        ));
+        assert_eq!(state("val:f:maybe"), state("val:f:elt"));
+        assert_eq!(state("val:f:null"), &StorageRootState::ProvenNull);
+        assert_eq!(state("val:f:both-null"), &StorageRootState::ProvenNull);
+        assert_eq!(state("val:f:bad-null-gep"), &StorageRootState::Unknown);
+    }
+
+    #[test]
+    fn storage_roots_fail_closed_when_addr_of_has_an_additional_producer() {
+        let pir: Pir = serde_json::from_str(
+            r#"{"module":"multi-producer","globals":[{"key":"g","mutable":true}],
+                "functions":[{"key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[]}]}"#,
+        )
+        .unwrap();
+        let mut pag = Pag::from_pir(&pir, &PagOpts::default());
+        let symbol = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "sym:global:g")
+            .map(|node| node.id)
+            .unwrap_or_else(|| {
+                // Force creation of the otherwise-unused symbol through a temporary build.
+                let mut with_use = pir.clone();
+                with_use.functions[0].body.push(Stmt::Load {
+                    dest: "x".into(),
+                    address: "g".into(),
+                    volatile: false,
+                    access_bytes: None,
+                    loc: None,
+                });
+                pag = Pag::from_pir(&with_use, &PagOpts::default());
+                pag.nodes
+                    .iter()
+                    .find(|node| node.label == "sym:global:g")
+                    .unwrap()
+                    .id
+            });
+        let unknown = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:f:x")
+            .map(|node| node.id)
+            .unwrap();
+        let object = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "obj:global:g")
+            .unwrap()
+            .id;
+        for (name, kind, src) in [
+            ("assign", EdgeKind::Assign, unknown),
+            ("load", EdgeKind::Load, unknown),
+            ("duplicate-addr-of", EdgeKind::AddrOf, object),
+        ] {
+            let mut malformed = pag.clone();
+            malformed.edges.push(Edge {
+                id: EdgeId(malformed.edges.len() as u32),
+                kind,
+                src,
+                dst: symbol,
+                owner: Owner::Function("f".into()),
+                access_bytes: None,
+                access_extent_unknown: false,
+                volatile: false,
+                loc: None,
+            });
+            let roots = allocation_storage_roots(&pir, &malformed);
+            assert_eq!(
+                roots.states[symbol.0 as usize],
+                StorageRootState::Unknown,
+                "{name}"
+            );
+            assert_eq!(roots.force_exposed_globals, BTreeSet::from([0]), "{name}");
         }
     }
 }

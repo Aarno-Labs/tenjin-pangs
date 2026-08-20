@@ -2980,6 +2980,87 @@ mod tests {
     }
 
     #[test]
+    fn derived_memset_writer_after_publication_prevents_phase_and_once_lock_certificate() {
+        let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
+        let loc = |line| json!({"file":"memory-writer.c","line":line,"col":1});
+        let mut pir: pangs_pir::Pir = serde_json::from_value(json!({
+            "module":"phase-memory-writer",
+            "functions":[{"key":"main", "sig":signature(), "body":[
+                {"kind":"global_ref", "global":"@g", "access":"mod", "loc":loc(1)},
+                {"kind":"global_ref", "global":"@g", "access":"ref", "loc":loc(2)},
+                {"kind":"gep", "dest":"%derived", "base":"@g", "loc":loc(3)},
+                {"kind":"memset", "dst":"%derived", "value":"0", "bytes":8, "loc":loc(4)}
+            ]}],
+            "globals":[{"key":"@g"}]
+        }))
+        .unwrap();
+        let cfg_loc = |line| pangs_pir::Loc {
+            file: "memory-writer.c".into(),
+            line,
+            col: 1,
+            dir: None,
+            filename: None,
+        };
+        pir.lowering.statement_cfgs.insert(
+            "main".into(),
+            StatementCfg {
+                entry: 0,
+                boundaries: (0..4)
+                    .map(|index| {
+                        let successors = if index < 3 { vec![index + 1] } else { vec![] };
+                        let predecessors = if index > 0 { vec![index - 1] } else { vec![] };
+                        StatementBoundary {
+                            loc: Some(cfg_loc(index + 1)),
+                            stmt_indices: vec![index],
+                            ..boundary(index, &successors, &predecessors)
+                        }
+                    })
+                    .collect(),
+                source_mapping_available: true,
+            },
+        );
+        let opts = Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let global = analysis.lookup_global("@g").unwrap();
+        let memory_writer_rows = analysis
+            .access_sites_for_global(global)
+            .filter(|site| site.access == Access::Mod)
+            .filter(|site| site.loc.as_ref().is_some_and(|loc| loc.line == 4))
+            .count();
+        assert_eq!(
+            memory_writer_rows, 1,
+            "the derived memset writer must survive"
+        );
+
+        let (_, slots, _) = certificate_slots(
+            &analysis,
+            &pir,
+            &opts,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &violation_witnesses(&analysis),
+        );
+        let Certificate::Failed { codes, .. } = &slots[&global] else {
+            panic!("a post-publication memory writer must not yield phase/once-lock support")
+        };
+        assert!(
+            codes.iter().any(|code| {
+                matches!(
+                    code.as_str(),
+                    "never-quiescent" | "observation-before-quiescence"
+                )
+            }),
+            "{codes:?}"
+        );
+    }
+
+    #[test]
     fn o6_attributes_ordinary_pre_publication_helper_subtrees() {
         let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
         let loc = |line| json!({"file":"helpers.c","line":line,"col":1});

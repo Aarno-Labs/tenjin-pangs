@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use pangs_pag::{
     positionally_modeled_vararg_functions, BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag,
-    PagOpts, VarargCallProof,
+    PagOpts, StorageRoot, StorageRootState, StorageRoots, VarargCallProof,
 };
 use pangs_pir::{
     fsa_compatible, Access, LoweringStats, Pir, ScalarOp, ScalarTypeClass, ScalarTypeEvidence,
@@ -1350,6 +1350,7 @@ impl Analysis {
                     _ => solve_steensgaard(module, &pag, opts.build_mode.into()),
                 };
                 solve_us = solve_started.elapsed().as_micros() as u64;
+                enforce_storage_root_identity(module, &pag, &global_lookup, &mut solved);
                 let safe_indirect_varargs = safe_indirect_vararg_callsites(
                     module,
                     &indirect_vararg_keys,
@@ -1436,6 +1437,7 @@ impl Analysis {
                         solve_us += solve_started.elapsed().as_micros() as u64;
                     }
                 }
+                enforce_storage_root_identity(module, &pag, &global_lookup, &mut solved);
                 let safe_indirect_varargs = safe_indirect_vararg_callsites(
                     module,
                     &indirect_vararg_keys,
@@ -1625,6 +1627,7 @@ impl Analysis {
                     &global_lookup,
                     &pag,
                     &solved.nodes,
+                    &solved.storage_roots,
                     &mut noloc_ord,
                 );
                 modrefs.print_profile("after-pag");
@@ -4950,6 +4953,75 @@ fn global_ids_for_keys<'a>(
     )
 }
 
+/// Validate the in-memory root certificate before any solver result is consumed.  A mismatch
+/// restores every narrowed node to its pre-filter envelope, because solved nodes feed audits and
+/// global-flow logic as well as ModRef emission.
+fn enforce_storage_root_identity(
+    module: &Pir,
+    pag: &Pag,
+    global_lookup: &HashMap<String, GlobalId>,
+    solved: &mut pangs_solve::SolveResult,
+) {
+    let mut normalized = HashMap::<String, Vec<GlobalId>>::new();
+    for (key, &id) in global_lookup {
+        normalized
+            .entry(key.strip_prefix('@').unwrap_or(key).to_string())
+            .or_default()
+            .push(id);
+    }
+    let valid = solved.storage_roots.global_identity_valid
+        && solved.storage_roots.states.len() == pag.nodes.len()
+        && solved.storage_roots.states.iter().all(|state| match state {
+            StorageRootState::Root(StorageRoot::Global {
+                object_node,
+                pir_global_index,
+                canonical_key,
+            }) => {
+                let pir_key = module
+                    .globals
+                    .get(*pir_global_index)
+                    .map(|global| global.key.strip_prefix('@').unwrap_or(&global.key));
+                let object_matches = pag.nodes.get(object_node.0 as usize).is_some_and(|node| {
+                    matches!(
+                        &node.kind,
+                        pangs_pag::NodeKind::Object {
+                            object: pangs_pag::ObjectKind::Global,
+                            key,
+                            ..
+                        } if key.strip_prefix('@').unwrap_or(key) == canonical_key
+                    )
+                });
+                pir_key == Some(canonical_key.as_str())
+                    && object_matches
+                    && (is_ignored_client_global(canonical_key)
+                        || matches!(normalized.get(canonical_key).map(Vec::as_slice), Some([_])))
+            }
+            StorageRootState::Root(StorageRoot::LocalAlloca { object_node }) => {
+                pag.nodes.get(object_node.0 as usize).is_some_and(|node| {
+                    matches!(
+                        node.kind,
+                        pangs_pag::NodeKind::Object {
+                            object: pangs_pag::ObjectKind::Alloca,
+                            ..
+                        }
+                    )
+                })
+            }
+            StorageRootState::Unknown | StorageRootState::ProvenNull => true,
+        });
+    if valid {
+        return;
+    }
+    for resolution in solved.nodes.values_mut() {
+        if !resolution.pointee_globals_unfiltered.is_empty() {
+            resolution.pointee_globals = resolution.pointee_globals_unfiltered.to_vec().into();
+            resolution.pointee_globals_unfiltered = Vec::new().into();
+        }
+    }
+    // An invalid certificate is no longer allowed to authorize exact API attribution either.
+    solved.storage_roots = StorageRoots::default();
+}
+
 fn push_pointer_modrefs_from_pag(
     modrefs: &mut ModRefBuilder,
     access_sites: &mut AccessSiteBuilder,
@@ -4957,6 +5029,7 @@ fn push_pointer_modrefs_from_pag(
     global_lookup: &HashMap<String, GlobalId>,
     pag: &Pag,
     nodes: &BTreeMap<String, NodeResolution>,
+    storage_roots: &StorageRoots,
     noloc_ord: &mut BTreeMap<(String, String), u32>,
 ) {
     let mut node_summaries = Vec::new();
@@ -4968,7 +5041,7 @@ fn push_pointer_modrefs_from_pag(
     let mut local_rows = LocalPointerModRefRows::new(global_lookup.len());
     let mut access_profile = PointerAccessEmitterProfile::from_env(global_lookup);
     let high_fanout_limit = pointer_modref_high_fanout_limit();
-    let precise_storage_addresses = precise_storage_addresses(pag, global_lookup);
+    let precise_storage_addresses = precise_storage_addresses(pag, global_lookup, storage_roots);
     let global_key_by_id = global_key_by_id(global_lookup);
     let mut active_func = None;
     for edge in &pag.edges {
@@ -5486,12 +5559,6 @@ fn modref_detail_with_external_sources(base: &str, sources: &[String]) -> String
     modref_detail_with_external_suffix(base, modref_external_source_suffix(sources).as_deref())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreciseStorageRoot {
-    LocalAlloca,
-    Global(GlobalId),
-}
-
 struct PreciseStorageAddresses {
     local_roots: BTreeSet<pangs_pag::NodeId>,
     direct_global_symbols: BTreeSet<pangs_pag::NodeId>,
@@ -5501,99 +5568,50 @@ struct PreciseStorageAddresses {
 fn precise_storage_addresses(
     pag: &Pag,
     global_lookup: &HashMap<String, GlobalId>,
+    storage_roots: &StorageRoots,
 ) -> PreciseStorageAddresses {
-    let mut roots = BTreeMap::<pangs_pag::NodeId, PreciseStorageRoot>::new();
+    let mut normalized = HashMap::<String, Vec<GlobalId>>::new();
+    for (key, &gid) in global_lookup {
+        normalized
+            .entry(key.strip_prefix('@').unwrap_or(key).to_string())
+            .or_default()
+            .push(gid);
+    }
     let mut direct_global_symbols = BTreeSet::new();
-    for node in &pag.nodes {
-        if let Some(global) = node
-            .label
-            .strip_prefix("sym:global:")
-            .and_then(|global_key| global_lookup.get(global_key).copied())
+    for edge in &pag.edges {
+        if edge.kind == EdgeKind::AddrOf
+            && matches!(
+                storage_roots.states.get(edge.dst.0 as usize),
+                Some(StorageRootState::Root(StorageRoot::Global { .. }))
+            )
         {
-            direct_global_symbols.insert(node.id);
-            roots.insert(node.id, PreciseStorageRoot::Global(global));
-        } else if let Some(global) = label_known_global(&node.label, global_lookup) {
-            roots.insert(node.id, PreciseStorageRoot::Global(global));
+            direct_global_symbols.insert(edge.dst);
         }
     }
-    for edge in &pag.edges {
-        if !matches!(edge.kind, EdgeKind::AddrOf) {
-            continue;
-        }
-        let Some(src) = pag.nodes.get(edge.src.0 as usize) else {
-            continue;
-        };
-        match &src.kind {
-            pangs_pag::NodeKind::Object {
-                object: pangs_pag::ObjectKind::Alloca,
-                ..
-            } => {
-                roots.insert(edge.dst, PreciseStorageRoot::LocalAlloca);
-            }
-            pangs_pag::NodeKind::Object {
-                object: pangs_pag::ObjectKind::Global,
-                key,
-                ..
-            } => {
-                if let Some(&global) = global_lookup.get(key) {
-                    direct_global_symbols.insert(edge.dst);
-                    roots.insert(edge.dst, PreciseStorageRoot::Global(global));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // This is an allocation-root certificate, not a points-to result. GEPs preserve their
-    // allocation root even when the byte offset is dynamic. Assign joins preserve a root only
-    // when every incoming pointer alternative has independently proved the same root. Loads,
-    // calls, integer casts, and mixed-root joins intentionally have no rule here.
-    let mut producers = BTreeMap::<pangs_pag::NodeId, Vec<&Edge>>::new();
-    for edge in &pag.edges {
-        if matches!(
-            edge.kind,
-            EdgeKind::AddrOf | EdgeKind::Assign | EdgeKind::Load | EdgeKind::Gep { .. }
-        ) {
-            producers.entry(edge.dst).or_default().push(edge);
-        }
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (&dst, incoming) in &producers {
-            if roots.contains_key(&dst) || incoming.is_empty() {
-                continue;
-            }
-            let candidate = match incoming[0].kind {
-                EdgeKind::Gep { .. } if incoming.len() == 1 => roots.get(&incoming[0].src).copied(),
-                EdgeKind::Assign
-                    if incoming
-                        .iter()
-                        .all(|edge| matches!(edge.kind, EdgeKind::Assign)) =>
-                {
-                    let mut incoming_roots =
-                        incoming.iter().map(|edge| roots.get(&edge.src).copied());
-                    let first = incoming_roots.next().flatten();
-                    first.filter(|root| incoming_roots.all(|candidate| candidate == Some(*root)))
-                }
-                _ => None,
-            };
-            let Some(root) = candidate else {
-                continue;
-            };
-            roots.insert(dst, root);
-            changed = true;
-        }
-    }
-    let local_roots = roots
+    let local_roots = storage_roots
+        .states
         .iter()
-        .filter_map(|(&node, root)| (*root == PreciseStorageRoot::LocalAlloca).then_some(node))
+        .enumerate()
+        .filter_map(|(index, state)| {
+            matches!(
+                state,
+                StorageRootState::Root(StorageRoot::LocalAlloca { .. })
+            )
+            .then_some(pangs_pag::NodeId(index as u32))
+        })
         .collect();
-    let global_bases = roots
-        .into_iter()
-        .filter_map(|(node, root)| match root {
-            PreciseStorageRoot::Global(global) => Some((node, global)),
-            PreciseStorageRoot::LocalAlloca => None,
+    let global_bases = storage_roots
+        .states
+        .iter()
+        .enumerate()
+        .filter_map(|(index, state)| {
+            let StorageRootState::Root(StorageRoot::Global { canonical_key, .. }) = state else {
+                return None;
+            };
+            let [gid] = normalized.get(canonical_key)?.as_slice() else {
+                return None;
+            };
+            Some((pangs_pag::NodeId(index as u32), *gid))
         })
         .collect();
     PreciseStorageAddresses {
@@ -6848,6 +6866,102 @@ mod registry_tests {
             .unwrap()
             .insert("external-call:earlier@file.c:9:3#0".into());
         assert!(pointee_operand_external(&solved, label, site));
+    }
+}
+
+#[cfg(test)]
+mod storage_root_identity_tests {
+    use std::collections::HashMap;
+
+    use pangs_pag::{allocation_storage_roots, Pag, PagOpts, StorageRoot, StorageRootState};
+    use pangs_pir::{AbiClass, Func, Global, Pir, Signature, Stmt};
+    use pangs_solve::{NodeResolution, SolveResult};
+
+    use super::{enforce_storage_root_identity, GlobalId};
+
+    fn fixture() -> (Pir, Pag, HashMap<String, GlobalId>, SolveResult) {
+        let pir = Pir {
+            module: "identity".into(),
+            source: None,
+            lowering: Default::default(),
+            target: None,
+            functions: vec![Func {
+                key: "f".into(),
+                sig: Signature {
+                    ret: AbiClass::Void,
+                    params: Vec::new(),
+                    vararg: false,
+                    cc: "ccc".into(),
+                },
+                param_names: Vec::new(),
+                file: None,
+                line: None,
+                external: false,
+                exported: false,
+                address_taken: false,
+                body: vec![Stmt::Load {
+                    dest: "x".into(),
+                    address: "g".into(),
+                    volatile: false,
+                    access_bytes: None,
+                    loc: None,
+                }],
+            }],
+            globals: vec![Global {
+                key: "g".into(),
+                ..Global::default()
+            }],
+            global_init: Vec::new(),
+        };
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let mut solved = SolveResult {
+            storage_roots: allocation_storage_roots(&pir, &pag),
+            ..SolveResult::default()
+        };
+        solved.nodes.insert(
+            "query".into(),
+            NodeResolution {
+                pointee_globals: Vec::<String>::new().into(),
+                pointee_globals_unfiltered: vec!["g".to_string()].into(),
+                ..NodeResolution::default()
+            },
+        );
+        (
+            pir,
+            pag,
+            HashMap::from([("@g".into(), GlobalId(0))]),
+            solved,
+        )
+    }
+
+    #[test]
+    fn sigil_normalization_preserves_the_shared_certificate() {
+        let (pir, pag, lookup, mut solved) = fixture();
+        enforce_storage_root_identity(&pir, &pag, &lookup, &mut solved);
+        assert!(solved.nodes["query"].pointee_globals.is_empty());
+        assert!(solved.storage_roots.global_identity_valid);
+        assert!(!solved.storage_roots.states.is_empty());
+    }
+
+    #[test]
+    fn conflicting_certificate_restores_every_unfiltered_envelope() {
+        let (pir, pag, lookup, mut solved) = fixture();
+        for state in &mut solved.storage_roots.states {
+            if let StorageRootState::Root(StorageRoot::Global { canonical_key, .. }) = state {
+                *canonical_key = "wrong".into();
+            }
+        }
+        enforce_storage_root_identity(&pir, &pag, &lookup, &mut solved);
+        assert_eq!(&*solved.nodes["query"].pointee_globals, &["g".to_string()]);
+        assert!(solved.storage_roots.states.is_empty());
+    }
+
+    #[test]
+    fn missing_global_id_restores_every_unfiltered_envelope() {
+        let (pir, pag, _, mut solved) = fixture();
+        enforce_storage_root_identity(&pir, &pag, &HashMap::new(), &mut solved);
+        assert_eq!(&*solved.nodes["query"].pointee_globals, &["g".to_string()]);
+        assert!(solved.storage_roots.states.is_empty());
     }
 }
 

@@ -707,7 +707,7 @@ impl<'a> Refiner<'a> {
             global_of_cell,
             param_nodes,
             ret_nodes,
-            exact_addresses: exact_allocation_addresses(pag),
+            exact_addresses: exact_allocation_addresses(pag, &base.storage_roots),
             receiver_payload_ops: HashMap::new(),
             receiver_payload_origins: Vec::new(),
             ap_parent: Vec::new(),
@@ -4251,7 +4251,7 @@ fn bounded_allocation_origins(pag: &Pag, limit: usize) -> Vec<AllocationOrigins>
     let mut complete = pag
         .nodes
         .iter()
-        .map(|node| node.label.rsplit(':').next() == Some("null"))
+        .map(pangs_pag::is_canonical_pointer_null)
         .collect::<Vec<_>>();
     loop {
         let mut changed = false;

@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use pangs_pag::{
-    BuildMode, CallKind, NodeId, NodeKind, ObjectKind, OmegaSeedKind, Pag, SeedTarget,
+    allocation_storage_roots, BuildMode, CallKind, NodeId, NodeKind, ObjectKind, OmegaSeedKind,
+    Pag, SeedTarget, StorageRoot, StorageRootState, StorageRoots,
 };
 use pangs_pir::{fsa_compatible, Pir, Signature};
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,10 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SolveResult {
+    /// In-memory soundness certificate shared with API ModRef construction.  It is deliberately
+    /// not serialized: loading an old solve cannot authorize derived-address filtering.
+    #[serde(skip)]
+    pub storage_roots: StorageRoots,
     #[serde(default)]
     pub indirect_calls: Vec<IndirectCallResolution>,
     #[serde(default)]
@@ -863,6 +868,7 @@ struct Solver<'a> {
     function_object_nodes: Vec<Option<NodeId>>,
     global_keys: Vec<String>,
     global_object_nodes: Vec<Option<NodeId>>,
+    storage_roots: StorageRoots,
     global_address_exposed: Vec<bool>,
     violation_exposure: ViolationExposure,
     exact_addresses: Vec<Option<ExactAddress>>,
@@ -1047,7 +1053,10 @@ fn gcd_u64(mut lhs: u64, mut rhs: u64) -> u64 {
 /// weaker than points-to analysis: address-of seeds a root, GEP preserves it, and an Assign join
 /// is retained only when every incoming alternative names the same root. A differing offset
 /// becomes the root's unknown-offset summary; loads and all other producers stop the proof.
-fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
+fn exact_allocation_addresses(
+    pag: &Pag,
+    storage_roots: &StorageRoots,
+) -> Vec<Option<ExactAddress>> {
     let mut addresses = vec![None; pag.nodes.len()];
     let mut producers = BTreeMap::<NodeId, Vec<&pangs_pag::Edge>>::new();
     for edge in &pag.edges {
@@ -1060,9 +1069,15 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
         ) {
             producers.entry(edge.dst).or_default().push(edge);
         }
-        if edge.kind == pangs_pag::EdgeKind::AddrOf {
-            addresses[edge.dst.0 as usize] = Some(ExactAddress {
-                root: edge.src,
+    }
+    for (&destination, incoming) in &producers {
+        if incoming.len() != 1 || incoming[0].kind != pangs_pag::EdgeKind::AddrOf {
+            continue;
+        }
+        if let Some(StorageRootState::Root(root)) = storage_roots.states.get(destination.0 as usize)
+        {
+            addresses[destination.0 as usize] = Some(ExactAddress {
+                root: root.object_node(),
                 location: FieldLocation::Exact(0),
                 via_gep: false,
             });
@@ -1076,6 +1091,11 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
             if addresses[dst.0 as usize].is_some() || incoming.is_empty() {
                 continue;
             }
+            let Some(StorageRootState::Root(certified_root)) =
+                storage_roots.states.get(dst.0 as usize)
+            else {
+                continue;
+            };
             let candidate = match incoming[0].kind {
                 pangs_pag::EdgeKind::Gep { byte_off, lane } if incoming.len() == 1 => {
                     addresses[incoming[0].src.0 as usize].map(|base| ExactAddress {
@@ -1089,10 +1109,16 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
                         .iter()
                         .all(|edge| edge.kind == pangs_pag::EdgeKind::Assign) =>
                 {
-                    let alternatives = incoming
-                        .iter()
-                        .map(|edge| addresses[edge.src.0 as usize])
-                        .collect::<Option<Vec<_>>>();
+                    let alternatives = incoming.iter().try_fold(Vec::new(), |mut out, edge| {
+                        match storage_roots.states.get(edge.src.0 as usize) {
+                            Some(StorageRootState::ProvenNull) => {}
+                            Some(StorageRootState::Root(_)) => {
+                                out.push(addresses[edge.src.0 as usize]?);
+                            }
+                            _ => return None,
+                        }
+                        Some(out)
+                    });
                     alternatives.and_then(|alternatives| {
                         let first = *alternatives.first()?;
                         alternatives
@@ -1117,7 +1143,9 @@ fn exact_allocation_addresses(pag: &Pag) -> Vec<Option<ExactAddress>> {
                 }
                 _ => None,
             };
-            if let Some(address) = candidate {
+            if let Some(address) =
+                candidate.filter(|address| address.root == certified_root.object_node())
+            {
                 addresses[dst.0 as usize] = Some(address);
                 changed = true;
             }
@@ -1138,7 +1166,40 @@ struct MaterializedPointsTo {
 /// load/store.  Everything else is exposure: address propagation, GEP, storage as a value,
 /// calls/returns, ptr-to-int, unknown operations (including inline asm), initializer capture,
 /// or export.
-fn global_address_exposure(pir: &Pir, pag: &Pag) -> Vec<bool> {
+fn global_address_exposure(pir: &Pir, pag: &Pag, roots: &StorageRoots) -> Vec<bool> {
+    fn global_index(roots: &StorageRoots, node: NodeId) -> Option<usize> {
+        match roots.states.get(node.0 as usize)? {
+            StorageRootState::Root(StorageRoot::Global {
+                pir_global_index, ..
+            }) => Some(*pir_global_index),
+            _ => None,
+        }
+    }
+    fn semantic_scope(kind: &NodeKind) -> (&str, Option<&str>) {
+        match kind {
+            NodeKind::Value {
+                scope: pangs_pag::Scope::Function(func),
+            }
+            | NodeKind::Param { func, .. }
+            | NodeKind::Return { func } => ("function", Some(func)),
+            NodeKind::Value {
+                scope: pangs_pag::Scope::Module,
+            } => ("module", None),
+            NodeKind::Value {
+                scope: pangs_pag::Scope::GlobalInit,
+            } => ("global_init", None),
+            NodeKind::Object {
+                owner: Some(owner), ..
+            } => ("function", Some(owner)),
+            NodeKind::Object { owner: None, .. } => ("module", None),
+        }
+    }
+    fn expose(exposed: &mut [bool], roots: &StorageRoots, node: NodeId) {
+        if let Some(index) = global_index(roots, node) {
+            exposed[index] = true;
+        }
+    }
+
     let global_by_key = pir
         .globals
         .iter()
@@ -1148,66 +1209,76 @@ fn global_address_exposure(pir: &Pir, pag: &Pag) -> Vec<bool> {
             [(global.key.as_str(), index), (bare, index)]
         })
         .collect::<HashMap<_, _>>();
-    let mut object_global = HashMap::<NodeId, usize>::new();
-    for node in &pag.nodes {
-        if let NodeKind::Object {
-            object: ObjectKind::Global,
-            key,
-            ..
-        } = &node.kind
-        {
-            if let Some(&index) = global_by_key
-                .get(key.as_str())
-                .or_else(|| global_by_key.get(key.strip_prefix('@').unwrap_or(key)))
-            {
-                object_global.insert(node.id, index);
-            }
+    let object_global = &roots.global_objects;
+    let mut exposed = if roots.global_identity_valid {
+        vec![false; pir.globals.len()]
+    } else {
+        vec![true; pir.globals.len()]
+    };
+    for &index in &roots.force_exposed_globals {
+        if let Some(bit) = exposed.get_mut(index) {
+            *bit = true;
         }
     }
-
-    let mut symbol_global = HashMap::<NodeId, usize>::new();
     for edge in &pag.edges {
-        if edge.kind == pangs_pag::EdgeKind::AddrOf {
-            if let Some(&index) = object_global.get(&edge.src) {
-                symbol_global.insert(edge.dst, index);
+        use pangs_pag::EdgeKind;
+        match edge.kind {
+            EdgeKind::AddrOf => {}
+            EdgeKind::Gep { .. } => {
+                let same =
+                    roots.states.get(edge.src.0 as usize) == roots.states.get(edge.dst.0 as usize);
+                if !same {
+                    expose(&mut exposed, roots, edge.src);
+                }
             }
-        }
-    }
-
-    let mut exposed = vec![false; pir.globals.len()];
-    for edge in &pag.edges {
-        if edge.kind == pangs_pag::EdgeKind::AddrOf {
-            continue;
-        }
-        if let Some(&index) = symbol_global.get(&edge.src) {
-            let direct_address = matches!(edge.kind, pangs_pag::EdgeKind::Load);
-            if !direct_address {
-                exposed[index] = true;
+            EdgeKind::Assign => {
+                let source = roots.states.get(edge.src.0 as usize);
+                let destination = roots.states.get(edge.dst.0 as usize);
+                let same_root = source == destination
+                    || matches!(source, Some(StorageRootState::ProvenNull))
+                        && matches!(
+                            destination,
+                            Some(StorageRootState::ProvenNull | StorageRootState::Root(_))
+                        );
+                let same_scope = semantic_scope(&pag.nodes[edge.src.0 as usize].kind)
+                    == semantic_scope(&pag.nodes[edge.dst.0 as usize].kind);
+                if !same_root || !same_scope {
+                    expose(&mut exposed, roots, edge.src);
+                    expose(&mut exposed, roots, edge.dst);
+                }
             }
-        }
-        if let Some(&index) = symbol_global.get(&edge.dst) {
-            let direct_address = matches!(edge.kind, pangs_pag::EdgeKind::Store);
-            if !direct_address {
-                exposed[index] = true;
+            EdgeKind::Load => {
+                // src is the admitted address operand; a rooted destination would mean a
+                // malformed additional producer and is never admitted.
+                expose(&mut exposed, roots, edge.dst);
+            }
+            EdgeKind::Store => {
+                // dst is the admitted address operand; storing an address value exposes it.
+                expose(&mut exposed, roots, edge.src);
+            }
+            EdgeKind::Memcpy { .. } => {
+                expose(&mut exposed, roots, edge.src);
+                expose(&mut exposed, roots, edge.dst);
             }
         }
     }
     for callsite in &pag.callsites {
         for node in callsite.operand.iter().chain(&callsite.args) {
-            if let Some(&index) = symbol_global.get(node) {
-                exposed[index] = true;
-            }
+            expose(&mut exposed, roots, *node);
         }
     }
     for seed in &pag.omega_seeds {
         let SeedTarget::Node(node) = seed.target else {
             continue;
         };
-        if let Some(&index) = symbol_global
-            .get(&node)
-            .or_else(|| object_global.get(&node))
-        {
-            exposed[index] = true;
+        expose(&mut exposed, roots, node);
+        if let Some(&pir_global_index) = object_global.get(&node) {
+            exposed[pir_global_index] = true;
+        }
+    }
+    for node in &pag.nodes {
+        if matches!(node.kind, NodeKind::Return { .. }) {
+            expose(&mut exposed, roots, node.id);
         }
     }
     for initializer in &pir.globals {
@@ -1218,6 +1289,38 @@ fn global_address_exposure(pir: &Pir, pag: &Pag) -> Vec<bool> {
             {
                 exposed[index] = true;
             }
+        }
+    }
+    // Memset lowers to an ordinary synthetic Store, so distinguish it at PIR level.  Exact
+    // function/global-init labels are used; direct global spellings are handled canonically.
+    let mut expose_memset = |owner: &str, dst: &str| {
+        let bare = dst.strip_prefix('@').unwrap_or(dst);
+        if let Some(&index) = global_by_key.get(dst).or_else(|| global_by_key.get(bare)) {
+            exposed[index] = true;
+        }
+        let value_label = format!("val:{owner}:{dst}");
+        for node in &pag.nodes {
+            if node.label == value_label
+                || node
+                    .label
+                    .strip_prefix("sym:global:")
+                    .map(|key| key.strip_prefix('@').unwrap_or(key) == bare)
+                    .unwrap_or(false)
+            {
+                expose(&mut exposed, roots, node.id);
+            }
+        }
+    };
+    for function in &pir.functions {
+        for stmt in &function.body {
+            if let pangs_pir::Stmt::Memset { dst, .. } = stmt {
+                expose_memset(&function.key, dst);
+            }
+        }
+    }
+    for stmt in &pir.global_init {
+        if let pangs_pir::Stmt::Memset { dst, .. } = stmt {
+            expose_memset("global_init", dst);
         }
     }
     exposed
@@ -1337,7 +1440,8 @@ impl<'a> Solver<'a> {
             .map(|(idx, key)| (key.clone(), idx))
             .collect::<HashMap<_, _>>();
         let mut global_object_nodes = vec![None; global_keys.len()];
-        let global_address_exposed = global_address_exposure(pir, pag);
+        let storage_roots = allocation_storage_roots(pir, pag);
+        let global_address_exposed = global_address_exposure(pir, pag, &storage_roots);
         let violation_exposure = violation_exposure(pir, pag);
 
         let mut classes = Vec::with_capacity(pag.nodes.len());
@@ -1387,7 +1491,7 @@ impl<'a> Solver<'a> {
         let function_count = function_keys.len();
         let callsites_by_index = pag.callsites.iter().collect();
         let queued = vec![false; classes.len()];
-        let exact_addresses = exact_allocation_addresses(pag);
+        let exact_addresses = exact_allocation_addresses(pag, &storage_roots);
 
         Self {
             pir,
@@ -1400,6 +1504,7 @@ impl<'a> Solver<'a> {
             function_object_nodes,
             global_keys,
             global_object_nodes,
+            storage_roots,
             global_address_exposed,
             violation_exposure,
             exact_addresses,
@@ -1964,6 +2069,7 @@ impl<'a> Solver<'a> {
         };
 
         SolveResult {
+            storage_roots: self.storage_roots,
             indirect_calls,
             unknown_callers,
             function_escapes,
@@ -3081,6 +3187,7 @@ mod tests {
                     owner: None,
                 },
                 value_kind: Default::default(),
+                canonical_pointer_null: false,
             },
             Node {
                 id: NodeId(1),
@@ -3091,6 +3198,7 @@ mod tests {
                     owner: None,
                 },
                 value_kind: Default::default(),
+                canonical_pointer_null: false,
             },
             Node {
                 id: NodeId(2),
@@ -3099,6 +3207,7 @@ mod tests {
                     scope: Scope::Module,
                 },
                 value_kind: Default::default(),
+                canonical_pointer_null: false,
             },
             Node {
                 id: NodeId(3),
@@ -3107,6 +3216,7 @@ mod tests {
                     scope: Scope::Module,
                 },
                 value_kind: Default::default(),
+                canonical_pointer_null: false,
             },
             Node {
                 id: NodeId(4),
@@ -3115,6 +3225,7 @@ mod tests {
                     scope: Scope::Module,
                 },
                 value_kind: Default::default(),
+                canonical_pointer_null: false,
             },
             Node {
                 id: NodeId(5),
@@ -3123,6 +3234,7 @@ mod tests {
                     scope: Scope::Module,
                 },
                 value_kind: Default::default(),
+                canonical_pointer_null: false,
             },
         ];
         let edges = vec![
@@ -3170,7 +3282,13 @@ mod tests {
             nodes,
             edges,
             callsites: Vec::new(),
-            omega_seeds: Vec::new(),
+            omega_seeds: vec![pangs_pag::OmegaSeed {
+                kind: OmegaSeedKind::PtrToInt,
+                target: SeedTarget::Node(NodeId(5)),
+                owner: None,
+                loc: None,
+                detail: None,
+            }],
         };
         let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
         let pointee = solver.join(0, 1, 0);
@@ -3186,6 +3304,156 @@ mod tests {
         assert_eq!(
             &*resolution.pointee_globals_unfiltered,
             &["closed".to_string(), "exposed".to_string()]
+        );
+    }
+
+    #[test]
+    fn derived_addresses_are_closed_only_for_local_load_store_uses() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+              "module":"derived-exposure",
+              "globals":[
+                {"key":"safe","mutable":true}, {"key":"called","mutable":true},
+                {"key":"returned","mutable":true}, {"key":"copied","mutable":true},
+                {"key":"filled","mutable":true}
+              ],
+              "functions":[
+                {"key":"helper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"body":[]},
+                {"key":"f","sig":{"ret":{"class":"integer"},"params":[]},"body":[
+                  {"kind":"gep","dest":"safe.elt","base":"safe"},
+                  {"kind":"load","dest":"x","address":"safe.elt"},
+                  {"kind":"store","address":"safe.elt","value":"x"},
+                  {"kind":"gep","dest":"called.elt","base":"called"},
+                  {"kind":"call_direct","callee":"helper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["called.elt"]},
+                  {"kind":"gep","dest":"copied.elt","base":"copied"},
+                  {"kind":"memcpy","dst":"safe.elt","src":"copied.elt","bytes":8},
+                  {"kind":"gep","dest":"filled.elt","base":"filled"},
+                  {"kind":"memset","dst":"filled.elt","value":"0","bytes":8},
+                  {"kind":"gep","dest":"returned.elt","base":"returned"},
+                  {"kind":"return","value":"returned.elt"}
+                ]}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &pangs_pag::PagOpts::default());
+        let roots = allocation_storage_roots(&pir, &pag);
+        assert_eq!(
+            global_address_exposure(&pir, &pag, &roots),
+            vec![true, true, true, true, true],
+            "memcpy exposes both operands; calls, returns, and memset are boundaries"
+        );
+
+        let mut safe_only = pir.clone();
+        safe_only.globals.truncate(1);
+        safe_only.functions.truncate(1);
+        safe_only.functions.push(pangs_pir::Func {
+            key: "safe_f".into(),
+            body: vec![
+                pangs_pir::Stmt::Gep {
+                    dest: "elt".into(),
+                    base: "safe".into(),
+                    byte_off: None,
+                    lane: None,
+                    loc: None,
+                },
+                pangs_pir::Stmt::Load {
+                    dest: "x".into(),
+                    address: "elt".into(),
+                    volatile: false,
+                    access_bytes: None,
+                    loc: None,
+                },
+                pangs_pir::Stmt::Store {
+                    address: "elt".into(),
+                    value: "x".into(),
+                    volatile: false,
+                    access_bytes: None,
+                    loc: None,
+                },
+            ],
+            ..frontier_test_func("safe_f")
+        });
+        let pag = Pag::from_pir(&safe_only, &pangs_pag::PagOpts::default());
+        let roots = allocation_storage_roots(&safe_only, &pag);
+        assert_eq!(
+            global_address_exposure(&safe_only, &pag, &roots),
+            vec![false]
+        );
+    }
+
+    #[test]
+    fn unused_exported_global_is_exposed_from_its_object_seed() {
+        let pir = Pir {
+            module: "export".into(),
+            source: None,
+            lowering: Default::default(),
+            target: None,
+            functions: Vec::new(),
+            globals: vec![Global {
+                key: "unused".into(),
+                exported: true,
+                ..Global::default()
+            }],
+            global_init: Vec::new(),
+        };
+        let pag = Pag::from_pir(
+            &pir,
+            &pangs_pag::PagOpts {
+                build_mode: BuildMode::Library,
+                ..Default::default()
+            },
+        );
+        let roots = allocation_storage_roots(&pir, &pag);
+        assert_eq!(global_address_exposure(&pir, &pag, &roots), vec![true]);
+    }
+
+    #[test]
+    fn null_alternative_join_is_safe_but_unknown_alternative_exposes() {
+        let make = |unknown: bool| {
+            let sources = if unknown {
+                r#"["elt","mystery"]"#
+            } else {
+                r#"["elt","null"]"#
+            };
+            let mut pir: Pir = serde_json::from_str(&format!(
+                r#"{{"module":"join","globals":[{{"key":"g","mutable":true}}],
+                    "functions":[{{"key":"f","sig":{{"ret":{{"class":"void"}},"params":[]}},"body":[
+                      {{"kind":"gep","dest":"elt","base":"g"}},
+                      {{"kind":"assign","dest":"maybe","sources":{sources}}},
+                      {{"kind":"load","dest":"x","address":"maybe"}},
+                      {{"kind":"store","address":"maybe","value":"x"}}
+                    ]}}]}}"#
+            ))
+            .unwrap();
+            pir.lowering
+                .semantic_value_kinds
+                .insert("null".into(), pangs_pir::ValueKind::Pointer);
+            let pag = Pag::from_pir(&pir, &pangs_pag::PagOpts::default());
+            let roots = allocation_storage_roots(&pir, &pag);
+            global_address_exposure(&pir, &pag, &roots)
+        };
+        assert_eq!(make(false), vec![false]);
+        assert_eq!(make(true), vec![true]);
+    }
+
+    #[test]
+    fn mixed_global_root_join_exposes_every_known_alternative() {
+        let pir: Pir = serde_json::from_str(
+            r#"{"module":"mixed-join","globals":[{"key":"g"},{"key":"h"}],
+                "functions":[{"key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                  {"kind":"gep","dest":"g.elt","base":"g"},
+                  {"kind":"gep","dest":"h.elt","base":"h"},
+                  {"kind":"assign","dest":"mixed","sources":["g.elt","h.elt"]},
+                  {"kind":"load","dest":"x","address":"mixed"}
+                ]}]}"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &pangs_pag::PagOpts::default());
+        let roots = allocation_storage_roots(&pir, &pag);
+        assert_eq!(
+            global_address_exposure(&pir, &pag, &roots),
+            vec![true, true]
         );
     }
 
@@ -3246,7 +3514,11 @@ mod tests {
             pag.nodes[nodes.iter().next().unwrap().0 as usize].label,
             "sym:global:@bits"
         );
-        assert_eq!(global_address_exposure(&pir, &pag), vec![true, false]);
+        let roots = allocation_storage_roots(&pir, &pag);
+        assert_eq!(
+            global_address_exposure(&pir, &pag, &roots),
+            vec![true, false]
+        );
         assert!(pag.omega_seeds.iter().all(|seed| {
             !matches!(seed.target, SeedTarget::Node(node) if pag.nodes[node.0 as usize].label == "val:asm_user:%scalar")
         }));
@@ -3318,6 +3590,7 @@ mod tests {
                         scope: Scope::Module,
                     },
                     value_kind: Default::default(),
+                    canonical_pointer_null: false,
                 },
                 Node {
                     id: NodeId(1),
@@ -3326,6 +3599,7 @@ mod tests {
                         scope: Scope::Module,
                     },
                     value_kind: Default::default(),
+                    canonical_pointer_null: false,
                 },
             ],
             edges: Vec::new(),
@@ -3381,6 +3655,7 @@ mod tests {
                         scope: Scope::Module,
                     },
                     value_kind: Default::default(),
+                    canonical_pointer_null: false,
                 },
                 Node {
                     id: NodeId(1),
@@ -3389,6 +3664,7 @@ mod tests {
                         scope: Scope::Module,
                     },
                     value_kind: Default::default(),
+                    canonical_pointer_null: false,
                 },
             ],
             edges: Vec::new(),

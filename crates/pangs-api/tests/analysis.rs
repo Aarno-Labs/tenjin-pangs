@@ -3781,6 +3781,138 @@ fn exact_root_certificate_handles_dynamic_geps_and_same_root_assigns() {
 }
 
 #[test]
+fn memory_operations_retain_direct_and_derived_writer_rows_in_both_solvers() {
+    let loc = |line| pangs_pir::Loc {
+        file: "memory-writers.c".into(),
+        line,
+        col: 1,
+        dir: None,
+        filename: None,
+    };
+    let pir = Pir {
+        module: "memory-writers".into(),
+        source: None,
+        lowering: Default::default(),
+        target: None,
+        functions: vec![Func {
+            key: "main".into(),
+            sig: sig(AbiClass::Void, vec![]),
+            param_names: vec![],
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: false,
+            body: vec![
+                Stmt::Gep {
+                    dest: "%dst".into(),
+                    base: "@Dst".into(),
+                    byte_off: None,
+                    lane: None,
+                    loc: Some(loc(1)),
+                },
+                Stmt::Gep {
+                    dest: "%src".into(),
+                    base: "@Src".into(),
+                    byte_off: None,
+                    lane: None,
+                    loc: Some(loc(2)),
+                },
+                Stmt::Memcpy {
+                    dst: "%dst".into(),
+                    src: "%src".into(),
+                    bytes: Some(8),
+                    proven_fnptr_init: false,
+                    loc: Some(loc(3)),
+                },
+                Stmt::Gep {
+                    dest: "%fill".into(),
+                    base: "@Fill".into(),
+                    byte_off: None,
+                    lane: None,
+                    loc: Some(loc(4)),
+                },
+                Stmt::Memset {
+                    dst: "%fill".into(),
+                    value: "0".into(),
+                    bytes: Some(8),
+                    loc: Some(loc(5)),
+                },
+                Stmt::Memcpy {
+                    dst: "@DirectDst".into(),
+                    src: "@DirectSrc".into(),
+                    bytes: Some(8),
+                    proven_fnptr_init: false,
+                    loc: Some(loc(6)),
+                },
+                Stmt::Memset {
+                    dst: "@DirectFill".into(),
+                    value: "0".into(),
+                    bytes: Some(8),
+                    loc: Some(loc(7)),
+                },
+            ],
+        }],
+        globals: [
+            "@Dst",
+            "@Src",
+            "@Fill",
+            "@DirectDst",
+            "@DirectSrc",
+            "@DirectFill",
+        ]
+        .into_iter()
+        .map(|key| Global {
+            key: key.into(),
+            ..Global::default()
+        })
+        .collect(),
+        global_init: Vec::new(),
+    };
+
+    for stage in [Stage::Steens, Stage::Andersen] {
+        let analysis = Analysis::run(
+            &pir,
+            &Opts {
+                stage,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        for (key, line) in [
+            ("@Dst", 3),
+            ("@Fill", 5),
+            ("@DirectDst", 6),
+            ("@DirectFill", 7),
+        ] {
+            let global = analysis.lookup_global(key).unwrap();
+            assert!(
+                analysis.globals()[global].runtime_written,
+                "{stage:?} {key}"
+            );
+            assert!(!analysis.globals()[global].never_written, "{stage:?} {key}");
+            let rows = analysis
+                .access_sites_for_global(global)
+                .filter(|site| site.access == Access::Mod)
+                .filter(|site| site.loc.as_ref().is_some_and(|loc| loc.line == line))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 1, "{stage:?} {key}: {rows:#?}");
+        }
+        for key in ["@Src", "@DirectSrc"] {
+            let global = analysis.lookup_global(key).unwrap();
+            assert!(
+                !analysis.globals()[global].runtime_written,
+                "{stage:?} {key}"
+            );
+            assert!(analysis
+                .access_sites_for_global(global)
+                .any(|site| site.access == Access::Ref));
+        }
+    }
+}
+
+#[test]
 fn field_aware_steens_separates_external_store_address_modref() {
     let fixture = m5_fixture("andersen_refines_store_external.pir.json");
     let steens = Analysis::run(
