@@ -86,6 +86,7 @@
     },
     "context_rewrite_field": {
       "type": "object",
+      "description": "Policy-independent localization candidate for one defined mutable global; its presence does not mean localization was selected.",
       "additionalProperties": false,
       "required": ["global", "accessors", "functions", "rewrite_callsites", "blockers"],
       "properties": {
@@ -98,6 +99,7 @@
     },
     "context_rewrite": {
       "type": "object",
+      "description": "Candidate context-rewrite inventory. Final disposition policy selects which fields, if any, are materialized.",
       "additionalProperties": false,
       "required": ["id", "functions", "rewrite_callsites", "fields"],
       "properties": {

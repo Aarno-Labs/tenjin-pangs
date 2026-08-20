@@ -4487,22 +4487,43 @@ mod tests {
             align_bits: Some(64),
             ..pangs_pir::Global::default()
         });
-        let pangs_pir::Stmt::GlobalRef { global, .. } = &mut pir.functions[0].body[0] else {
-            panic!("trivial fixture starts with a global access")
+        // Retain the owner's original runtime write and add a read-only runtime reference to its
+        // backing storage. The latter is init-value stable, but must still receive a localization
+        // candidate so storage-closure folding cannot erase the owner's localization fact.
+        pir.functions[0].body.insert(
+            0,
+            pangs_pir::Stmt::GlobalRef {
+                global: ".compoundliteral".into(),
+                access: pangs_pir::Access::Ref,
+                volatile: false,
+                loc: None,
+            },
+        );
+        pir.functions[0].body.insert(
+            1,
+            pangs_pir::Stmt::Store {
+                address: "@g_counter".into(),
+                value: "0".into(),
+                volatile: false,
+                access_bytes: Some(4),
+                loc: None,
+            },
+        );
+        let opts = Opts {
+            stage: Stage::Andersen,
+            ..Opts::default()
         };
-        *global = ".compoundliteral".into();
-        let opts = Opts::default();
         let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let backing = analysis
+            .globals()
+            .iter()
+            .find(|global| global.key == ".compoundliteral")
+            .unwrap();
         assert_eq!(
-            analysis
-                .globals()
-                .iter()
-                .find(|global| global.key == ".compoundliteral")
-                .unwrap()
-                .synthetic_kind
-                .as_deref(),
+            backing.synthetic_kind.as_deref(),
             Some("unnamed-compound-literal")
         );
+        assert!(backing.initval_stable);
         let target = pangs_pir::TargetInfo {
             triple: "x86_64-unknown-linux-gnu".into(),
             data_layout: String::new(),
@@ -4525,6 +4546,7 @@ mod tests {
         );
         assert_eq!(manifest.globals[0].storage_members.len(), 1);
         assert!(manifest.globals[0].facts.written.value);
+        assert!(manifest.globals[0].facts.localization.is_some());
         assert_eq!(
             manifest.globals[0].storage_members[0].llvm_name,
             ".compoundliteral"
@@ -4642,6 +4664,29 @@ mod tests {
         ));
         let schema = JSONSchema::compile(schema_json).unwrap();
         validate_value_against_schema(&schema, &components, "initializer blocker").unwrap();
+    }
+
+    #[test]
+    fn initval_stable_global_still_has_a_localization_fact() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        let pangs_pir::Stmt::GlobalRef { access, .. } = &mut pir.functions[0].body[0] else {
+            panic!("trivial fixture starts with a global access")
+        };
+        *access = pangs_pir::Access::Ref;
+        let analysis = Analysis::run_with_disposition(
+            &pir,
+            &Opts {
+                stage: Stage::Andersen,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let global = analysis.lookup_global("g_counter").unwrap();
+
+        assert!(analysis.globals()[global].initval_stable);
+        assert!(localization_index(&analysis)[global.0 as usize].is_some());
     }
 
     #[test]

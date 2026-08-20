@@ -351,9 +351,10 @@ pub struct ComponentInfo {
     pub mutable_globals: Vec<GlobalId>,
 }
 
-/// One field's participation in the program-wide context rewrite.  The context itself is shared;
-/// this per-field record exists solely to explain which boundary prevents that field from joining
-/// the common rewrite.
+/// One defined mutable global's candidacy for the program-wide context rewrite. The context itself
+/// is shared; this per-field record exists solely to explain which boundary prevents that field
+/// from joining the common rewrite. Candidate construction is policy-independent: a later
+/// disposition may select a strategy other than localization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextFieldPlan {
     pub global: GlobalId,
@@ -374,8 +375,10 @@ pub struct ContextRewriteBlocker {
     pub initializer: Option<String>,
 }
 
-/// The source-rewrite slice for the single context object constructed by an executable's `main`.
-/// Components remain useful diagnostics, but are deliberately not the eligibility criterion.
+/// The candidate source-rewrite slice for the single context object constructed by an
+/// executable's `main`. Components remain useful diagnostics, but are deliberately not the
+/// eligibility criterion. Consumers that materialize a disposition must retain only fields whose
+/// final disposition selects localization.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextRewritePlan {
     pub id: String,
@@ -5752,7 +5755,11 @@ fn compute_context_rewrite_plan(
     let mut fields = Vec::new();
     for (index, field_accessors) in rewrite_roots.iter().enumerate() {
         let info = &globals[index];
-        if !info.mutable || info.initval_stable {
+        // Localization is an independent disposition capability. In particular, the B1
+        // `initval_stable` verdict only licenses initializer-based load resolution and must not
+        // suppress this candidate: disposition facts, policy order, overrides, or coupling-group
+        // resolution may still require localization.
+        if !info.mutable || !info.is_definition {
             continue;
         }
         if field_accessors.is_empty() {
@@ -7114,6 +7121,57 @@ mod component_tests {
         assert_eq!(plan.functions, vec![FuncId(0), FuncId(1)]);
         assert_eq!(plan.rewrite_callsites, vec![CallsiteId(0)]);
         assert!(plan.fields[0].blockers.is_empty());
+    }
+
+    #[test]
+    fn context_rewrite_candidates_ignore_initval_stability_but_require_defined_mutable_roots() {
+        let funcs = vec![func("main", false), func("helper", false)];
+        let mut main_to_helper = edge(0, 1);
+        main_to_helper.callsite = None;
+
+        let mut stable = global("stable");
+        stable.initval_stable = true;
+        stable.runtime_written = false;
+        stable.never_written = true;
+
+        let mut declaration = global("declaration");
+        declaration.is_definition = false;
+
+        let mut constant = global("constant");
+        constant.is_const = true;
+        constant.mutable = false;
+
+        let no_root = global("no_root");
+        let ordinary = global("ordinary");
+        let globals = vec![stable, declaration, constant, no_root, ordinary];
+        let rewrite_roots = vec![
+            BTreeSet::from([FuncId(1)]),
+            BTreeSet::from([FuncId(0)]),
+            BTreeSet::from([FuncId(0)]),
+            BTreeSet::new(),
+            BTreeSet::from([FuncId(0)]),
+        ];
+
+        let plan = compute_context_rewrite_plan(
+            &funcs,
+            &globals,
+            &[],
+            &[main_to_helper],
+            &rewrite_roots,
+            &BTreeMap::new(),
+            BuildMode::Executable,
+        );
+
+        assert_eq!(
+            plan.fields
+                .iter()
+                .map(|field| field.global)
+                .collect::<Vec<_>>(),
+            vec![GlobalId(0), GlobalId(4)]
+        );
+        assert_eq!(plan.fields[0].functions, vec![FuncId(0), FuncId(1)]);
+        assert_eq!(plan.fields[1].functions, vec![FuncId(0)]);
+        assert_eq!(plan.functions, vec![FuncId(0), FuncId(1)]);
     }
 
     #[test]

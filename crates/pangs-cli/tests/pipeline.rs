@@ -2142,7 +2142,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "756939b663cba4fa01ded6d1dcb217ab99bc3bc3dcefd4fc1518b8c8faae4741"
+        "b31c23c979adaefc23cb931ff0fe222ceaa128904a40121cac3e7c6cccd0065c"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(

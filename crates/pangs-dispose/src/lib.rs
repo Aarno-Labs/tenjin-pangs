@@ -1944,4 +1944,25 @@ mod tests {
         );
         assert_eq!(report["override_usage"]["honored"], 0);
     }
+
+    #[test]
+    fn unused_localization_candidate_does_not_add_context_struct_pressure() {
+        let mut facts = base_facts();
+        facts.localization = Some(ok_localization());
+        let mut manifest = manifest_with(facts);
+        manifest.globals[0].meta.size_bits = Some(64);
+        let mut ledger = Vec::new();
+        let config = CascadeConfig::default_for(DisposeMode::Application);
+
+        apply_policy(&mut manifest, &mut ledger, &config, None, None, None).unwrap();
+
+        let disposition = manifest.globals[0].disposition.as_ref().unwrap();
+        assert_eq!(disposition.chosen, Strategy::Immutable);
+        let pressure = &manifest.run.dispose.as_ref().unwrap().extra["measurement_report"]
+            ["context_struct_pressure"];
+        assert_eq!(pressure["localized_globals"], 0);
+        assert_eq!(pressure["known_size_bits"], 0);
+        assert_eq!(pressure["unknown_size_globals"], 0);
+        assert_eq!(pressure["components"], json!({}));
+    }
 }
