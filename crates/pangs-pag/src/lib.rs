@@ -1188,23 +1188,31 @@ impl<'a> Builder<'a> {
             } => {
                 for operand in operands {
                     let node = self.operand_node(func_index, owner_scope(&owner), operand);
-                    self.add_seed(
-                        OmegaSeedKind::UnknownOperandEscape,
-                        SeedTarget::Node(node),
-                        Some(owner.clone()),
-                        loc.clone(),
-                        Some(reason.clone()),
-                    );
+                    if !reason.starts_with("inline_asm")
+                        || self.nodes[node.0 as usize].value_kind.may_carry_pointer()
+                    {
+                        self.add_seed(
+                            OmegaSeedKind::UnknownOperandEscape,
+                            SeedTarget::Node(node),
+                            Some(owner.clone()),
+                            loc.clone(),
+                            Some(reason.clone()),
+                        );
+                    }
                 }
                 for result in results {
                     let node = self.value_node(func_index, owner_scope(&owner), result);
-                    self.add_seed(
-                        OmegaSeedKind::UnknownResultExternal,
-                        SeedTarget::Node(node),
-                        Some(owner.clone()),
-                        loc.clone(),
-                        Some(reason.clone()),
-                    );
+                    if !reason.starts_with("inline_asm")
+                        || self.nodes[node.0 as usize].value_kind.may_carry_pointer()
+                    {
+                        self.add_seed(
+                            OmegaSeedKind::UnknownResultExternal,
+                            SeedTarget::Node(node),
+                            Some(owner.clone()),
+                            loc.clone(),
+                            Some(reason.clone()),
+                        );
+                    }
                 }
             }
             Stmt::Return { value, loc } => {

@@ -551,9 +551,12 @@ load/store (including the load/store representation of `atomicrmw` and `cmpxchg`
 copies, stores as a value, calls, returns, `ptrtoint`, initializer capture, export, and unknown
 operations all expose it. An unexposed object cannot be the target of another pointer because its
 address never exists as a program value, so class-unification side effects alone do not justify
-including it in a finite `pointee_globals` set. Universal external rows bypass the filter, as do
-modules containing inline assembly without a complete value-flow certificate. When candidates are
-removed, `pointee_globals_unfiltered` retains the original class envelope for differential checks.
+including it in a finite `pointee_globals` set. Universal external rows bypass the filter. Inline
+assembly with modeled operands seeds Ω only from its pointer-capable operands and results, so
+globals whose address-flow closure is disjoint remain filtered. Assembly that embeds symbol
+references or otherwise has no bounded modeled storage operand records module-wide violation
+exposure and bypasses the filter. When candidates are removed, `pointee_globals_unfiltered`
+retains the original class envelope for differential checks.
 Post-filter node resolutions also carry non-authoritative `pointee_provenance` diagnostics. The
 solver accumulates whether the surviving class involved direct address flow, scalar/unknown
 payload flow, by-value aggregate binding, memory merging, or call/return merging, then adds the

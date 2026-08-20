@@ -3941,7 +3941,10 @@ impl<'a> Refiner<'a> {
     fn emit_node_resolutions(&self, pts: &Solve) -> Vec<RefinedNodeResolution> {
         let explain_label = std::env::var(knobs::ENV_ANDERSEN_EXPLAIN_NODE).ok();
         let address_exposed = &self.classes.global_address_exposed;
-        let violation_tainted = self.classes.module_violation_tainted;
+        let violation_module_wide = matches!(
+            self.classes.violation_exposure,
+            crate::ViolationExposure::ModuleWide
+        );
         let global_index_by_key = self
             .pir
             .globals
@@ -3983,7 +3986,7 @@ impl<'a> Refiner<'a> {
                 .collect();
             globals_unfiltered.sort();
             globals_unfiltered.dedup();
-            let mut globals = if external_universal || violation_tainted {
+            let mut globals = if external_universal || violation_module_wide {
                 globals_unfiltered.clone()
             } else {
                 globals_unfiltered

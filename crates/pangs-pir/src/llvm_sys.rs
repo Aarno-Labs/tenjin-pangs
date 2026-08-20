@@ -1570,12 +1570,17 @@ unsafe fn lower_call_site(
         if inline_reason == "inline_asm" {
             lowering.bump_tainted("inline_asm");
         }
+        let reason = if inline_asm_embeds_symbol_reference(ctx, called) {
+            format!("{inline_reason}_symbol_reference")
+        } else {
+            inline_reason.to_string()
+        };
         push_unknown(
             body,
             op,
             call_operand_keys(fctx, inst),
             call_result_keys(fctx, inst),
-            inline_reason,
+            reason,
             loc(inst),
             lowering,
         );
@@ -1629,6 +1634,36 @@ unsafe fn lower_call_site(
         }
     }
     bump_missing_loc(lowering, op, inst);
+}
+
+/// LLVM 14's C API exposes inline-assembly construction but not its template getters. Its
+/// canonical printed value nevertheless retains the template and constraints. Token matching
+/// against this module's symbol table proves the important opaque case: the assembly names
+/// storage or code without carrying that address through a call operand.
+unsafe fn inline_asm_embeds_symbol_reference(ctx: &ModuleCtx, called: LLVMValueRef) -> bool {
+    let printed = value_string(called);
+    let has_symbol = |symbol: &str| {
+        !symbol.is_empty()
+            && printed.match_indices(symbol).any(|(start, _)| {
+                let end = start + symbol.len();
+                let identifier =
+                    |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '$');
+                printed[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|ch| !identifier(ch))
+                    && printed[end..]
+                        .chars()
+                        .next()
+                        .is_none_or(|ch| !identifier(ch))
+            })
+    };
+    ctx.global_names
+        .iter()
+        .chain(&ctx.func_names)
+        .chain(ctx.aliases.keys())
+        .chain(&ctx.ifunc_names)
+        .any(|symbol| has_symbol(symbol))
 }
 
 unsafe fn lower_ifunc_call(

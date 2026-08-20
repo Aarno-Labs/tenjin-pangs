@@ -479,9 +479,22 @@ pub struct SteensClasses {
     /// One bit per PIR global. False proves that the global symbol is used only as the
     /// address operand of direct memory accesses.
     pub global_address_exposed: Vec<bool>,
-    /// Module-wide violations without a complete value-flow certificate disable exposure
-    /// filtering for every node resolution.
-    pub module_violation_tainted: bool,
+    /// Storage reachable by assumption violations. Modeled inline assembly names its exact
+    /// pointer-capable operand/result nodes; only opaque assembly defeats exposure filtering
+    /// module-wide.
+    pub violation_exposure: ViolationExposure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViolationExposure {
+    Finite(BTreeSet<NodeId>),
+    ModuleWide,
+}
+
+impl Default for ViolationExposure {
+    fn default() -> Self {
+        Self::Finite(BTreeSet::new())
+    }
 }
 
 impl SteensClasses {
@@ -851,7 +864,7 @@ struct Solver<'a> {
     global_keys: Vec<String>,
     global_object_nodes: Vec<Option<NodeId>>,
     global_address_exposed: Vec<bool>,
-    module_violation_tainted: bool,
+    violation_exposure: ViolationExposure,
     exact_addresses: Vec<Option<ExactAddress>>,
     field_classes: HashMap<(NodeId, FieldRegion), usize>,
     fields_by_root: HashMap<NodeId, Vec<usize>>,
@@ -1210,18 +1223,46 @@ fn global_address_exposure(pir: &Pir, pag: &Pag) -> Vec<bool> {
     exposed
 }
 
-fn module_violation_tainted(pir: &Pir) -> bool {
-    // Match the existing module-wide violation discipline: inline assembly has no complete
-    // value-operand flow certificate and can name storage outside the modeled IR. Other
-    // lowered `Unknown` statements explicitly expose their operands/results to Ω, so the
-    // per-global exposure proof remains applicable to globals absent from those values.
-    pir.functions
+fn violation_exposure(pir: &Pir, pag: &Pag) -> ViolationExposure {
+    // A statement with no modeled value boundary, or one whose lowerer found an embedded symbol,
+    // can touch storage absent from the PAG. Everything else is bounded by the Ω seeds emitted
+    // for its pointer-capable operands/results.
+    let inline_asm = pir
+        .functions
         .iter()
         .flat_map(|func| &func.body)
         .chain(&pir.global_init)
-        .any(|stmt| {
-            matches!(stmt, pangs_pir::Stmt::Unknown { reason, .. } if reason.starts_with("inline_asm"))
+        .filter_map(|stmt| match stmt {
+            pangs_pir::Stmt::Unknown {
+                operands,
+                results,
+                reason,
+                ..
+            } if reason.starts_with("inline_asm") => Some((operands, results, reason)),
+            _ => None,
         })
+        .collect::<Vec<_>>();
+
+    if inline_asm.iter().any(|(operands, results, reason)| {
+        (operands.is_empty() && results.is_empty()) || reason.contains("symbol_reference")
+    }) {
+        return ViolationExposure::ModuleWide;
+    }
+
+    let nodes = pag
+        .omega_seeds
+        .iter()
+        .filter(|seed| {
+            seed.detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("inline_asm"))
+        })
+        .filter_map(|seed| match seed.target {
+            SeedTarget::Node(node) => Some(node),
+            SeedTarget::Callsite(_) => None,
+        })
+        .collect();
+    ViolationExposure::Finite(nodes)
 }
 
 #[derive(Debug, Clone)]
@@ -1297,7 +1338,7 @@ impl<'a> Solver<'a> {
             .collect::<HashMap<_, _>>();
         let mut global_object_nodes = vec![None; global_keys.len()];
         let global_address_exposed = global_address_exposure(pir, pag);
-        let module_violation_tainted = module_violation_tainted(pir);
+        let violation_exposure = violation_exposure(pir, pag);
 
         let mut classes = Vec::with_capacity(pag.nodes.len());
         for (index, node) in pag.nodes.iter().enumerate() {
@@ -1360,7 +1401,7 @@ impl<'a> Solver<'a> {
             global_keys,
             global_object_nodes,
             global_address_exposed,
-            module_violation_tainted,
+            violation_exposure,
             exact_addresses,
             field_classes: HashMap::new(),
             fields_by_root: HashMap::new(),
@@ -1427,7 +1468,7 @@ impl<'a> Solver<'a> {
             esc,
             global_storage,
             global_address_exposed: self.global_address_exposed.clone(),
-            module_violation_tainted: self.module_violation_tainted,
+            violation_exposure: self.violation_exposure.clone(),
         }
     }
 
@@ -1828,7 +1869,9 @@ impl<'a> Solver<'a> {
                             unfiltered_pointee_globals_by_root[pointee] = Some(globals.clone());
                             globals
                         };
-                    if self.module_violation_tainted || self.classes[root].universal {
+                    if matches!(self.violation_exposure, ViolationExposure::ModuleWide)
+                        || self.classes[root].universal
+                    {
                         return (unfiltered, SharedStringList::default());
                     }
                     let filtered = if let Some(globals) = &exposed_pointee_globals_by_root[pointee]
@@ -3160,6 +3203,73 @@ mod tests {
             );
             assert!(resolution.pointee_globals_unfiltered.is_empty());
         }
+    }
+
+    #[test]
+    fn inline_asm_violation_exposure_is_operand_local_unless_opaque() {
+        let mut modeled = frontier_test_func("asm_user");
+        modeled.body = vec![pangs_pir::Stmt::Unknown {
+            op: "call".into(),
+            operands: vec!["@bits".into(), "%scalar".into()],
+            results: Vec::new(),
+            reason: "inline_asm".into(),
+            loc: None,
+        }];
+        let mut pir = Pir {
+            module: "modeled_inline_asm".into(),
+            source: None,
+            lowering: Default::default(),
+            target: None,
+            functions: vec![modeled],
+            globals: vec![
+                Global {
+                    key: "bits".into(),
+                    ..Global::default()
+                },
+                Global {
+                    key: "transfersl".into(),
+                    ..Global::default()
+                },
+            ],
+            global_init: Vec::new(),
+        };
+        pir.lowering
+            .semantic_value_kinds
+            .insert("%scalar".into(), pangs_pir::ValueKind::NonPointer);
+        let pag = Pag::from_pir(&pir, &pangs_pag::PagOpts::default());
+
+        let ViolationExposure::Finite(nodes) = violation_exposure(&pir, &pag) else {
+            panic!("modeled inline assembly must have finite exposure");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            pag.nodes[nodes.iter().next().unwrap().0 as usize].label,
+            "sym:global:@bits"
+        );
+        assert_eq!(global_address_exposure(&pir, &pag), vec![true, false]);
+        assert!(pag.omega_seeds.iter().all(|seed| {
+            !matches!(seed.target, SeedTarget::Node(node) if pag.nodes[node.0 as usize].label == "val:asm_user:%scalar")
+        }));
+
+        if let pangs_pir::Stmt::Unknown { operands, .. } = &mut pir.functions[0].body[0] {
+            operands.clear();
+        }
+        assert_eq!(
+            violation_exposure(&pir, &Pag::from_pir(&pir, &pangs_pag::PagOpts::default())),
+            ViolationExposure::ModuleWide
+        );
+
+        if let pangs_pir::Stmt::Unknown {
+            operands, reason, ..
+        } = &mut pir.functions[0].body[0]
+        {
+            operands.push("@bits".into());
+            *reason = "inline_asm_symbol_reference".into();
+        }
+        assert_eq!(
+            violation_exposure(&pir, &Pag::from_pir(&pir, &pangs_pag::PagOpts::default())),
+            ViolationExposure::ModuleWide
+        );
     }
 
     #[test]

@@ -760,6 +760,31 @@ fn lowers_inline_asm_calls_as_unknown_and_taints_them() {
 }
 
 #[test]
+fn classifies_operand_bounded_and_symbol_referencing_inline_asm() {
+    let pir = Pir::from_path(m1_1_fixture("inline_asm_exposure.ll")).unwrap();
+    let bounded = pir
+        .functions
+        .iter()
+        .find(|func| func.key == "bounded_asm")
+        .unwrap();
+    assert!(bounded.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { operands, reason, .. }
+            if operands == &["@bits".to_string()] && reason == "inline_asm"
+    )));
+
+    let symbol = pir
+        .functions
+        .iter()
+        .find(|func| func.key == "symbol_asm")
+        .unwrap();
+    assert!(symbol.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::Unknown { reason, .. } if reason == "inline_asm_symbol_reference"
+    )));
+}
+
+#[test]
 fn lowers_large_struct_byval_and_sret_from_bitcode() {
     assert!(
         Path::new(CLANG_14).exists(),
