@@ -3247,6 +3247,7 @@ mod tests {
                 access_bytes: None,
                 access_extent_unknown: false,
                 volatile: false,
+                modeled_external_write: false,
                 loc: None,
             },
             pangs_pag::Edge {
@@ -3258,6 +3259,7 @@ mod tests {
                 access_bytes: None,
                 access_extent_unknown: false,
                 volatile: false,
+                modeled_external_write: false,
                 loc: None,
             },
             pangs_pag::Edge {
@@ -3272,6 +3274,7 @@ mod tests {
                 access_bytes: None,
                 access_extent_unknown: false,
                 volatile: false,
+                modeled_external_write: false,
                 loc: None,
             },
         ];
@@ -3811,6 +3814,32 @@ mod tests {
         assert!(!result.globals["@Esc"].never_written);
         assert!(!result.globals["@Local"].escape_external);
         assert!(result.globals["@Local"].never_written);
+    }
+
+    #[test]
+    fn modeled_scanf_output_is_written_without_external_escape() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"scanf-summary",
+                "globals":[{"key":"@out","initializer_ir":"i8 0"}],
+                "functions":[
+                    {"key":"main","exported":true,"sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"call_direct","callee":"sscanf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"args":["%input","%dynamic_format","@out"]}
+                    ]},
+                    {"key":"sscanf","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"body":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let steens = solve_steensgaard(&pir, &pag, BuildMode::Executable);
+        assert!(!steens.globals["@out"].escape_external);
+        assert!(!steens.globals["@out"].never_written);
+
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Executable, u64::MAX);
+        assert!(!andersen.globals["@out"].escape_external);
+        assert!(!andersen.globals["@out"].never_written);
     }
 
     #[test]

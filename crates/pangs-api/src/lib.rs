@@ -5106,9 +5106,10 @@ fn push_pointer_modrefs_from_pag(
                 {
                     continue;
                 }
-                if precise_storage_addresses
-                    .direct_global_symbols
-                    .contains(&pointer_access.address_node)
+                if pointer_access.suppress_direct_symbol
+                    && precise_storage_addresses
+                        .direct_global_symbols
+                        .contains(&pointer_access.address_node)
                 {
                     continue;
                 }
@@ -5669,8 +5670,12 @@ fn edge_accesses(
                 volatile: edge.volatile,
                 address_node: edge.dst,
                 unknown_reason: "omega_store",
-                detail: "edge:store",
-                suppress_direct_symbol: true,
+                detail: if edge.modeled_external_write {
+                    "edge:modeled_external_write"
+                } else {
+                    "edge:store"
+                },
+                suppress_direct_symbol: !edge.modeled_external_write,
             }],
         )),
         EdgeKind::Memcpy { .. } => Some((
@@ -7186,6 +7191,94 @@ mod component_tests {
         );
 
         assert_eq!(roots, vec![BTreeSet::from([FuncId(0)])]);
+    }
+
+    #[test]
+    fn modeled_scanf_write_is_complete_non_escaping_and_localizable() {
+        let scanf_sig = pangs_pir::Signature {
+            ret: pangs_pir::AbiClass::Integer,
+            params: vec![pangs_pir::Param::Integer, pangs_pir::Param::Integer],
+            vararg: true,
+            cc: "ccc".into(),
+        };
+        let module = Pir {
+            module: "scanf-summary".into(),
+            source: None,
+            lowering: Default::default(),
+            target: None,
+            globals: vec![pangs_pir::Global {
+                key: "out".into(),
+                initializer_ir: Some("i8 0".into()),
+                ..Default::default()
+            }],
+            functions: vec![
+                pangs_pir::Func {
+                    key: "main".into(),
+                    sig: pangs_pir::Signature {
+                        ret: pangs_pir::AbiClass::Void,
+                        params: Vec::new(),
+                        vararg: false,
+                        cc: "ccc".into(),
+                    },
+                    param_names: Vec::new(),
+                    file: None,
+                    line: None,
+                    external: false,
+                    exported: true,
+                    address_taken: false,
+                    body: vec![Stmt::CallDirect {
+                        callee: "sscanf".into(),
+                        sig: scanf_sig.clone(),
+                        args: vec!["%input".into(), "%dynamic_format".into(), "@out".into()],
+                        dest: None,
+                        loc: None,
+                    }],
+                },
+                pangs_pir::Func {
+                    key: "sscanf".into(),
+                    sig: scanf_sig,
+                    param_names: vec!["%input".into(), "%format".into()],
+                    file: None,
+                    line: None,
+                    external: true,
+                    exported: false,
+                    address_taken: false,
+                    body: Vec::new(),
+                },
+            ],
+            global_init: Vec::new(),
+        };
+        let analysis = Analysis::run_with_disposition(
+            &module,
+            &Opts {
+                stage: Stage::Andersen,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let global = analysis.lookup_global("out").unwrap();
+
+        assert!(!analysis.globals()[global].address_escaped);
+        assert!(!analysis.globals()[global].never_written);
+        assert!(!analysis.globals()[global].stationary);
+        assert!(
+            analysis.modrefs().iter().any(|row| {
+                row.global == GlobalTarget::Name(global)
+                    && row.access == Access::Mod
+                    && row.via == Via::Aliased
+            }),
+            "modrefs: {:#?}",
+            analysis.modrefs()
+        );
+        assert!(analysis
+            .access_sites_for_global(global)
+            .any(|site| site.access == Access::Mod && site.via == Via::Aliased));
+        assert!(analysis
+            .context_rewrite_plan()
+            .fields
+            .iter()
+            .any(|field| field.global == global && field.blockers.is_empty()));
     }
 
     #[test]

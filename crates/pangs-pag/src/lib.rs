@@ -778,6 +778,11 @@ pub struct Edge {
     pub access_extent_unknown: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub volatile: bool,
+    /// The memory effect is a summary of a non-capturing external call, rather than a source
+    /// load/store expression. Consumers must retain the effect for ModRef while treating its
+    /// address use as indirect for source-materialization purposes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub modeled_external_write: bool,
     #[serde(default)]
     pub loc: Option<Loc>,
 }
@@ -1493,11 +1498,14 @@ impl<'a> Builder<'a> {
                 let printf_effect = is_external
                     .then(|| proven_printf_effect(self.pir, callee, args))
                     .flatten();
+                let scanf_destination_start = coarse_scanf_fixed_args(callee)
+                    .filter(|&fixed| is_external && sig.vararg && sig.params.len() == fixed);
                 let external_boundary = !fresh_allocation
                     && return_alias.is_none()
                     && external_readonly_result.is_none()
                     && !pure_constant_external
                     && printf_effect.is_none()
+                    && scanf_destination_start.is_none()
                     && self
                         .functions
                         .get(callee)
@@ -1555,6 +1563,43 @@ impl<'a> Builder<'a> {
                             owner.clone(),
                             loc.clone(),
                         );
+                    }
+                }
+                if let Some(start) = scanf_destination_start {
+                    let destinations = arg_nodes
+                        .iter()
+                        .copied()
+                        .skip(start)
+                        .filter(|destination| {
+                            self.nodes[destination.0 as usize]
+                                .value_kind
+                                .may_carry_pointer()
+                        })
+                        .collect::<Vec<_>>();
+                    if !destinations.is_empty() {
+                        let source = self.add_node(
+                            NodeKey::ExternalNonPointerWrite(func_index, stmt_index),
+                            format!(
+                                "val:{}:@scanf-nonpointer-write:{stmt_index}",
+                                owner_name(&owner)
+                            ),
+                            NodeKind::Value {
+                                scope: owner_scope(&owner),
+                            },
+                        );
+                        for destination in destinations {
+                            let edge = self.add_memory_edge(
+                                EdgeKind::Store,
+                                source,
+                                destination,
+                                owner.clone(),
+                                None,
+                                true,
+                                false,
+                                loc.clone(),
+                            );
+                            self.edges[edge.0 as usize].modeled_external_write = true;
+                        }
                     }
                 }
                 if let Some(callee_index) = self.functions.get(callee).copied() {
@@ -1671,7 +1716,7 @@ impl<'a> Builder<'a> {
                         Some(callee.clone()),
                     );
                 }
-                if sig.vararg && self.direct_vararg_call_requires_boundary(callee, args) {
+                if sig.vararg && self.direct_vararg_call_requires_boundary(callee, sig, args) {
                     self.add_seed(
                         OmegaSeedKind::VarargCallBoundary,
                         SeedTarget::Callsite(callsite),
@@ -1771,7 +1816,23 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn direct_vararg_call_requires_boundary(&mut self, callee: &str, args: &[String]) -> bool {
+    fn direct_vararg_call_requires_boundary(
+        &mut self,
+        callee: &str,
+        sig: &Signature,
+        args: &[String],
+    ) -> bool {
+        let external = self
+            .functions
+            .get(callee)
+            .and_then(|index| self.pir.functions.get(*index))
+            .map(|func| func.external)
+            .unwrap_or(true);
+        if external
+            && coarse_scanf_fixed_args(callee).is_some_and(|fixed| sig.params.len() == fixed)
+        {
+            return false;
+        }
         if self.vararg_call_proof.is_benign(callee, args) {
             return false;
         }
@@ -1810,6 +1871,7 @@ impl<'a> Builder<'a> {
             access_bytes: None,
             access_extent_unknown: false,
             volatile: false,
+            modeled_external_write: false,
             loc,
         });
         id
@@ -2028,6 +2090,25 @@ fn printf_format_arg(callee: &str) -> Option<usize> {
         "printf" => Some(0),
         "fprintf" | "sprintf" | "dprintf" => Some(1),
         "snprintf" => Some(2),
+        _ => None,
+    }
+}
+
+/// Standard scanf-family conversion arguments are caller-owned output pointers which are used
+/// only for the duration of the call. The coarse model deliberately does not parse the format:
+/// every pointer-valued variadic actual may be written, which over-approximates suppressed,
+/// conditional, and unused conversions without turning a non-capturing libc contract into an
+/// address escape. `v*scanf` entry points are excluded because their destinations are hidden in a
+/// `va_list` rather than present as positional callsite actuals.
+fn coarse_scanf_fixed_args(callee: &str) -> Option<usize> {
+    let callee = callee.strip_prefix('@').unwrap_or(callee);
+    let base = callee
+        .strip_prefix("__isoc99_")
+        .or_else(|| callee.strip_prefix("__isoc23_"))
+        .unwrap_or(callee);
+    match base {
+        "scanf" | "wscanf" => Some(1),
+        "fscanf" | "sscanf" | "fwscanf" | "swscanf" => Some(2),
         _ => None,
     }
 }
@@ -3577,6 +3658,47 @@ mod tests {
     }
 
     #[test]
+    fn scanf_family_models_pointer_outputs_as_non_capturing_writes() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"scanf-summary",
+                "globals":[
+                    {"key":"@out_a","initializer_ir":"i8 0"},
+                    {"key":"@out_b","initializer_ir":"i32 0"}
+                ],
+                "functions":[
+                    {"key":"main","exported":true,"sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"call_direct","callee":"sscanf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"args":["%input","%dynamic_format","@out_a"]},
+                        {"kind":"call_direct","callee":"__isoc99_scanf","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}],"vararg":true},"args":["%dynamic_format","@out_b"]}
+                    ]},
+                    {"key":"sscanf","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"vararg":true},"body":[]},
+                    {"key":"__isoc99_scanf","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}],"vararg":true},"body":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        assert_eq!(pag.callsites.len(), 2);
+        for callsite in &pag.callsites {
+            assert!(!callsite.external_boundary);
+            assert!(!pag.omega_seeds.iter().any(|seed| {
+                matches!(
+                    seed.kind,
+                    OmegaSeedKind::ExternalCallBoundary | OmegaSeedKind::VarargCallBoundary
+                ) && seed.target == SeedTarget::Callsite(callsite.id)
+            }));
+            let destination = *callsite.args.last().unwrap();
+            assert!(pag.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Store
+                    && edge.dst == destination
+                    && edge.modeled_external_write
+                    && edge.access_extent_unknown
+            }));
+        }
+    }
+
+    #[test]
     fn comparison_only_ptrtoint_does_not_seed_omega() {
         let pir: Pir = serde_json::from_str(
             r#"{
@@ -3785,6 +3907,7 @@ mod tests {
                 access_bytes: None,
                 access_extent_unknown: false,
                 volatile: false,
+                modeled_external_write: false,
                 loc: None,
             });
             let roots = allocation_storage_roots(&pir, &malformed);
