@@ -492,3 +492,30 @@ The representation therefore makes this forced megacomponent solvable, but does 
 cheap and does not improve default-budget coverage. A separate experiment must determine whether
 the quadratic admission proxy can be made summary-aware without admitting unrelated pathological
 components; the current budget must not simply be raised.
+
+### Callsite-local cut/shortcut rewriting, tiers 1–2 (2026-08-21)
+
+Implemented (then abandoned) `20260821_CUTSHORT.md`: fixed-PAG local-flow, getter, and complete-caller setter
+certificates; return/Store cuts; per-callsite copy/load/Store replicas; propagation-only address
+chains; baseline-admission preservation for accessors; profile/census knobs; and an explicit
+baseline-versus-rewritten differential ledger. The workspace suite passed after implementation.
+
+The 56-module census found 75,215 tier-1 callsites, but only 2,265 had a nonempty parameter-source
+set (four modules reached 1% of direct calls on that meaningful measure). Getters covered 1,673
+callsites; setters covered 2,194 after excluding constant-only stores. That exclusion fixed a real
+Curl O1 widening found by the ledger: removing a null Store had removed direct-access bookkeeping
+despite carrying no pointer payload.
+
+Fifty-three three-arm disposition pairs validated; both Vim inputs and OpenSSL exceeded a
+180-second cap in every arm. Tier 1 and combined shortcuts respectively measured 0.978x and 0.979x
+geometric-mean wall, with 1.000x and 1.003x aggregate peak RSS. The fixed combined arm reduced
+copy/load/store/GEP propagation pairs by 13%/11%/20%/24%. It did not change oversize-fallback or
+in-scope-icall counts. All completed-pair disposition distributions were identical (1,011/1,795
+handled); only tmux O1 and library Curl O1 changed detailed manifests.
+
+The W2 ledger was clean on every completed performance module after extended checks for Curl O0,
+libplacebo, and SQLite O0. It found ModRef-row reductions in tmux O1, FreeType, and Zstd and no
+widened lattice fact. No persisted instrumented-corpus traces were available, so the mandatory
+dynamic-recall gate remains unresolved. Both shortcut knobs stay default-off; the result does not
+justify a default without trace recall, repeated timings, or a material flagship
+disposition/admission effect.
