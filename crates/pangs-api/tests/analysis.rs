@@ -1961,6 +1961,76 @@ fn allocation_provenance_isolates_forged_pointer_effects_per_global() {
 }
 
 #[test]
+fn direct_constant_gep_global_write_survives_solver_fact_merge() {
+    let pir = Pir {
+        module: "constant-gep-global-write".to_string(),
+        source: None,
+        lowering: Default::default(),
+        target: None,
+        functions: vec![Func {
+            key: "writer".to_string(),
+            sig: sig(AbiClass::Void, vec![]),
+            param_names: vec![],
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: false,
+            body: vec![
+                Stmt::Store {
+                    address: "i8* getelementptr inbounds ([2 x i8], [2 x i8]* @G, i64 0, i64 1)"
+                        .to_string(),
+                    value: "0".to_string(),
+                    volatile: false,
+                    access_bytes: Some(1),
+                    loc: None,
+                },
+                Stmt::GlobalRef {
+                    global: "@G".to_string(),
+                    access: Access::Mod,
+                    volatile: false,
+                    loc: None,
+                },
+            ],
+        }],
+        globals: vec![Global {
+            key: "@G".to_string(),
+            file: None,
+            line: None,
+            is_const: false,
+            mutable: true,
+            init_refs: Vec::new(),
+            exported: false,
+            ..Global::default()
+        }],
+        global_init: vec![],
+    };
+
+    for stage in [Stage::Conservative, Stage::Steens, Stage::Andersen] {
+        let analysis = Analysis::run(
+            &pir,
+            &Opts {
+                stage,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let global = analysis.lookup_global("@G").unwrap();
+        let info = &analysis.globals()[global];
+
+        assert!(!info.never_written, "{stage:?}");
+        assert!(info.runtime_written, "{stage:?}");
+        let writer = analysis.lookup_func("writer").unwrap();
+        assert!(analysis.modref(writer).any(|row| {
+            row.access == Access::Mod
+                && matches!(row.global, pangs_api::GlobalTarget::Name(id) if id == global)
+                && row.witness.as_deref() == Some("writer@!noloc#0")
+        }));
+    }
+}
+
+#[test]
 fn steens_ptrtoint_marks_only_the_pointee_global_as_external() {
     let pir = Pir::from_path(m1_4_fixture("ptrtoint_escape.pir.json")).unwrap();
     let analysis = Analysis::run(

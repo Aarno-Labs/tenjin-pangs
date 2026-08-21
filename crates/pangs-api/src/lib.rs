@@ -1612,8 +1612,13 @@ impl Analysis {
                             .iter()
                             .find(|source| *source != &own_export)
                             .cloned();
-                        global.never_written = state.never_written;
-                        global.runtime_written = state.runtime_written;
+                        // The initial PIR scan records exact direct GlobalRef writes.  Solver
+                        // facts add indirect writes and may remove class-induced false positives,
+                        // but must not erase that independent positive evidence.  In particular,
+                        // constant-expression GEP addresses intentionally remain standalone PAG
+                        // values, so their exact GlobalRef is the authoritative write witness.
+                        global.never_written &= state.never_written;
+                        global.runtime_written |= state.runtime_written;
                     }
                 }
                 mark_external_storage_globals(
