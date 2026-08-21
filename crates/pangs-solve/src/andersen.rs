@@ -4217,6 +4217,15 @@ fn closed_consumers_enabled() -> bool {
     std::env::var_os(knobs::ENV_ANDERSEN_CLOSED_CONSUMERS).is_some()
 }
 
+fn memcpy_edge_summaries_enabled_for(value: Option<&str>) -> bool {
+    !matches!(value, Some("0"))
+}
+
+fn memcpy_edge_summaries_enabled() -> bool {
+    let value = std::env::var(knobs::ENV_ANDERSEN_MEMCPY_EDGE_SUMMARIES).ok();
+    memcpy_edge_summaries_enabled_for(value.as_deref())
+}
+
 fn graph_reachable(start: usize, adjacency: &[Vec<usize>]) -> HashSet<usize> {
     let mut reachable = HashSet::from([start]);
     let mut stack = vec![start];
@@ -5133,8 +5142,7 @@ impl Solve {
             scc_nodes_collapsed: 0,
             scc_copy_edges_removed: 0,
             hybrid_points_to: std::env::var_os(knobs::ENV_ANDERSEN_HYBRID_BITSETS).is_some(),
-            memcpy_edge_summaries: std::env::var_os(knobs::ENV_ANDERSEN_MEMCPY_EDGE_SUMMARIES)
-                .is_some(),
+            memcpy_edge_summaries: memcpy_edge_summaries_enabled(),
         }
     }
 
@@ -6471,8 +6479,9 @@ mod tests {
     use pangs_pir::{Pir, Stmt};
 
     use super::{
-        finish_andersen_controlled, solve_andersen, solve_andersen_with_overrides,
-        AndersenControls, Cell, ExternalRegion, HybridPointSet, PointSet, Refiner, Solve,
+        finish_andersen_controlled, memcpy_edge_summaries_enabled_for, solve_andersen,
+        solve_andersen_with_overrides, AndersenControls, Cell, ExternalRegion, HybridPointSet,
+        PointSet, Refiner, Solve,
     };
     use crate::{solve_steensgaard, FieldLocation, PointsToMaterialization};
 
@@ -7125,6 +7134,7 @@ mod tests {
     #[test]
     fn memcpy_joins_only_new_pointee_pairs() {
         let mut solve = Solve::new(10, false);
+        solve.memcpy_edge_summaries = false;
         solve.add_memcpy(0, 1);
 
         solve.add_pts(0, 2);
@@ -7162,6 +7172,7 @@ mod tests {
     #[test]
     fn memcpy_with_same_endpoint_avoids_new_new_overlap() {
         let mut solve = Solve::new(6, false);
+        solve.memcpy_edge_summaries = false;
         solve.add_memcpy(0, 0);
         solve.add_pts(0, 1);
         solve.add_pts(0, 2);
@@ -7214,6 +7225,14 @@ mod tests {
             .pts
             .values()
             .all(|points_to| !points_to.contains(&summary)));
+    }
+
+    #[test]
+    fn memcpy_edge_summaries_default_on_with_zero_opt_out() {
+        assert!(memcpy_edge_summaries_enabled_for(None));
+        assert!(memcpy_edge_summaries_enabled_for(Some("1")));
+        assert!(memcpy_edge_summaries_enabled_for(Some("")));
+        assert!(!memcpy_edge_summaries_enabled_for(Some("0")));
     }
 
     #[test]

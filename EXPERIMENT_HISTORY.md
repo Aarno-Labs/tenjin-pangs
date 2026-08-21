@@ -448,7 +448,17 @@ Focused tests compare direct and summarized incremental joins, empty endpoint se
 activation, late exact/lane/unknown field materialization, external propagation, copy-SCC
 canonicalization, and non-pointee identity. The full workspace suite passed (396 tests). A
 small function-pointer aggregate fixture produced identical normalized client exports with both
-closed certificates enabled. The feature remains opt-in; adaptive promotion is not implemented.
+closed certificates enabled. The feature remained opt-in at this stage; adaptive promotion was
+not implemented.
+
+On 2026-08-21, a 56-module corpus A/B found essentially neutral typical overhead
+(0.996x geometric-mean and 1.006x median wall-time ratios, with unchanged typical RSS)
+and byte-identical manifests and audits across all 53 validated pairs. On normal Vim,
+the direct join exceeded a 600-second cap while summaries completed in 504.35 seconds;
+debug Vim and OpenSSL exceeded the cap in both modes. Summaries were therefore promoted
+to the default, with `PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES=0` retaining the direct join
+for ablation. Single-sample regressions on libplacebo, SQLite O0, and Curl O0 remain
+targets for isolated repetition.
 
 The exact gifsicle input was
 `/home/brk/pangs-corpus/_out_bc/exe-gifsicle-O0.bc` (SHA-256

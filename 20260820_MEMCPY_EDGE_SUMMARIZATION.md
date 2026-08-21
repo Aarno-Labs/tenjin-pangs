@@ -3,7 +3,9 @@
 ## Status
 
 The unconditional opt-in prototype was implemented and evaluated on 2026-08-20 under
-`PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES=1`. Focused and full-workspace tests pass. Forced
+`PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES=1`. It was promoted to the default on 2026-08-21;
+`PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES=0` retains the direct join for ablation. Focused
+and full-workspace tests pass. Forced
 gifsicle admission completes in 119.08 seconds at 2,301,692 KiB peak RSS, representing
 16,609,344,880 logical pairs with 6,021 summary edges and zero direct memcpy-pair
 iterations. Default admission remains unchanged. Adaptive promotion and a summary-aware
@@ -12,7 +14,7 @@ admission model are not implemented; see `EXPERIMENT_HISTORY.md` for the measure
 This experiment targets the intrinsic source-object × destination-object copy-edge
 product created by Andersen's field-insensitive `memcpy` rule. It does not change PAG
 construction, prepartition admission, ModRef, or the semantic treatment of copied bytes.
-The first implementation is opt-in and must preserve all client-visible analysis exports.
+The first implementation was opt-in and had to preserve all client-visible analysis exports.
 
 ## 1. Problem statement
 

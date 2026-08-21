@@ -371,8 +371,9 @@ established relations from newly installed relations:
   `new_dst × all_src` and `old_dst × new_src`, so each required object pair is visited
   once.
 
-`PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES` experimentally changes only the last relation's
-physical representation. Each admitted memcpy receives a fresh propagation-only cell;
+The Andersen solver summarizes memcpy edges by default. Set
+`PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES=0` to restore the direct Cartesian join for
+ablation. Each admitted memcpy receives a fresh propagation-only cell;
 once both endpoint sets are nonempty, sources point to the summary and the summary points
 to destinations. Logical endpoint sets remain explicit for closed-producer and
 closed-consumer audits, and one-sided joins retain the direct rule's access guards. The
