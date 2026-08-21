@@ -90,10 +90,15 @@ The exact-name external summary registry is deliberately small and shape checked
 addition to safe format consumers, it can classify an external as pure/constant-returning,
 read-only over client state, or returning an interior alias of a particular argument.
 Implemented examples include `__ctype_get_*` accessors, the glibc ctype tables, and standard
-byte/string search routines such as `strchr`. A name match with the wrong call shape is not
-a proof: unlisted or mismatched calls retain the normal Ω effects. Known positional
-variadic bindings are modeled only when the callee's consumption is visible; otherwise
-function-pointer actuals and other pointer-bearing tail arguments fail closed.
+byte/string search routines such as `strchr`. Standard `free` is also recognized when a direct
+external call has exactly one integer-ABI-class argument, a non-variadic void signature, and no
+result. Its argument is a non-capturing terminal: the call produces no pointer flow and has no
+client-state Mod/Ref effect. A module-defined `free`, an indirect or unresolved call, or a name
+match with the wrong call shape retains the normal Ω effects. This summary trusts the standard
+library contract and does not model either statically linked replacements from unanalyzed
+translation units or dynamic interposition. Other unlisted calls retain the normal Ω effects.
+Known positional variadic bindings are modeled only when the callee's consumption is visible;
+otherwise function-pointer actuals and other pointer-bearing tail arguments fail closed.
 
 **Cut:**
 - **Typed heap clones** (cclyzer use-based back-propagation). v1 uses plain
@@ -283,7 +288,9 @@ facts once and checks their fixed PAG transfers:
   preserve each named-function fact at every modeled destination;
 - external and vararg arguments, exported or opaque storage, pointer/integer escape,
   unsupported function-address arithmetic, external regions, and returns from functions
-  that still have unknown callers are open terminals; and
+  that still have unknown callers are open terminals; the sole argument of a recognized standard
+  `free` call is the exception, including pointer contents reachable only through the destroyed
+  container; and
 - an address producer or transfer omitted at an admission boundary makes that function
   uncertifiable.
 
@@ -546,12 +553,17 @@ Library mode additionally treats exported functions as unknown-caller entries an
 global addresses as externally reachable; an explicit export set overrides the defaults.
 
 Finite pointee-class enumeration is additionally filtered by a per-global address-exposure bit.
-A global is unexposed only when every modeled use of its symbol is the address operand of a direct
-load/store (including the load/store representation of `atomicrmw` and `cmpxchg`); GEPs, address
-copies, stores as a value, calls, returns, `ptrtoint`, initializer capture, export, and unknown
-operations all expose it. An unexposed object cannot be the target of another pointer because its
-address never exists as a program value, so class-unification side effects alone do not justify
-including it in a finite `pointee_globals` set. Universal external rows bypass the filter. Inline
+A global is unexposed only when the storage-root proof accounts for every producer and every use of
+its symbol or derived address. GEP and same-root-or-null local assignments may preserve the root;
+direct load/store address operands (including the load/store representation of `atomicrmw` and
+`cmpxchg`) consume it safely. The sole argument of a recognized standard `free` call is also a safe
+terminal. `free` does not capture, publish, or propagate that address; under the defined-C contract,
+an execution of `free(&global)` is undefined and need not be diagnosed or compensated for. Memcpy
+and memset operands, mixed or cross-function joins, stores as a value, all other calls, returns,
+`ptrtoint`, initializer capture, export, unsupported producers, and unknown operations expose every
+root they can carry. Thus every admitted use of an unexposed global address is proven
+non-capturing and non-publishing; class-unification side effects alone do not justify including the
+global in a finite `pointee_globals` set. Universal external rows bypass the filter. Inline
 assembly with modeled operands seeds Ω only from its pointer-capable operands and results, so
 globals whose address-flow closure is disjoint remain filtered. Assembly that embeds symbol
 references or otherwise has no bounded modeled storage operand records module-wide violation

@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pangs_pir::{
-    external_return_alias_arg, GepLane, Loc, Pir, Signature, Stmt, ValueKind, VarArgPosition,
+    external_return_alias_arg, AbiClass, GepLane, Loc, Param, Pir, Signature, Stmt, ValueKind,
+    VarArgPosition,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1476,12 +1477,9 @@ impl<'a> Builder<'a> {
                     .as_ref()
                     .map(|dest| self.value_node(func_index, owner_scope(&owner), dest));
                 let fresh_allocation = is_fresh_allocator(callee) && result.is_some();
-                let is_external = self
-                    .functions
-                    .get(callee)
-                    .and_then(|index| self.pir.functions.get(*index))
-                    .map(|func| func.external)
-                    .unwrap_or(true);
+                let is_external = direct_callee_is_external(self.pir, callee);
+                let trusted_free =
+                    trusted_free_call(self.pir, callee, sig, args.len(), dest.is_some());
                 let return_alias = is_external
                     .then(|| external_return_alias_arg(callee))
                     .flatten()
@@ -1506,12 +1504,8 @@ impl<'a> Builder<'a> {
                     && !pure_constant_external
                     && printf_effect.is_none()
                     && scanf_destination_start.is_none()
-                    && self
-                        .functions
-                        .get(callee)
-                        .and_then(|index| self.pir.functions.get(*index))
-                        .map(|func| func.external)
-                        .unwrap_or(true);
+                    && !trusted_free
+                    && is_external;
                 if let Some((arg, result)) = return_alias {
                     self.add_edge(EdgeKind::Assign, arg, result, owner.clone(), loc.clone());
                 }
@@ -2066,6 +2060,39 @@ fn is_fresh_allocator(callee: &str) -> bool {
         callee.strip_prefix('@').unwrap_or(callee),
         "malloc" | "calloc" | "aligned_alloc"
     )
+}
+
+/// Whether a direct callee is outside the analyzed module. Missing declarations retain the
+/// existing external-call fallback.
+pub fn direct_callee_is_external(pir: &Pir, callee: &str) -> bool {
+    pir.functions
+        .iter()
+        .find(|function| function.key == callee)
+        .map(|function| function.external)
+        .unwrap_or(true)
+}
+
+/// Recognize the standard `free(void *)` contract at a direct callsite. PIR classifies LLVM
+/// pointers in the integer ABI class, so exact name plus this complete call shape is the strongest
+/// check available without restoring source-level types. Replacement implementations present in
+/// the analyzed module are deliberately excluded.
+pub fn trusted_free_call(
+    pir: &Pir,
+    callee: &str,
+    sig: &Signature,
+    arg_count: usize,
+    has_result: bool,
+) -> bool {
+    pir.functions
+        .iter()
+        .find(|function| function.key == callee)
+        .is_some_and(|function| function.external)
+        && callee.strip_prefix('@').unwrap_or(callee) == "free"
+        && arg_count == 1
+        && matches!(sig.params.as_slice(), [Param::Integer])
+        && !sig.vararg
+        && sig.ret == AbiClass::Void
+        && !has_result
 }
 
 /// Exact-name external functions whose pointer result leads only to stable external readonly
@@ -3136,9 +3163,9 @@ fn is_exported_global(marked: bool, key: &str, opts: &PagOpts) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        allocation_storage_roots, direct_vararg_call_is_benign, Edge, EdgeId, EdgeKind, NodeKind,
-        ObjectKind, OmegaSeedKind, Owner, Pag, PagOpts, SeedTarget, StorageRoot, StorageRootState,
-        VarargCallProof,
+        allocation_storage_roots, direct_vararg_call_is_benign, trusted_free_call, Edge, EdgeId,
+        EdgeKind, NodeKind, ObjectKind, OmegaSeedKind, Owner, Pag, PagOpts, SeedTarget,
+        StorageRoot, StorageRootState, VarargCallProof,
     };
     use pangs_pir::{Global, Pir, Stmt, ValueKind};
     use std::collections::BTreeSet;
@@ -3654,6 +3681,69 @@ mod tests {
         assert!(pag.omega_seeds.iter().any(|seed| {
             seed.kind == OmegaSeedKind::ExternalCallBoundary
                 && seed.target == SeedTarget::Callsite(unmodeled.id)
+        }));
+    }
+
+    #[test]
+    fn trusted_free_requires_an_external_standard_call_with_exactly_one_argument() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"free-summary",
+                "functions":[
+                    {"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"call_direct","callee":"free","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["one"]},
+                        {"kind":"call_direct","callee":"free","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["one","two"]},
+                        {"kind":"call_direct","callee":"free","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"args":["one"],"dest":"result"}
+                    ]},
+                    {"key":"free","external":true,"sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"body":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let free_calls = pag
+            .callsites
+            .iter()
+            .filter(|callsite| callsite.callee.as_deref() == Some("free"))
+            .collect::<Vec<_>>();
+        assert_eq!(free_calls.len(), 3);
+        assert!(!free_calls[0].external_boundary);
+        assert!(free_calls[1].external_boundary);
+        assert!(free_calls[2].external_boundary);
+        assert!(!pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::ExternalCallBoundary
+                && seed.target == SeedTarget::Callsite(free_calls[0].id)
+        }));
+        for callsite in &free_calls[1..] {
+            assert!(pag.omega_seeds.iter().any(|seed| {
+                seed.kind == OmegaSeedKind::ExternalCallBoundary
+                    && seed.target == SeedTarget::Callsite(callsite.id)
+            }));
+        }
+
+        let mut replacement = pir.clone();
+        replacement.functions[1].external = false;
+        let call = &free_calls[0];
+        assert!(!trusted_free_call(
+            &replacement,
+            "free",
+            &call.sig,
+            call.args.len(),
+            call.result.is_some()
+        ));
+
+        let mut unresolved = pir.clone();
+        unresolved.functions.pop();
+        let unresolved_pag = Pag::from_pir(&unresolved, &PagOpts::default());
+        let unresolved_free = unresolved_pag
+            .callsites
+            .iter()
+            .find(|callsite| callsite.callee.as_deref() == Some("free"))
+            .unwrap();
+        assert!(unresolved_free.external_boundary);
+        assert!(unresolved_pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::ExternalCallBoundary
+                && seed.target == SeedTarget::Callsite(unresolved_free.id)
         }));
     }
 

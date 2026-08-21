@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use pangs_pag::{
-    allocation_storage_roots, BuildMode, CallKind, NodeId, NodeKind, ObjectKind, OmegaSeedKind,
-    Pag, SeedTarget, StorageRoot, StorageRootState, StorageRoots,
+    allocation_storage_roots, trusted_free_call, BuildMode, CallKind, NodeId, NodeKind, ObjectKind,
+    OmegaSeedKind, Pag, SeedTarget, StorageRoot, StorageRootState, StorageRoots,
 };
 use pangs_pir::{fsa_compatible, Pir, Signature};
 use serde::{Deserialize, Serialize};
@@ -1161,11 +1161,12 @@ struct MaterializedPointsTo {
     through_memory_external: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// Compute the negative-proof bit used when enumerating finite pointee classes.  A global is
-/// unexposed only when its symbol value is used exclusively as the address of a direct
-/// load/store.  Everything else is exposure: address propagation, GEP, storage as a value,
-/// calls/returns, ptr-to-int, unknown operations (including inline asm), initializer capture,
-/// or export.
+/// Compute the negative-proof bit used when enumerating finite pointee classes. A global is
+/// unexposed only when the storage-root certificate accounts for every producer and every use is
+/// a safe terminal: a direct load/store address or the sole argument of recognized standard
+/// `free`. Everything else fails closed, including memcpy/memset, cross-scope propagation,
+/// storage as a value, other calls/returns, ptr-to-int, unknown operations (including inline
+/// assembly), initializer capture, and export.
 fn global_address_exposure(pir: &Pir, pag: &Pag, roots: &StorageRoots) -> Vec<bool> {
     fn global_index(roots: &StorageRoots, node: NodeId) -> Option<usize> {
         match roots.states.get(node.0 as usize)? {
@@ -1263,6 +1264,19 @@ fn global_address_exposure(pir: &Pir, pag: &Pag, roots: &StorageRoots) -> Vec<bo
         }
     }
     for callsite in &pag.callsites {
+        let trusted_free = callsite.kind == CallKind::Direct
+            && callsite.callee.as_deref().is_some_and(|callee| {
+                trusted_free_call(
+                    pir,
+                    callee,
+                    &callsite.sig,
+                    callsite.args.len(),
+                    callsite.result.is_some(),
+                )
+            });
+        if trusted_free {
+            continue;
+        }
         for node in callsite.operand.iter().chain(&callsite.args) {
             expose(&mut exposed, roots, *node);
         }
@@ -3814,6 +3828,51 @@ mod tests {
         assert!(!result.globals["@Esc"].never_written);
         assert!(!result.globals["@Local"].escape_external);
         assert!(result.globals["@Local"].never_written);
+    }
+
+    #[test]
+    fn trusted_free_does_not_escape_a_freed_containers_pointer_payload() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"free-summary",
+                "globals":[
+                    {"key":"@payload","mutable":true},
+                    {"key":"@freed_address","mutable":true},
+                    {"key":"@malformed","mutable":true}
+                ],
+                "functions":[
+                    {"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"call_direct","callee":"malloc","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"args":["24"],"dest":"container"},
+                        {"kind":"store","address":"container","value":"@payload"},
+                        {"kind":"call_direct","callee":"free","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["container"]},
+                        {"kind":"gep","dest":"freed.elt","base":"@freed_address","byte_off":0},
+                        {"kind":"call_direct","callee":"free","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["freed.elt"]},
+                        {"kind":"gep","dest":"malformed.elt","base":"@malformed","byte_off":0},
+                        {"kind":"call_direct","callee":"free","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["malformed.elt","extra"]}
+                    ]},
+                    {"key":"malloc","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"body":[]},
+                    {"key":"free","external":true,"sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"body":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let roots = allocation_storage_roots(&pir, &pag);
+        assert_eq!(
+            global_address_exposure(&pir, &pag, &roots),
+            vec![true, false, true],
+            "trusted free is a safe terminal; a shape mismatch remains exposing"
+        );
+
+        for solved in [
+            solve_steensgaard(&pir, &pag, BuildMode::Executable),
+            solve_andersen(&pir, &pag, BuildMode::Executable, u64::MAX),
+        ] {
+            assert!(
+                !solved.globals["@payload"].escape_external,
+                "freeing the container must not recursively escape its pointer payload"
+            );
+        }
     }
 
     #[test]

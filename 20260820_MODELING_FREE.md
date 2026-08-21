@@ -4,7 +4,7 @@ Date: 2026-08-20
 
 ## Status
 
-Proposed.
+Implemented.
 
 ## 1. Summary
 
@@ -95,33 +95,20 @@ existing allocator, `printf`, `scanf`, and libc result models.
 
 ### 4.1 Recognize the call in `pangs-pag`
 
-Add a small exact-name predicate next to the existing external-call helpers in
-`crates/pangs-pag/src/lib.rs`:
+Add one shared classifier next to the existing external-call helpers in
+`crates/pangs-pag/src/lib.rs`. In `Stmt::CallDirect` lowering, use it as follows:
 
 ```rust
-fn is_free(callee: &str) -> bool {
-    callee.strip_prefix('@').unwrap_or(callee) == "free"
-}
+let trusted_free = trusted_free_call(pir, callee, sig, args.len(), dest.is_some());
 ```
 
-In `Stmt::CallDirect` lowering, combine that predicate with the standard call-shape check:
-
-```rust
-let trusted_free = is_external
-    && is_free(callee)
-    && args.len() == 1
-    && sig.params.len() == 1
-    && matches!(sig.params[0], Param::Integer)
-    && !sig.vararg
-    && matches!(sig.ret, AbiClass::Void)
-    && result.is_none();
-```
-
-PIR's ABI signature class represents an LLVM pointer as `Integer`, so this is the strongest shape
-check available without adding type information to PIR or the PAG. The exact standard name supplies
-the pointer-parameter contract; the remaining checks reject extra arguments, varargs, non-integer
-ABI parameters, and non-void/result-producing declarations. A name match without this compatible
-shape falls back to an ordinary external boundary.
+`trusted_free_call` requires an external callee, the exact normalized standard name, exactly one
+actual and one `Integer`-class formal, a non-variadic `Void` signature, and no result. PIR's ABI
+signature class represents an LLVM pointer as `Integer`, so this is the strongest shape check
+available without adding type information to PIR or the PAG. The exact standard name supplies the
+pointer-parameter contract; the remaining checks reject extra arguments, varargs, non-integer ABI
+parameters, and non-void/result-producing declarations. A name match without this compatible shape
+falls back to an ordinary external boundary.
 
 Include `!trusted_free` in the expression that computes `external_boundary`. No new node, edge,
 seed, callsite field, or serialized schema is required. The existing callsite remains present,
@@ -229,7 +216,7 @@ This patch does not:
 - detect `free(&global)` or any other undefined behavior;
 - model `realloc`, C++ destruction, custom deallocators, `cfree`, or allocator aliases;
 - summarize indirect calls that resolve to `free`;
-- account for arbitrary dynamic interposition;
+- account for statically or dynamically linked replacement implementations;
 - change the generic model for any other external function;
 - attempt to resolve FriBidi's independent possible-write or localization blockers.
 
