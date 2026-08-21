@@ -126,6 +126,11 @@ pub(crate) const ENV_ANDERSEN_DISABLE_COPY_SCC: &str = "PANGS_ANDERSEN_DISABLE_C
 /// and factors exact repeated copy fanout through synthetic union variables.
 pub(crate) const ENV_ANDERSEN_OFFLINE_QUOTIENT: &str = "PANGS_ANDERSEN_OFFLINE_QUOTIENT";
 
+/// Replaces each admitted Andersen memcpy endpoint biclique with two site-local stars
+/// through a propagation-only summary cell. This changes only the internal representation
+/// of the field-insensitive content-copy relation; partition admission remains unchanged.
+pub(crate) const ENV_ANDERSEN_MEMCPY_EDGE_SUMMARIES: &str = "PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES";
+
 /// Optional hard propagation-step limit used for diagnostics and fault tests.
 pub(crate) const ENV_ANDERSEN_MAX_STEPS: &str = "PANGS_ANDERSEN_MAX_STEPS";
 

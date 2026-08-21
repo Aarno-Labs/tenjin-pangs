@@ -304,7 +304,7 @@ fn finish_andersen_controlled(
             base.metrics.oversize_fallbacks = exhausted.oversize_fallbacks;
             base.metrics.oversize_fallback_max_size = exhausted.oversize_fallback_max_size;
             eprintln!(
-                "pangs andersen exhausted: reason={} steps={} resume_rounds={} worklist={} queued={} pending_copy_seeds={} pending_pts_deltas={} known_unbound_targets={} activated_targets={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} memcpy_pairs_processed={} copy_fact_pairs_processed={}",
+                "pangs andersen exhausted: reason={} steps={} resume_rounds={} worklist={} queued={} pending_copy_seeds={} pending_pts_deltas={} known_unbound_targets={} activated_targets={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={}",
                 exhausted.reason,
                 exhausted.steps,
                 exhausted.resume_rounds,
@@ -318,6 +318,10 @@ fn finish_andersen_controlled(
                 exhausted.scc_nodes_collapsed,
                 exhausted.scc_copy_edges_removed,
                 exhausted.memcpy_pairs_processed,
+                exhausted.memcpy_logical_pairs_covered,
+                exhausted.memcpy_summary_edges_inserted,
+                exhausted.memcpy_summary_sites,
+                exhausted.memcpy_summary_cells,
                 exhausted.copy_fact_pairs_processed,
             );
         }
@@ -358,6 +362,10 @@ struct ExhaustionDiagnostic {
     scc_nodes_collapsed: usize,
     scc_copy_edges_removed: usize,
     memcpy_pairs_processed: usize,
+    memcpy_logical_pairs_covered: usize,
+    memcpy_summary_edges_inserted: usize,
+    memcpy_summary_sites: usize,
+    memcpy_summary_cells: usize,
     copy_fact_pairs_processed: usize,
     oversize_fallbacks: usize,
     oversize_fallback_max_size: usize,
@@ -478,6 +486,10 @@ struct AdmissionWorkProfile {
     store_pairs_processed: usize,
     gep_pairs_processed: usize,
     memcpy_pairs_processed: usize,
+    memcpy_logical_pairs_covered: usize,
+    memcpy_summary_edges_inserted: usize,
+    memcpy_summary_sites: usize,
+    memcpy_summary_cells: usize,
     field_cells_allocated: usize,
     scc_nodes_scanned: usize,
     scc_edges_scanned: usize,
@@ -2551,7 +2563,7 @@ impl<'a> Refiner<'a> {
         let activated_targets = activated.values().map(BTreeSet::len).sum();
         if andersen_profile_enabled() {
             eprintln!(
-                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
+                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
                 solve.steps,
                 resume_rounds,
                 activated_targets,
@@ -2563,6 +2575,10 @@ impl<'a> Refiner<'a> {
                 solve.fields.len(),
                 solve.unknown_fields.len(),
                 solve.memcpy_pairs_processed,
+                solve.memcpy_logical_pairs_covered,
+                solve.memcpy_summary_edges_inserted,
+                solve.memcpy_summary_sites,
+                solve.memcpy_summary_cells_allocated,
                 solve.copy_fact_pairs_processed,
                 solve.load_pairs_processed,
                 solve.store_pairs_processed,
@@ -2623,6 +2639,10 @@ impl<'a> Refiner<'a> {
                 store_pairs_processed: solve.store_pairs_processed,
                 gep_pairs_processed: solve.gep_pairs_processed,
                 memcpy_pairs_processed: solve.memcpy_pairs_processed,
+                memcpy_logical_pairs_covered: solve.memcpy_logical_pairs_covered,
+                memcpy_summary_edges_inserted: solve.memcpy_summary_edges_inserted,
+                memcpy_summary_sites: solve.memcpy_summary_sites,
+                memcpy_summary_cells: solve.memcpy_summary_cells_allocated,
                 field_cells_allocated: solve.field_cells_allocated,
                 scc_nodes_scanned: solve.scc_nodes_scanned,
                 scc_edges_scanned: solve.scc_edges_scanned,
@@ -2668,6 +2688,10 @@ impl<'a> Refiner<'a> {
             scc_nodes_collapsed: solve.scc_nodes_collapsed,
             scc_copy_edges_removed: solve.scc_copy_edges_removed,
             memcpy_pairs_processed: solve.memcpy_pairs_processed,
+            memcpy_logical_pairs_covered: solve.memcpy_logical_pairs_covered,
+            memcpy_summary_edges_inserted: solve.memcpy_summary_edges_inserted,
+            memcpy_summary_sites: solve.memcpy_summary_sites,
+            memcpy_summary_cells: solve.memcpy_summary_cells_allocated,
             copy_fact_pairs_processed: solve.copy_fact_pairs_processed,
             oversize_fallbacks: self.oversize_fallbacks,
             oversize_fallback_max_size: self.oversize_fallback_max_size,
@@ -3381,6 +3405,13 @@ impl<'a> Refiner<'a> {
         let mut explicit_open = vec![false; node_count];
         let mut has_producer = vec![false; node_count];
 
+        // Propagation-only memcpy summaries are outside the producer graph's declared
+        // PAG/allocation-relative domain. If SCC canonicalization makes one visible through
+        // a real cell, failing that component open is conservative.
+        for &summary in &solve.memcpy_summary_cells {
+            explicit_open[solve.canonical(summary) as usize] = true;
+        }
+
         let mut add_dependency = |source: Cell, destination: Cell| {
             let source = solve.canonical(source) as usize;
             let destination = solve.canonical(destination) as usize;
@@ -3465,9 +3496,15 @@ impl<'a> Refiner<'a> {
                     }
                 }
                 EdgeKind::Memcpy { .. } => {
-                    let Some(destinations) = solve.points_to(edge.dst.0) else {
-                        continue;
-                    };
+                    let destinations = solve
+                        .memcpy_logical_endpoints(edge.dst.0, edge.src.0)
+                        .map(|(destinations, _)| destinations)
+                        .unwrap_or_else(|| {
+                            solve
+                                .points_to(edge.dst.0)
+                                .map(|set| set.iter().collect())
+                                .unwrap_or_default()
+                        });
                     for destination in destinations {
                         if solve.external_region(destination).is_some() {
                             continue;
@@ -3702,18 +3739,22 @@ impl<'a> Refiner<'a> {
                 EdgeKind::Memcpy { .. } => {
                     mark_open(functions_in(edge.src.0), &mut open);
                     mark_open(functions_in(edge.dst.0), &mut open);
-                    let Some(sources) = solve.points_to(edge.src.0) else {
-                        continue;
-                    };
-                    let Some(destinations) = solve.points_to(edge.dst.0) else {
-                        for source in sources {
-                            mark_open(functions_in(source), &mut open);
+                    let Some((destinations, sources)) =
+                        solve.memcpy_logical_endpoints(edge.dst.0, edge.src.0)
+                    else {
+                        // Missing join metadata makes the represented transfer inventory
+                        // incomplete. Fail every function currently visible at the source
+                        // storage open rather than clearing an unknown-caller bit.
+                        if let Some(sources) = solve.points_to(edge.src.0) {
+                            for source in sources {
+                                mark_open(functions_in(source), &mut open);
+                            }
                         }
                         continue;
                     };
                     for source in sources {
                         let copied = functions_in(source);
-                        for destination in destinations {
+                        for &destination in &destinations {
                             if solve.is_external(destination) {
                                 mark_open(copied.clone(), &mut open);
                                 continue;
@@ -4459,6 +4500,12 @@ fn edge_witness(kind: &str, edge: &pangs_pag::Edge) -> String {
 struct MemcpyJoin {
     dst: Cell,
     src: Cell,
+    /// Site-local propagation cell. It is never inserted into a points-to set or any
+    /// allocation/object lookup. `None` retains the direct Cartesian implementation.
+    summary: Option<Cell>,
+    /// A summary stays dormant until both logical endpoint sets are non-empty, preserving
+    /// the direct join's guarded direct-access effects and copy-edge topology.
+    summary_active: bool,
     seen_destinations: HashSet<Cell>,
     seen_sources: HashSet<Cell>,
 }
@@ -4960,11 +5007,18 @@ struct Solve {
     /// base object cells that have had a direct load/store through the whole object. If the
     /// object also has an unknown-offset summary, the direct cell aliases the summary.
     direct_accessed: HashSet<Cell>,
+    /// Raw identities of propagation-only memcpy cells. Copy-SCC canonicalization may fold
+    /// one into an ordinary representative, but the synthetic identity remains non-pointee.
+    memcpy_summary_cells: HashSet<Cell>,
     worklist: Vec<Cell>,
     queued: HashSet<Cell>,
     profile: bool,
     steps: usize,
     memcpy_pairs_processed: usize,
+    memcpy_logical_pairs_covered: usize,
+    memcpy_summary_edges_inserted: usize,
+    memcpy_summary_sites: usize,
+    memcpy_summary_cells_allocated: usize,
     copy_fact_pairs_processed: usize,
     load_pairs_processed: usize,
     store_pairs_processed: usize,
@@ -4981,6 +5035,7 @@ struct Solve {
     scc_nodes_collapsed: usize,
     scc_copy_edges_removed: usize,
     hybrid_points_to: bool,
+    memcpy_edge_summaries: bool,
 }
 
 #[derive(Debug, Default)]
@@ -5052,11 +5107,16 @@ impl Solve {
             unknown_fields: HashMap::new(),
             unknown_field_base: HashMap::new(),
             direct_accessed: HashSet::new(),
+            memcpy_summary_cells: HashSet::new(),
             worklist: Vec::new(),
             queued: HashSet::new(),
             profile,
             steps: 0,
             memcpy_pairs_processed: 0,
+            memcpy_logical_pairs_covered: 0,
+            memcpy_summary_edges_inserted: 0,
+            memcpy_summary_sites: 0,
+            memcpy_summary_cells_allocated: 0,
             copy_fact_pairs_processed: 0,
             load_pairs_processed: 0,
             store_pairs_processed: 0,
@@ -5073,6 +5133,8 @@ impl Solve {
             scc_nodes_collapsed: 0,
             scc_copy_edges_removed: 0,
             hybrid_points_to: std::env::var_os(knobs::ENV_ANDERSEN_HYBRID_BITSETS).is_some(),
+            memcpy_edge_summaries: std::env::var_os(knobs::ENV_ANDERSEN_MEMCPY_EDGE_SUMMARIES)
+                .is_some(),
         }
     }
 
@@ -5310,9 +5372,18 @@ impl Solve {
             return;
         }
         let index = self.memcpys.len();
+        let summary = self.memcpy_edge_summaries.then(|| {
+            let cell = self.allocate_cell();
+            self.memcpy_summary_cells.insert(cell);
+            self.memcpy_summary_cells_allocated =
+                self.memcpy_summary_cells_allocated.saturating_add(1);
+            cell
+        });
         self.memcpys.push(MemcpyJoin {
             dst,
             src,
+            summary,
+            summary_active: false,
             seen_destinations: HashSet::new(),
             seen_sources: HashSet::new(),
         });
@@ -5370,6 +5441,117 @@ impl Solve {
             old_destinations,
             all_sources,
             new_sources,
+        }
+    }
+
+    /// Logical memcpy endpoint relation for post-solve soundness audits. The physical copy
+    /// graph may be a Cartesian biclique or two stars; certificates must not depend on it.
+    fn memcpy_logical_endpoints(&self, dst: Cell, src: Cell) -> Option<(Vec<Cell>, Vec<Cell>)> {
+        let dst = self.canonical(dst);
+        let src = self.canonical(src);
+        let matching = self
+            .memcpys
+            .iter()
+            .filter(|join| self.canonical(join.dst) == dst && self.canonical(join.src) == src)
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return None;
+        }
+        let mut destinations = matching
+            .iter()
+            .flat_map(|join| join.seen_destinations.iter().copied())
+            .collect::<Vec<_>>();
+        let mut sources = matching
+            .iter()
+            .flat_map(|join| join.seen_sources.iter().copied())
+            .collect::<Vec<_>>();
+        destinations.sort_unstable();
+        destinations.dedup();
+        sources.sort_unstable();
+        sources.dedup();
+
+        debug_assert_eq!(
+            destinations.iter().copied().collect::<HashSet<_>>(),
+            self.points_to(dst)
+                .map(|set| set.iter().collect())
+                .unwrap_or_default(),
+            "quiescent memcpy destination inventory is incomplete"
+        );
+        debug_assert_eq!(
+            sources.iter().copied().collect::<HashSet<_>>(),
+            self.points_to(src)
+                .map(|set| set.iter().collect())
+                .unwrap_or_default(),
+            "quiescent memcpy source inventory is incomplete"
+        );
+        Some((destinations, sources))
+    }
+
+    fn add_memcpy_summary_edge(&mut self, source: Cell, destination: Cell) {
+        let before = self.copy_edges_inserted;
+        self.add_copy(source, destination);
+        self.memcpy_summary_edges_inserted = self
+            .memcpy_summary_edges_inserted
+            .saturating_add(self.copy_edges_inserted.saturating_sub(before));
+    }
+
+    fn process_memcpy_summary(&mut self, index: usize, delta: MemcpyDelta) {
+        let logical_pairs = delta
+            .new_destinations
+            .len()
+            .saturating_mul(delta.all_sources.len())
+            .saturating_add(
+                delta
+                    .old_destinations
+                    .len()
+                    .saturating_mul(delta.new_sources.len()),
+            );
+        self.memcpy_logical_pairs_covered = self
+            .memcpy_logical_pairs_covered
+            .saturating_add(logical_pairs);
+
+        // The baseline marks every newly discovered destination before entering its
+        // possibly-empty source loop. Preserve that asymmetric side effect exactly.
+        for &destination in &delta.new_destinations {
+            self.note_direct_access(destination);
+        }
+
+        let (summary, active, all_destinations, all_sources) = {
+            let join = &self.memcpys[index];
+            (
+                join.summary
+                    .expect("summary mode memcpy has a summary cell"),
+                join.summary_active,
+                join.seen_destinations.iter().copied().collect::<Vec<_>>(),
+                join.seen_sources.iter().copied().collect::<Vec<_>>(),
+            )
+        };
+
+        if !active {
+            if all_destinations.is_empty() || all_sources.is_empty() {
+                return;
+            }
+            // Publish the active state before enqueueing copy work. All retained endpoints
+            // are connected synchronously in this worklist step; solver exhaustion is only
+            // observed between steps and therefore cannot expose a partial refined result.
+            self.memcpys[index].summary_active = true;
+            self.memcpy_summary_sites = self.memcpy_summary_sites.saturating_add(1);
+            for source in all_sources {
+                self.note_direct_access(source);
+                self.add_memcpy_summary_edge(source, summary);
+            }
+            for destination in all_destinations {
+                self.add_memcpy_summary_edge(summary, destination);
+            }
+            return;
+        }
+
+        for source in delta.new_sources {
+            self.note_direct_access(source);
+            self.add_memcpy_summary_edge(source, summary);
+        }
+        for destination in delta.new_destinations {
+            self.add_memcpy_summary_edge(summary, destination);
         }
     }
 
@@ -5997,7 +6179,7 @@ impl Solve {
     fn maybe_report_progress(&self) {
         if self.profile && self.steps % knobs::ANDERSEN_PROFILE_STEP_INTERVAL == 0 {
             eprintln!(
-                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} new_copy_edges_since_scc={}",
+                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} new_copy_edges_since_scc={}",
                 self.steps,
                 self.worklist.len(),
                 self.queued.len(),
@@ -6008,6 +6190,10 @@ impl Solve {
                 self.fields.len(),
                 self.unknown_fields.len(),
                 self.memcpy_pairs_processed,
+                self.memcpy_logical_pairs_covered,
+                self.memcpy_summary_edges_inserted,
+                self.memcpy_summary_sites,
+                self.memcpy_summary_cells_allocated,
                 self.copy_fact_pairs_processed,
                 self.load_pairs_processed,
                 self.store_pairs_processed,
@@ -6197,6 +6383,10 @@ impl Solve {
             if let Some(relevant) = self.memcpy_by_endpoint.get(&n).cloned() {
                 for index in relevant {
                     let delta = self.memcpy_delta(index);
+                    if self.memcpys[index].summary.is_some() {
+                        self.process_memcpy_summary(index, delta);
+                        continue;
+                    }
                     self.report_large_product(
                         "memcpy",
                         n,
@@ -6209,6 +6399,13 @@ impl Solve {
                             .len()
                             .saturating_mul(delta.all_sources.len()),
                     );
+                    self.memcpy_logical_pairs_covered =
+                        self.memcpy_logical_pairs_covered.saturating_add(
+                            delta
+                                .new_destinations
+                                .len()
+                                .saturating_mul(delta.all_sources.len()),
+                        );
                     for &od in &delta.new_destinations {
                         self.note_direct_access(od);
                         for &os in &delta.all_sources {
@@ -6228,6 +6425,13 @@ impl Solve {
                             .len()
                             .saturating_mul(delta.new_sources.len()),
                     );
+                    self.memcpy_logical_pairs_covered =
+                        self.memcpy_logical_pairs_covered.saturating_add(
+                            delta
+                                .old_destinations
+                                .len()
+                                .saturating_mul(delta.new_sources.len()),
+                        );
                     for &od in &delta.old_destinations {
                         self.note_direct_access(od);
                         for &os in &delta.new_sources {
@@ -6971,6 +7175,174 @@ mod tests {
         assert_eq!(solve.memcpy_pairs_processed, 9);
         solve.run();
         assert_eq!(solve.memcpy_pairs_processed, 9);
+    }
+
+    #[test]
+    fn memcpy_summary_matches_incremental_direct_join() {
+        fn problem(summarized: bool) -> Solve {
+            let mut solve = Solve::new(12, false);
+            solve.memcpy_edge_summaries = summarized;
+            solve.add_memcpy(0, 1);
+            solve.add_pts(0, 2);
+            solve.add_pts(1, 3);
+            solve.add_pts(3, 6);
+            solve.run();
+            solve.add_pts(0, 4);
+            solve.add_pts(1, 5);
+            solve.add_pts(5, 7);
+            solve.run();
+            solve.add_pts(3, 8);
+            solve.run();
+            solve
+        }
+
+        let direct = problem(false);
+        let summarized = problem(true);
+        assert_eq!(
+            original_points_to(&summarized, 12),
+            original_points_to(&direct, 12)
+        );
+        assert_eq!(summarized.direct_accessed, direct.direct_accessed);
+        assert_eq!(direct.memcpy_pairs_processed, 4);
+        assert_eq!(summarized.memcpy_pairs_processed, 0);
+        assert_eq!(summarized.memcpy_logical_pairs_covered, 4);
+        assert_eq!(summarized.memcpy_summary_sites, 1);
+        assert_eq!(summarized.memcpy_summary_cells_allocated, 1);
+        assert_eq!(summarized.memcpy_summary_edges_inserted, 4);
+        let summary = *summarized.memcpy_summary_cells.iter().next().unwrap();
+        assert!(summarized
+            .pts
+            .values()
+            .all(|points_to| !points_to.contains(&summary)));
+    }
+
+    #[test]
+    fn memcpy_summary_preserves_empty_side_direct_access_guards() {
+        let mut empty_source = Solve::new(8, false);
+        empty_source.memcpy_edge_summaries = true;
+        empty_source.add_memcpy(0, 1);
+        empty_source.add_pts(0, 2);
+        empty_source.run();
+        assert!(empty_source.direct_accessed.contains(&2));
+        assert!(!empty_source.memcpys[0].summary_active);
+        assert_eq!(empty_source.memcpy_summary_edges_inserted, 0);
+
+        let mut empty_destination = Solve::new(8, false);
+        empty_destination.memcpy_edge_summaries = true;
+        empty_destination.add_memcpy(0, 1);
+        empty_destination.add_pts(1, 3);
+        empty_destination.add_pts(3, 6);
+        empty_destination.run();
+        assert!(!empty_destination.direct_accessed.contains(&3));
+        assert!(!empty_destination.memcpys[0].summary_active);
+        assert_eq!(empty_destination.memcpy_summary_edges_inserted, 0);
+
+        // A late opposite endpoint activates the retained source and seeds its complete
+        // current contents through the newly installed star.
+        empty_destination.add_pts(0, 2);
+        empty_destination.run();
+        assert!(empty_destination.direct_accessed.contains(&2));
+        assert!(empty_destination.direct_accessed.contains(&3));
+        assert!(empty_destination.memcpys[0].summary_active);
+        assert!(empty_destination.points_to(2).unwrap().contains(&6));
+    }
+
+    #[test]
+    fn memcpy_summary_preserves_late_unknown_field_bridges() {
+        fn problem(summarized: bool) -> (Solve, Cell, Cell) {
+            let mut solve = Solve::new(12, false);
+            solve.memcpy_edge_summaries = summarized;
+            solve.known_locations.insert(FieldLocation::Exact(4));
+            solve.add_memcpy(0, 1);
+            solve.add_pts(0, 2);
+            solve.add_pts(1, 3);
+            solve.add_pts(3, 6);
+            solve.run();
+
+            let source_field = solve.field_of(3, FieldLocation::Exact(4));
+            solve.add_pts(source_field, 7);
+            let source_unknown = solve.unknown_field_of(3);
+            let destination_field = solve.field_of(2, FieldLocation::Exact(4));
+            let destination_unknown = solve.unknown_field_of(2);
+            solve.run();
+            assert!(solve.points_to(source_unknown).unwrap().contains(&7));
+            assert!(solve.points_to(destination_unknown).unwrap().contains(&7));
+            (solve, destination_field, destination_unknown)
+        }
+
+        let (direct, direct_field, direct_unknown) = problem(false);
+        let (summarized, summarized_field, summarized_unknown) = problem(true);
+        for fact in [6, 7] {
+            assert_eq!(
+                summarized.points_to(2).unwrap().contains(&fact),
+                direct.points_to(2).unwrap().contains(&fact)
+            );
+            assert_eq!(
+                summarized
+                    .points_to(summarized_field)
+                    .unwrap()
+                    .contains(&fact),
+                direct.points_to(direct_field).unwrap().contains(&fact)
+            );
+            assert_eq!(
+                summarized
+                    .points_to(summarized_unknown)
+                    .unwrap()
+                    .contains(&fact),
+                direct.points_to(direct_unknown).unwrap().contains(&fact)
+            );
+        }
+    }
+
+    #[test]
+    fn memcpy_summary_preserves_external_origin_labels() {
+        let mut solve = Solve::new(8, false);
+        solve.memcpy_edge_summaries = true;
+        solve.add_memcpy(0, 1);
+        let external = solve.region(ExternalRegion::ExternalReturn(7));
+        solve.add_pts(0, 2);
+        solve.add_pts(1, 3);
+        solve.add_pts_with_source(3, external, Some("memcpy-external"));
+        solve.run();
+
+        assert!(solve.points_to(2).unwrap().contains(&external));
+        assert!(solve
+            .external_sources_for(2)
+            .unwrap()
+            .contains("memcpy-external"));
+        let summary = solve.memcpys[0].summary.unwrap();
+        assert!(solve
+            .external_sources_for(summary)
+            .unwrap()
+            .contains("memcpy-external"));
+    }
+
+    #[test]
+    fn memcpy_summaries_remain_site_local_after_scc_canonicalization() {
+        let mut solve = Solve::new(16, false);
+        solve.memcpy_edge_summaries = true;
+        solve.scc_min_edges = 1;
+        solve.add_memcpy(0, 1);
+        solve.add_memcpy(2, 3);
+        solve.add_pts(0, 4);
+        solve.add_pts(1, 5);
+        solve.add_pts(2, 6);
+        solve.add_pts(3, 7);
+        solve.add_pts(5, 10);
+        solve.add_pts(7, 11);
+        solve.add_copy(0, 2);
+        solve.add_copy(2, 0);
+        solve.add_copy(1, 3);
+        solve.add_copy(3, 1);
+        solve.run();
+
+        assert_eq!(solve.memcpys.len(), 2);
+        assert_eq!(solve.memcpy_summary_cells.len(), 2);
+        assert_ne!(solve.memcpys[0].summary, solve.memcpys[1].summary);
+        assert_eq!(solve.canonical(0), solve.canonical(2));
+        assert_eq!(solve.canonical(1), solve.canonical(3));
+        assert!(solve.points_to(4).unwrap().contains(&10));
+        assert!(solve.points_to(6).unwrap().contains(&11));
     }
 
     #[test]

@@ -433,3 +433,52 @@ complete modules; most had incomplete-origin payload rows. The forced-full chibi
 exceptional performance result (5.51 s/236 MiB baseline versus 1.02 s/174 MiB payload), but it
 also changed five indirect edges (one removed) and therefore does not rescue the general design.
 Keep this feature disabled pending a bounded-context design and precision validation.
+
+### Per-site Andersen `memcpy` summaries (2026-08-20)
+
+`PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES=1` now gives each admitted PAG `memcpy` a fresh,
+propagation-only cell and replaces its discovered source/destination biclique with
+`source -> summary -> destination` stars. One-sided joins remain dormant so the existing
+`note_direct_access` guards are unchanged. Summaries are site-local, never pointee identities,
+and remain distinct when later copy-SCC collapse makes two joins canonically identical.
+Closed-producer and closed-consumer certificates enumerate the retained logical endpoint sets,
+not physical copy adjacency; a summary that surfaces in the producer graph fails open.
+
+Focused tests compare direct and summarized incremental joins, empty endpoint sets, late
+activation, late exact/lane/unknown field materialization, external propagation, copy-SCC
+canonicalization, and non-pointee identity. The full workspace suite passed (396 tests). A
+small function-pointer aggregate fixture produced identical normalized client exports with both
+closed certificates enabled. The feature remains opt-in; adaptive promotion is not implemented.
+
+The exact gifsicle input was
+`/home/brk/pangs-corpus/_out_bc/exe-gifsicle-O0.bc` (SHA-256
+`513bf2a2971252dd7fc615192dd6c1b1c6f8e96f3f78e06f88f152355de5612a`). At the normal
+200,000 admission budget, direct and summarized runs both rejected the 20,702-node oversized
+component. They took 1.48 s/119,976 KiB and 1.51 s/119,664 KiB respectively and emitted
+byte-identical disposition manifest/audit artifacts: 11 immutable, five localize, and 80
+unhandled globals. The admitted residue activated none of its seven memcpy joins.
+
+With `--partition-budget 900000000`, the summarized solve completed and validated in 119.08 s
+at 2,301,692 KiB peak RSS. It performed 1,052,874 worklist steps and ended with 249,791,636
+points-to facts, 21,994 copy edges, and 1,654,259,033 copy-fact propagations. Eighty-four of
+162 memcpy joins activated. Their final logical relation contained 16,609,344,880 pairs, but
+the solver iterated zero direct memcpy pairs and installed only 6,021 summary edges. The fresh
+direct arm did not complete in its 30-second cap: at timeout it had reached about 52 million
+points-to facts, 357 million memcpy-pair iterations, and 924,348 KiB peak RSS. An earlier
+uncapped direct attempt remained incomplete after roughly four minutes and had processed at
+least 4.735 billion memcpy pairs.
+
+Forced admission changed disposition precision, as expected from analyzing the formerly rejected
+component: 11 immutable, one localize, 15 mutex, and 69 unhandled globals (27/96 handled versus
+16/96 at the default budget). `error_count.access_set_complete` became true. The residual
+`parse_int@!noloc#7` unknown-load row narrowed from module-wide to a finite candidate containing
+only `clp_option_sentinel`; genuine universal provenance remained in its evidence.
+
+A matched 30-second CPU-clock profile showed that the targeted hot spot was removed:
+`Solve::note_direct_access` fell from 18.59% self time in the direct profile to 0.68% with
+summaries. The summarized profile was instead dominated by `HashMap::insert` (26.33%), hashing
+(14.62%), `Solve::run_with_limit` (13.62%), `Solve::field_of` (12.32%), and rehashing (8.48%).
+The representation therefore makes this forced megacomponent solvable, but does not make it
+cheap and does not improve default-budget coverage. A separate experiment must determine whether
+the quadratic admission proxy can be made summary-aware without admitting unrelated pathological
+components; the current budget must not simply be raised.
