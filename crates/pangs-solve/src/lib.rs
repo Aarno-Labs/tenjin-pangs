@@ -1833,10 +1833,14 @@ impl<'a> Solver<'a> {
                 })
                 .collect::<Vec<_>>();
             targets.sort();
+            // An empty finite answer is not conservative.  It commonly indicates that an
+            // address producer was not represented in the PAG; represent that loss as top so
+            // clients never mistake analysis silence for a proof that the call has no target.
+            let unknown_callee = self.classes[root].ext || targets.is_empty();
             indirect_calls.push(IndirectCallResolution {
                 callsite_key: callsite.key.clone(),
                 targets,
-                unknown_callee: self.classes[root].ext,
+                unknown_callee,
                 fallback: false,
                 prefsa_targets,
                 fsa_rejected_targets,
@@ -3838,6 +3842,32 @@ mod tests {
         assert!(!result.unknown_callers.contains("cb"));
         assert!(!result.globals["@G"].escape_external);
         assert!(result.globals["@G"].never_written);
+    }
+
+    #[test]
+    fn producerless_indirect_call_is_unknown_not_silent() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"producerless-icall",
+                "functions":[
+                    {"key":"cb","address_taken":true,"sig":{"ret":{"class":"void"},"params":[]},"body":[]},
+                    {"key":"driver","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"call_indirect","operand":"%driver::missing","sig":{"ret":{"class":"void"},"params":[]},"args":[]}
+                    ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        for result in [
+            solve_steensgaard(&pir, &pag, BuildMode::Executable),
+            solve_andersen(&pir, &pag, BuildMode::Executable, u64::MAX),
+        ] {
+            assert_eq!(result.indirect_calls.len(), 1);
+            assert!(result.indirect_calls[0].targets.is_empty());
+            assert!(result.indirect_calls[0].unknown_callee);
+        }
     }
 
     #[test]

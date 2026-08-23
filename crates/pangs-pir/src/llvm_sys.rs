@@ -180,6 +180,7 @@ struct FunctionCtx {
     next_unnamed: u64,
     positional_varargs: BTreeMap<usize, VarArgPosition>,
     value_kinds: BTreeMap<String, ValueKind>,
+    lowered_constant_exprs: BTreeMap<usize, String>,
 }
 
 impl FunctionCtx {
@@ -195,6 +196,7 @@ impl FunctionCtx {
             next_unnamed: 0,
             positional_varargs,
             value_kinds: BTreeMap::new(),
+            lowered_constant_exprs: BTreeMap::new(),
         }
     }
 
@@ -241,6 +243,9 @@ impl FunctionCtx {
         }
         if !LLVMIsAArgument(value).is_null() || !LLVMIsAInstruction(value).is_null() {
             return self.local_key(value);
+        }
+        if let Some(key) = self.lowered_constant_exprs.get(&(value as usize)) {
+            return key.clone();
         }
         if !LLVMIsAConstantInt(value).is_null() {
             let width = LLVMGetIntTypeWidth(LLVMTypeOf(value));
@@ -731,6 +736,7 @@ unsafe fn lower_function(
             }
             let statement_loc = normalized_statement_loc(inst, repo_roots);
             let first_stmt = body.len();
+            lower_instruction_constant_expr_operands(ctx, &mut fctx, inst, &mut body, lowering);
             lower_instruction(ctx, &mut fctx, inst, opcode, &mut body, lowering);
             let stmt_indices = (first_stmt..body.len()).map(|index| index as u32);
             if let Some(group) = groups.last_mut().filter(|group| group.loc == statement_loc) {
@@ -1301,6 +1307,137 @@ unsafe fn instruction_block_is_cyclic(instruction: LLVMValueRef) -> bool {
         }
     }
     false
+}
+
+/// Materialize pointer-valued LLVM constant expressions used by a function instruction.
+///
+/// LLVM does not require a constant GEP to be an instruction.  Clang consequently emits common
+/// callback-table loads with an inline `getelementptr (@table, 0, field)` address.  Keeping that
+/// expression's printed text as an operand creates an isolated PAG value: it has neither the
+/// global root nor the byte offset carried by an ordinary `Stmt::Gep`.  Lower these expressions
+/// into the same PIR operations as instruction GEPs before lowering the consuming instruction.
+/// Exact pointer casts of globals retain the existing root-identity shortcut.
+unsafe fn lower_instruction_constant_expr_operands(
+    ctx: &ModuleCtx,
+    fctx: &mut FunctionCtx,
+    instruction: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+) {
+    let location = loc(instruction);
+    for index in 0..LLVMGetNumOperands(instruction) as u32 {
+        let operand = LLVMGetOperand(instruction, index);
+        if !LLVMIsAConstantExpr(operand).is_null()
+            && (is_pointer_like_type(LLVMTypeOf(operand)) || constant_has_pointer_flow(operand))
+        {
+            let mut path = BTreeSet::new();
+            lower_function_constant_expr_value(
+                ctx, fctx, operand, body, lowering, &location, &mut path, 0,
+            );
+        }
+    }
+}
+
+unsafe fn lower_function_constant_expr_value(
+    ctx: &ModuleCtx,
+    fctx: &mut FunctionCtx,
+    value: LLVMValueRef,
+    body: &mut Vec<Stmt>,
+    lowering: &mut LoweringStats,
+    location: &Option<Loc>,
+    path: &mut BTreeSet<usize>,
+    depth: usize,
+) -> String {
+    if let Some(key) = fctx.lowered_constant_exprs.get(&(value as usize)) {
+        return key.clone();
+    }
+    if LLVMIsAConstantExpr(value).is_null() {
+        return fctx.operand_key(value);
+    }
+    // Preserve the established exact-root behavior for address-preserving global casts.  A GEP
+    // never reaches this shortcut, including a zero-offset GEP: it remains explicit address flow.
+    if let Some(global) = constant_pointer_cast_global(value) {
+        return format!("@{}", value_name(global));
+    }
+
+    let id = value as usize;
+    if depth >= CONSTANT_EXPR_RECURSION_LIMIT || !path.insert(id) {
+        let dest = fctx.local_key(value);
+        fctx.lowered_constant_exprs.insert(id, dest.clone());
+        lowering.bump_tainted("function_constant_expr_traversal_limit");
+        push_unknown(
+            body,
+            "constant_expr:traversal_limit",
+            constant_pointer_operand_keys(ctx, value),
+            vec![dest.clone()],
+            "function_pointer_constant",
+            location.clone(),
+            lowering,
+        );
+        return dest;
+    }
+
+    let dest = fctx.local_key(value);
+    // Install the identity before descending so even malformed cyclic IR has one stable node.
+    fctx.lowered_constant_exprs.insert(id, dest.clone());
+    match LLVMGetConstOpcode(value) {
+        LLVMOpcode::LLVMBitCast | LLVMOpcode::LLVMAddrSpaceCast => {
+            let source = lower_function_constant_expr_value(
+                ctx,
+                fctx,
+                LLVMGetOperand(value, 0),
+                body,
+                lowering,
+                location,
+                path,
+                depth + 1,
+            );
+            body.push(Stmt::Assign {
+                dest: dest.clone(),
+                sources: vec![source],
+                loc: location.clone(),
+            });
+            lowering.bump_modeled("function_constexpr_assign");
+        }
+        LLVMOpcode::LLVMGetElementPtr => {
+            let base = lower_function_constant_expr_value(
+                ctx,
+                fctx,
+                LLVMGetOperand(value, 0),
+                body,
+                lowering,
+                location,
+                path,
+                depth + 1,
+            );
+            let (byte_off, lane) = gep_displacement(ctx, value, lowering, true);
+            body.push(Stmt::Gep {
+                dest: dest.clone(),
+                base,
+                byte_off,
+                lane,
+                loc: location.clone(),
+            });
+            lowering.bump_modeled("function_constexpr_gep");
+        }
+        other => {
+            lowering.bump_tainted(format!(
+                "function_unmodeled_pointer_constant:{}",
+                opcode_key(other)
+            ));
+            push_unknown(
+                body,
+                format!("constant_expr:{}", opcode_key(other)),
+                constant_pointer_operand_keys(ctx, value),
+                vec![dest.clone()],
+                "function_pointer_constant",
+                location.clone(),
+                lowering,
+            );
+        }
+    }
+    path.remove(&id);
+    dest
 }
 
 unsafe fn lower_instruction(

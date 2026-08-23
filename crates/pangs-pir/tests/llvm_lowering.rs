@@ -2383,6 +2383,7 @@ lpad:
   %ehptr = extractvalue { i8*, i32 } %lp, 0
   ret i8* %ehptr
 }
+
 "#,
     )
     .unwrap();

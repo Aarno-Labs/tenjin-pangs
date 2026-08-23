@@ -1644,9 +1644,9 @@ impl Analysis {
                             .cloned();
                         // The initial PIR scan records exact direct GlobalRef writes.  Solver
                         // facts add indirect writes and may remove class-induced false positives,
-                        // but must not erase that independent positive evidence.  In particular,
-                        // constant-expression GEP addresses intentionally remain standalone PAG
-                        // values, so their exact GlobalRef is the authoritative write witness.
+                        // but must not erase that independent positive evidence. Derived-address
+                        // precision can still be unavailable at a solver boundary, so an exact
+                        // GlobalRef remains the authoritative direct write witness.
                         global.never_written &= state.never_written;
                         global.runtime_written |= state.runtime_written;
                     }
@@ -1739,6 +1739,7 @@ impl Analysis {
             simple_icalls,
             &initval_report.resolutions,
         );
+        ensure_indirect_calls_have_edges(&mut call_edges, &indirect_callsites, opts.stage);
         let initval_reapply_us = initval_reapply_started.elapsed().as_micros() as u64;
 
         let transitive_started = Instant::now();
@@ -2447,6 +2448,38 @@ fn emit_simple_call_edges(
             callee: Callee::Func(callee_id),
             kind: CallKind::Indirect,
             tier: Tier::Simple,
+        });
+    }
+}
+
+/// Last-resort soundness guard at the exported call-graph boundary.  Solver and exact-resolution
+/// paths should already emit either a concrete target or Ω, but keeping the invariant here makes
+/// a future lowering/key mismatch loud in the artifact instead of silently dropping a callsite.
+fn ensure_indirect_calls_have_edges(
+    call_edges: &mut Vec<CallEdge>,
+    indirect_callsites: &[(CallsiteId, FuncId, pangs_pir::Signature)],
+    stage: Stage,
+) {
+    let tier = match stage {
+        Stage::Conservative => Tier::Fsa,
+        Stage::Steens => Tier::Steens,
+        Stage::Andersen => Tier::Andersen,
+    };
+    let emitted = call_edges
+        .iter()
+        .filter(|edge| edge.kind == CallKind::Indirect)
+        .filter_map(|edge| edge.callsite)
+        .collect::<BTreeSet<_>>();
+    for (callsite, caller, _) in indirect_callsites {
+        if emitted.contains(callsite) {
+            continue;
+        }
+        call_edges.push(CallEdge {
+            caller: Caller::Func(*caller),
+            callsite: Some(*callsite),
+            callee: Callee::Unknown("omega_fnptr".to_string()),
+            kind: CallKind::Indirect,
+            tier,
         });
     }
 }

@@ -3988,6 +3988,9 @@ impl<'a> Refiner<'a> {
                         fsa_rejected_targets += 1;
                     }
                 }
+                // Preserve the target-lattice invariant at the final refinement boundary:
+                // empty-without-top is analysis silence, never a conservative call answer.
+                unknown_callee |= targets.is_empty();
                 out.push(IndirectCallResolution {
                     callsite_key: cs.key.clone(),
                     targets,

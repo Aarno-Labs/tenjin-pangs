@@ -2632,3 +2632,4 @@ fn dynamic_multi_icall_trace_validates_both_sites() {
         String::from_utf8_lossy(&check.stderr)
     );
 }
+
