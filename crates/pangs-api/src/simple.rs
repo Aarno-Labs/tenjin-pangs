@@ -98,12 +98,12 @@ impl<'a> SimpleResolver<'a> {
             .functions
             .iter()
             .enumerate()
-            .map(|(index, func)| (func.key.as_str(), index))
+            .map(|(index, func)| (canonical_symbol(&func.key), index))
             .collect();
         let globals = module
             .globals
             .iter()
-            .map(|global| global.key.as_str())
+            .map(|global| canonical_symbol(&global.key))
             .collect();
         let definitions = module
             .functions
@@ -181,7 +181,7 @@ impl<'a> SimpleResolver<'a> {
         if depth > self.context_depth {
             return WalkResult::Complex;
         }
-        if let Some(&target_index) = self.functions.get(value) {
+        if let Some(&target_index) = self.functions.get(canonical_symbol(value)) {
             let target = &self.module.functions[target_index];
             out.targets.insert(target.key.clone());
             out.sites.insert(format!(
@@ -191,8 +191,8 @@ impl<'a> SimpleResolver<'a> {
             ));
             return WalkResult::Simple;
         }
-        if self.globals.contains(value) {
-            return self.resolve_global(value, depth, visiting, out);
+        if self.globals.contains(canonical_symbol(value)) {
+            return self.resolve_global(canonical_symbol(value), depth, visiting, out);
         }
         if !visiting.insert((func_index, value.to_string(), depth)) {
             return WalkResult::Simple;
@@ -284,7 +284,7 @@ impl<'a> SimpleResolver<'a> {
         if depth > self.context_depth {
             return WalkResult::Complex;
         }
-        let Some(&callee_index) = self.functions.get(callee) else {
+        let Some(&callee_index) = self.functions.get(canonical_symbol(callee)) else {
             return WalkResult::Complex;
         };
         let callee_func = &self.module.functions[callee_index];
@@ -442,15 +442,15 @@ impl<'a> SimpleResolver<'a> {
         visiting: &mut HashSet<(usize, String, usize)>,
         out: &mut ValueResolution,
     ) -> WalkResult {
-        if let Some(&target_index) = self.functions.get(value) {
+        if let Some(&target_index) = self.functions.get(canonical_symbol(value)) {
             let target = &self.module.functions[target_index];
             out.targets.insert(target.key.clone());
             out.sites
                 .insert(format!("function:{}@global_init", target.key));
             return WalkResult::Simple;
         }
-        if self.globals.contains(value) {
-            return self.resolve_global(value, depth + 1, visiting, out);
+        if self.globals.contains(canonical_symbol(value)) {
+            return self.resolve_global(canonical_symbol(value), depth + 1, visiting, out);
         }
         for stmt_index in (0..before_stmt).rev() {
             let Some(dest) = stmt_dest(&self.module.global_init[stmt_index]) else {
@@ -494,11 +494,12 @@ impl<'a> SimpleResolver<'a> {
     }
 
     fn global_is_never_address_taken(&self, global: &str) -> bool {
+        let global = canonical_symbol(global);
         if self
             .module
             .globals
             .iter()
-            .find(|candidate| candidate.key == global)
+            .find(|candidate| same_symbol(&candidate.key, global))
             .map(|candidate| candidate.exported)
             .unwrap_or(true)
         {
@@ -560,39 +561,49 @@ impl<'a> SimpleResolver<'a> {
         visiting: &mut HashSet<(usize, String, usize)>,
     ) -> bool {
         match stmt {
-            Stmt::Assign { dest, sources, .. } if sources.iter().any(|source| source == target) => {
+            Stmt::Assign { dest, sources, .. }
+                if sources.iter().any(|source| same_symbol(source, target)) =>
+            {
                 self.local_value_escapes(func_index, dest, depth, visiting)
             }
-            Stmt::ScalarOp { dest, lhs, rhs, .. } if lhs == target || rhs == target => {
+            Stmt::ScalarOp { dest, lhs, rhs, .. }
+                if same_symbol(lhs, target) || same_symbol(rhs, target) =>
+            {
                 self.local_value_escapes(func_index, dest, depth, visiting)
             }
-            Stmt::Store { address, value, .. } if value == target => !self
+            Stmt::Store { address, value, .. } if same_symbol(value, target) => !self
                 .function_place(func_index, stmt_index, address)
                 .map(|place| self.global_place_is_simple(&place))
                 .unwrap_or_else(|| self.global_is_never_address_taken(address)),
             Stmt::CallDirect {
                 callee, sig, args, ..
             } => args.iter().enumerate().any(|(index, arg)| {
-                arg == target
+                same_symbol(arg, target)
                     && self.call_arg_escapes(callee, sig.vararg, index, target, depth, visiting)
             }),
             Stmt::CallIndirect { operand, args, .. } => {
-                operand != target && args.iter().any(|arg| arg == target)
+                !same_symbol(operand, target) && args.iter().any(|arg| same_symbol(arg, target))
             }
-            Stmt::Return { value, .. } if value.as_deref() == Some(target) => {
+            Stmt::Return { value, .. }
+                if value
+                    .as_deref()
+                    .is_some_and(|value| same_symbol(value, target)) =>
+            {
                 self.return_value_escapes(func_index, target, depth, visiting)
             }
-            Stmt::Load { address, .. } => address == target,
-            Stmt::Gep { base, .. } => base == target,
-            Stmt::PtrToInt { source, .. } => source == target,
-            Stmt::IntToPtr { source, .. } => source == target,
-            Stmt::Memcpy { dst, src, .. } => dst == target || src == target,
-            Stmt::Memset { dst, value, .. } => dst == target || value == target,
+            Stmt::Load { address, .. } => same_symbol(address, target),
+            Stmt::Gep { base, .. } => same_symbol(base, target),
+            Stmt::PtrToInt { source, .. } => same_symbol(source, target),
+            Stmt::IntToPtr { source, .. } => same_symbol(source, target),
+            Stmt::Memcpy { dst, src, .. } => same_symbol(dst, target) || same_symbol(src, target),
+            Stmt::Memset { dst, value, .. } => {
+                same_symbol(dst, target) || same_symbol(value, target)
+            }
             Stmt::Unknown {
                 operands, results, ..
             } => {
-                operands.iter().any(|operand| operand == target)
-                    || results.iter().any(|result| result == target)
+                operands.iter().any(|operand| same_symbol(operand, target))
+                    || results.iter().any(|result| same_symbol(result, target))
             }
             Stmt::Alloca { .. }
             | Stmt::Assign { .. }
@@ -703,7 +714,7 @@ impl<'a> SimpleResolver<'a> {
         if vararg {
             return true;
         }
-        let Some(&callee_index) = self.functions.get(callee) else {
+        let Some(&callee_index) = self.functions.get(canonical_symbol(callee)) else {
             return true;
         };
         let callee_func = &self.module.functions[callee_index];
@@ -755,8 +766,10 @@ impl<'a> SimpleResolver<'a> {
         for (func_index, func) in self.module.functions.iter().enumerate() {
             for stmt in &func.body {
                 for target in function_symbol_value_operands(stmt) {
-                    if self.functions.contains_key(target) {
-                        sites.entry(target.to_string()).or_default().insert(format!(
+                    let target = canonical_symbol(target);
+                    if let Some(&target_index) = self.functions.get(target) {
+                        let target = &self.module.functions[target_index].key;
+                        sites.entry(target.clone()).or_default().insert(format!(
                             "function:{}@{}",
                             target,
                             self.owner_key(func_index)
@@ -767,9 +780,11 @@ impl<'a> SimpleResolver<'a> {
         }
         for stmt in &self.module.global_init {
             for target in function_symbol_value_operands(stmt) {
-                if self.functions.contains_key(target) {
+                let target = canonical_symbol(target);
+                if let Some(&target_index) = self.functions.get(target) {
+                    let target = &self.module.functions[target_index].key;
                     sites
-                        .entry(target.to_string())
+                        .entry(target.clone())
                         .or_default()
                         .insert(format!("function:{target}@global_init"));
                 }
@@ -779,9 +794,10 @@ impl<'a> SimpleResolver<'a> {
     }
 
     fn function_place(&self, func_index: usize, before_stmt: usize, value: &str) -> Option<SubObj> {
-        if self.globals.contains(value) {
+        let symbol = canonical_symbol(value);
+        if self.globals.contains(symbol) {
             return Some(SubObj {
-                root: value.to_string(),
+                root: symbol.to_string(),
                 byte_off: 0,
             });
         }
@@ -807,9 +823,10 @@ impl<'a> SimpleResolver<'a> {
     }
 
     fn global_init_place(&self, before_stmt: usize, value: &str) -> Option<SubObj> {
-        if self.globals.contains(value) {
+        let symbol = canonical_symbol(value);
+        if self.globals.contains(symbol) {
             return Some(SubObj {
-                root: value.to_string(),
+                root: symbol.to_string(),
                 byte_off: 0,
             });
         }
@@ -1016,7 +1033,15 @@ fn function_symbol_value_operands(stmt: &Stmt) -> Vec<&str> {
 }
 
 fn operand_mentions_global(operand: &str, global: &str) -> bool {
-    operand == global
+    same_symbol(operand, global)
+}
+
+fn canonical_symbol(value: &str) -> &str {
+    value.strip_prefix('@').unwrap_or(value)
+}
+
+fn same_symbol(lhs: &str, rhs: &str) -> bool {
+    canonical_symbol(lhs) == canonical_symbol(rhs)
 }
 
 fn function_use_is_unsafe<F>(stmt: &Stmt, target: &str, mut global_is_safe_slot: F) -> bool
@@ -1025,8 +1050,10 @@ where
 {
     match stmt {
         Stmt::Assign { .. } => false,
-        Stmt::ScalarOp { dest, lhs, rhs, .. } => dest == target || lhs == target || rhs == target,
-        Stmt::Store { address, value, .. } if value == target => {
+        Stmt::ScalarOp { dest, lhs, rhs, .. } => {
+            same_symbol(dest, target) || same_symbol(lhs, target) || same_symbol(rhs, target)
+        }
+        Stmt::Store { address, value, .. } if same_symbol(value, target) => {
             !global_is_safe_slot(address.as_str())
         }
         Stmt::Store { .. } => false,
@@ -1036,31 +1063,38 @@ where
             dest,
             ..
         } => {
-            args.iter().any(|arg| arg == target)
-                || (operand != target && dest.as_deref() == Some(target))
+            args.iter().any(|arg| same_symbol(arg, target))
+                || (!same_symbol(operand, target)
+                    && dest
+                        .as_deref()
+                        .is_some_and(|dest| same_symbol(dest, target)))
         }
-        Stmt::Load { address, .. } => address == target,
-        Stmt::Gep { base, .. } => base == target,
-        Stmt::PtrToInt { source, .. } => source == target,
-        Stmt::IntToPtr { source, .. } => source == target,
-        Stmt::Memcpy { dst, src, .. } => dst == target || src == target,
-        Stmt::Memset { dst, value, .. } => dst == target || value == target,
+        Stmt::Load { address, .. } => same_symbol(address, target),
+        Stmt::Gep { base, .. } => same_symbol(base, target),
+        Stmt::PtrToInt { source, .. } => same_symbol(source, target),
+        Stmt::IntToPtr { source, .. } => same_symbol(source, target),
+        Stmt::Memcpy { dst, src, .. } => same_symbol(dst, target) || same_symbol(src, target),
+        Stmt::Memset { dst, value, .. } => same_symbol(dst, target) || same_symbol(value, target),
         Stmt::Unknown {
             operands, results, ..
         } => {
-            operands.iter().any(|operand| operand == target)
-                || results.iter().any(|result| result == target)
+            operands.iter().any(|operand| same_symbol(operand, target))
+                || results.iter().any(|result| same_symbol(result, target))
         }
-        Stmt::Return { value, .. } => value.as_deref() == Some(target),
+        Stmt::Return { value, .. } => value
+            .as_deref()
+            .is_some_and(|value| same_symbol(value, target)),
         Stmt::CallDirect {
             callee, args, dest, ..
         } => {
-            callee == target
-                || dest.as_deref() == Some(target)
-                || args.iter().any(|arg| arg == target)
+            same_symbol(callee, target)
+                || dest
+                    .as_deref()
+                    .is_some_and(|dest| same_symbol(dest, target))
+                || args.iter().any(|arg| same_symbol(arg, target))
         }
-        Stmt::Alloca { dest, .. } => dest == target,
-        Stmt::VarArg { dest, .. } => dest == target,
+        Stmt::Alloca { dest, .. } => same_symbol(dest, target),
+        Stmt::VarArg { dest, .. } => same_symbol(dest, target),
         Stmt::GlobalRef { .. } => false,
     }
 }

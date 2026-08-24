@@ -278,6 +278,24 @@ fn m2_2_simple_never_address_taken_global_slot_resolves_exactly() {
 }
 
 #[test]
+fn m2_2_llvm_global_slot_symbols_are_canonicalized() {
+    let pir = Pir::from_path(m2_2_fixture("simple_global_slot.ll")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            enable_b1_initval: false,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_single_exact_target(&analysis, "cb", pangs_api::Tier::B2Simple);
+}
+
+#[test]
 fn m2_2_simple_constant_global_field_resolves_exactly() {
     let pir = Pir::from_path(m2_2_fixture("simple_global_fields.pir.json")).unwrap();
 
