@@ -258,9 +258,10 @@ values and materialized allocation-relative memory cells. Assignments and GEPs p
 producers; solved stores feed their possible destination cells; solved loads consume their
 possible source cells. Direct-call parameter and return summaries require no separate
 syntax because PAG construction has already flattened those bindings into assignments.
-Aggregate copies currently make their affected destination cells incomplete; certifying
-field-preserving memcpy requires a width-aware projection summary and is left for a later
-extension.
+Aggregate copies make their affected destination cells incomplete: the copy transfers
+contents at whole-object granularity, so a certificate cannot attribute a destination field
+to one source field. Certifying field-preserving memcpy requires the width-aware projection
+summary of `20260730_MEMCPY_HANDLING.md` and is left for a later extension.
 
 The graph is condensed into SCCs once. A component is incomplete when it contains an
 external-region producer, depends on an incomplete component, or forms an ungrounded
@@ -372,7 +373,15 @@ dynamic sequential indices materializes
 `table[*].fn` and `table[*].used` remain separate when their member offsets occupy
 disjoint lanes, while a constant element address aliases the appropriate lane. Each root
 also has at most one fully unknown-offset summary, which aliases every materialized
-location for that root; a direct whole-object access is likewise bridged to that summary.
+location for that root; a whole-object access is likewise bridged to that summary, and
+**materializes it when absent**. Both access families that bypass field cells — a direct
+load/store through the object, and a bulk-copy endpoint — install that bridge, so an
+aggregate copy delivers its contents to the destination's fields at whole-object
+granularity. `PANGS_ANDERSEN_WHOLE_OBJECT_FIELD_BRIDGE` disables it (`0`) or selects one
+family (`access`, `copy`) for ablation. Until 2026-08-24 the bridge fired only when a
+dynamic GEP had already created the summary, so an object whose GEPs all had constant
+offsets exchanged nothing between its root cell and its fields; the consequences are
+recorded in [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md).
 Nested GEPs canonicalize to a root-relative exact offset or lane only when that location
 occurs in the fixed PAG's finite location vocabulary. Other nested or recursive locations
 route to the root's unknown summary rather than creating an unbounded field-of-field
@@ -398,7 +407,15 @@ established relations from newly installed relations:
 - A `memcpy(dst, src)` remembers the destination and source objects it has already
   joined. Growth is processed as the two disjoint rectangles
   `new_dst × all_src` and `old_dst × new_src`, so each required object pair is visited
-  once.
+  once. The join relates *root objects*; the destination's field cells receive the
+  contents through the whole-object summary bridge above, not through the join itself.
+
+A bulk copy's prepartition endpoints are both synthetic storage regions, so — unlike every
+other memory edge, which contributes a value node — its two address carriers are unioned
+into that component explicitly. Without it the carriers' producers sit in an uninteresting
+partition, are dropped from the admitted solve, and the copy is solved with an empty
+endpoint set, which no amount of field modelling can repair.
+`PANGS_ANDERSEN_MEMCPY_PREPARTITION_CARRIERS=0` restores the older behaviour for ablation.
 
 The Andersen solver summarizes memcpy edges by default. Set
 `PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES=0` to restore the direct Cartesian join for

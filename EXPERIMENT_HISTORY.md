@@ -519,3 +519,51 @@ widened lattice fact. No persisted instrumented-corpus traces were available, so
 dynamic-recall gate remains unresolved. Both shortcut knobs stay default-off; the result does not
 justify a default without trace recall, repeated timings, or a material flagship
 disposition/admission effect.
+
+### Aggregate-copy field delivery (2026-08-24)
+
+The T4 investigation into `-O0` dispatch-table sites that resolve to nothing found three
+separable defects around whole-object accesses, and fixed all three by default.
+
+The reproducer is 30 lines (`metrics/icall_census/memcpy_aggregate_fnptr_repro.c`): a global
+struct of function pointers populated by a compound-literal assignment and called through
+constant-offset field loads. Before the fix both callsites returned `targets=0` with an Ω
+marker while a plain scalar global slot in the same function resolved. Steensgaard answered
+the same sites with four finite targets and no Ω, so Andersen *lost to the tier it refines*
+and `pangs differential` exited 3 — on `exe-tree-O0`, `exe-OMP__tree-O0` and `lib-sqlite-O0`
+as well as the fixture. Nothing ran that check.
+
+The three mechanisms, and their measured contributions on a six-module ablation
+(`base` / `carriers` / `copy` / `access` / `all`, carriers held constant across the bridge
+arms):
+
+| mechanism | independent? | effect |
+|---|---|---|
+| prepartition carrier union | yes | exe-jq-O0 +165 ModRef rows, exe-gifsicle-O0 +2 |
+| bulk-copy field bridge | no — requires carriers | exe-tree-O0 +323 call edges, Ω icalls 19 → 2, differential 3 → 0 |
+| direct-access field bridge | yes | exe-tmux-O0 +4 ModRef rows, exe-chibicc-O0 +1 |
+
+No module drew from more than one. On jq and gifsicle all four non-base arms produced
+byte-identical row sets to `carriers` alone; on tree, `copy` without carriers gave +0 edges
+and Ω still 19; on tmux, `carriers` alone was `+0 -0`. Every change on every module was
+additive — **no row was removed anywhere** — which is the expected signature for a fix that
+recovers missed effects.
+
+Two dead ends worth not repeating. The whole-object bridge was first attributed as the sole
+cause; it is inert on its own, because the copy's source set is empty until the carriers are
+admitted. And the initial regression fixture for the carrier union was vacuous: a
+source-side *field* read resolves regardless of scope, because `exact_addresses`
+pre-resolves constant GEPs to field cells in `build_base_solve`. Only a whole-object access
+on both sides of the copy discriminates.
+
+Cost, from an interleaved five-arm run on `exe-tmux-O0` and the fork's single-run vim arms:
+RSS is flat to three digits everywhere (tmux 599 MB on all five arms; vim 17.53 GB on all
+four). Wall time on tmux was indistinguishable — per-arm medians 54.8–66.7 s against per-arm
+ranges of 50–77 s, with the `all` arm's fastest run beating the baseline median. Vim showed
+baseline 1887.8 s versus both-on 2039.0 s (+8.0%), single runs. A quiet-machine corpus
+timing run is still owed: these overlapped a contended window.
+
+The fix is field-*insensitive*: it restores Steensgaard-grade transfer through the copy, so
+a two-member callback table resolves to both members. Offset correspondence — the precision
+half of `20260730_MEMCPY_HANDLING.md` — remains unimplemented, and its motivation is now
+precision and propagation cost rather than soundness.

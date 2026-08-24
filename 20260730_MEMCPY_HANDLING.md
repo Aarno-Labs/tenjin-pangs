@@ -2,7 +2,32 @@
 
 ## Status
 
-Design sketch for review. Nothing here is implemented.
+Design sketch for review. Phase 5 was prototyped separately and remains opt-in
+(`PANGS_ANDERSEN_HYBRID_BITSETS`); Phase 0's aggregate counters exist but not its per-site
+attribution. Phases 1-4 -- the pointer-region inventory and the projected copy itself --
+are **not implemented**.
+
+**Correction (2026-08-24).** The premise below, that the current whole-object rule is
+"sound but field-insensitive", is wrong on both counts, and the rest of this document should
+be read with that in mind:
+
+- It was not merely coarse. The contents-copy relates *root object* cells while the reads
+  and writes around it use `Exact`/`Lane` field cells, so a copy delivered **nothing** to
+  the destination's fields rather than delivering something imprecise.
+- It was therefore not sound. The call-graph client was rescued by
+  `unknown_callee |= targets.is_empty()`; ModRef has no equivalent net and silently
+  under-approximated the write set of any function reached through an aggregate copy.
+
+Two separate defects produced that, and each was inert without the other: the copy's
+prepartition address carriers were never unioned into their component (so the join ran with
+an empty source set), and the whole-object summary bridge fired only when a dynamic GEP had
+already materialized the summary. Both are fixed as of 2026-08-24 and are on by default;
+see `DESIGN_lite.md` §2 D' and [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md).
+
+That fix supplies the **fallback** half of this design -- Steensgaard-grade transfer through
+the copy. Everything below remains the plan for the *precision* half: offset correspondence,
+so a two-member callback table resolves to the member its offset selects rather than to
+both. The motivation for that work is now precision and propagation cost, not soundness.
 
 The proposal separates two questions that the current solver answers with one
 field-insensitive rule:
@@ -25,7 +50,8 @@ for destination object od in pts(dst):
         add copy edge os -> od
 ```
 
-This rule is sound but field-insensitive. It eagerly constructs a Cartesian
+This rule is field-insensitive *and*, before the 2026-08-24 fix described in the status
+section, delivered nothing at all to field cells. It also eagerly constructs a Cartesian
 product even when the copy moves only character data.
 
 The forced solve of the oversize partition in
