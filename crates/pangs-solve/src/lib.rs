@@ -235,6 +235,10 @@ pub struct NodeResolution {
     pub pointee_provenance: SharedProvenanceList,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_sources: Vec<String>,
+    /// Diagnostic-only seed support for `external_universal`. Kept separate from ordinary
+    /// external sources so more precise attribution does not change ModRef details or solving.
+    #[serde(skip)]
+    pub universal_sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -808,6 +812,7 @@ struct ClassData {
     pointee: Option<usize>,
     ext: bool,
     universal: bool,
+    universal_sources: BTreeSet<String>,
     esc: bool,
     escape_sources: BTreeSet<String>,
     icall_sites: HashSet<usize>,
@@ -1755,7 +1760,8 @@ impl<'a> Solver<'a> {
                 (OmegaSeedKind::IntToPtr, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
                     self.add_class_provenance(class, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
-                    self.set_universal_ext(class);
+                    let source = format!("omega:inttoptr:{}", self.pag.nodes[id.0 as usize].label);
+                    self.set_universal_ext_with_sources(class, &BTreeSet::from([source]));
                 }
                 (OmegaSeedKind::UnknownResultExternal, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
@@ -2084,6 +2090,11 @@ impl<'a> Solver<'a> {
                     } else {
                         Vec::new()
                     },
+                    universal_sources: self.classes[root]
+                        .universal_sources
+                        .iter()
+                        .cloned()
+                        .collect(),
                 },
             );
         }
@@ -2250,13 +2261,14 @@ impl<'a> Solver<'a> {
         let root = self.find(class);
         let ext = self.classes[root].ext;
         let universal = self.classes[root].universal;
+        let universal_sources = self.classes[root].universal_sources.clone();
         let esc = self.classes[root].esc;
         let escape_sources = self.classes[root].escape_sources.clone();
 
         if ext || esc {
             if let Some(pointee) = self.classes[root].pointee {
                 if universal {
-                    self.set_universal_ext(pointee);
+                    self.set_universal_ext_with_sources(pointee, &universal_sources);
                 } else {
                     self.set_ext(pointee);
                 }
@@ -2612,9 +2624,15 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn set_universal_ext(&mut self, class: usize) {
+    fn set_universal_ext_with_sources(&mut self, class: usize, sources: &BTreeSet<String>) {
         let root = self.find(class);
-        let changed = !self.classes[root].ext || !self.classes[root].universal;
+        let old_sources = self.classes[root].universal_sources.len();
+        self.classes[root]
+            .universal_sources
+            .extend(sources.iter().cloned());
+        let changed = !self.classes[root].ext
+            || !self.classes[root].universal
+            || self.classes[root].universal_sources.len() != old_sources;
         self.classes[root].ext = true;
         self.classes[root].universal = true;
         if changed {
@@ -2661,6 +2679,10 @@ impl<'a> Solver<'a> {
         self.classes[a].node_count += self.classes[b].node_count;
         self.classes[a].ext |= self.classes[b].ext;
         self.classes[a].universal |= self.classes[b].universal;
+        let other_universal_sources = std::mem::take(&mut self.classes[b].universal_sources);
+        self.classes[a]
+            .universal_sources
+            .extend(other_universal_sources);
         self.classes[a].esc |= self.classes[b].esc;
         self.classes[a].provenance |= self.classes[b].provenance | provenance;
         let other_escape_sources = std::mem::take(&mut self.classes[b].escape_sources);

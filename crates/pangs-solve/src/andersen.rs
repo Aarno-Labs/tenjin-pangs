@@ -271,6 +271,7 @@ fn finish_andersen_controlled(
                         node.pointee_provenance = Default::default();
                     }
                     node.external_sources = resolution.external_sources;
+                    node.universal_sources = resolution.universal_sources;
                 }
             }
             for (label, allocs) in refined.global_points_to {
@@ -402,6 +403,7 @@ struct RefinedNodeResolution {
     pointee_globals: Vec<String>,
     pointee_globals_unfiltered: Vec<String>,
     external_sources: Vec<String>,
+    universal_sources: Vec<String>,
 }
 
 #[derive(Default)]
@@ -4141,6 +4143,23 @@ impl<'a> Refiner<'a> {
                     source_sample
                 );
             }
+            let universal_sources = if external_universal {
+                set.into_iter()
+                    .flat_map(|set| set.iter())
+                    .filter_map(|cell| match pts.external_region(cell) {
+                        Some(ExternalRegion::ForgedPointer(node)) => self
+                            .pag
+                            .nodes
+                            .get(node as usize)
+                            .map(|node| format!("omega:inttoptr:{}", node.label)),
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             out.push(RefinedNodeResolution {
                 label: node.label.clone(),
                 reaches_function_pointer,
@@ -4149,6 +4168,7 @@ impl<'a> Refiner<'a> {
                 pointee_globals: globals,
                 pointee_globals_unfiltered: globals_unfiltered,
                 external_sources,
+                universal_sources,
             });
         }
         out
@@ -6602,10 +6622,9 @@ mod tests {
 
     use super::{
         finish_andersen_controlled, memcpy_edge_summaries_enabled_for,
-        memcpy_prepartition_carriers_enabled_for, whole_object_field_bridge_policy_for,
-        solve_andersen,
-        solve_andersen_with_overrides, AndersenControls, Cell, ExternalRegion, HybridPointSet,
-        PointSet, Refiner, Solve, WholeObjectAccess, WholeObjectBridgePolicy,
+        memcpy_prepartition_carriers_enabled_for, solve_andersen, solve_andersen_with_overrides,
+        whole_object_field_bridge_policy_for, AndersenControls, Cell, ExternalRegion,
+        HybridPointSet, PointSet, Refiner, Solve, WholeObjectAccess, WholeObjectBridgePolicy,
     };
     use crate::{solve_steensgaard, FieldLocation, PointsToMaterialization};
 
@@ -7355,7 +7374,10 @@ mod tests {
     fn whole_object_field_bridge_policy_selects_access_families() {
         for value in [None, Some("1"), Some("access")] {
             let policy = whole_object_field_bridge_policy_for(value);
-            assert!(policy.enabled_for(WholeObjectAccess::DirectAccess), "{value:?}");
+            assert!(
+                policy.enabled_for(WholeObjectAccess::DirectAccess),
+                "{value:?}"
+            );
         }
         for value in [Some("0"), Some("off")] {
             assert_eq!(
@@ -7399,7 +7421,10 @@ mod tests {
             call.targets.contains(&"intro".to_string()),
             "bulk-copied callback table did not reach the dispatch site: {call:?}"
         );
-        assert!(!call.unknown_callee, "site retained its omega marker: {call:?}");
+        assert!(
+            !call.unknown_callee,
+            "site retained its omega marker: {call:?}"
+        );
     }
 
     #[test]
@@ -7645,9 +7670,7 @@ mod tests {
                     .map(|set| {
                         set.iter()
                             .map(|pointee| match solve.field_base.get(&pointee) {
-                                Some(&root) => {
-                                    (root, solve.field_location.get(&pointee).copied())
-                                }
+                                Some(&root) => (root, solve.field_location.get(&pointee).copied()),
                                 None => (pointee, None),
                             })
                             .collect()

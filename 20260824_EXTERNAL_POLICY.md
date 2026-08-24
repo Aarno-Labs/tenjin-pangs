@@ -2,7 +2,12 @@
 
 Date: 2026-08-24
 
-Status: proposed for review; no implementation has begun
+Status: Phase-0 census measured; stop gate failed; semantic implementation is not recommended
+
+The measured results are recorded in
+[`20260824_EXTERNAL_POLICY_CENSUS.md`](20260824_EXTERNAL_POLICY_CENSUS.md). The primary graduation
+metric was zero newly mutex-eligible globals, so this document remains a rejected design rather
+than an implementation roadmap.
 
 ## 0. Decision summary
 
@@ -469,8 +474,7 @@ For each unresolved callsite reachable from a candidate global's accessor set, r
 
 For each strict `ModuleWide` ModRef row, report:
 
-- its seed-kind support: `OmegaSeedKind::IntToPtr`, `ViolationExposure::ModuleWide` from inline
-  assembly, or both;
+- its `OmegaSeedKind::IntToPtr` support and forged-pointer origin;
 - the originating instruction or exposure witness;
 - the number and identities of globals that receive a module-wide poison from that row;
 - how many of those globals are poisoned exclusively by that row versus also poisoned by another
@@ -490,8 +494,8 @@ Aggregate:
 - complete closures that reach an accessor versus complete closures disjoint from all accessors;
 - D4 failures that the ideal conventional policy would clear;
 - globals that would become mutex-eligible after that D4 change;
-- `ModuleWide` rows and distinct poisoned globals by seed kind, including the overlap between
-  `IntToPtr` and inline-assembly exposure;
+- `ModuleWide` rows and distinct poisoned globals by `IntToPtr` seed, plus a separate inventory of
+  module-wide inline-assembly exposures;
 - exclusively poisoned globals and counterfactual client decisions attributable to each
   `ModuleWide` row, so row counts do not overstate the recoverable prize;
 - globals that would become stationary after finite writer-candidate narrowing;
@@ -503,11 +507,13 @@ Aggregate:
 
 Expected access-completeness result: **zero newly access-complete globals**. Today
 `access_set_complete` fails only for a module-wide unknown ModRef, an Ω-escaped address, or a
-library-mode export. Finite unknown rows do not defeat it. The only current module-wide ModRef
-sources are forged/universal pointer provenance and module-wide violation exposure, both of which
-block conventional certification. The census records access-completeness transitions as a
-negative control: any nonzero transition falsifies this premise or reveals a separate behavior
-change and must be explained before proceeding. It is not graduation credit.
+library-mode export. Finite unknown rows do not defeat it. The census confirmed that the current
+`ModuleWide` lattice element comes only from forged/universal pointer provenance. A module-wide
+inline-assembly violation exposure disables address-exposure filtering but remains a finite
+candidate set. Both conditions block conventional certification. The census records
+access-completeness transitions as a negative control: any nonzero transition falsifies this
+premise or reveals a separate behavior change and must be explained before proceeding. It is not
+graduation credit.
 
 The `ModuleWide` census measures an opportunity deliberately outside this proposal rather than an
 opportunity for external-principal separation. If its overlap-aware client prize materially
@@ -677,9 +683,9 @@ Each phase is independently reviewable and should be one or more focused `jj` co
 1. Inventory existing external-region and source provenance at ModRef address nodes and unknown
    callsites.
 2. Add diagnostic-only principal grouping using §6.3.
-3. Attribute every strict `ModuleWide` row to `IntToPtr`,
-   `ViolationExposure::ModuleWide` from inline assembly, or both, and compute overlap-aware
-   poisoned-global and leave-one-row-out client upper bounds.
+3. Attribute every strict `ModuleWide` row to its `IntToPtr` origins, inventory module-wide
+   inline-assembly exposures separately, and compute overlap-aware poisoned-global and
+   leave-one-row-out client upper bounds.
 4. Inventory every internal function pointer supplied to each principal and record whether that
    callback inventory is complete.
 5. Build the diagnostic alternating control closure over the final concrete call graph and add
@@ -871,8 +877,8 @@ Report:
 - eligible and rejected effect and reentry certificates by blocker;
 - admitted versus oversize opportunity counts;
 - strict versus conventional ModRef candidate fanout;
-- `ModuleWide` rows by `IntToPtr`/inline-assembly seed kind, their overlap-aware poisoned-global
-  counts, and client decisions blocked exclusively by each row;
+- `ModuleWide` rows by `IntToPtr` origin, separate inline-assembly exposure counts, their
+  overlap-aware poisoned-global counts, and client decisions blocked exclusively by each row;
 - retained callbacks per principal and callback/control closure sizes;
 - effect candidates contributed by callback `TransMod` closure;
 - globals newly stationary;

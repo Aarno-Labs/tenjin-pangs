@@ -69,6 +69,27 @@ enum Command {
         #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
     },
+    /// Emit the diagnostic-only Phase-0 external-policy opportunity census as JSON.
+    ExternalPolicyCensus {
+        module: PathBuf,
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value = knobs::DEFAULT_ANALYSIS_STAGE)]
+        stage: StageArg,
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
+        build_mode: BuildModeArg,
+        #[arg(long)]
+        exports: Option<PathBuf>,
+        #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
+        partition_budget: u64,
+        /// Repository root used by disposition fact assembly.
+        #[arg(long, default_value = ".")]
+        repo_root: PathBuf,
+        /// Retain targeted allocation-level points-to for callback-capable opaque-call
+        /// arguments. Expensive; use after the core census identifies a D4 opportunity.
+        #[arg(long)]
+        callback_closure: bool,
+    },
     DumpPir {
         module: PathBuf,
         #[arg(long)]
@@ -411,6 +432,107 @@ fn run() -> Result<()> {
                     "metrics": analysis.metrics(),
                 }))?
             );
+        }
+        Command::ExternalPolicyCensus {
+            module,
+            out,
+            stage,
+            build_mode,
+            exports,
+            partition_budget,
+            repo_root,
+            callback_closure,
+        } => {
+            if matches!(stage, StageArg::Conservative) {
+                anyhow::bail!("external-policy-census requires --stage steens or andersen");
+            }
+            let pir = Pir::from_path_with_repo_root(&module, &repo_root)?;
+            let opts = Opts {
+                stage: stage.into(),
+                build_mode: build_mode.into(),
+                exports: read_exports(exports)?,
+                partition_budget,
+                ..Opts::default()
+            };
+            let mut analysis = Analysis::run_with_external_policy_census(&pir, &opts, None)?;
+            let target = pir
+                .target
+                .as_ref()
+                .context("external-policy-census requires LLVM target metadata")?;
+            let (mut manifest, _) = pangs_clients::assemble_disposition_artifacts(
+                &analysis, &pir, &opts, &module, &repo_root, target,
+            )?;
+            let mut d4 = pangs_clients::external_policy_d4_census(&analysis, &manifest);
+            let mut callback_target_callsites = BTreeSet::new();
+            if callback_closure {
+                let core = analysis
+                    .external_policy_census()
+                    .context("external-policy core census inputs were not produced")?;
+                let selected_callsites = d4
+                    .globals
+                    .iter()
+                    .filter(|global| {
+                        global
+                            .strict_mutex_codes
+                            .iter()
+                            .any(|code| code == "unknown-callee-reentrancy")
+                    })
+                    .flat_map(|global| &global.unknown_calls)
+                    .filter_map(|call| call.callsite)
+                    .collect::<BTreeSet<_>>();
+                let selected_principals = core
+                    .opaque_callsites
+                    .iter()
+                    .filter(|callsite| selected_callsites.contains(&callsite.callsite))
+                    .map(|callsite| callsite.principal.as_str())
+                    .collect::<BTreeSet<_>>();
+                callback_target_callsites.extend(
+                    core.opaque_callsites
+                        .iter()
+                        .filter(|callsite| {
+                            selected_principals.contains(callsite.principal.as_str())
+                        })
+                        .map(|callsite| callsite.key.clone()),
+                );
+                eprintln!(
+                    "external-policy callback enrichment: d4_callsites={} principals={} targeted_callsites={}",
+                    selected_callsites.len(),
+                    selected_principals.len(),
+                    callback_target_callsites.len(),
+                );
+                if !callback_target_callsites.is_empty() {
+                    analysis = Analysis::run_with_external_policy_census(
+                        &pir,
+                        &opts,
+                        Some(&callback_target_callsites),
+                    )?;
+                    (manifest, _) = pangs_clients::assemble_disposition_artifacts(
+                        &analysis, &pir, &opts, &module, &repo_root, target,
+                    )?;
+                    d4 = pangs_clients::external_policy_d4_census(&analysis, &manifest);
+                }
+            }
+            let effect_control = analysis
+                .external_policy_census()
+                .context("external-policy census inputs were not produced")?;
+            let report = serde_json::json!({
+                "module": module,
+                "stage": opts.stage,
+                "build_mode": opts.build_mode,
+                "callback_closure_enrichment": callback_closure,
+                "callback_target_callsites": callback_target_callsites.len(),
+                "analysis_metrics": analysis.metrics(),
+                "effect_control": effect_control,
+                "d4": d4,
+            });
+            let rendered = serde_json::to_string_pretty(&report)?;
+            if let Some(path) = out {
+                fs::write(&path, format!("{rendered}\n"))
+                    .with_context(|| format!("write {}", path.display()))?;
+                eprintln!("external-policy census -> {}", path.display());
+            } else {
+                println!("{rendered}");
+            }
         }
         Command::DumpPir { module, func } => {
             let mut pir = Pir::from_path(&module)?;

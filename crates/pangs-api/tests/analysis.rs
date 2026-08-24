@@ -54,6 +54,49 @@ fn m1_7_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+#[test]
+fn external_policy_census_is_observational_and_attributes_inttoptr_rows() {
+    let pir = Pir::from_path(m1_6_fixture("aliased_unknown_modref.pir.json")).unwrap();
+    let opts = Opts {
+        stage: Stage::Andersen,
+        build_mode: BuildMode::Executable,
+        ..Opts::default()
+    };
+    let ordinary = Analysis::run_with_disposition(&pir, &opts).unwrap();
+    let instrumented = Analysis::run_with_external_policy_census(&pir, &opts, None).unwrap();
+
+    assert_eq!(
+        format!("{:?}", ordinary.call_edges()),
+        format!("{:?}", instrumented.call_edges())
+    );
+    assert_eq!(
+        format!("{:?}", ordinary.modrefs()),
+        format!("{:?}", instrumented.modrefs())
+    );
+    for (ordinary, instrumented) in ordinary.modrefs().iter().zip(instrumented.modrefs()) {
+        assert_eq!(
+            format!("{:?}", ordinary.global_candidates),
+            format!("{:?}", instrumented.global_candidates)
+        );
+    }
+
+    let census = instrumented.external_policy_census().unwrap();
+    assert_eq!(census.summary.module_wide_rows, 2);
+    assert_eq!(census.summary.module_wide_inttoptr_rows, 2);
+    assert_eq!(census.summary.distinct_module_wide_poisoned_globals, 2);
+    assert!(census
+        .module_wide_rows
+        .iter()
+        .all(|row| row.seed_kinds == ["int_to_ptr"]));
+    assert!(census.module_wide_rows.iter().all(|row| {
+        !row.external_sources.is_empty()
+            && row
+                .external_sources
+                .iter()
+                .all(|source| source.starts_with("omega:inttoptr:"))
+    }));
+}
+
 fn m2_2_fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/synthetic/m2_2")
