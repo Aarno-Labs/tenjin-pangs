@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use pangs_pir::{fsa_compatible, Pir, Signature, Stmt};
@@ -89,6 +90,8 @@ struct SimpleResolver<'a> {
     reachable: Vec<bool>,
     externally_callable: Vec<bool>,
     externally_writable_globals: HashSet<String>,
+    global_safety_cache: RefCell<HashMap<String, bool>>,
+    function_escape_cache: RefCell<HashMap<String, bool>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -159,6 +162,8 @@ impl<'a> SimpleResolver<'a> {
             reachable,
             externally_callable,
             externally_writable_globals,
+            global_safety_cache: RefCell::new(HashMap::new()),
+            function_escape_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -539,19 +544,22 @@ impl<'a> SimpleResolver<'a> {
 
     fn global_is_never_address_taken(&self, global: &str) -> bool {
         let global = canonical_symbol(global);
-        if !self.globals.contains(global) || self.externally_writable_globals.contains(global) {
-            return false;
+        if let Some(&safe) = self.global_safety_cache.borrow().get(global) {
+            return safe;
         }
-        self.module
-            .functions
-            .iter()
-            .enumerate()
-            .filter(|(func_index, _)| self.reachable[*func_index])
-            .all(|(func_index, func)| {
-                func.body.iter().enumerate().all(|(stmt_index, stmt)| {
-                    self.function_global_use_is_safe(func_index, stmt_index, stmt, global)
+        let safe = !self.externally_writable_globals.contains(global)
+            && self.globals.contains(global)
+            && self
+                .module
+                .functions
+                .iter()
+                .enumerate()
+                .filter(|(func_index, _)| self.reachable[*func_index])
+                .all(|(func_index, func)| {
+                    func.body.iter().enumerate().all(|(stmt_index, stmt)| {
+                        self.function_global_use_is_safe(func_index, stmt_index, stmt, global)
+                    })
                 })
-            })
             && self
                 .module
                 .global_init
@@ -559,7 +567,11 @@ impl<'a> SimpleResolver<'a> {
                 .enumerate()
                 .all(|(stmt_index, stmt)| {
                     self.global_init_global_use_is_safe(stmt_index, stmt, global)
-                })
+                });
+        self.global_safety_cache
+            .borrow_mut()
+            .insert(global.to_string(), safe);
+        safe
     }
 
     fn global_place_is_simple(&self, place: &SubObj) -> bool {
@@ -567,6 +579,18 @@ impl<'a> SimpleResolver<'a> {
     }
 
     fn function_has_unsafe_escape(&self, target: &str) -> bool {
+        let target = canonical_symbol(target);
+        if let Some(&unsafe_escape) = self.function_escape_cache.borrow().get(target) {
+            return unsafe_escape;
+        }
+        let unsafe_escape = self.compute_function_has_unsafe_escape(target);
+        self.function_escape_cache
+            .borrow_mut()
+            .insert(target.to_string(), unsafe_escape);
+        unsafe_escape
+    }
+
+    fn compute_function_has_unsafe_escape(&self, target: &str) -> bool {
         let mut visiting = HashSet::new();
         for (func_index, func) in self.module.functions.iter().enumerate() {
             if !self.reachable[func_index] {
