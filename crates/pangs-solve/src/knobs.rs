@@ -146,6 +146,25 @@ pub(crate) const ENV_ANDERSEN_MEMCPY_EDGE_SUMMARIES: &str = "PANGS_ANDERSEN_MEMC
 pub(crate) const ENV_ANDERSEN_MEMCPY_PREPARTITION_CARRIERS: &str =
     "PANGS_ANDERSEN_MEMCPY_PREPARTITION_CARRIERS";
 
+/// Selects which whole-object access families create the accessed object's unknown-offset
+/// summary rather than bridging only to one that already exists.
+///
+/// `DESIGN_lite.md` §2 D' specifies the bridge -- "a direct whole-object access is likewise
+/// bridged to that summary" -- but `note_direct_access` used to fire only when a dynamic GEP
+/// had already materialized the summary. An object whose GEPs all have constant offsets never
+/// has one, so a whole-object access exchanged nothing with the object's `Exact`/`Lane` field
+/// cells: the access wrote the root cell while every field read a different cell.
+///
+/// Two independent access families reach the bridge and are separately selectable so their
+/// contributions stay measurable:
+///
+/// - `access` -- direct whole-object loads and stores only;
+/// - `copy`   -- bulk-copy endpoints only;
+/// - `0`/`off` -- neither;
+/// - unset or any other value -- the shipped default.
+pub(crate) const ENV_ANDERSEN_WHOLE_OBJECT_FIELD_BRIDGE: &str =
+    "PANGS_ANDERSEN_WHOLE_OBJECT_FIELD_BRIDGE";
+
 /// Optional hard propagation-step limit used for diagnostics and fault tests.
 pub(crate) const ENV_ANDERSEN_MAX_STEPS: &str = "PANGS_ANDERSEN_MAX_STEPS";
 
