@@ -278,7 +278,7 @@ fn m2_2_simple_never_address_taken_global_slot_resolves_exactly() {
 }
 
 #[test]
-fn m2_2_llvm_global_slot_symbols_are_canonicalized() {
+fn m2_2_llvm_global_slot_ignores_unrelated_global_accesses() {
     let pir = Pir::from_path(m2_2_fixture("simple_global_slot.ll")).unwrap();
 
     let analysis = Analysis::run(
@@ -3696,12 +3696,11 @@ fn steens_modref_closure_carries_pointer_rows_through_direct_and_indirect_calls(
     assert!(analysis.call_edges().iter().any(|edge| {
         edge.caller == pangs_api::Caller::Func(setup)
             && edge.callee == pangs_api::Callee::Func(target)
-            && edge.tier == pangs_api::Tier::Steens
+            && edge.tier == pangs_api::Tier::B2Simple
     }));
     assert!(!analysis.call_edges().iter().any(|edge| {
         edge.caller == pangs_api::Caller::Func(setup)
             && edge.callee == pangs_api::Callee::Func(other)
-            && edge.tier == pangs_api::Tier::Steens
     }));
 
     let raw_modrefs: Vec<_> = analysis.modrefs().iter().collect();

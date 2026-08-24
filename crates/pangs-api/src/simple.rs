@@ -866,12 +866,12 @@ impl<'a> SimpleResolver<'a> {
         match stmt {
             Stmt::Load { address, .. } => self
                 .function_place(func_index, stmt_index, address)
-                .map(|place| place.root == global)
+                .map(|_| true)
                 .unwrap_or_else(|| !operand_mentions_global(address, global)),
             Stmt::Store { address, value, .. } => {
                 let address_safe = self
                     .function_place(func_index, stmt_index, address)
-                    .map(|place| place.root == global)
+                    .map(|_| true)
                     .unwrap_or_else(|| !operand_mentions_global(address, global));
                 address_safe
                     && self
@@ -885,7 +885,7 @@ impl<'a> SimpleResolver<'a> {
                 ..
             } => self
                 .function_place(func_index, stmt_index, base)
-                .map(|place| place.root == global)
+                .map(|_| true)
                 .unwrap_or_else(|| !operand_mentions_global(base, global)),
             Stmt::Gep { base, .. } => self
                 .function_place(func_index, stmt_index, base)
@@ -904,12 +904,12 @@ impl<'a> SimpleResolver<'a> {
         match stmt {
             Stmt::Load { address, .. } => self
                 .global_init_place(stmt_index, address)
-                .map(|place| place.root == global)
+                .map(|_| true)
                 .unwrap_or_else(|| !operand_mentions_global(address, global)),
             Stmt::Store { address, value, .. } => {
                 let address_safe = self
                     .global_init_place(stmt_index, address)
-                    .map(|place| place.root == global)
+                    .map(|_| true)
                     .unwrap_or_else(|| !operand_mentions_global(address, global));
                 address_safe
                     && self
@@ -923,7 +923,7 @@ impl<'a> SimpleResolver<'a> {
                 ..
             } => self
                 .global_init_place(stmt_index, base)
-                .map(|place| place.root == global)
+                .map(|_| true)
                 .unwrap_or_else(|| !operand_mentions_global(base, global)),
             Stmt::Gep { base, .. } => self
                 .global_init_place(stmt_index, base)

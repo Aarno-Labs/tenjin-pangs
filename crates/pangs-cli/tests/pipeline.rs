@@ -1619,14 +1619,12 @@ fn analyze_steens_keeps_pointer_modref_exports_local_while_callgraph_narrows_ind
     assert!(callgraph.iter().any(|row| {
         row["caller"]["func"] == "setup"
             && row["callee"]["func"] == "target"
-            && row["tier"] == "steens"
+            && row["tier"] == "b2_simple"
             && row["callsite"] == "setup@m1_6_icall.c:12:1#0"
     }));
-    assert!(!callgraph.iter().any(|row| {
-        row["caller"]["func"] == "setup"
-            && row["callee"]["func"] == "other"
-            && row["tier"] == "steens"
-    }));
+    assert!(!callgraph
+        .iter()
+        .any(|row| { row["caller"]["func"] == "setup" && row["callee"]["func"] == "other" }));
 
     let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
         .unwrap()
