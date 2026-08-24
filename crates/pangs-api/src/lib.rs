@@ -1268,7 +1268,13 @@ impl Analysis {
         let setup_scan_us = setup_scan_started.elapsed().as_micros() as u64;
         let preanalysis_started = Instant::now();
         let mut simple_report = if opts.enable_b2_simple {
-            resolve_simple_icalls(module, &simple_icall_queries, opts.b2_context_depth)
+            resolve_simple_icalls(
+                module,
+                &simple_icall_queries,
+                opts.b2_context_depth,
+                opts.build_mode,
+                &opts.exports,
+            )
         } else {
             Default::default()
         };

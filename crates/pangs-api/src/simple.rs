@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use pangs_pir::{fsa_compatible, Pir, Signature, Stmt};
 
-use crate::CallsiteId;
+use crate::{BuildMode, CallsiteId};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SimpleIcallQuery {
@@ -42,8 +42,10 @@ pub(crate) fn resolve_simple_icalls(
     module: &Pir,
     queries: &[SimpleIcallQuery],
     context_depth: usize,
+    build_mode: BuildMode,
+    exports: &BTreeSet<String>,
 ) -> SimpleIcallReport {
-    let mut resolver = SimpleResolver::new(module, context_depth);
+    let mut resolver = SimpleResolver::new(module, context_depth, build_mode, exports);
     let mut resolutions = BTreeMap::new();
     let mut reached_sites: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for query in queries {
@@ -84,6 +86,9 @@ struct SimpleResolver<'a> {
     functions: HashMap<&'a str, usize>,
     globals: HashSet<&'a str>,
     definitions: Vec<HashMap<&'a str, usize>>,
+    reachable: Vec<bool>,
+    externally_callable: Vec<bool>,
+    externally_writable_globals: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -93,7 +98,12 @@ struct SubObj {
 }
 
 impl<'a> SimpleResolver<'a> {
-    fn new(module: &'a Pir, context_depth: usize) -> Self {
+    fn new(
+        module: &'a Pir,
+        context_depth: usize,
+        build_mode: BuildMode,
+        exports: &BTreeSet<String>,
+    ) -> Self {
         let functions = module
             .functions
             .iter()
@@ -118,12 +128,37 @@ impl<'a> SimpleResolver<'a> {
                 defs
             })
             .collect();
+        let externally_callable = module
+            .functions
+            .iter()
+            .map(|func| {
+                func.external
+                    || exports.iter().any(|name| same_symbol(name, &func.key))
+                    || match build_mode {
+                        BuildMode::Library => func.exported,
+                        BuildMode::Executable => canonical_symbol(&func.key) == "main",
+                    }
+            })
+            .collect::<Vec<_>>();
+        let reachable = reachable_functions(module, build_mode, &externally_callable);
+        let externally_writable_globals = module
+            .globals
+            .iter()
+            .filter(|global| {
+                exports.iter().any(|name| same_symbol(name, &global.key))
+                    || (build_mode == BuildMode::Library && global.exported)
+            })
+            .map(|global| canonical_symbol(&global.key).to_string())
+            .collect();
         Self {
             module,
             context_depth,
             functions,
             globals,
             definitions,
+            reachable,
+            externally_callable,
+            externally_writable_globals,
         }
     }
 
@@ -324,8 +359,14 @@ impl<'a> SimpleResolver<'a> {
             return WalkResult::Complex;
         }
         let callee = self.module.functions[callee_index].key.clone();
+        if self.externally_callable[callee_index] {
+            return WalkResult::Complex;
+        }
         let mut saw_call = false;
         for caller_index in 0..self.module.functions.len() {
+            if !self.reachable[caller_index] {
+                continue;
+            }
             let body_len = self.module.functions[caller_index].body.len();
             for stmt_index in 0..body_len {
                 let Stmt::CallDirect {
@@ -387,6 +428,9 @@ impl<'a> SimpleResolver<'a> {
         }
         let mut saw_store = false;
         for func_index in 0..self.module.functions.len() {
+            if !self.reachable[func_index] {
+                continue;
+            }
             let body_len = self.module.functions[func_index].body.len();
             for stmt_index in 0..body_len {
                 let Stmt::Store { address, value, .. } =
@@ -495,20 +539,14 @@ impl<'a> SimpleResolver<'a> {
 
     fn global_is_never_address_taken(&self, global: &str) -> bool {
         let global = canonical_symbol(global);
-        if self
-            .module
-            .globals
-            .iter()
-            .find(|candidate| same_symbol(&candidate.key, global))
-            .map(|candidate| candidate.exported)
-            .unwrap_or(true)
-        {
+        if !self.globals.contains(global) || self.externally_writable_globals.contains(global) {
             return false;
         }
         self.module
             .functions
             .iter()
             .enumerate()
+            .filter(|(func_index, _)| self.reachable[*func_index])
             .all(|(func_index, func)| {
                 func.body.iter().enumerate().all(|(stmt_index, stmt)| {
                     self.function_global_use_is_safe(func_index, stmt_index, stmt, global)
@@ -531,6 +569,9 @@ impl<'a> SimpleResolver<'a> {
     fn function_has_unsafe_escape(&self, target: &str) -> bool {
         let mut visiting = HashSet::new();
         for (func_index, func) in self.module.functions.iter().enumerate() {
+            if !self.reachable[func_index] {
+                continue;
+            }
             for (stmt_index, stmt) in func.body.iter().enumerate() {
                 if self.function_symbol_use_escapes(
                     func_index,
@@ -735,7 +776,7 @@ impl<'a> SimpleResolver<'a> {
         visiting: &mut HashSet<(usize, String, usize)>,
     ) -> bool {
         let func = &self.module.functions[func_index];
-        if func.external || func.exported || func.address_taken {
+        if self.externally_callable[func_index] || func.address_taken {
             return true;
         }
         let mut saw_caller = false;
@@ -1042,6 +1083,61 @@ fn canonical_symbol(value: &str) -> &str {
 
 fn same_symbol(lhs: &str, rhs: &str) -> bool {
     canonical_symbol(lhs) == canonical_symbol(rhs)
+}
+
+fn reachable_functions(
+    module: &Pir,
+    build_mode: BuildMode,
+    externally_callable: &[bool],
+) -> Vec<bool> {
+    if build_mode == BuildMode::Library {
+        return vec![true; module.functions.len()];
+    }
+    if !module
+        .functions
+        .iter()
+        .enumerate()
+        .any(|(index, func)| !func.external && externally_callable[index])
+    {
+        // Without a closed-world entry point, pruning would turn an absent root declaration into
+        // an exactness claim. Preserve the historical fail-closed behavior for such fixtures and
+        // partial modules by treating every function as reachable.
+        return vec![true; module.functions.len()];
+    }
+
+    let functions = module
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(index, func)| (canonical_symbol(&func.key), index))
+        .collect::<HashMap<_, _>>();
+    let mut reachable = module
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(index, func)| externally_callable[index] || func.address_taken)
+        .collect::<Vec<_>>();
+    let mut work = reachable
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &is_reachable)| is_reachable.then_some(index))
+        .collect::<Vec<_>>();
+
+    while let Some(func_index) = work.pop() {
+        for stmt in &module.functions[func_index].body {
+            let Stmt::CallDirect { callee, .. } = stmt else {
+                continue;
+            };
+            let Some(&callee_index) = functions.get(canonical_symbol(callee)) else {
+                continue;
+            };
+            if !reachable[callee_index] {
+                reachable[callee_index] = true;
+                work.push(callee_index);
+            }
+        }
+    }
+    reachable
 }
 
 fn function_use_is_unsafe<F>(stmt: &Stmt, target: &str, mut global_is_safe_slot: F) -> bool

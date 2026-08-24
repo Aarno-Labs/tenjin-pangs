@@ -296,6 +296,61 @@ fn m2_2_llvm_global_slot_ignores_unrelated_global_accesses() {
 }
 
 #[test]
+fn m2_2_executable_reachability_excludes_an_uncalled_setter() {
+    let pir = Pir::from_path(m2_2_fixture("simple_global_slot_dead_setter.ll")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            enable_b1_initval: false,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_single_exact_target(&analysis, "cb", pangs_api::Tier::B2Simple);
+}
+
+#[test]
+fn m2_2_explicitly_reachable_setter_keeps_the_slot_complex() {
+    let pir = Pir::from_path(m2_2_fixture("simple_global_slot_dead_setter.ll")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Executable,
+            exports: ["dead_setter".to_string()].into_iter().collect(),
+            enable_b1_initval: false,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.metrics().icalls_b2_simple, 0);
+}
+
+#[test]
+fn m2_2_library_mode_keeps_the_exported_slot_complex() {
+    let pir = Pir::from_path(m2_2_fixture("simple_global_slot_dead_setter.ll")).unwrap();
+
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Andersen,
+            build_mode: BuildMode::Library,
+            enable_b1_initval: false,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.metrics().icalls_b2_simple, 0);
+}
+
+#[test]
 fn m2_2_simple_constant_global_field_resolves_exactly() {
     let pir = Pir::from_path(m2_2_fixture("simple_global_fields.pir.json")).unwrap();
 
