@@ -132,6 +132,20 @@ pub(crate) const ENV_ANDERSEN_OFFLINE_QUOTIENT: &str = "PANGS_ANDERSEN_OFFLINE_Q
 /// Partition admission remains unchanged.
 pub(crate) const ENV_ANDERSEN_MEMCPY_EDGE_SUMMARIES: &str = "PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES";
 
+/// Controls whether a bulk copy's two address carriers are unioned into the prepartition
+/// component that its storage regions form. Enabled by default; set this variable to `0` to
+/// restore the previous behaviour for ablation.
+///
+/// Every other memory edge contributes at least one real value node to the component union,
+/// so its address carrier lands in the component. A `Memcpy` edge's endpoints are *both*
+/// synthetic storage regions, so neither carrier used to be attached: the carriers'
+/// `AddrOf`/`Assign` producers then sat in an uninteresting partition, were dropped from the
+/// admitted solve, and the copy's endpoint sets came back empty. The directed dependency was
+/// already recorded in `prepartition_flow_edges`; only the weak-component membership that
+/// governs admission was missing.
+pub(crate) const ENV_ANDERSEN_MEMCPY_PREPARTITION_CARRIERS: &str =
+    "PANGS_ANDERSEN_MEMCPY_PREPARTITION_CARRIERS";
+
 /// Optional hard propagation-step limit used for diagnostics and fault tests.
 pub(crate) const ENV_ANDERSEN_MAX_STEPS: &str = "PANGS_ANDERSEN_MAX_STEPS";
 

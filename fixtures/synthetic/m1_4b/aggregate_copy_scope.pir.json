@@ -1,0 +1,35 @@
+{
+  "module": "m1_4b.aggregate_copy_scope",
+  "comment": "A bulk copy whose endpoints are accessed as whole objects, so the answer depends on the copy's root-to-root contents transfer actually running. `producer`'s local is reached from client-relevant storage only through the `memcpy`, and a `Memcpy` edge's prepartition endpoints are both synthetic storage regions -- so unless its address carriers are unioned into that component, the local's producers are dropped from the admitted solve, the copy's source set stays empty, and `consumer`'s indirect call resolves to nothing.",
+  "functions": [
+    {
+      "key": "producer",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%lit", "ty": "{ void ()* }" },
+        { "kind": "store", "address": "%lit", "value": "@handler", "access_bytes": 8 },
+        { "kind": "memcpy", "dst": "@sink", "src": "%lit", "bytes": 8 }
+      ]
+    },
+    {
+      "key": "consumer",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "load", "dest": "%fn", "address": "@sink", "access_bytes": 8 },
+        {
+          "kind": "call_indirect",
+          "operand": "%fn",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "handler",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": [{ "key": "sink", "mutable": true, "exported": false }]
+}
