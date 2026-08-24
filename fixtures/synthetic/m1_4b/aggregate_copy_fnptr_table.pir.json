@@ -1,0 +1,45 @@
+{
+  "module": "m1_4b.aggregate_copy_fnptr_table",
+  "comment": "The Old-Man-Programmer/tree dispatch shape: a zero-initialized global struct of function pointers populated only by a compound-literal assignment (lowered to a bulk copy from a stack literal), then called through constant-offset field loads. The literal's fields are written through GEPs and the calls read GEPs of the destination, so the copy must reach field cells on both sides; a root-to-root contents copy alone leaves both callsites with no pointees and only an omega marker. Accounted for 34 of the 43 omega-empty dispatch_table sites on the -O0 corpus (20260823_TODOS.md T4).",
+  "functions": [
+    {
+      "key": "select_calls",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%lit", "ty": "{ void ()*, void ()* }" },
+        { "kind": "gep", "dest": "%lit.intro", "base": "%lit", "byte_off": 0 },
+        { "kind": "store", "address": "%lit.intro", "value": "@intro", "access_bytes": 8 },
+        { "kind": "gep", "dest": "%lit.outtro", "base": "%lit", "byte_off": 8 },
+        { "kind": "store", "address": "%lit.outtro", "value": "@outtro", "access_bytes": 8 },
+        { "kind": "memcpy", "dst": "@lc", "src": "%lit", "bytes": 16 }
+      ]
+    },
+    {
+      "key": "run",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "gep", "dest": "%lc.intro", "base": "@lc", "byte_off": 0 },
+        { "kind": "load", "dest": "%fn", "address": "%lc.intro", "access_bytes": 8 },
+        {
+          "kind": "call_indirect",
+          "operand": "%fn",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "intro",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    },
+    {
+      "key": "outtro",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": [{ "key": "lc", "mutable": true, "exported": false }]
+}

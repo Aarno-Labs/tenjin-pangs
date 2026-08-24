@@ -4301,10 +4301,9 @@ fn whole_object_field_bridge_policy_for(value: Option<&str>) -> WholeObjectBridg
             direct_access: true,
             bulk_copy: false,
         },
-        // Default: direct whole-object loads and stores only.
         _ => WholeObjectBridgePolicy {
             direct_access: true,
-            bulk_copy: false,
+            bulk_copy: true,
         },
     }
 }
@@ -7388,6 +7387,22 @@ mod tests {
     }
 
     #[test]
+    fn bulk_copied_fnptr_table_resolves_its_dispatch_site() {
+        // A global callback table populated only by a compound-literal assignment. The copy
+        // is field-insensitive, so the site sees both members -- but it must not come back
+        // empty with an omega marker, which is what a root-to-root contents copy produced.
+        let (pir, pag) = load("aggregate_copy_fnptr_table.pir.json");
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Library, 1_000_000);
+        assert_eq!(andersen.indirect_calls.len(), 1);
+        let call = &andersen.indirect_calls[0];
+        assert!(
+            call.targets.contains(&"intro".to_string()),
+            "bulk-copied callback table did not reach the dispatch site: {call:?}"
+        );
+        assert!(!call.unknown_callee, "site retained its omega marker: {call:?}");
+    }
+
+    #[test]
     fn whole_object_bridge_is_not_suppressed_by_a_prior_other_family_access() {
         // A disabled-family access records `direct_accessed` but must not consume the
         // enabled family's one-shot bridge installation.
@@ -7615,6 +7630,33 @@ mod tests {
             .collect()
     }
 
+    /// Points-to sets with synthetic field cells replaced by the `(root, location)` they
+    /// denote. Raw cell ids are allocation-order artifacts: materializing one extra
+    /// unknown-offset summary shifts every later id, so two runs that agree semantically can
+    /// disagree numerically. Comparing identities asserts what the caller actually means.
+    fn original_points_to_by_identity(
+        solve: &Solve,
+        cells: usize,
+    ) -> Vec<HashSet<(Cell, Option<FieldLocation>)>> {
+        (0..cells as Cell)
+            .map(|cell| {
+                solve
+                    .points_to(cell)
+                    .map(|set| {
+                        set.iter()
+                            .map(|pointee| match solve.field_base.get(&pointee) {
+                                Some(&root) => {
+                                    (root, solve.field_location.get(&pointee).copied())
+                                }
+                                None => (pointee, None),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
     #[test]
     fn offline_quotient_exactly_substitutes_chains_diamonds_and_static_cycles() {
         fn problem() -> Solve {
@@ -7670,12 +7712,12 @@ mod tests {
 
         let mut baseline = problem();
         baseline.run();
-        let expected = original_points_to(&baseline, 24);
+        let expected = original_points_to_by_identity(&baseline, 24);
 
         let mut quotient = problem();
         quotient.offline_quotient(&HashSet::new());
         quotient.run();
-        assert_eq!(original_points_to(&quotient, 24), expected);
+        assert_eq!(original_points_to_by_identity(&quotient, 24), expected);
         assert_eq!(
             quotient.memcpy_pairs_processed,
             baseline.memcpy_pairs_processed
