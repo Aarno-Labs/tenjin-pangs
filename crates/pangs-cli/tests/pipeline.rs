@@ -166,11 +166,13 @@ fn analyze_exports_m2_2_simple_icall_provenance() {
         .collect::<Vec<_>>();
     assert_eq!(indirect.len(), 1, "{indirect:#?}");
     assert_eq!(indirect[0]["callee"]["func"], "cb");
-    assert_eq!(indirect[0]["tier"], "simple");
+    assert_eq!(indirect[0]["tier"], "b2_simple");
 
     let metrics: Value =
         serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
     assert_eq!(metrics["icalls_simple"], 1);
+    assert_eq!(metrics["icalls_b1_initval"], 0);
+    assert_eq!(metrics["icalls_b2_simple"], 1);
     assert_eq!(metrics["icalls_andersen"], 0);
     assert_eq!(metrics["icalls_unknown"], 0);
 }
@@ -192,7 +194,7 @@ fn analyze_exports_m2_3_confined_subtraction() {
         row["kind"] == "indirect"
             && row["callsite"] == "driver@!noloc#0"
             && row["callee"]["func"] == "cb"
-            && row["tier"] == "simple"
+            && row["tier"] == "b2_simple"
     }));
     assert!(callgraph.iter().any(|row| {
         row["kind"] == "indirect"
@@ -210,6 +212,8 @@ fn analyze_exports_m2_3_confined_subtraction() {
         serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
     assert_eq!(metrics["confined_functions"], 1);
     assert_eq!(metrics["icalls_simple"], 1);
+    assert_eq!(metrics["icalls_b1_initval"], 0);
+    assert_eq!(metrics["icalls_b2_simple"], 1);
     assert_eq!(metrics["icalls_andersen"], 1);
 }
 
@@ -232,11 +236,13 @@ fn analyze_exports_m2_4_initval_dispatch_table_resolution() {
         .collect::<Vec<_>>();
     assert_eq!(indirect.len(), 1, "{indirect:#?}");
     assert_eq!(indirect[0]["callee"]["func"], "other");
-    assert_eq!(indirect[0]["tier"], "simple");
+    assert_eq!(indirect[0]["tier"], "b1_initval");
 
     let metrics: Value =
         serde_json::from_str(&fs::read_to_string(out.join("metrics.json")).unwrap()).unwrap();
     assert_eq!(metrics["icalls_simple"], 1);
+    assert_eq!(metrics["icalls_b1_initval"], 1);
+    assert_eq!(metrics["icalls_b2_simple"], 0);
     assert_eq!(metrics["globals_with_complete_initval"], 1);
     assert_eq!(metrics["initval_stable_globals"], 1);
     assert_eq!(metrics["mutable_globals_total"], 0);
@@ -373,9 +379,12 @@ fn m2_ablation_reports_preanalysis_variants() {
     assert!(variants
         .iter()
         .any(|variant| { variant["mode"] == "m1_baseline" && variant["icalls_simple"] == 0 }));
-    assert!(variants
-        .iter()
-        .any(|variant| { variant["mode"] == "b2_only" && variant["icalls_simple"] == 1 }));
+    assert!(variants.iter().any(|variant| {
+        variant["mode"] == "b2_only"
+            && variant["icalls_simple"] == 1
+            && variant["icalls_b1_initval"] == 0
+            && variant["icalls_b2_simple"] == 1
+    }));
     assert!(variants
         .iter()
         .any(|variant| { variant["mode"] == "b1_only" && variant["icalls_simple"] == 0 }));

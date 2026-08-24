@@ -3358,11 +3358,13 @@ pub fn report(outdir: &Path) -> Result<String> {
     let audit_kind_summary = jsonl_histogram(outdir, "audit.jsonl", &["kind"])?;
     let audit_effect_summary = jsonl_histogram(outdir, "audit.jsonl", &["effect"])?;
     Ok(format!(
-        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} andersen={} steens={} fsa={} unknown={}\ncall edges by tier: {}\nconfined functions: {}\ninitval complete globals: {}\ninitval-stable globals: {}\nstationarity reasons: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\naudit kinds: {}\naudit effects: {}\nmutable globals rewritable: {}/{}\ncomponent sizes: {}\nlargest frozen components: {}\ncomponent taints: {}\ncomponent blockers: {}\npipeline wall: {} ms\nanalysis wall: {} us\nsetup scan: {} us\npreanalysis: {} us\npag build: {} us\nsolve: {} us\nsolver postprocess: {} us\npointer modref: {} us\ncallgraph dedup: {} us\nmodref dedup: {} us\nstationarity: {} us\ninitval reapply: {} us\ntransitive modref: {} us\nfindings dedup: {} us\ncomponents: {} us\nmetrics bookkeeping: {} us\n",
+        "functions: {}\nglobals: {}\ncall edges: {}\nicalls by tier: simple={} (b1_initval={}, b2_simple={}) andersen={} steens={} fsa={} unknown={}\ncall edges by tier: {}\nconfined functions: {}\ninitval complete globals: {}\ninitval-stable globals: {}\nstationarity reasons: {}\noversize fallbacks: {} max_size={}\naudit findings: {}\naudit kinds: {}\naudit effects: {}\nmutable globals rewritable: {}/{}\ncomponent sizes: {}\nlargest frozen components: {}\ncomponent taints: {}\ncomponent blockers: {}\npipeline wall: {} ms\nanalysis wall: {} us\nsetup scan: {} us\npreanalysis: {} us\npag build: {} us\nsolve: {} us\nsolver postprocess: {} us\npointer modref: {} us\ncallgraph dedup: {} us\nmodref dedup: {} us\nstationarity: {} us\ninitval reapply: {} us\ntransitive modref: {} us\nfindings dedup: {} us\ncomponents: {} us\nmetrics bookkeeping: {} us\n",
         metrics.functions,
         metrics.globals,
         metrics.call_edges,
         metrics.icalls_simple,
+        metrics.icalls_b1_initval,
+        metrics.icalls_b2_simple,
         metrics.icalls_andersen,
         metrics.icalls_steens,
         metrics.icalls_fsa,

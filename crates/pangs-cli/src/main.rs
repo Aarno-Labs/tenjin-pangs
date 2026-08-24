@@ -723,6 +723,8 @@ fn run() -> Result<()> {
                         .filter(|func| func.address_taken)
                         .count(),
                     "icalls_simple": metrics.icalls_simple,
+                    "icalls_b1_initval": metrics.icalls_b1_initval,
+                    "icalls_b2_simple": metrics.icalls_b2_simple,
                     "icalls_andersen": metrics.icalls_andersen,
                     "icalls_steens": metrics.icalls_steens,
                     "icalls_fsa": metrics.icalls_fsa,

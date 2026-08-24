@@ -213,10 +213,10 @@ pub enum Callee {
 }
 
 /// Provenance of a resolved call edge. Tiers are ordered by *exactness*: a later phase may
-/// only narrow an earlier one (`Simple ⊆ Andersen ⊆ Steens ⊆ Fsa`); `Direct` is a
-/// syntactic call. `Simple` is the M2 lite provenance (`DESIGN_lite.md` §2F) for icalls
-/// resolved exactly by a B1/B2 def-use walk — it bypasses the FSA envelope entirely. It is
-/// declared now (M2.0) and populated by M2.2/M2.4.
+/// only narrow an earlier one (`B1Initval/B2Simple ⊆ Andersen ⊆ Steens ⊆ Fsa`);
+/// `Direct` is a syntactic call. B1 and B2 are independently exact and bypass the FSA
+/// envelope entirely. `Simple` is retained only to deserialize pre-split artifacts; new
+/// analyses emit `B1Initval` or `B2Simple`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
@@ -224,6 +224,9 @@ pub enum Tier {
     Fsa,
     Steens,
     Andersen,
+    B1Initval,
+    B2Simple,
+    /// Legacy combined B1/B2 provenance from artifacts produced before the split.
     Simple,
 }
 
@@ -637,7 +640,12 @@ pub struct Metrics {
     /// Flat per-provenance icall attribution (M2.0, `DESIGN_lite.md` §2F). Counts indirect
     /// callsites whose resolved edges carry each tier; the ablation signal M2.7 reads.
     /// `icalls_unknown` counts sites with an Ω/unknown-callee edge. No certificate cascade.
+    /// Combined exact-preanalysis count retained for artifact compatibility.
     pub icalls_simple: usize,
+    #[serde(default)]
+    pub icalls_b1_initval: usize,
+    #[serde(default)]
+    pub icalls_b2_simple: usize,
     pub icalls_andersen: usize,
     pub icalls_steens: usize,
     pub icalls_fsa: usize,
@@ -673,6 +681,10 @@ pub struct M2AblationReport {
 pub struct M2AblationVariant {
     pub mode: M2AblationMode,
     pub icalls_simple: usize,
+    #[serde(default)]
+    pub icalls_b1_initval: usize,
+    #[serde(default)]
+    pub icalls_b2_simple: usize,
     pub icalls_andersen: usize,
     pub icalls_steens: usize,
     pub icalls_fsa: usize,
@@ -1539,6 +1551,7 @@ impl Analysis {
                                 cs,
                                 query,
                                 simple,
+                                Tier::B2Simple,
                             );
                             simple_emitted.insert(cs);
                             continue;
@@ -1590,6 +1603,7 @@ impl Analysis {
                             *cs,
                             query,
                             simple,
+                            Tier::B2Simple,
                         );
                     }
                 }
@@ -1819,19 +1833,24 @@ impl Analysis {
                 site_unknown.insert(cs);
             }
         }
-        let mut icalls_simple = 0;
+        let mut icalls_b1_initval = 0;
+        let mut icalls_b2_simple = 0;
+        let mut icalls_simple_legacy = 0;
         let mut icalls_andersen = 0;
         let mut icalls_steens = 0;
         let mut icalls_fsa = 0;
         for tier in site_tier.values() {
             match tier {
-                Tier::Simple => icalls_simple += 1,
+                Tier::B1Initval => icalls_b1_initval += 1,
+                Tier::B2Simple => icalls_b2_simple += 1,
+                Tier::Simple => icalls_simple_legacy += 1,
                 Tier::Andersen => icalls_andersen += 1,
                 Tier::Steens => icalls_steens += 1,
                 Tier::Fsa => icalls_fsa += 1,
                 Tier::Direct => {}
             }
         }
+        let icalls_simple = icalls_b1_initval + icalls_b2_simple + icalls_simple_legacy;
         let icalls_unknown = site_unknown.len();
 
         let metrics = Metrics {
@@ -1840,6 +1859,8 @@ impl Analysis {
             callsites: callsites.len(),
             call_edges: call_edges.len(),
             icalls_simple,
+            icalls_b1_initval,
+            icalls_b2_simple,
             icalls_andersen,
             icalls_steens,
             icalls_fsa,
@@ -2204,6 +2225,8 @@ impl M2AblationVariant {
         Self {
             mode,
             icalls_simple: metrics.icalls_simple,
+            icalls_b1_initval: metrics.icalls_b1_initval,
+            icalls_b2_simple: metrics.icalls_b2_simple,
             icalls_andersen: metrics.icalls_andersen,
             icalls_steens: metrics.icalls_steens,
             icalls_fsa: metrics.icalls_fsa,
@@ -2406,7 +2429,9 @@ fn emit_simple_call_edges(
     callsite: CallsiteId,
     query: &SimpleIcallQuery,
     simple: &SimpleIcallResolution,
+    tier: Tier,
 ) {
+    debug_assert!(matches!(tier, Tier::B1Initval | Tier::B2Simple));
     let mut fsa_envelope = address_taken
         .iter()
         .filter(|(_, func)| fsa_compatible(&query.sig, &func.sig))
@@ -2447,7 +2472,7 @@ fn emit_simple_call_edges(
             callsite: Some(callsite),
             callee: Callee::Func(callee_id),
             kind: CallKind::Indirect,
-            tier: Tier::Simple,
+            tier,
         });
     }
 }
@@ -2796,6 +2821,7 @@ fn apply_initval_exact_call_edges(
             *cs,
             query,
             resolution,
+            Tier::B1Initval,
         );
     }
 }
@@ -3097,6 +3123,8 @@ fn tier_label(tier: Tier) -> &'static str {
         Tier::Fsa => "Fsa",
         Tier::Steens => "Steens",
         Tier::Andersen => "Andersen",
+        Tier::B1Initval => "B1Initval",
+        Tier::B2Simple => "B2Simple",
         Tier::Simple => "Simple",
     }
 }

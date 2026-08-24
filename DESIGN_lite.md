@@ -120,10 +120,11 @@ otherwise function-pointer actuals and other pointer-bearing tail arguments fail
   unchanged. KELP reports ~⅓ of icalls resolved this way; **that yield does not reproduce
   here.** On the 2026-08-23 corpus (`20260823_ICALL_AUDIT.md` §6) the exact pre-analyses
   together settled **6 of 19,719** indirect callsites, all six in one module. Whether B2 is
-  correctly conservative on this corpus or defective is unresolved, and the metric cannot
-  currently distinguish them: B1's InitVal edges and B2's edges are both tagged
-  `Tier::Simple`, so the six are unattributed. Splitting that tag is a prerequisite for
-  deciding whether B2 earns its place.
+  correctly conservative on this corpus or defective is unresolved. Exact edges now carry
+  distinct `Tier::B1Initval` and `Tier::B2Simple` provenance, with separate
+  `icalls_b1_initval` and `icalls_b2_simple` counters; `icalls_simple` remains their combined
+  compatibility counter. The recorded six-site corpus result predates that split and must be
+  rerun before the sites can be attributed and B2's place decided.
 
 **Kept:** B3 confined-function subtraction falls out of B2's bookkeeping. Functions whose
 every address flow was consumed by an exact simple chain are removed from non-exact
@@ -454,8 +455,8 @@ in Cartesian work can be distinguished from changes elsewhere in the pipeline.
 ### F. Clients as post-passes
 With an exhaustive materialized solution, every client is a scan, not a query engine:
 
-- **Call graph:** joint fixed-point edges; each icall edge tagged `B2-exact` or
-  `Andersen∩FSA` (two provenance tags instead of five tiers').
+- **Call graph:** joint fixed-point edges; each icall edge tagged `B1-initval-exact`,
+  `B2-simple-exact`, or `Andersen∩FSA`.
 - **Mod/ref and writers:** direct accesses are syntactic; pointer-aware load/store,
   `memcpy`, and `memset` accesses expand through the materialized points-to relation.
   Before consulting that relation, an independent allocation-root certificate recognizes

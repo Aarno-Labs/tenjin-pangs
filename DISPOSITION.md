@@ -648,7 +648,8 @@ rows to this matrix in the soundness inventory.
 2. **`DESIGN_lite.md` §2F** — the client list gains the disposition stage as a named
    post-pass, and the sentence "Globals localization: unchanged from `DESIGN.md` §7"
    gains "…consuming the disposition manifest (see `DISPOSITION.md`)". The two
-   provenance tags on icall edges are unaffected.
+   provenance tags on icall edges are unaffected by disposition. The later B1/B2 provenance
+   split is likewise analysis-owned and does not alter disposition policy.
 3. **`DESIGN.md` §4F** — the mutability lattice is re-labeled a *reporting summary*
    derived from the fact vector (§2 here); no analysis change.
 4. **`DESIGN.md` §7 / §8** — the localization client's input becomes "globals disposed

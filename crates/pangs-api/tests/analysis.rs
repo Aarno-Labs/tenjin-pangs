@@ -127,7 +127,7 @@ fn m5_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-fn assert_single_simple_target(analysis: &Analysis, target: &str) {
+fn assert_single_exact_target(analysis: &Analysis, target: &str, tier: pangs_api::Tier) {
     let target_id = analysis.lookup_func(target).unwrap();
     let concrete_edges = analysis
         .call_edges()
@@ -136,8 +136,16 @@ fn assert_single_simple_target(analysis: &Analysis, target: &str) {
         .collect::<Vec<_>>();
     assert_eq!(concrete_edges.len(), 1, "{concrete_edges:#?}");
     assert_eq!(concrete_edges[0].callee, pangs_api::Callee::Func(target_id));
-    assert_eq!(concrete_edges[0].tier, pangs_api::Tier::Simple);
+    assert_eq!(concrete_edges[0].tier, tier);
     assert_eq!(analysis.metrics().icalls_simple, 1);
+    assert_eq!(
+        analysis.metrics().icalls_b1_initval,
+        usize::from(tier == pangs_api::Tier::B1Initval)
+    );
+    assert_eq!(
+        analysis.metrics().icalls_b2_simple,
+        usize::from(tier == pangs_api::Tier::B2Simple)
+    );
     assert_eq!(analysis.metrics().icalls_andersen, 0);
     assert_eq!(analysis.metrics().icalls_unknown, 0);
 }
@@ -250,7 +258,7 @@ fn m2_2_simple_local_assign_icall_takes_exact_precedence() {
     )
     .unwrap();
 
-    assert_single_simple_target(&analysis, "cb");
+    assert_single_exact_target(&analysis, "cb", pangs_api::Tier::B2Simple);
 }
 
 #[test]
@@ -266,7 +274,7 @@ fn m2_2_simple_never_address_taken_global_slot_resolves_exactly() {
     )
     .unwrap();
 
-    assert_single_simple_target(&analysis, "cb");
+    assert_single_exact_target(&analysis, "cb", pangs_api::Tier::B2Simple);
 }
 
 #[test]
@@ -282,7 +290,7 @@ fn m2_2_simple_constant_global_field_resolves_exactly() {
     )
     .unwrap();
 
-    assert_single_simple_target(&analysis, "cb");
+    assert_single_exact_target(&analysis, "cb", pangs_api::Tier::B2Simple);
 }
 
 #[test]
@@ -317,7 +325,7 @@ fn m2_2_direct_calls_do_not_count_as_function_pointer_escape() {
     )
     .unwrap();
 
-    assert_single_simple_target(&analysis, "cb");
+    assert_single_exact_target(&analysis, "cb", pangs_api::Tier::B2Simple);
 }
 
 #[test]
@@ -352,7 +360,7 @@ fn m2_2_simple_param_actual_resolves_through_internal_direct_call() {
     )
     .unwrap();
 
-    assert_single_simple_target(&analysis, "cb");
+    assert_single_exact_target(&analysis, "cb", pangs_api::Tier::B2Simple);
 }
 
 #[test]
@@ -368,7 +376,7 @@ fn m2_2_simple_return_value_resolves_through_internal_direct_call() {
     )
     .unwrap();
 
-    assert_single_simple_target(&analysis, "cb");
+    assert_single_exact_target(&analysis, "cb", pangs_api::Tier::B2Simple);
 }
 
 #[test]
@@ -385,6 +393,8 @@ fn m2_3_confined_function_is_subtracted_from_complex_icall_site() {
     .unwrap();
 
     assert_eq!(analysis.metrics().icalls_simple, 1);
+    assert_eq!(analysis.metrics().icalls_b1_initval, 0);
+    assert_eq!(analysis.metrics().icalls_b2_simple, 1);
     assert_eq!(analysis.metrics().icalls_andersen, 1);
     assert_eq!(analysis.metrics().confined_functions, 1);
 
@@ -398,7 +408,7 @@ fn m2_3_confined_function_is_subtracted_from_complex_icall_site() {
         }
         if edge.callsite == Some(pangs_api::CallsiteId(0))
             && edge.callee == pangs_api::Callee::Func(cb)
-            && edge.tier == pangs_api::Tier::Simple
+            && edge.tier == pangs_api::Tier::B2Simple
         {
             simple_cb = true;
         }
@@ -431,7 +441,7 @@ fn m2_4_initval_stationary_dispatch_table_resolves_exactly() {
     )
     .unwrap();
 
-    assert_single_simple_target(&analysis, "other");
+    assert_single_exact_target(&analysis, "other", pangs_api::Tier::B1Initval);
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
     assert_eq!(analysis.metrics().initval_stable_globals, 1);
     assert_eq!(analysis.metrics().mutable_globals_total, 0);
@@ -478,7 +488,7 @@ fn m2_4_initval_accepts_llvm_sigil_on_function_constants() {
     )
     .unwrap();
 
-    assert_single_simple_target(&analysis, "other");
+    assert_single_exact_target(&analysis, "other", pangs_api::Tier::B1Initval);
     let table = analysis.lookup_global("@Table").unwrap();
     let verdict = analysis
         .stationarity_verdicts()
@@ -998,7 +1008,11 @@ fn m2_7_ablation_toggles_isolate_b2_and_b1_effects() {
         .find(|variant| variant.mode == M2AblationMode::B1Only)
         .unwrap();
     assert_eq!(b2_only.icalls_simple, 1);
+    assert_eq!(b2_only.icalls_b1_initval, 0);
+    assert_eq!(b2_only.icalls_b2_simple, 1);
     assert_eq!(b1_only.icalls_simple, 0);
+    assert_eq!(b1_only.icalls_b1_initval, 0);
+    assert_eq!(b1_only.icalls_b2_simple, 0);
 
     let b1_pir = Pir::from_path(m2_4_fixture("initval_dispatch_table.pir.json")).unwrap();
     let b1_report = run_m2_ablation(
@@ -1024,6 +1038,8 @@ fn m2_7_ablation_toggles_isolate_b2_and_b1_effects() {
     assert_eq!(b1_only.globals_with_complete_initval, 1);
     assert_eq!(b1_only.initval_stable_globals, 1);
     assert_eq!(b1_only.icalls_simple, 1);
+    assert_eq!(b1_only.icalls_b1_initval, 1);
+    assert_eq!(b1_only.icalls_b2_simple, 0);
 }
 
 #[test]

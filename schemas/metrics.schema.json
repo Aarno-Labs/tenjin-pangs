@@ -384,6 +384,14 @@
       "type": "integer",
       "minimum": 0
     },
+    "icalls_b1_initval": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "icalls_b2_simple": {
+      "type": "integer",
+      "minimum": 0
+    },
     "icalls_andersen": {
       "type": "integer",
       "minimum": 0
