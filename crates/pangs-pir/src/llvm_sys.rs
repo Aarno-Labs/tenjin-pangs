@@ -1420,6 +1420,110 @@ unsafe fn lower_function_constant_expr_value(
             });
             lowering.bump_modeled("function_constexpr_gep");
         }
+        LLVMOpcode::LLVMAdd
+        | LLVMOpcode::LLVMSub
+        | LLVMOpcode::LLVMAnd
+        | LLVMOpcode::LLVMOr
+        | LLVMOpcode::LLVMXor => {
+            let lhs = lower_function_constant_expr_value(
+                ctx,
+                fctx,
+                LLVMGetOperand(value, 0),
+                body,
+                lowering,
+                location,
+                path,
+                depth + 1,
+            );
+            let rhs = lower_function_constant_expr_value(
+                ctx,
+                fctx,
+                LLVMGetOperand(value, 1),
+                body,
+                lowering,
+                location,
+                path,
+                depth + 1,
+            );
+            let op = match LLVMGetConstOpcode(value) {
+                LLVMOpcode::LLVMAdd => crate::ScalarOp::Add,
+                LLVMOpcode::LLVMSub => crate::ScalarOp::Sub,
+                LLVMOpcode::LLVMAnd => crate::ScalarOp::And,
+                LLVMOpcode::LLVMOr => crate::ScalarOp::Or,
+                LLVMOpcode::LLVMXor => crate::ScalarOp::Xor,
+                _ => unreachable!(),
+            };
+            body.push(Stmt::ScalarOp {
+                dest: dest.clone(),
+                op,
+                lhs,
+                rhs,
+                loc: location.clone(),
+            });
+            lowering.bump_modeled("function_constexpr_scalar");
+        }
+        LLVMOpcode::LLVMPtrToInt => {
+            let pointer = LLVMGetOperand(value, 0);
+            let source = lower_function_constant_expr_value(
+                ctx,
+                fctx,
+                pointer,
+                body,
+                lowering,
+                location,
+                path,
+                depth + 1,
+            );
+            let address_space = LLVMGetPointerAddressSpace(LLVMTypeOf(pointer));
+            let comparison_only = ptrint::classify(value).is_innocuous();
+            body.push(Stmt::PtrToInt {
+                dest: dest.clone(),
+                source,
+                integer_bits: Some(LLVMGetIntTypeWidth(LLVMTypeOf(value))),
+                pointer_bits: Some(LLVMPointerSizeForAS(ctx.data_layout, address_space) * 8),
+                pointer_address_space: Some(address_space),
+                comparison_only,
+                loc: location.clone(),
+            });
+            lowering.bump_modeled("function_constexpr_ptrtoint");
+            if !comparison_only {
+                lowering.bump_tainted("function_constant_expr_ptrtoint");
+            }
+        }
+        LLVMOpcode::LLVMIntToPtr => {
+            let integer = LLVMGetOperand(value, 0);
+            let source = lower_function_constant_expr_value(
+                ctx,
+                fctx,
+                integer,
+                body,
+                lowering,
+                location,
+                path,
+                depth + 1,
+            );
+            let address_space = LLVMGetPointerAddressSpace(LLVMTypeOf(value));
+            let integer_bits = LLVMGetIntTypeWidth(LLVMTypeOf(integer));
+            let pointer_bits = LLVMPointerSizeForAS(ctx.data_layout, address_space) * 8;
+            body.push(Stmt::IntToPtr {
+                dest: dest.clone(),
+                source,
+                integer_bits: Some(integer_bits),
+                pointer_bits: Some(pointer_bits),
+                pointer_address_space: Some(address_space),
+                provenance_trace: Some(trace_inttoptr_source(
+                    ctx,
+                    fctx,
+                    integer,
+                    integer_bits,
+                    pointer_bits,
+                    address_space,
+                )),
+                loc: location.clone(),
+            });
+            lowering.bump_modeled("function_constexpr_inttoptr");
+            lowering.bump_tainted("function_constant_expr_inttoptr");
+        }
         other => {
             lowering.bump_tainted(format!(
                 "function_unmodeled_pointer_constant:{}",
@@ -2935,6 +3039,14 @@ unsafe fn lower_constant_expr_value_inner(
         let name = value_name(constant);
         return format!("@{}", resolve_symbol_name(ctx, &name).unwrap_or(name));
     }
+    if !LLVMIsAConstantInt(constant).is_null() {
+        let width = LLVMGetIntTypeWidth(LLVMTypeOf(constant));
+        return if width <= 64 {
+            LLVMConstIntGetSExtValue(constant).to_string()
+        } else {
+            value_string(constant)
+        };
+    }
     if depth >= CONSTANT_EXPR_RECURSION_LIMIT || !path.insert(constant as usize) {
         let dest = global_init_temp(temp_ordinal);
         lowering.bump_tainted("global_initializer_constant_traversal_limit");
@@ -3020,6 +3132,48 @@ unsafe fn lower_constant_expr_value_inner(
                 });
                 lowering.bump_modeled("global_init_ptrtoint");
                 lowering.bump_tainted("global_initializer_ptrtoint");
+                dest
+            }
+            LLVMOpcode::LLVMAdd
+            | LLVMOpcode::LLVMSub
+            | LLVMOpcode::LLVMAnd
+            | LLVMOpcode::LLVMOr
+            | LLVMOpcode::LLVMXor => {
+                let lhs = lower_constant_expr_value_inner(
+                    ctx,
+                    LLVMGetOperand(constant, 0),
+                    body,
+                    temp_ordinal,
+                    lowering,
+                    path,
+                    depth + 1,
+                );
+                let rhs = lower_constant_expr_value_inner(
+                    ctx,
+                    LLVMGetOperand(constant, 1),
+                    body,
+                    temp_ordinal,
+                    lowering,
+                    path,
+                    depth + 1,
+                );
+                let dest = global_init_temp(temp_ordinal);
+                let op = match LLVMGetConstOpcode(constant) {
+                    LLVMOpcode::LLVMAdd => crate::ScalarOp::Add,
+                    LLVMOpcode::LLVMSub => crate::ScalarOp::Sub,
+                    LLVMOpcode::LLVMAnd => crate::ScalarOp::And,
+                    LLVMOpcode::LLVMOr => crate::ScalarOp::Or,
+                    LLVMOpcode::LLVMXor => crate::ScalarOp::Xor,
+                    _ => unreachable!(),
+                };
+                body.push(Stmt::ScalarOp {
+                    dest: dest.clone(),
+                    op,
+                    lhs,
+                    rhs,
+                    loc: None,
+                });
+                lowering.bump_modeled("global_init_scalar");
                 dest
             }
             LLVMOpcode::LLVMIntToPtr => {

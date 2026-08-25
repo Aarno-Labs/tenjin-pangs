@@ -46,6 +46,11 @@ pub struct Pag {
     pub callsites: Vec<Callsite>,
     #[serde(default)]
     pub omega_seeds: Vec<OmegaSeed>,
+    /// Proven pointer origins of integer-derived pointer values. These records are consumed only
+    /// by allocation-root analyses; ordinary points-to solvers continue to see the corresponding
+    /// `IntToPtr` as an Ω source unless the stricter lossless-round-trip proof also succeeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pointer_integer_origins: Vec<PointerIntegerOrigin>,
 }
 
 impl Pag {
@@ -116,6 +121,17 @@ impl Pag {
         for edge in &edges {
             keep_nodes.insert(edge.src);
             keep_nodes.insert(edge.dst);
+        }
+
+        let pointer_integer_origins: Vec<_> = self
+            .pointer_integer_origins
+            .iter()
+            .filter(|origin| matches!(&origin.owner, Owner::Function(owner) if owner == func))
+            .cloned()
+            .collect();
+        for origin in &pointer_integer_origins {
+            keep_nodes.insert(origin.destination);
+            keep_nodes.extend(origin.sources.iter().copied());
         }
 
         let nodes: Vec<_> = self
@@ -192,6 +208,19 @@ impl Pag {
                 seed
             })
             .collect::<Vec<_>>();
+        let pointer_integer_origins = pointer_integer_origins
+            .into_iter()
+            .map(|origin| PointerIntegerOrigin {
+                destination: node_map[&origin.destination],
+                sources: origin
+                    .sources
+                    .into_iter()
+                    .map(|source| node_map[&source])
+                    .collect(),
+                complete: origin.complete,
+                owner: origin.owner,
+            })
+            .collect();
 
         Self {
             module: self.module.clone(),
@@ -201,6 +230,7 @@ impl Pag {
             edges,
             callsites,
             omega_seeds,
+            pointer_integer_origins,
         }
     }
 
@@ -388,6 +418,23 @@ impl Pag {
             }
         }
 
+        for origin in &self.pointer_integer_origins {
+            if self.nodes.get(origin.destination.0 as usize).is_none() {
+                issues.push(ValidationIssue::DanglingPointerIntegerOrigin {
+                    which: "destination",
+                    node: origin.destination,
+                });
+            }
+            for source in &origin.sources {
+                if self.nodes.get(source.0 as usize).is_none() {
+                    issues.push(ValidationIssue::DanglingPointerIntegerOrigin {
+                        which: "source",
+                        node: *source,
+                    });
+                }
+            }
+        }
+
         if issues.is_empty() {
             Ok(())
         } else {
@@ -404,6 +451,19 @@ pub struct EdgeId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CallsiteId(pub u32);
+
+/// A pointer value reconstructed from an integer expression, together with every compatible
+/// `ptrtoint` source found in that expression. `complete` means the whole integer producer graph
+/// was made only from those sources, integer constants, assignments, and supported scalar ops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerIntegerOrigin {
+    pub destination: NodeId,
+    #[serde(default)]
+    pub sources: Vec<NodeId>,
+    #[serde(default)]
+    pub complete: bool,
+    pub owner: Owner,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PagMetrics {
@@ -703,6 +763,37 @@ pub fn allocation_storage_roots(pir: &Pir, pag: &Pag) -> StorageRoots {
             states[destination] = candidate;
             changed = true;
         }
+        for origin in &pag.pointer_integer_origins {
+            let destination = origin.destination.0 as usize;
+            if !origin.complete
+                || !matches!(states[destination], StorageRootState::Unknown)
+                || origin.sources.is_empty()
+            {
+                continue;
+            }
+            let mut common: Option<&StorageRoot> = None;
+            let mut unknown = false;
+            let mut mixed = false;
+            for source in &origin.sources {
+                match &states[source.0 as usize] {
+                    StorageRootState::Unknown => unknown = true,
+                    StorageRootState::ProvenNull => {}
+                    StorageRootState::Root(root) => match common {
+                        None => common = Some(root),
+                        Some(first) if first == root => {}
+                        Some(_) => mixed = true,
+                    },
+                }
+            }
+            if unknown || mixed {
+                continue;
+            }
+            states[destination] = common
+                .cloned()
+                .map(StorageRootState::Root)
+                .unwrap_or(StorageRootState::ProvenNull);
+            changed = true;
+        }
         if !changed {
             break;
         }
@@ -923,6 +1014,8 @@ pub enum ValidationIssue {
     DanglingCallsiteOperand { callsite: CallsiteId, node: NodeId },
     #[error("seed {kind} targets missing {target}")]
     DanglingSeedTarget { kind: String, target: String },
+    #[error("pointer-integer origin has dangling {which} node {node:?}")]
+    DanglingPointerIntegerOrigin { which: &'static str, node: NodeId },
     #[error("edge {edge:?} violates {kind} invariant: {detail}")]
     EdgeKindInvariant {
         edge: EdgeId,
@@ -1065,6 +1158,158 @@ fn collect_lossless_pointer_round_trips(
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct IntegerOriginProof {
+    sources: BTreeSet<String>,
+    complete: bool,
+}
+
+fn is_integer_literal(value: &str) -> bool {
+    let token = value.split_whitespace().last().unwrap_or(value);
+    if matches!(token, "true" | "false") {
+        return true;
+    }
+    let digits = token.strip_prefix(['-', '+']).unwrap_or(token);
+    if let Some(hex) = digits.strip_prefix("0x") {
+        return !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Recover pointer provenance through the integer side of an `inttoptr`. Unlike the lossless
+/// round-trip proof above, scalar arithmetic does not become an ordinary pointer assignment: it
+/// only records allocation origins for the positive origin analyses. Unknown leaves make the
+/// record incomplete without discarding compatible pointer origins already found.
+fn collect_pointer_integer_origins(
+    pir: &Pir,
+    scope: usize,
+    body: &[Stmt],
+    origins: &mut BTreeMap<(usize, usize), IntegerOriginProof>,
+) {
+    let Some(target) = pir.target.as_ref() else {
+        return;
+    };
+    let non_integral = target
+        .data_layout
+        .split('-')
+        .find_map(|part| part.strip_prefix("ni:"))
+        .into_iter()
+        .flat_map(|spaces| spaces.split(':'))
+        .filter_map(|space| space.parse::<u32>().ok())
+        .collect::<BTreeSet<_>>();
+    let mut definitions = BTreeMap::<&str, usize>::new();
+    let mut multiply_defined = BTreeSet::new();
+    for (index, stmt) in body.iter().enumerate() {
+        if let Some(destination) = stmt_destination(stmt) {
+            if definitions.insert(destination, index).is_some() {
+                multiply_defined.insert(destination);
+            }
+        }
+    }
+
+    fn trace(
+        value: &str,
+        before: usize,
+        integer_bits: u32,
+        address_space: u32,
+        non_integral: &BTreeSet<u32>,
+        body: &[Stmt],
+        definitions: &BTreeMap<&str, usize>,
+        multiply_defined: &BTreeSet<&str>,
+        visiting: &mut BTreeSet<usize>,
+    ) -> IntegerOriginProof {
+        let Some(&definition) = definitions.get(value) else {
+            return IntegerOriginProof {
+                sources: BTreeSet::new(),
+                complete: is_integer_literal(value),
+            };
+        };
+        if definition >= before || multiply_defined.contains(value) || !visiting.insert(definition)
+        {
+            return IntegerOriginProof::default();
+        }
+
+        let mut merge = |operands: &[&str]| {
+            let mut result = IntegerOriginProof {
+                sources: BTreeSet::new(),
+                complete: true,
+            };
+            for operand in operands {
+                let source = trace(
+                    operand,
+                    definition,
+                    integer_bits,
+                    address_space,
+                    non_integral,
+                    body,
+                    definitions,
+                    multiply_defined,
+                    visiting,
+                );
+                result.sources.extend(source.sources);
+                result.complete &= source.complete;
+            }
+            result
+        };
+
+        let result = match &body[definition] {
+            Stmt::PtrToInt {
+                source,
+                integer_bits: Some(source_integer_bits),
+                pointer_bits: Some(source_pointer_bits),
+                pointer_address_space: Some(source_address_space),
+                ..
+            } if *source_integer_bits == integer_bits
+                && source_integer_bits == source_pointer_bits
+                && *source_address_space == address_space
+                && !non_integral.contains(source_address_space) =>
+            {
+                IntegerOriginProof {
+                    sources: BTreeSet::from([source.clone()]),
+                    complete: true,
+                }
+            }
+            Stmt::Assign { sources, .. } if !sources.is_empty() => {
+                merge(&sources.iter().map(String::as_str).collect::<Vec<_>>())
+            }
+            Stmt::ScalarOp { lhs, rhs, .. } => merge(&[lhs, rhs]),
+            _ => IntegerOriginProof::default(),
+        };
+        visiting.remove(&definition);
+        result
+    }
+
+    for (index, stmt) in body.iter().enumerate() {
+        let Stmt::IntToPtr {
+            source,
+            integer_bits: Some(integer_bits),
+            pointer_bits: Some(pointer_bits),
+            pointer_address_space: Some(address_space),
+            ..
+        } = stmt
+        else {
+            continue;
+        };
+        if integer_bits != pointer_bits || non_integral.contains(address_space) {
+            continue;
+        }
+        let proof = trace(
+            source,
+            index,
+            *integer_bits,
+            *address_space,
+            &non_integral,
+            body,
+            &definitions,
+            &multiply_defined,
+            &mut BTreeSet::new(),
+        );
+        if !proof.sources.is_empty() {
+            origins.insert((scope, index), proof);
+        }
+    }
+}
+
 struct Builder<'a> {
     pir: &'a Pir,
     opts: &'a PagOpts,
@@ -1083,6 +1328,8 @@ struct Builder<'a> {
     /// operand whose representation survived the integer detour unchanged.
     lossless_inttoptr: BTreeMap<(usize, usize), String>,
     lossless_ptrtoint: BTreeSet<(usize, usize)>,
+    pointer_integer_origin_proofs: BTreeMap<(usize, usize), IntegerOriginProof>,
+    pointer_integer_origins: Vec<PointerIntegerOrigin>,
 }
 
 impl<'a> Builder<'a> {
@@ -1102,6 +1349,7 @@ impl<'a> Builder<'a> {
         let positional_vararg_functions = positionally_modeled_vararg_functions(pir, opts);
         let mut lossless_inttoptr = BTreeMap::new();
         let mut lossless_ptrtoint = BTreeSet::new();
+        let mut pointer_integer_origin_proofs = BTreeMap::new();
         for (func_index, func) in pir.functions.iter().enumerate() {
             collect_lossless_pointer_round_trips(
                 pir,
@@ -1110,6 +1358,12 @@ impl<'a> Builder<'a> {
                 &mut lossless_ptrtoint,
                 &mut lossless_inttoptr,
             );
+            collect_pointer_integer_origins(
+                pir,
+                func_index,
+                &func.body,
+                &mut pointer_integer_origin_proofs,
+            );
         }
         collect_lossless_pointer_round_trips(
             pir,
@@ -1117,6 +1371,12 @@ impl<'a> Builder<'a> {
             &pir.global_init,
             &mut lossless_ptrtoint,
             &mut lossless_inttoptr,
+        );
+        collect_pointer_integer_origins(
+            pir,
+            usize::MAX,
+            &pir.global_init,
+            &mut pointer_integer_origin_proofs,
         );
         Self {
             pir,
@@ -1134,6 +1394,8 @@ impl<'a> Builder<'a> {
             callsite_ordinals: BTreeMap::new(),
             lossless_inttoptr,
             lossless_ptrtoint,
+            pointer_integer_origin_proofs,
+            pointer_integer_origins: Vec::new(),
         }
     }
 
@@ -1242,6 +1504,7 @@ impl<'a> Builder<'a> {
             edges: self.edges,
             callsites: self.callsites,
             omega_seeds: self.omega_seeds,
+            pointer_integer_origins: self.pointer_integer_origins,
         }
     }
 
@@ -1359,6 +1622,25 @@ impl<'a> Builder<'a> {
                     let src = self.operand_node(func_index, owner_scope(&owner), &original);
                     self.add_edge(EdgeKind::Assign, src, dst, owner, loc.clone());
                 } else {
+                    if let Some(proof) = self
+                        .pointer_integer_origin_proofs
+                        .get(&(func_index, stmt_index))
+                        .cloned()
+                    {
+                        let sources = proof
+                            .sources
+                            .iter()
+                            .map(|source| {
+                                self.operand_node(func_index, owner_scope(&owner), source)
+                            })
+                            .collect();
+                        self.pointer_integer_origins.push(PointerIntegerOrigin {
+                            destination: dst,
+                            sources,
+                            complete: proof.complete,
+                            owner: owner.clone(),
+                        });
+                    }
                     self.add_seed(
                         OmegaSeedKind::IntToPtr,
                         SeedTarget::Node(dst),
@@ -3164,8 +3446,8 @@ fn is_exported_global(marked: bool, key: &str, opts: &PagOpts) -> bool {
 mod tests {
     use super::{
         allocation_storage_roots, direct_vararg_call_is_benign, trusted_free_call, Edge, EdgeId,
-        EdgeKind, NodeKind, ObjectKind, OmegaSeedKind, Owner, Pag, PagOpts, SeedTarget,
-        StorageRoot, StorageRootState, VarargCallProof,
+        EdgeKind, NodeKind, ObjectKind, OmegaSeedKind, Owner, Pag, PagOpts, PointerIntegerOrigin,
+        SeedTarget, StorageRoot, StorageRootState, VarargCallProof,
     };
     use pangs_pir::{Global, Pir, Stmt, ValueKind};
     use std::collections::BTreeSet;
@@ -3851,6 +4133,59 @@ mod tests {
             .edges
             .iter()
             .any(|edge| { edge.kind == EdgeKind::Assign && edge.src == p && edge.dst == q }));
+    }
+
+    #[test]
+    fn integer_transforms_preserve_allocation_origin_without_becoming_assignments() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"pointer-tag",
+                "target":{"triple":"x86_64","data_layout":"e-p:64:64","supported_atomic_widths":[8,16,32,64]},
+                "globals":[{"key":"g","mutable":true}],
+                "functions":[{"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                    {"kind":"ptr_to_int","dest":"bits","source":"g","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"scalar_op","dest":"tagged","op":"xor","lhs":"bits","rhs":"1"},
+                    {"kind":"int_to_ptr","dest":"q","source":"tagged","integer_bits":64,"pointer_bits":64,"pointer_address_space":0}
+                ]}]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let node = |label: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == label)
+                .unwrap_or_else(|| panic!("missing PAG node {label}"))
+                .id
+        };
+        let source = node("sym:global:g");
+        let destination = node("val:main:q");
+
+        assert_eq!(
+            pag.pointer_integer_origins,
+            [PointerIntegerOrigin {
+                destination,
+                sources: vec![source],
+                complete: true,
+                owner: Owner::Function("main".into()),
+            }]
+        );
+        assert!(pag
+            .omega_seeds
+            .iter()
+            .any(|seed| seed.kind == OmegaSeedKind::PtrToInt));
+        assert!(pag
+            .omega_seeds
+            .iter()
+            .any(|seed| seed.kind == OmegaSeedKind::IntToPtr));
+        assert!(!pag.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Assign && edge.src == source && edge.dst == destination
+        }));
+
+        assert!(matches!(
+            &allocation_storage_roots(&pir, &pag).states[destination.0 as usize],
+            StorageRootState::Root(StorageRoot::Global { canonical_key, .. }) if canonical_key == "g"
+        ));
     }
 
     #[test]

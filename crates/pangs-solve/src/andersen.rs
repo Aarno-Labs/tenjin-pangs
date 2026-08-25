@@ -4414,6 +4414,25 @@ fn bounded_allocation_origins(pag: &Pag, limit: usize) -> Vec<AllocationOrigins>
                 }
             }
         }
+        for origin in &pag.pointer_integer_origins {
+            let destination = origin.destination.0 as usize;
+            for source in &origin.sources {
+                let source = source.0 as usize;
+                if overflow[source] && !overflow[destination] {
+                    overflow[destination] = true;
+                    changed = true;
+                }
+                let source_roots = roots[source].iter().copied().collect::<Vec<_>>();
+                for root in source_roots {
+                    if roots[destination].len() < limit {
+                        changed |= roots[destination].insert(root);
+                    } else if !roots[destination].contains(&root) && !overflow[destination] {
+                        overflow[destination] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
         if !changed {
             break;
         }
@@ -4436,6 +4455,20 @@ fn bounded_allocation_origins(pag: &Pag, limit: usize) -> Vec<AllocationOrigins>
                 _ => false,
             });
             if all_supported_and_complete {
+                complete[destination] = true;
+                changed = true;
+            }
+        }
+        for origin in &pag.pointer_integer_origins {
+            let destination = origin.destination.0 as usize;
+            if complete[destination] || !origin.complete || overflow[destination] {
+                continue;
+            }
+            if origin
+                .sources
+                .iter()
+                .all(|source| complete[source.0 as usize])
+            {
                 complete[destination] = true;
                 changed = true;
             }
@@ -8114,6 +8147,36 @@ mod tests {
         };
         assert_eq!(output.indirect_calls[0].targets, vec!["target".to_string()]);
         assert!(!output.indirect_calls[0].unknown_callee);
+    }
+
+    #[test]
+    fn bounded_origins_retain_positive_roots_through_incomplete_integer_transforms() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"pointer-tag",
+                "target":{"triple":"x86_64","data_layout":"e-p:64:64","supported_atomic_widths":[8,16,32,64]},
+                "globals":[{"key":"g","mutable":true}],
+                "functions":[{"key":"main","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"param_names":["c"],"body":[
+                    {"kind":"ptr_to_int","dest":"bits","source":"g","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"scalar_op","dest":"tagged","op":"xor","lhs":"bits","rhs":"c"},
+                    {"kind":"int_to_ptr","dest":"q","source":"tagged","integer_bits":64,"pointer_bits":64,"pointer_address_space":0}
+                ]}]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let node = |label: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == label)
+                .unwrap_or_else(|| panic!("missing PAG node {label}"))
+                .id
+        };
+        let origins = super::bounded_allocation_origins(&pag, 64);
+        let destination = &origins[node("val:main:q").0 as usize];
+
+        assert_eq!(destination.roots, BTreeSet::from([node("obj:global:g")]));
+        assert!(!destination.complete);
     }
 
     #[test]

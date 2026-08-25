@@ -1074,6 +1074,38 @@ entry:
 }
 
 #[test]
+fn lowers_pointer_integer_arithmetic_in_constant_expressions() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("pointer-integer-constant-expr.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@storage = global i8 0
+@tagged = global i8* inttoptr (i64 xor (i64 ptrtoint (i8* @storage to i64), i64 1) to i8*)
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    assert!(pir
+        .global_init
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::PtrToInt { source, .. } if source == "@storage")));
+    assert!(pir.global_init.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::ScalarOp {
+            op: pangs_pir::ScalarOp::Xor,
+            rhs,
+            ..
+        } if rhs == "1"
+    )));
+    assert!(pir
+        .global_init
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::IntToPtr { .. })));
+}
+
+#[test]
 fn certifies_only_exact_fully_initialized_function_pointer_aggregate_copies() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("fnptr-init-copy.ll");

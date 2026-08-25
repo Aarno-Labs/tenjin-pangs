@@ -232,8 +232,14 @@ Payload stores need a more discriminating seed than the carrier's Steensgaard cl
 An independent positive dataflow analysis computes, for every PAG value,
 `{ allocation roots, complete }`. `AddrOf` introduces a root; address-preserving
 assignment (including phi/select and flattened direct call/return bindings) and GEP copy
-roots forward. Loads and unsupported producers prevent completeness. Null is the complete
-empty set. At most 64 roots are retained per value; seeing another root sets
+roots forward. A separate provenance-only PAG record also forwards roots through a compatible
+`inttoptr` whose integer producer graph contains matching-width, same-integral-address-space
+`ptrtoint` leaves, integer constants, assignments, and the modeled scalar operations
+(`add`, `sub`, `and`, `or`, and `xor`). Thus tagged-address shapes such as
+`inttoptr(ptrtoint(p) xor c)` retain `p`'s allocation root without asserting that the reconstructed
+pointer is an exact copy of `p`. Unknown integer leaves preserve any positive roots already found
+but prevent completeness. Loads and other unsupported producers likewise prevent completeness.
+Null is the complete empty set. At most 64 roots are retained per value; seeing another root sets
 `complete = false` rather than silently truncating the abstract value.
 
 A complete row seeds exactly its named allocation roots into the receiver-relative
@@ -244,11 +250,12 @@ receiver context. The external token propagates through normal Andersen constrai
 is interpreted as unknown at consumers; it never certifies a finite target set.
 
 The abstract domain is separable from receiver summarization: it is implemented as an
-independent PAG pass and can serve other clients. The current option nevertheless wires
-it only into receiver summaries and exposes no separate origin-analysis flag. Receiver
-summarization supplies its current precision payoff by giving those facts a contextual
-destination. Conversely, receiver summaries remain sound without a complete origin proof
-because incomplete or overflowing rows explicitly carry the local unknown region.
+independent PAG pass and can serve other clients. Complete singleton facts also feed the
+always-on storage-root certificate used by Mod/Ref attribution; the bounded multi-origin rows
+remain wired only into receiver summaries and expose no separate origin-analysis flag. Receiver
+summarization supplies their current precision payoff by giving those facts a contextual
+destination. Conversely, receiver summaries remain sound without a complete origin proof because
+incomplete or overflowing rows explicitly carry the local unknown region.
 
 **Shared closed-producer certificates (experimental):**
 
@@ -461,9 +468,11 @@ With an exhaustive materialized solution, every client is a scan, not a query en
   `memcpy`, and `memset` accesses expand through the materialized points-to relation.
   Before consulting that relation, an independent allocation-root certificate recognizes
   addresses derived from one global or local alloca through arbitrary-offset GEPs and
-  same-root assignments. It settles only the storage root of that access: mixed-root
-  joins, loads, calls, and integer conversions remain solver queries, and field contents
-  still participate in pointer, escape, and indirect-call analysis.
+  same-root assignments. Complete provenance-only pointer/integer reconstructions may carry that
+  root through modeled scalar transforms, without becoming points-to assignments. It settles only
+  the storage root of that access: mixed-root joins, loads, calls, and unsupported or incomplete
+  integer conversions remain solver queries, and field contents still participate in pointer,
+  escape, and indirect-call analysis.
   Rows distinguish direct, aliased, finite-unknown, and universal-unknown provenance.
   Transitive mod/ref closes over the final direct and indirect call graph. When a local
   or transitive expansion exceeds its configured high-fanout bound, the concrete rows
@@ -579,6 +588,13 @@ integer storage, width or address-space changes, non-integral pointers, and exte
 integers all retain the fail-closed behavior. Function-pointer conversion findings are still
 emitted when the preserved incoming pointer may actually denote a function; ordinary data-pointer
 round trips do not acquire that label merely from the conversion syntax.
+
+Integer transforms between the two conversions have a deliberately weaker interpretation. When
+their complete producer graph is formed from compatible `ptrtoint` leaves, integer constants,
+assignments, and modeled scalar operations, the PAG records those leaves as allocation origins of
+the reconstructed value. This provenance-only relation feeds allocation-root analyses but is not a
+points-to assignment: both conversion Ω seeds and the integer-forged universal region remain. An
+unknown producer makes the origin row incomplete while retaining any compatible positive origins.
 
 This contract has a narrow theoretical soundness hole: low-level code may deliberately compute a
 relative function-address integer and later reconstruct and call the function, either locally or
