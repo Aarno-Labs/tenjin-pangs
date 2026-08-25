@@ -16,9 +16,11 @@ primary graduation metric is zero: no global becomes mutex-eligible through a co
 accessor-disjoint reentry certificate. The proposed policy therefore fails §10.3 before policy
 plumbing or semantic narrowing is added.
 
-The census does reveal a separate opportunity: forged-pointer provenance accounts for every
-observed strict `ModuleWide` ModRef row. That is evidence for evaluating a provenance-bounded
-`IntToPtr` successor, not for weakening the external-code policy's certificate rules.
+The census revealed a separate forged-pointer channel and the follow-up instrumentation now
+evaluates it group-wise. The result is also negative for the first plausible certificate grammar:
+none of the 651 relevant `IntToPtr` seeds is an exact pointer-derived/null case after the literal
+lossless round trips already handled by the PAG are removed. A larger forged-pointer project would
+therefore need a new proof for integer tags or pointer arithmetic, not just group-wise accounting.
 
 ## Instrumentation
 
@@ -31,7 +33,11 @@ The new `pangs external-policy-census` command emits one JSON report containing:
 - every accessor-reachable unknown call used by D4 and the ideal reentry counterfactual;
 - every strict `ModuleWide` row, its forged-pointer seed witnesses, poison count, overlap, and
   leave-one-row-out client counterfactual; the common module-wide global identity set is emitted
-  once at report level.
+  once at report level;
+- the LLVM integer-expression trace for each relevant `IntToPtr`, including pointer origins,
+  constants, operations, and fail-closed blockers;
+- connected forged-pointer groups over both shared ModRef support and circular forged provenance
+  at pointer origins, plus per-group, remove-all, and accepted-group client counterfactuals.
 
 The ordinary `Analysis::run` path is unchanged. Diagnostic points-to materialization is enabled
 only by `Analysis::run_with_external_policy_census`. `--callback-closure` performs a second,
@@ -150,6 +156,57 @@ honest successor must reason about the overlapping `IntToPtr` rows as a group an
 provenance bound; external-principal separation cannot claim these 6,006 poisoned global
 occurrences because §9 correctly rejects forged provenance.
 
+## Group-wise forged-pointer follow-up
+
+The follow-up uses a read-only proof grammar. It accepts only a pointer-width, default-address-space
+`ptrtoint` origin propagated through `phi`, `select`, or `freeze`, optionally joined with integer
+zero. Memory loads, call results, parameters, non-zero integers, width changes, cycles, and integer
+arithmetic fail closed. Exact universal sources at a pointer origin become graph edges rather than
+immediate blockers: otherwise a seed would reject itself merely because its own forged region
+flowed back to the origin. The connected components therefore close over both seed-to-ModRef
+support and seed-to-origin dependencies.
+
+| measure | result |
+|---|---:|
+| relevant `IntToPtr` seeds | 651 |
+| provenance-connected groups | 61 |
+| exact pointer-derived/null seeds | **0** |
+| exact pointer-derived/null groups | **0** |
+| rows in exact-certifiable groups | **0** |
+| seeds classified non-zero-integer | 578 |
+| seeds with other unbounded input | 73 |
+| remove-every-`ModuleWide` upper bound: newly access-complete globals | 1,950 |
+| remove-every-`ModuleWide` upper bound: newly mutex-eligible globals | **0** |
+
+Grouping is materially different from row counting. The 16,254 rows collapse to 61 components.
+Fourteen affected modules have one component; `lib-placebo-O1-g` has 47 after circular origin
+dependencies collapse the 213 components obtained from row overlap alone. `lib-usb-O0` similarly
+collapses from seven row-overlap groups to one. This validates the group construction while still
+producing no certificate.
+
+The source expressions explain the zero. Literal `p -> ptrtoint -> inttoptr -> q` round trips are
+already recognized and removed before `OmegaSeedKind::IntToPtr` is emitted. Among the residual
+seeds, blockers overlap but are dominated by 578 non-zero integer constants, 394 additions, 64
+subtractions, 60 memory loads, 15 call results, and 11 function parameters. This is real integer
+punning, not an unimplemented copy/`phi` propagation case.
+
+Two deliberately weaker upper bounds were also measured:
+
+- 129 seeds are finite non-zero constant candidates. Only two whole groups qualify: the `{0,2}`
+  tag in gifsicle O0 and the matching YAPET O0-g case. Treating those values as non-addresses would
+  remove 228 rows and make 97 globals access-complete, but still make zero globals mutex-eligible.
+  This requires a target/link-layout non-alias argument that bitcode provenance does not provide.
+- An aggregator-only optimistic profile admits one pointer origin plus additive constants without
+  proving the exact expression tree. It identifies 362 seeds, 45 groups, and 87 rows, all within
+  `lib-placebo-O1-g`. Two remaining unbounded groups keep the module poisoned, so it changes zero
+  access-completeness and zero mutex decisions. It is an upper bound, not a certificate.
+
+Even the impossible remove-all counterfactual produces zero new mutex decisions. The 1,950
+access-completeness changes are blocked downstream by strict reentry or other mutex conditions.
+Thus the currently measurable benefit is diagnostic access-set precision, not a final disposition
+gain. Curl—linked or library, O0 or O1—has no `ModuleWide` row, so this extension cannot affect the
+curl/KELP comparison.
+
 ## Decision
 
 The pre-implementation stop gate is decisive:
@@ -159,8 +216,13 @@ The pre-implementation stop gate is decisive:
    not affect access completeness;
 3. callback-closed reentry analysis changes reachability facts but produces zero complete,
    accessor-disjoint D4 opportunities and zero final mutex decisions;
-4. all measured `ModuleWide` rows belong to the separately excluded forged-pointer channel.
+4. all measured `ModuleWide` rows belong to the separately excluded forged-pointer channel;
+5. the group-wise follow-up finds zero exact provenance-certifiable groups and zero final mutex
+   gains even under the remove-all upper bound.
 
 Retain the instrumentation for reproducibility, but do not proceed to policy plumbing or semantic
-phases 1–6. If another experiment follows, scope it explicitly to group-wise `IntToPtr`
-provenance and measure final client decisions before adding a new lattice/domain mechanism.
+phases 1–6. Do not add a group-wise forged-pointer semantic overlay under the current proof
+grammar. A successor would first need a concrete soundness argument for non-zero tags or
+pointer-plus-integer arithmetic and a client metric other than mutex eligibility; the group and
+counterfactual instrumentation can evaluate that proposal before adding a new lattice/domain
+mechanism.

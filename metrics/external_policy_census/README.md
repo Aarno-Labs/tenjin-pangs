@@ -6,6 +6,19 @@ analysis, records finite external ModRef provenance, attributes `ModuleWide` row
 proposed callback/control closure, and evaluates the D4 counterfactual without changing analysis or
 disposition facts.
 
+For forged-pointer evaluation, the report also records the LLVM integer-expression trace for each
+`IntToPtr` seed, connects seeds through both shared `ModuleWide` rows and circular universal
+provenance at pointer origins, and emits three deliberately separate bounds:
+
+- exact pointer-derived/null groups that could support a provenance certificate;
+- finite non-zero integer-tag groups, which still need a target/link-layout non-alias argument;
+- an aggregator-only optimistic single-origin constant-offset profile, which is an upper bound and
+  not a certificate because the trace does not yet prove every integer operation preserves one
+  pointer provenance.
+
+The D4 section computes remove-one-group, remove-all-groups, and remove-all-candidate-groups client
+counterfactuals. This avoids the false zero caused by removing one overlapping row at a time.
+
 The 2026-08-24 measurements and stop-gate decision are in
 [`20260824_EXTERNAL_POLICY_CENSUS.md`](../../20260824_EXTERNAL_POLICY_CENSUS.md).
 

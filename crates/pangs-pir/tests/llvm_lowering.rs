@@ -998,6 +998,82 @@ entry:
 }
 
 #[test]
+fn records_fail_closed_inttoptr_integer_provenance_traces() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("inttoptr-provenance.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@tag = global i8* inttoptr (i64 2 to i8*)
+
+define i8* @pointer_or_null(i1 %condition, i8* %pointer) {
+entry:
+  %bits = ptrtoint i8* %pointer to i64
+  %selected = select i1 %condition, i64 %bits, i64 0
+  %result = inttoptr i64 %selected to i8*
+  ret i8* %result
+}
+
+define i8* @integer_tag() {
+entry:
+  %result = inttoptr i64 2 to i8*
+  ret i8* %result
+}
+
+define i8* @unbounded_argument(i64 %bits) {
+entry:
+  %result = inttoptr i64 %bits to i8*
+  ret i8* %result
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = Pir::from_path(&ll_path).unwrap();
+    let trace = |function: &str| {
+        pir.functions
+            .iter()
+            .find(|candidate| candidate.key == function)
+            .unwrap()
+            .body
+            .iter()
+            .find_map(|statement| match statement {
+                Stmt::IntToPtr {
+                    provenance_trace, ..
+                } => provenance_trace.as_ref(),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let pointer_or_null = trace("pointer_or_null");
+    assert_eq!(pointer_or_null.operations, ["ptrtoint", "select"]);
+    assert_eq!(pointer_or_null.integer_constants, ["0"]);
+    assert_eq!(pointer_or_null.pointer_origins.len(), 1);
+    assert!(pointer_or_null.blockers.is_empty());
+
+    let tag = trace("integer_tag");
+    assert_eq!(tag.integer_constants, ["2"]);
+    assert!(tag.pointer_origins.is_empty());
+    assert!(tag.blockers.is_empty());
+
+    let argument = trace("unbounded_argument");
+    assert_eq!(argument.blockers, ["function-argument"]);
+
+    let global_tag = pir
+        .global_init
+        .iter()
+        .find_map(|statement| match statement {
+            Stmt::IntToPtr {
+                provenance_trace, ..
+            } => provenance_trace.as_ref(),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(global_tag.integer_constants, ["2"]);
+    assert!(global_tag.blockers.is_empty());
+}
+
+#[test]
 fn certifies_only_exact_fully_initialized_function_pointer_aggregate_copies() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("fnptr-init-copy.ll");

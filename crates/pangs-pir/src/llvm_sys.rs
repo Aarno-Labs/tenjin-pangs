@@ -20,9 +20,9 @@ use llvm_sys::{
 
 use crate::knobs::{CONSTANT_EXPR_RECURSION_LIMIT, DEBUG_TYPE_RECURSION_LIMIT};
 use crate::{
-    AbiClass, Access, Func, GepLane, Global, Loc, LoweringStats, Param, Pir, PirError,
-    ScalarTypeClass, ScalarTypeEvidence, Signature, StatementBoundary, StatementCfg, Stmt,
-    SymbolLinkage, TargetInfo, TypeQualifiers, ValueKind, VarArgPosition,
+    AbiClass, Access, Func, GepLane, Global, IntToPtrProvenanceTrace, Loc, LoweringStats, Param,
+    Pir, PirError, ScalarTypeClass, ScalarTypeEvidence, Signature, StatementBoundary, StatementCfg,
+    Stmt, SymbolLinkage, TargetInfo, TypeQualifiers, ValueKind, VarArgPosition,
 };
 
 mod ptrint;
@@ -1440,6 +1440,319 @@ unsafe fn lower_function_constant_expr_value(
     dest
 }
 
+const INTTOPTR_TRACE_RECURSION_LIMIT: usize = 128;
+
+/// Trace the integer side of an `inttoptr` while the LLVM def-use graph is still available.
+/// This metadata is intentionally more restrictive than LLVM itself: non-zero address spaces,
+/// arithmetic, memory, calls, parameters, and width-changing casts all remain blockers.
+unsafe fn trace_inttoptr_source(
+    ctx: &ModuleCtx,
+    fctx: &mut FunctionCtx,
+    source: LLVMValueRef,
+    integer_bits: u32,
+    pointer_bits: u32,
+    pointer_address_space: u32,
+) -> IntToPtrProvenanceTrace {
+    unsafe fn visit(
+        ctx: &ModuleCtx,
+        fctx: &mut FunctionCtx,
+        value: LLVMValueRef,
+        trace: &mut IntToPtrProvenanceTrace,
+        path: &mut BTreeSet<usize>,
+        depth: usize,
+    ) {
+        if value.is_null() {
+            trace.blockers.push("null-llvm-value".into());
+            return;
+        }
+        if depth >= INTTOPTR_TRACE_RECURSION_LIMIT {
+            trace.blockers.push("source-traversal-limit".into());
+            return;
+        }
+        let id = value as usize;
+        if !path.insert(id) {
+            trace.blockers.push("source-cycle".into());
+            return;
+        }
+
+        if !LLVMIsAConstantInt(value).is_null() {
+            let width = LLVMGetIntTypeWidth(LLVMTypeOf(value));
+            trace.integer_constants.push(if width <= 64 {
+                LLVMConstIntGetSExtValue(value).to_string()
+            } else {
+                value_string(value)
+            });
+            path.remove(&id);
+            return;
+        }
+        if !LLVMIsAUndefValue(value).is_null() {
+            trace.blockers.push("undef-integer".into());
+            path.remove(&id);
+            return;
+        }
+        if !LLVMIsAPoisonValue(value).is_null() {
+            trace.blockers.push("poison-integer".into());
+            path.remove(&id);
+            return;
+        }
+        if !LLVMIsAArgument(value).is_null() {
+            trace.blockers.push("function-argument".into());
+            path.remove(&id);
+            return;
+        }
+
+        let is_instruction = !LLVMIsAInstruction(value).is_null();
+        let is_constant_expr = !LLVMIsAConstantExpr(value).is_null();
+        if !is_instruction && !is_constant_expr {
+            trace
+                .blockers
+                .push(format!("unclassified-source:{}", value_string(value)));
+            path.remove(&id);
+            return;
+        }
+        let opcode = if is_instruction {
+            LLVMGetInstructionOpcode(value)
+        } else {
+            LLVMGetConstOpcode(value)
+        };
+        match opcode {
+            LLVMOpcode::LLVMPtrToInt => {
+                let pointer = LLVMGetOperand(value, 0);
+                let source_space = LLVMGetPointerAddressSpace(LLVMTypeOf(pointer));
+                let source_pointer_bits = LLVMPointerSizeForAS(ctx.data_layout, source_space) * 8;
+                let result_bits = LLVMGetIntTypeWidth(LLVMTypeOf(value));
+                trace.operations.push("ptrtoint".into());
+                if source_space != 0 {
+                    trace
+                        .blockers
+                        .push(format!("ptrtoint-address-space:{source_space}"));
+                }
+                if result_bits != source_pointer_bits {
+                    trace.blockers.push(format!(
+                        "ptrtoint-width-mismatch:{result_bits}:{source_pointer_bits}"
+                    ));
+                }
+                trace.pointer_origins.push(fctx.operand_key(pointer));
+            }
+            LLVMOpcode::LLVMPHI if is_instruction => {
+                trace.operations.push("phi".into());
+                for index in 0..LLVMCountIncoming(value) {
+                    visit(
+                        ctx,
+                        fctx,
+                        LLVMGetIncomingValue(value, index),
+                        trace,
+                        path,
+                        depth + 1,
+                    );
+                }
+            }
+            LLVMOpcode::LLVMSelect => {
+                trace.operations.push("select".into());
+                visit(ctx, fctx, LLVMGetOperand(value, 1), trace, path, depth + 1);
+                visit(ctx, fctx, LLVMGetOperand(value, 2), trace, path, depth + 1);
+            }
+            LLVMOpcode::LLVMFreeze => {
+                trace.operations.push("freeze".into());
+                visit(ctx, fctx, LLVMGetOperand(value, 0), trace, path, depth + 1);
+            }
+            LLVMOpcode::LLVMAdd
+            | LLVMOpcode::LLVMSub
+            | LLVMOpcode::LLVMAnd
+            | LLVMOpcode::LLVMOr
+            | LLVMOpcode::LLVMXor => {
+                let operation = opcode_key(opcode);
+                trace.operations.push(operation.into());
+                trace
+                    .blockers
+                    .push(format!("integer-arithmetic:{operation}"));
+                for index in 0..2 {
+                    visit(
+                        ctx,
+                        fctx,
+                        LLVMGetOperand(value, index),
+                        trace,
+                        path,
+                        depth + 1,
+                    );
+                }
+            }
+            LLVMOpcode::LLVMLoad => trace.blockers.push("memory-load".into()),
+            LLVMOpcode::LLVMCall | LLVMOpcode::LLVMInvoke | LLVMOpcode::LLVMCallBr => {
+                trace.blockers.push("call-result".into())
+            }
+            LLVMOpcode::LLVMTrunc | LLVMOpcode::LLVMZExt | LLVMOpcode::LLVMSExt => {
+                trace
+                    .blockers
+                    .push(format!("integer-width-cast:{}", opcode_key(opcode)));
+                visit(ctx, fctx, LLVMGetOperand(value, 0), trace, path, depth + 1);
+            }
+            other => trace
+                .blockers
+                .push(format!("unsupported-source-op:{}", opcode_key(other))),
+        }
+        path.remove(&id);
+    }
+
+    let mut trace = IntToPtrProvenanceTrace::default();
+    if integer_bits != pointer_bits {
+        trace.blockers.push(format!(
+            "inttoptr-width-mismatch:{integer_bits}:{pointer_bits}"
+        ));
+    }
+    // Conservatively exclude every non-default address space from this first experiment. This
+    // is stronger than merely consulting LLVM's non-integral address-space list.
+    if pointer_address_space != 0 {
+        trace
+            .blockers
+            .push(format!("inttoptr-address-space:{pointer_address_space}"));
+    }
+    visit(ctx, fctx, source, &mut trace, &mut BTreeSet::new(), 0);
+    trace.pointer_origins.sort();
+    trace.pointer_origins.dedup();
+    trace.integer_constants.sort();
+    trace.integer_constants.dedup();
+    trace.operations.sort();
+    trace.operations.dedup();
+    trace.blockers.sort();
+    trace.blockers.dedup();
+    trace
+}
+
+unsafe fn trace_global_init_inttoptr_source(
+    ctx: &ModuleCtx,
+    source: LLVMValueRef,
+    integer_bits: u32,
+    pointer_bits: u32,
+    pointer_address_space: u32,
+) -> IntToPtrProvenanceTrace {
+    unsafe fn visit(
+        ctx: &ModuleCtx,
+        value: LLVMValueRef,
+        trace: &mut IntToPtrProvenanceTrace,
+        path: &mut BTreeSet<usize>,
+        depth: usize,
+    ) {
+        if value.is_null() || depth >= INTTOPTR_TRACE_RECURSION_LIMIT {
+            trace.blockers.push("source-traversal-limit".into());
+            return;
+        }
+        let id = value as usize;
+        if !path.insert(id) {
+            trace.blockers.push("source-cycle".into());
+            return;
+        }
+        if !LLVMIsAConstantInt(value).is_null() {
+            let width = LLVMGetIntTypeWidth(LLVMTypeOf(value));
+            trace.integer_constants.push(if width <= 64 {
+                LLVMConstIntGetSExtValue(value).to_string()
+            } else {
+                value_string(value)
+            });
+            path.remove(&id);
+            return;
+        }
+        if !LLVMIsAUndefValue(value).is_null() {
+            trace.blockers.push("undef-integer".into());
+            path.remove(&id);
+            return;
+        }
+        if !LLVMIsAPoisonValue(value).is_null() {
+            trace.blockers.push("poison-integer".into());
+            path.remove(&id);
+            return;
+        }
+        if LLVMIsAConstantExpr(value).is_null() {
+            trace
+                .blockers
+                .push(format!("unclassified-source:{}", value_string(value)));
+            path.remove(&id);
+            return;
+        }
+        let opcode = LLVMGetConstOpcode(value);
+        match opcode {
+            LLVMOpcode::LLVMPtrToInt => {
+                let pointer = LLVMGetOperand(value, 0);
+                let source_space = LLVMGetPointerAddressSpace(LLVMTypeOf(pointer));
+                let source_pointer_bits = LLVMPointerSizeForAS(ctx.data_layout, source_space) * 8;
+                let result_bits = LLVMGetIntTypeWidth(LLVMTypeOf(value));
+                trace.operations.push("ptrtoint".into());
+                if source_space != 0 {
+                    trace
+                        .blockers
+                        .push(format!("ptrtoint-address-space:{source_space}"));
+                }
+                if result_bits != source_pointer_bits {
+                    trace.blockers.push(format!(
+                        "ptrtoint-width-mismatch:{result_bits}:{source_pointer_bits}"
+                    ));
+                }
+                if let Some(symbol) = direct_global_value_name(pointer) {
+                    trace.pointer_origins.push(format!("@{symbol}"));
+                } else if !LLVMIsAConstantPointerNull(pointer).is_null() {
+                    trace.pointer_origins.push("null".into());
+                } else {
+                    trace.blockers.push(format!(
+                        "global-init-pointer-origin-unresolved:{}",
+                        value_string(pointer)
+                    ));
+                }
+            }
+            LLVMOpcode::LLVMSelect => {
+                trace.operations.push("select".into());
+                visit(ctx, LLVMGetOperand(value, 1), trace, path, depth + 1);
+                visit(ctx, LLVMGetOperand(value, 2), trace, path, depth + 1);
+            }
+            LLVMOpcode::LLVMAdd
+            | LLVMOpcode::LLVMSub
+            | LLVMOpcode::LLVMAnd
+            | LLVMOpcode::LLVMOr
+            | LLVMOpcode::LLVMXor => {
+                let operation = opcode_key(opcode);
+                trace.operations.push(operation.into());
+                trace
+                    .blockers
+                    .push(format!("integer-arithmetic:{operation}"));
+                for index in 0..2 {
+                    visit(ctx, LLVMGetOperand(value, index), trace, path, depth + 1);
+                }
+            }
+            LLVMOpcode::LLVMTrunc | LLVMOpcode::LLVMZExt | LLVMOpcode::LLVMSExt => {
+                trace
+                    .blockers
+                    .push(format!("integer-width-cast:{}", opcode_key(opcode)));
+                visit(ctx, LLVMGetOperand(value, 0), trace, path, depth + 1);
+            }
+            other => trace
+                .blockers
+                .push(format!("unsupported-source-op:{}", opcode_key(other))),
+        }
+        path.remove(&id);
+    }
+
+    let mut trace = IntToPtrProvenanceTrace::default();
+    if integer_bits != pointer_bits {
+        trace.blockers.push(format!(
+            "inttoptr-width-mismatch:{integer_bits}:{pointer_bits}"
+        ));
+    }
+    if pointer_address_space != 0 {
+        trace
+            .blockers
+            .push(format!("inttoptr-address-space:{pointer_address_space}"));
+    }
+    visit(ctx, source, &mut trace, &mut BTreeSet::new(), 0);
+    trace.pointer_origins.sort();
+    trace.pointer_origins.dedup();
+    trace.integer_constants.sort();
+    trace.integer_constants.dedup();
+    trace.operations.sort();
+    trace.operations.dedup();
+    trace.blockers.sort();
+    trace.blockers.dedup();
+    trace
+}
+
 unsafe fn lower_instruction(
     ctx: &ModuleCtx,
     fctx: &mut FunctionCtx,
@@ -1605,12 +1918,18 @@ unsafe fn lower_instruction(
             let source = LLVMGetOperand(inst, 0);
             let destination_ty = LLVMTypeOf(inst);
             let address_space = LLVMGetPointerAddressSpace(destination_ty);
+            let source_key = fctx.operand_key(source);
+            let integer_bits = LLVMGetIntTypeWidth(LLVMTypeOf(source));
+            let pointer_bits = LLVMPointerSizeForAS(ctx.data_layout, address_space) * 8;
+            let provenance_trace =
+                trace_inttoptr_source(ctx, fctx, source, integer_bits, pointer_bits, address_space);
             body.push(Stmt::IntToPtr {
                 dest: fctx.local_key(inst),
-                source: fctx.operand_key(source),
-                integer_bits: Some(LLVMGetIntTypeWidth(LLVMTypeOf(source))),
-                pointer_bits: Some(LLVMPointerSizeForAS(ctx.data_layout, address_space) * 8),
+                source: source_key,
+                integer_bits: Some(integer_bits),
+                pointer_bits: Some(pointer_bits),
                 pointer_address_space: Some(address_space),
+                provenance_trace: Some(provenance_trace),
                 loc: loc(inst),
             });
             lowering.bump_modeled("inttoptr");
@@ -2716,12 +3035,21 @@ unsafe fn lower_constant_expr_value_inner(
                 );
                 let dest = global_init_temp(temp_ordinal);
                 let address_space = LLVMGetPointerAddressSpace(LLVMTypeOf(constant));
+                let integer_bits = LLVMGetIntTypeWidth(LLVMTypeOf(operand));
+                let pointer_bits = LLVMPointerSizeForAS(ctx.data_layout, address_space) * 8;
                 body.push(Stmt::IntToPtr {
                     dest: dest.clone(),
                     source,
-                    integer_bits: Some(LLVMGetIntTypeWidth(LLVMTypeOf(operand))),
-                    pointer_bits: Some(LLVMPointerSizeForAS(ctx.data_layout, address_space) * 8),
+                    integer_bits: Some(integer_bits),
+                    pointer_bits: Some(pointer_bits),
                     pointer_address_space: Some(address_space),
+                    provenance_trace: Some(trace_global_init_inttoptr_source(
+                        ctx,
+                        operand,
+                        integer_bits,
+                        pointer_bits,
+                        address_space,
+                    )),
                     loc: None,
                 });
                 lowering.bump_modeled("global_init_inttoptr");

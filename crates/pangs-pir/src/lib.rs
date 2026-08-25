@@ -273,6 +273,24 @@ pub enum ScalarOp {
     Xor,
 }
 
+/// Diagnostic-only trace of the integer expression consumed by an LLVM `inttoptr`.
+///
+/// The pointer analysis deliberately ignores this metadata.  It exists so experiments can
+/// distinguish pointer-derived integers from arbitrary integers without weakening the ordinary
+/// fail-closed `IntToPtr` semantics.  A trace is certifiable only when `blockers` is empty and
+/// every integer constant is zero.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IntToPtrProvenanceTrace {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pointer_origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integer_constants: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
+}
+
 /// The vararg slots that may be read by one statically recognized `va_arg` operation.
 /// `From` is used when the operation is in a loop and can consume every remaining slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +400,10 @@ pub enum Stmt {
         pointer_bits: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pointer_address_space: Option<u32>,
+        /// Present for LLVM input and absent from legacy/hand-written PIR. It is observational
+        /// metadata only; PAG construction and every solver ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance_trace: Option<IntToPtrProvenanceTrace>,
         #[serde(default)]
         loc: Option<Loc>,
     },

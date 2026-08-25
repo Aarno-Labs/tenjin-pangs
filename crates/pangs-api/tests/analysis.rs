@@ -95,6 +95,14 @@ fn external_policy_census_is_observational_and_attributes_inttoptr_rows() {
                 .iter()
                 .all(|source| source.starts_with("omega:inttoptr:"))
     }));
+    assert_eq!(census.summary.forged_pointer_seeds, 1);
+    assert_eq!(census.summary.forged_pointer_groups, 1);
+    assert_eq!(census.forged_pointer_groups[0].modref_row_indices.len(), 2);
+    assert!(!census.forged_pointer_groups[0].feasibly_certifiable);
+    assert!(census
+        .module_wide_rows
+        .iter()
+        .all(|row| { row.forged_pointer_group.as_deref() == Some("forged-group:0") }));
 }
 
 fn m2_2_fixture(name: &str) -> std::path::PathBuf {
@@ -2346,6 +2354,7 @@ fn steens_data_pointer_round_trip_is_not_a_function_pointer_conversion() {
         integer_bits: Some(64),
         pointer_bits: Some(64),
         pointer_address_space: Some(0),
+        provenance_trace: None,
         loc: None,
     });
     let analysis = Analysis::run(

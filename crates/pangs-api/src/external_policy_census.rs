@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use pangs_pag::{CallKind as PagCallKind, Pag};
-use pangs_pir::{Access, Pir, Stmt, ValueKind};
+use pangs_pir::{Access, IntToPtrProvenanceTrace, Pir, Stmt, ValueKind};
 use pangs_solve::SolveResult;
 use serde::Serialize;
 
@@ -18,8 +18,11 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalPolicyCensus {
+    pub build_mode: BuildMode,
     pub finite_effect_rows: Vec<FiniteEffectRow>,
     pub module_wide_rows: Vec<ModuleWideRow>,
+    pub forged_pointer_seeds: Vec<ForgedPointerSeedRow>,
+    pub forged_pointer_groups: Vec<ForgedPointerGroupRow>,
     /// Every `ModuleWide` row poisons this same set. Store the identities once rather than
     /// repeating a module-sized string vector on every row.
     pub module_wide_poisoned_globals: Vec<String>,
@@ -42,6 +45,14 @@ pub struct ExternalPolicyCensusSummary {
     pub module_wide_inline_asm_rows: usize,
     pub module_wide_mixed_rows: usize,
     pub module_wide_unattributed_rows: usize,
+    pub forged_pointer_seeds: usize,
+    pub forged_pointer_seeds_feasibly_bounded: usize,
+    pub forged_pointer_seeds_bounded_constant_candidates: usize,
+    pub forged_pointer_groups: usize,
+    pub forged_pointer_groups_feasibly_certifiable: usize,
+    pub forged_pointer_groups_bounded_constant_candidates: usize,
+    pub module_wide_rows_in_feasibly_certifiable_groups: usize,
+    pub module_wide_rows_in_bounded_constant_candidate_groups: usize,
     pub distinct_module_wide_poisoned_globals: usize,
     pub opaque_inline_asm_exposures: usize,
     pub opaque_callsites: usize,
@@ -78,6 +89,38 @@ pub struct ModuleWideRow {
     pub external_sources: Vec<String>,
     pub poisoned_globals: usize,
     pub exclusively_poisoned_globals: Vec<String>,
+    pub forged_pointer_group: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForgedPointerSeedRow {
+    pub source: String,
+    pub function: Option<String>,
+    pub destination: Option<String>,
+    pub source_expression: Option<String>,
+    pub classification: String,
+    pub feasibly_bounded: bool,
+    /// Requires an additional target/link-layout argument that the LLVM module alone does not
+    /// provide: the enumerated non-zero integers must not name program storage.
+    pub bounded_constant_candidate: bool,
+    pub pointer_origins: Vec<String>,
+    pub integer_constants: Vec<String>,
+    pub operations: Vec<String>,
+    pub pointer_origin_seed_dependencies: Vec<String>,
+    pub finite_candidate_globals: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForgedPointerGroupRow {
+    pub group: String,
+    pub seed_sources: Vec<String>,
+    pub modref_row_indices: Vec<usize>,
+    pub classification: String,
+    pub feasibly_certifiable: bool,
+    pub bounded_constant_candidate: bool,
+    pub finite_candidate_globals: Vec<String>,
+    pub blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +152,18 @@ pub(crate) struct SolverInputs {
     callsites: Vec<SolverCallsiteInput>,
     opaque_inline_asm_exposures: usize,
     universal_sources_by_node: BTreeMap<String, Vec<String>>,
+    forged_seed_inputs: BTreeMap<String, ForgedSeedInput>,
+}
+
+#[derive(Debug, Clone)]
+struct ForgedSeedInput {
+    function: String,
+    destination: String,
+    source_expression: String,
+    trace: Option<IntToPtrProvenanceTrace>,
+    finite_candidate_globals: BTreeSet<String>,
+    blockers: BTreeSet<String>,
+    pointer_origin_seed_dependencies: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +324,7 @@ pub(crate) fn collect_solver_inputs(
             }
         })
         .collect();
+    let forged_seed_inputs = collect_forged_seed_inputs(pir, solved);
     SolverInputs {
         callsites,
         opaque_inline_asm_exposures,
@@ -278,7 +334,191 @@ pub(crate) fn collect_solver_inputs(
             .filter(|(_, node)| !node.universal_sources.is_empty())
             .map(|(label, node)| (label.clone(), node.universal_sources.clone()))
             .collect(),
+        forged_seed_inputs,
     }
+}
+
+fn collect_forged_seed_inputs(
+    pir: &Pir,
+    solved: &SolveResult,
+) -> BTreeMap<String, ForgedSeedInput> {
+    let mut out = BTreeMap::new();
+    for function in pir.functions.iter().filter(|function| !function.external) {
+        for statement in &function.body {
+            let Stmt::IntToPtr {
+                dest,
+                source,
+                provenance_trace,
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            let universal_source = format!("omega:inttoptr:val:{}:{}", function.key, dest);
+            let mut candidates = BTreeSet::new();
+            let mut blockers = BTreeSet::new();
+            let mut pointer_origin_seed_dependencies = BTreeSet::new();
+            if let Some(trace) = provenance_trace {
+                blockers.extend(trace.blockers.iter().cloned());
+                if trace
+                    .integer_constants
+                    .iter()
+                    .any(|constant| !integer_constant_is_zero(constant))
+                {
+                    blockers.insert("nonzero-integer-constant".to_string());
+                }
+                for origin in &trace.pointer_origins {
+                    let labels = pointer_origin_labels(function.key.as_str(), origin);
+                    let resolution = labels.iter().find_map(|label| solved.nodes.get(label));
+                    if let Some(resolution) = resolution {
+                        if resolution.external_universal {
+                            let dependencies = resolution
+                                .universal_sources
+                                .iter()
+                                .filter(|source| source.starts_with("omega:inttoptr:"))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            if dependencies.is_empty() {
+                                blockers.insert(format!(
+                                    "universal-pointer-origin-unattributed:{origin}"
+                                ));
+                            }
+                            pointer_origin_seed_dependencies.extend(dependencies);
+                        }
+                        let globals = if resolution.pointee_globals_unfiltered.is_empty() {
+                            &resolution.pointee_globals
+                        } else {
+                            &resolution.pointee_globals_unfiltered
+                        };
+                        candidates.extend(globals.iter().cloned());
+                    } else if let Some(global) = pir
+                        .globals
+                        .iter()
+                        .find(|global| canonical_symbol(&global.key) == canonical_symbol(origin))
+                    {
+                        candidates.insert(global.key.clone());
+                    } else if origin != "null"
+                        && !pir.functions.iter().any(|candidate| {
+                            canonical_symbol(&candidate.key) == canonical_symbol(origin)
+                        })
+                    {
+                        blockers.insert(format!("pointer-origin-resolution-unavailable:{origin}"));
+                    }
+                }
+            } else {
+                blockers.insert("source-provenance-unavailable".to_string());
+            }
+            out.insert(
+                universal_source,
+                ForgedSeedInput {
+                    function: function.key.clone(),
+                    destination: dest.clone(),
+                    source_expression: source.clone(),
+                    trace: provenance_trace.clone(),
+                    finite_candidate_globals: candidates,
+                    blockers,
+                    pointer_origin_seed_dependencies,
+                },
+            );
+        }
+    }
+    for statement in &pir.global_init {
+        let Stmt::IntToPtr {
+            dest,
+            source,
+            provenance_trace,
+            ..
+        } = statement
+        else {
+            continue;
+        };
+        let universal_source = format!("omega:inttoptr:val:global_init:{dest}");
+        let mut candidates = BTreeSet::new();
+        let mut blockers = BTreeSet::new();
+        let mut pointer_origin_seed_dependencies = BTreeSet::new();
+        if let Some(trace) = provenance_trace {
+            blockers.extend(trace.blockers.iter().cloned());
+            if trace
+                .integer_constants
+                .iter()
+                .any(|constant| !integer_constant_is_zero(constant))
+            {
+                blockers.insert("nonzero-integer-constant".to_string());
+            }
+            for origin in &trace.pointer_origins {
+                let labels = pointer_origin_labels("global_init", origin);
+                let resolution = labels.iter().find_map(|label| solved.nodes.get(label));
+                if let Some(resolution) = resolution {
+                    if resolution.external_universal {
+                        let dependencies = resolution
+                            .universal_sources
+                            .iter()
+                            .filter(|source| source.starts_with("omega:inttoptr:"))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if dependencies.is_empty() {
+                            blockers
+                                .insert(format!("universal-pointer-origin-unattributed:{origin}"));
+                        }
+                        pointer_origin_seed_dependencies.extend(dependencies);
+                    }
+                    let globals = if resolution.pointee_globals_unfiltered.is_empty() {
+                        &resolution.pointee_globals
+                    } else {
+                        &resolution.pointee_globals_unfiltered
+                    };
+                    candidates.extend(globals.iter().cloned());
+                } else if let Some(global) = pir
+                    .globals
+                    .iter()
+                    .find(|global| canonical_symbol(&global.key) == canonical_symbol(origin))
+                {
+                    candidates.insert(global.key.clone());
+                } else if origin != "null"
+                    && !pir.functions.iter().any(|candidate| {
+                        canonical_symbol(&candidate.key) == canonical_symbol(origin)
+                    })
+                {
+                    blockers.insert(format!("pointer-origin-resolution-unavailable:{origin}"));
+                }
+            }
+        } else {
+            blockers.insert("source-provenance-unavailable".to_string());
+        }
+        out.insert(
+            universal_source,
+            ForgedSeedInput {
+                function: "global_init".to_string(),
+                destination: dest.clone(),
+                source_expression: source.clone(),
+                trace: provenance_trace.clone(),
+                finite_candidate_globals: candidates,
+                blockers,
+                pointer_origin_seed_dependencies,
+            },
+        );
+    }
+    out
+}
+
+fn pointer_origin_labels(function: &str, origin: &str) -> Vec<String> {
+    if origin.starts_with('@') {
+        vec![
+            format!("sym:global:{origin}"),
+            format!("sym:function:{origin}"),
+        ]
+    } else {
+        vec![format!("val:{function}:{origin}")]
+    }
+}
+
+fn integer_constant_is_zero(constant: &str) -> bool {
+    constant == "0"
+        || constant == "null"
+        || constant
+            .split_whitespace()
+            .last()
+            .is_some_and(|value| value == "0")
 }
 
 pub(crate) fn build(
@@ -288,6 +528,7 @@ pub(crate) fn build(
     inputs: SolverInputs,
 ) -> ExternalPolicyCensus {
     let universal_sources_by_node = inputs.universal_sources_by_node.clone();
+    let forged_seed_inputs = inputs.forged_seed_inputs.clone();
     let callsite_by_key = analysis
         .callsites()
         .iter()
@@ -505,11 +746,15 @@ pub(crate) fn build(
                     } else {
                         Vec::new()
                     },
+                    forged_pointer_group: None,
                 });
             }
             GlobalCandidateSet::Finite(_) => {}
         }
     }
+
+    let (forged_pointer_seeds, forged_pointer_groups) =
+        build_forged_pointer_groups(&mut module_wide_rows, &forged_seed_inputs);
 
     let callback_functions = principal_rows
         .iter()
@@ -556,6 +801,34 @@ pub(crate) fn build(
             .iter()
             .filter(|row| row.seed_kinds.is_empty())
             .count(),
+        forged_pointer_seeds: forged_pointer_seeds.len(),
+        forged_pointer_seeds_feasibly_bounded: forged_pointer_seeds
+            .iter()
+            .filter(|seed| seed.feasibly_bounded)
+            .count(),
+        forged_pointer_seeds_bounded_constant_candidates: forged_pointer_seeds
+            .iter()
+            .filter(|seed| seed.bounded_constant_candidate)
+            .count(),
+        forged_pointer_groups: forged_pointer_groups.len(),
+        forged_pointer_groups_feasibly_certifiable: forged_pointer_groups
+            .iter()
+            .filter(|group| group.feasibly_certifiable)
+            .count(),
+        forged_pointer_groups_bounded_constant_candidates: forged_pointer_groups
+            .iter()
+            .filter(|group| group.bounded_constant_candidate)
+            .count(),
+        module_wide_rows_in_feasibly_certifiable_groups: forged_pointer_groups
+            .iter()
+            .filter(|group| group.feasibly_certifiable)
+            .map(|group| group.modref_row_indices.len())
+            .sum(),
+        module_wide_rows_in_bounded_constant_candidate_groups: forged_pointer_groups
+            .iter()
+            .filter(|group| group.bounded_constant_candidate)
+            .map(|group| group.modref_row_indices.len())
+            .sum(),
         distinct_module_wide_poisoned_globals: if module_wide_rows.is_empty() {
             0
         } else {
@@ -580,12 +853,268 @@ pub(crate) fn build(
     };
 
     ExternalPolicyCensus {
+        build_mode: opts.build_mode,
         finite_effect_rows,
         module_wide_rows,
+        forged_pointer_seeds,
+        forged_pointer_groups,
         module_wide_poisoned_globals: poisoned_globals,
         principals: principal_rows,
         opaque_callsites: opaque_callsite_rows,
         summary,
+    }
+}
+
+fn build_forged_pointer_groups(
+    rows: &mut [ModuleWideRow],
+    inputs: &BTreeMap<String, ForgedSeedInput>,
+) -> (Vec<ForgedPointerSeedRow>, Vec<ForgedPointerGroupRow>) {
+    let row_seeds = rows
+        .iter()
+        .map(|row| {
+            row.external_sources
+                .iter()
+                .filter(|source| source.starts_with("omega:inttoptr:"))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut relevant_sources = row_seeds
+        .iter()
+        .flat_map(|sources| sources.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut dependency_queue = relevant_sources.iter().cloned().collect::<VecDeque<_>>();
+    while let Some(source) = dependency_queue.pop_front() {
+        let Some(input) = inputs.get(&source) else {
+            continue;
+        };
+        for dependency in &input.pointer_origin_seed_dependencies {
+            if relevant_sources.insert(dependency.clone()) {
+                dependency_queue.push_back(dependency.clone());
+            }
+        }
+    }
+    let seed_rows = relevant_sources
+        .iter()
+        .map(|source| forged_pointer_seed_row(source, inputs.get(source)))
+        .collect::<Vec<_>>();
+    let seed_by_source = seed_rows
+        .iter()
+        .map(|row| (row.source.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows_by_seed = BTreeMap::<String, BTreeSet<usize>>::new();
+    for (row, sources) in row_seeds.iter().enumerate() {
+        for source in sources {
+            rows_by_seed.entry(source.clone()).or_default().insert(row);
+        }
+    }
+    let mut adjacent = relevant_sources
+        .iter()
+        .map(|source| (source.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut connect = |left: &str, right: &str| {
+        if left == right {
+            return;
+        }
+        adjacent
+            .entry(left.to_string())
+            .or_default()
+            .insert(right.to_string());
+        adjacent
+            .entry(right.to_string())
+            .or_default()
+            .insert(left.to_string());
+    };
+    for sources in &row_seeds {
+        if let Some(first) = sources.first() {
+            for source in sources.iter().skip(1) {
+                connect(first, source);
+            }
+        }
+    }
+    for source in &relevant_sources {
+        if let Some(input) = inputs.get(source) {
+            for dependency in &input.pointer_origin_seed_dependencies {
+                connect(source, dependency);
+            }
+        }
+    }
+
+    let mut groups = Vec::new();
+    let mut visited_seeds = BTreeSet::new();
+    let mut assigned_rows = BTreeSet::new();
+    for initial_seed in &relevant_sources {
+        if !visited_seeds.insert(initial_seed.clone()) {
+            continue;
+        }
+        let mut group_seeds = BTreeSet::from([initial_seed.clone()]);
+        let mut queue = VecDeque::from([initial_seed.clone()]);
+        while let Some(source) = queue.pop_front() {
+            for connected in &adjacent[&source] {
+                if visited_seeds.insert(connected.clone()) {
+                    group_seeds.insert(connected.clone());
+                    queue.push_back(connected.clone());
+                }
+            }
+        }
+        let group_rows = group_seeds
+            .iter()
+            .flat_map(|source| rows_by_seed.get(source).into_iter().flatten().copied())
+            .collect::<BTreeSet<_>>();
+        if group_rows.is_empty() {
+            continue;
+        }
+        assigned_rows.extend(group_rows.iter().copied());
+        let group = format!("forged-group:{}", groups.len());
+        for &row in &group_rows {
+            rows[row].forged_pointer_group = Some(group.clone());
+        }
+        let seed_records = group_seeds
+            .iter()
+            .filter_map(|source| seed_by_source.get(source.as_str()).copied())
+            .collect::<Vec<_>>();
+        let feasibly_certifiable = seed_records.len() == group_seeds.len()
+            && seed_records.iter().all(|seed| seed.feasibly_bounded);
+        let bounded_constant_candidate = seed_records.len() == group_seeds.len()
+            && seed_records
+                .iter()
+                .all(|seed| seed.feasibly_bounded || seed.bounded_constant_candidate)
+            && seed_records
+                .iter()
+                .any(|seed| seed.bounded_constant_candidate);
+        let mut candidates = seed_records
+            .iter()
+            .flat_map(|seed| seed.finite_candidate_globals.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let mut blockers = seed_records
+            .iter()
+            .flat_map(|seed| seed.blockers.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if seed_records.len() != group_seeds.len() {
+            blockers.insert("seed-record-unavailable".to_string());
+        }
+        let classification = if feasibly_certifiable {
+            let classes = seed_records
+                .iter()
+                .map(|seed| seed.classification.as_str())
+                .collect::<BTreeSet<_>>();
+            if classes.len() == 1 {
+                classes.first().unwrap().to_string()
+            } else {
+                "pointer_or_null".to_string()
+            }
+        } else if bounded_constant_candidate {
+            "bounded_constant_candidate".to_string()
+        } else if seed_records.iter().any(|seed| seed.feasibly_bounded) {
+            "mixed".to_string()
+        } else {
+            "unbounded".to_string()
+        };
+        groups.push(ForgedPointerGroupRow {
+            group,
+            seed_sources: group_seeds.into_iter().collect(),
+            modref_row_indices: group_rows.iter().map(|row| rows[*row].row_index).collect(),
+            classification,
+            feasibly_certifiable,
+            bounded_constant_candidate,
+            finite_candidate_globals: candidates.iter().cloned().collect(),
+            blockers: blockers.iter().cloned().collect(),
+        });
+        candidates.clear();
+        blockers.clear();
+    }
+    for row in 0..rows.len() {
+        if assigned_rows.contains(&row) {
+            continue;
+        }
+        let group = format!("forged-group:{}", groups.len());
+        rows[row].forged_pointer_group = Some(group.clone());
+        groups.push(ForgedPointerGroupRow {
+            group,
+            seed_sources: Vec::new(),
+            modref_row_indices: vec![rows[row].row_index],
+            classification: "unbounded".to_string(),
+            feasibly_certifiable: false,
+            bounded_constant_candidate: false,
+            finite_candidate_globals: Vec::new(),
+            blockers: vec!["module-wide-row-unattributed".to_string()],
+        });
+    }
+    (seed_rows, groups)
+}
+
+fn forged_pointer_seed_row(source: &str, input: Option<&ForgedSeedInput>) -> ForgedPointerSeedRow {
+    let Some(input) = input else {
+        return ForgedPointerSeedRow {
+            source: source.to_string(),
+            function: None,
+            destination: None,
+            source_expression: None,
+            classification: "unbounded".to_string(),
+            feasibly_bounded: false,
+            bounded_constant_candidate: false,
+            pointer_origins: Vec::new(),
+            integer_constants: Vec::new(),
+            operations: Vec::new(),
+            pointer_origin_seed_dependencies: Vec::new(),
+            finite_candidate_globals: Vec::new(),
+            blockers: vec!["seed-provenance-unavailable".to_string()],
+        };
+    };
+    let (pointer_origins, integer_constants, operations) = input
+        .trace
+        .as_ref()
+        .map(|trace| {
+            (
+                trace.pointer_origins.clone(),
+                trace.integer_constants.clone(),
+                trace.operations.clone(),
+            )
+        })
+        .unwrap_or_default();
+    let all_constants_zero = integer_constants
+        .iter()
+        .all(|constant| integer_constant_is_zero(constant));
+    let feasibly_bounded = input.blockers.is_empty()
+        && all_constants_zero
+        && (!pointer_origins.is_empty() || !integer_constants.is_empty());
+    let bounded_constant_candidate = !feasibly_bounded
+        && !integer_constants.is_empty()
+        && input.blockers.iter().all(|blocker| {
+            blocker == "nonzero-integer-constant"
+                || blocker == "integer-width-cast:zext"
+                || blocker == "integer-width-cast:sext"
+        });
+    let classification = if feasibly_bounded {
+        match (pointer_origins.is_empty(), integer_constants.is_empty()) {
+            (false, true) => "pointer_derived",
+            (true, false) => "null",
+            (false, false) => "pointer_or_null",
+            (true, true) => unreachable!(),
+        }
+    } else if !all_constants_zero {
+        "nonzero_integer_constant"
+    } else {
+        "unbounded"
+    };
+    ForgedPointerSeedRow {
+        source: source.to_string(),
+        function: Some(input.function.clone()),
+        destination: Some(input.destination.clone()),
+        source_expression: Some(input.source_expression.clone()),
+        classification: classification.to_string(),
+        feasibly_bounded,
+        bounded_constant_candidate,
+        pointer_origins,
+        integer_constants,
+        operations,
+        pointer_origin_seed_dependencies: input
+            .pointer_origin_seed_dependencies
+            .iter()
+            .cloned()
+            .collect(),
+        finite_candidate_globals: input.finite_candidate_globals.iter().cloned().collect(),
+        blockers: input.blockers.iter().cloned().collect(),
     }
 }
 
