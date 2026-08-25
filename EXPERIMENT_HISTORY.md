@@ -567,3 +567,41 @@ The fix is field-*insensitive*: it restores Steensgaard-grade transfer through t
 a two-member callback table resolves to both members. Offset correspondence — the precision
 half of `20260730_MEMCPY_HANDLING.md` — remains unimplemented, and its motivation is now
 precision and propagation cost rather than soundness.
+
+### Group-wise forged-pointer provenance census (2026-08-25)
+
+A diagnostic follow-up to `20260824_EXTERNAL_POLICY.md` tested whether overlapping
+`ModuleWide` ModRef rows could be narrowed as provenance-connected groups rather than one row at
+a time. The instrumentation traced each `inttoptr` seed's integer def-use graph and grouped seeds
+that either supported the same ModuleWide row or depended on the same exact universal pointer
+origin. Its sound experimental grammar admitted only matching-width, default-address-space
+`ptrtoint` origins propagated through `phi`, `select`, or `freeze`, optionally joined with zero;
+loads, calls, parameters, non-zero integers, width changes, cycles, and arithmetic failed closed.
+
+The 54 completed modules contained 16,254 ModuleWide rows, all from `IntToPtr` and none from
+inline assembly. Those rows represented 651 relevant seeds in 61 provenance-connected groups and
+poisoned 6,006 per-module global occurrences. **No seed, group, or row satisfied the exact
+pointer-derived/null grammar.** This was not primarily a missing propagation case: literal
+`ptrtoint`/`inttoptr` round trips are already handled without creating forged-pointer seeds, while
+the residual population was dominated by 578 non-zero integer inputs, 394 additions, 64
+subtractions, 60 loads, 15 call results, and 11 parameters (blocker counts overlap). Vim O1 and
+OpenSSL O1 timed out; all other corpus modules completed.
+
+Weaker counterfactuals found access-set precision but no measured disposition gain:
+
+- Treating finite non-zero constants as non-address tags would qualify only two complete groups,
+  remove 228 rows, and make 97 globals newly access-complete, but make zero globals newly
+  mutex-eligible. This is not a certificate without a target/link-layout non-alias proof.
+- An optimistic single-pointer-origin-plus-constant profile identified 45 groups in libplacebo,
+  but two residual unbounded groups kept the module poisoned, yielding zero newly access-complete
+  and zero newly mutex-eligible globals.
+- Even the impossible upper bound that removed every ModuleWide row made 1,950 globals newly
+  access-complete and **zero** newly mutex-eligible. Strict reentry and other downstream mutex
+  conditions consumed the entire apparent gain.
+
+Curl, in both executable and library modes at O0 and O1, had no ModuleWide row, so this mechanism
+cannot explain or improve the curl/KELP result. The diagnostic instrumentation was retained, but
+a semantic group-wise forged-pointer extension was rejected: the exact proof has no opportunities,
+and progressively less sound assumptions still do not change the measured mutex disposition.
+Reconsider it only with a sound argument for integer tags or pointer arithmetic and a downstream
+client for which access completeness itself has demonstrated value.
