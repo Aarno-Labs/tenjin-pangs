@@ -278,7 +278,7 @@ def main() -> int:
             "schema": 1, "pangs": str(pangs), "corpus": str(corpus), "modules": [path.name for path in modules],
             "standard_partition_budget": standard_budget, "forced_module": forced.name,
             "forced_partition_budget": forced_budget, "timeout_seconds": args.timeout_seconds,
-            "points_to_representation": "standard default: hash sets (hybrid opt-in disabled)",
+            "points_to_representation": "standard default: hybrid points-to sets",
             "baseline_environment": {"PANGS_ANDERSEN_PROFILE": "1"},
             "receiver_payload_environment": {"PANGS_ANDERSEN_PROFILE": "1", "PANGS_ANDERSEN_RECEIVER_PAYLOADS": "1"},
             "runs": [], "pairs": [],

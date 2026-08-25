@@ -95,7 +95,8 @@ pub(crate) const STEENS_PROFILE_INTERVAL_CANDIDATE_PAIRS: u64 = 10_000_000;
 /// Enables Andersen solver profiling when present.
 pub(crate) const ENV_ANDERSEN_PROFILE: &str = "PANGS_ANDERSEN_PROFILE";
 
-/// Enables the experimental small-vector/hash-set/dense-bitset points-to representation.
+/// Controls the default-on small-vector/hash-set/dense-bitset points-to representation.
+/// Set to `0` to use hash-set-only storage.
 pub(crate) const ENV_ANDERSEN_HYBRID_BITSETS: &str = "PANGS_ANDERSEN_HYBRID_BITSETS";
 
 /// Overrides the minimum number of points-to facts required for dense-bitset promotion.

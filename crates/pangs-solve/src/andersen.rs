@@ -4239,6 +4239,15 @@ fn andersen_profile_enabled() -> bool {
     std::env::var_os(knobs::ENV_ANDERSEN_PROFILE).is_some()
 }
 
+fn hybrid_points_to_enabled_for(value: Option<&str>) -> bool {
+    !matches!(value, Some("0"))
+}
+
+fn hybrid_points_to_enabled() -> bool {
+    let value = std::env::var(knobs::ENV_ANDERSEN_HYBRID_BITSETS).ok();
+    hybrid_points_to_enabled_for(value.as_deref())
+}
+
 fn copy_scc_min_edges() -> usize {
     std::env::var(knobs::ENV_ANDERSEN_COPY_SCC_MIN_EDGES)
         .ok()
@@ -5303,7 +5312,7 @@ impl Solve {
             scc_passes: 0,
             scc_nodes_collapsed: 0,
             scc_copy_edges_removed: 0,
-            hybrid_points_to: std::env::var_os(knobs::ENV_ANDERSEN_HYBRID_BITSETS).is_some(),
+            hybrid_points_to: hybrid_points_to_enabled(),
             memcpy_edge_summaries: memcpy_edge_summaries_enabled(),
             whole_object_field_bridge: whole_object_field_bridge_policy(),
             bridged_objects: HashSet::new(),
@@ -6654,10 +6663,11 @@ mod tests {
     use pangs_pir::{Pir, Stmt};
 
     use super::{
-        finish_andersen_controlled, memcpy_edge_summaries_enabled_for,
-        memcpy_prepartition_carriers_enabled_for, solve_andersen, solve_andersen_with_overrides,
-        whole_object_field_bridge_policy_for, AndersenControls, Cell, ExternalRegion,
-        HybridPointSet, PointSet, Refiner, Solve, WholeObjectAccess, WholeObjectBridgePolicy,
+        finish_andersen_controlled, hybrid_points_to_enabled_for,
+        memcpy_edge_summaries_enabled_for, memcpy_prepartition_carriers_enabled_for,
+        solve_andersen, solve_andersen_with_overrides, whole_object_field_bridge_policy_for,
+        AndersenControls, Cell, ExternalRegion, HybridPointSet, PointSet, Refiner, Solve,
+        WholeObjectAccess, WholeObjectBridgePolicy,
     };
     use crate::{solve_steensgaard, FieldLocation, PointsToMaterialization};
 
@@ -7489,6 +7499,14 @@ mod tests {
         assert!(memcpy_prepartition_carriers_enabled_for(None));
         assert!(memcpy_prepartition_carriers_enabled_for(Some("1")));
         assert!(!memcpy_prepartition_carriers_enabled_for(Some("0")));
+    }
+
+    #[test]
+    fn hybrid_points_to_default_on_with_zero_opt_out() {
+        assert!(hybrid_points_to_enabled_for(None));
+        assert!(hybrid_points_to_enabled_for(Some("1")));
+        assert!(hybrid_points_to_enabled_for(Some("")));
+        assert!(!hybrid_points_to_enabled_for(Some("0")));
     }
 
     #[test]

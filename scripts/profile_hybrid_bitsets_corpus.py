@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Paired time/RSS measurements for opt-in hybrid Andersen points-to sets.
+"""Paired time/RSS measurements for hybrid Andersen points-to sets.
 
 The default input is every top-level ``*.bc`` in the PANGS corpus except
 OpenSSL and Vim.  Each module is solved with the requested partition budget
-in both the ordinary hash-set and opt-in hybrid representations.  Analysis
+in both the ordinary hash-set and default hybrid representations.  Analysis
 exports are retained only long enough to compute content hashes, so a full
 corpus pass does not leave a large output tree behind.
 
@@ -103,7 +103,7 @@ SEMANTIC_EXPORTS = (
 def hash_exports(out_dir: pathlib.Path) -> dict[str, str]:
     """Hash the deterministic client-visible export families.
 
-    The manifest carries configuration details (including the hybrid opt-in) and
+    The manifest carries configuration details (including the points-to representation) and
     is therefore deliberately not part of semantic equivalence.
     """
     result: dict[str, str] = {}
@@ -163,8 +163,9 @@ def run_one(
         "PANGS_ANDERSEN_HYBRID_BITSETS_PROFILE",
     ):
         env.pop(key, None)
-    if label == "hybrid":
-        env["PANGS_ANDERSEN_HYBRID_BITSETS"] = "1"
+    if label == "baseline":
+        env["PANGS_ANDERSEN_HYBRID_BITSETS"] = "0"
+    else:
         if threshold is not None:
             env["PANGS_ANDERSEN_HYBRID_BITSET_THRESHOLD"] = str(threshold)
 

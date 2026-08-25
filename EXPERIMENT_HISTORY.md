@@ -173,8 +173,8 @@ escape remain separate work.
 ## Hybrid points-to bitsets
 
 Phase 5 of `20260730_MEMCPY_HANDLING.md` was prototyped independently of the memcpy
-model. `PANGS_ANDERSEN_HYBRID_BITSETS=1` retains points-to sets in small vectors and
-promotes them to dense bitmaps after 64 facts by default. The threshold can be changed
+model. The hybrid representation retains points-to sets in small vectors and promotes
+them to dense bitmaps after 64 facts by default. The threshold can be changed
 with `PANGS_ANDERSEN_HYBRID_BITSET_THRESHOLD`; 64--256 performed similarly, while
 always-dense storage was worse. `PANGS_ANDERSEN_HYBRID_BITSETS_PROFILE=1` reports the
 final storage mix.
@@ -205,10 +205,11 @@ and used wordwise dense-to-dense union. It did not measurably improve YAPET or g
 reconstructing the temporary bitmap consumed the union savings. That part was removed.
 A useful wordwise implementation would store pending deltas natively as hybrid bitsets.
 
-The retained prototype remains opt-in. Dense sets are indexed by the module-wide cell
-ID, so a large, sparse module could allocate much more empty bitmap space than these
-corpora. A production default should either validate this shape across the corpus or use
-a sparse chunked/Roaring representation for promoted sets.
+As of 2026-08-25, the retained prototype is opt-out: it is enabled when
+`PANGS_ANDERSEN_HYBRID_BITSETS` is unset, and setting that variable to `0` restores
+hash-set-only storage. Dense sets are indexed by the module-wide cell ID, so a large,
+sparse module could allocate much more empty bitmap space than these corpora. A future
+representation should use sparse chunked/Roaring storage if this shape becomes a problem.
 
 ### Full-corpus forced-admission profile (2026-07-31)
 

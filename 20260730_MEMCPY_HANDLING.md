@@ -2,10 +2,10 @@
 
 ## Status
 
-Design sketch for review. Phase 5 was prototyped separately and remains opt-in
-(`PANGS_ANDERSEN_HYBRID_BITSETS`); Phase 0's aggregate counters exist but not its per-site
-attribution. Phases 1-4 -- the pointer-region inventory and the projected copy itself --
-are **not implemented**.
+Design sketch for review. Phase 5 was prototyped separately and is now enabled by default;
+`PANGS_ANDERSEN_HYBRID_BITSETS=0` opts out. Phase 0's aggregate counters exist but not its
+per-site attribution. Phases 1-4 -- the pointer-region inventory and the projected copy
+itself -- are **not implemented**.
 
 **Correction (2026-08-24).** The premise below, that the current whole-object rule is
 "sound but field-insensitive", is wrong on both counts, and the rest of this document should
