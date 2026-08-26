@@ -606,3 +606,24 @@ a semantic group-wise forged-pointer extension was rejected: the exact proof has
 and progressively less sound assumptions still do not change the measured mutex disposition.
 Reconsider it only with a sound argument for integer tags or pointer arithmetic and a downstream
 client for which access completeness itself has demonstrated value.
+
+### KELP-style function-confinement census (2026-08-25)
+
+The current B2/B3 implementation was rerun over all 56 top-level corpus bitcodes, using build
+mode from each `exe-`/`lib-` prefix. Because `resolve_simple_icalls` and its confinement subset
+test run before the solver-stage branch, the sweep used the conservative stage to exclude
+unrelated Andersen cost. The metric counts function occurrences per module configuration; it
+does not deduplicate the same source function across O0/O1 or executable/library builds.
+
+The corpus contained 58,735 function occurrences, 19,719 indirect callsites, and 14,332
+address-taken function occurrences. B3 classified **277 / 14,332 (1.93%)** as confined, spread
+across 14 of 56 modules. The optimization split was 6 / 2,322 (0.26%) at O0 and 271 / 12,010
+(2.26%) at O1. This supersedes the 2026-08-23 result of zero confined functions, but still does
+not reproduce KELP's reported 23.9% rate: the PANGS rate is about 12.4x lower. The largest counts
+were OpenSSL O1 (67), Vim O1 (62), debug-info Vim O1 (55), tmux O1 (23), and cairo O1 (17).
+
+Runtime had a severe long tail. The median module's full conservative analysis took 52 ms, while
+Vim O1, debug-info Vim O1, and OpenSSL O1 took 359 s, 232 s, and 365 s and peaked at roughly
+2.14 GiB, 1.96 GiB, and 1.84 GiB RSS. Those three modules accounted for about 99% of summed
+analysis wall time. The result therefore rescues B3 from the old "always zero" conclusion but
+does not establish KELP-like yield or acceptable large-module scaling.

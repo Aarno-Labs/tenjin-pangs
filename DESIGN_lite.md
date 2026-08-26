@@ -128,9 +128,11 @@ otherwise function-pointer actuals and other pointer-bearing tail arguments fail
 
 **Kept:** B3 confined-function subtraction falls out of B2's bookkeeping. Functions whose
 every address flow was consumed by an exact simple chain are removed from non-exact
-candidate envelopes, while an exact B2 binding to such a function remains pinned. Since
-B3's input is B2's exact resolutions, its measured effect on that corpus is also nil:
-`confined_functions` was **0** on every module.
+candidate envelopes, while an exact B2 binding to such a function remains pinned. A
+current-source rerun on 2026-08-25 found **277 confined function occurrences among 14,332
+address-taken functions (1.93%)**, spread across 14 of 56 modules. The rate was 6/2,322
+(0.26%) at O0 and 271/12,010 (2.26%) at O1. This supersedes the 2026-08-23 zero result but
+remains far below KELP's reported 23.9%; see `EXPERIMENT_HISTORY.md`.
 
 B1 now emits more than an initializer target set. Its production certificate records the
 publication boundary, initialization subtree and writers, readers/observations, and
