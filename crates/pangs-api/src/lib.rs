@@ -4487,13 +4487,16 @@ fn resolve_registry_entries(
                     solved.nodes.get(label).is_some_and(|node| node.external)
                 }
             });
+            let proven_null = label
+                .is_some_and(|label| solved.nodes.get(label).is_some_and(|node| node.proven_null));
             let targeted = label.is_some_and(|label| targeted_labels.contains(label));
+            let unresolved = external || !targeted || (targets.is_empty() && !proven_null);
             entries.insert(
                 CallsiteId(index as u32),
                 RegistryEntryResolution {
                     kind,
                     targets,
-                    unresolved: external || !targeted,
+                    unresolved,
                 },
             );
         }

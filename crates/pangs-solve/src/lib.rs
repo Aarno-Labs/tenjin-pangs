@@ -213,6 +213,15 @@ pub struct GlobalResolution {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeResolution {
     pub reaches_function_pointer: bool,
+    /// The value may be the canonical null pointer. This is a positive solver fact, kept
+    /// independently of the allocation points-to set so an empty set is never overloaded as
+    /// either null or analysis silence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub may_be_null: bool,
+    /// The value is proven to be null: it may be null, has no allocation pointee, and carries
+    /// no external/forged provenance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proven_null: bool,
     #[serde(default)]
     pub external: bool,
     /// True only when the external provenance can denote an arbitrary client allocation
@@ -810,6 +819,7 @@ struct ClassData {
     size: usize,
     node_count: usize,
     pointee: Option<usize>,
+    may_be_null: bool,
     ext: bool,
     universal: bool,
     universal_sources: BTreeSet<String>,
@@ -868,6 +878,8 @@ fn pointee_provenance_labels(mask: u8, external: bool, universal: bool) -> Vec<P
 #[derive(Clone)]
 struct CachedRootNodeSummary {
     reaches_function_pointer: bool,
+    may_be_null: bool,
+    proven_null: bool,
     external: bool,
     pointee: Option<usize>,
 }
@@ -887,6 +899,10 @@ struct Solver<'a> {
     global_address_exposed: Vec<bool>,
     violation_exposure: ViolationExposure,
     exact_addresses: Vec<Option<ExactAddress>>,
+    /// Directed nullability flow for memcpy storage cells. Allocation pointees retain the
+    /// existing Steensgaard join, while this side relation preserves null without equating the
+    /// source and destination carrier classes.
+    null_copy_edges: Vec<(usize, usize)>,
     field_classes: HashMap<(NodeId, FieldRegion), usize>,
     fields_by_root: HashMap<NodeId, Vec<usize>>,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
@@ -1479,6 +1495,10 @@ impl<'a> Solver<'a> {
                 parent: index,
                 size: 1,
                 node_count: 1,
+                may_be_null: matches!(
+                    storage_roots.states.get(index),
+                    Some(StorageRootState::ProvenNull)
+                ),
                 ..ClassData::default()
             };
             match &node.kind {
@@ -1537,6 +1557,7 @@ impl<'a> Solver<'a> {
             global_address_exposed,
             violation_exposure,
             exact_addresses,
+            null_copy_edges: Vec::new(),
             field_classes: HashMap::new(),
             fields_by_root: HashMap::new(),
             callsites_by_index,
@@ -1567,6 +1588,8 @@ impl<'a> Solver<'a> {
             let root = self.find(class);
             self.process_class(root);
         }
+        self.propagate_nullability();
+        self.assert_canonical_null_isolated();
         self.print_steens_profile("done");
     }
 
@@ -1620,6 +1643,10 @@ impl<'a> Solver<'a> {
                         continue;
                     }
                     let dst = self.class_of(edge.dst);
+                    if self.node_is_proven_null(edge.src) {
+                        self.set_may_be_null(dst);
+                        continue;
+                    }
                     if let Some(storage) = self.exact_storage_class(edge.dst, Some(0), true) {
                         // A complete fixed-PAG certificate proves every producer of `dst`
                         // names this one allocation-relative location. Preserve that fact
@@ -1637,6 +1664,14 @@ impl<'a> Solver<'a> {
                         continue;
                     }
                     let dst = self.class_of(edge.dst);
+                    if self.node_is_proven_null(edge.src) {
+                        let source = format!(
+                            "omega:null_load:{}",
+                            self.pag.nodes[edge.src.0 as usize].label
+                        );
+                        self.set_universal_ext_with_sources(dst, &BTreeSet::from([source]));
+                        continue;
+                    }
                     // Missing widths occur only in legacy/hand-written PIR. Preserve its
                     // historical same-offset semantics; LLVM lowering always emits a width.
                     let width =
@@ -1649,10 +1684,19 @@ impl<'a> Solver<'a> {
                     );
                 }
                 pangs_pag::EdgeKind::Store => {
+                    if self.node_is_proven_null(edge.dst) {
+                        // Preserve the PAG store for ModRef and completeness audits, but an
+                        // invalid null address has no allocation storage class to unify.
+                        continue;
+                    }
                     let width =
                         (!edge.access_extent_unknown).then_some(edge.access_bytes.unwrap_or(0));
                     let storage = self.storage_class_for_address(edge.dst, width, true);
                     if !self.node_may_carry_pointer(edge.src) {
+                        continue;
+                    }
+                    if self.node_is_proven_null(edge.src) {
+                        self.set_may_be_null(storage);
                         continue;
                     }
                     let src = self.class_of(edge.src);
@@ -1664,6 +1708,16 @@ impl<'a> Solver<'a> {
                 }
                 pangs_pag::EdgeKind::Gep { .. } => {
                     let dst = self.class_of(edge.dst);
+                    if self.node_is_proven_null(edge.src) {
+                        // Pointer arithmetic on null is outside the canonical-null contract.
+                        // Keep the null class isolated and fail closed on the derived value.
+                        let source = format!(
+                            "omega:null_gep:{}",
+                            self.pag.nodes[edge.src.0 as usize].label
+                        );
+                        self.set_universal_ext_with_sources(dst, &BTreeSet::from([source]));
+                        continue;
+                    }
                     let dst_p = self.pointee_of(dst);
                     if let Some(address) = self.exact_addresses[edge.dst.0 as usize] {
                         let storage =
@@ -1676,8 +1730,24 @@ impl<'a> Solver<'a> {
                     }
                 }
                 pangs_pag::EdgeKind::Memcpy { bytes } => {
+                    if self.node_is_proven_null(edge.dst) {
+                        // The destination has no modeled storage. Keep the edge in the PAG so
+                        // clients still observe the invalid write.
+                        continue;
+                    }
                     let dst_storage = self.storage_class_for_address(edge.dst, bytes, false);
+                    if self.node_is_proven_null(edge.src) {
+                        // Reading bytes from a null address is unsupported. Preserve the access
+                        // edge and conservatively make the destination contents universal.
+                        let source = format!(
+                            "omega:null_memcpy_src:{}",
+                            self.pag.nodes[edge.src.0 as usize].label
+                        );
+                        self.set_universal_ext_with_sources(dst_storage, &BTreeSet::from([source]));
+                        continue;
+                    }
                     let src_storage = self.storage_class_for_address(edge.src, bytes, false);
+                    self.null_copy_edges.push((src_storage, dst_storage));
                     let dst_content = self.pointee_of(dst_storage);
                     let src_content = self.pointee_of(src_storage);
                     self.join(
@@ -1724,6 +1794,9 @@ impl<'a> Solver<'a> {
             let Some(operand) = callsite.operand else {
                 continue;
             };
+            if self.node_is_proven_null(operand) {
+                continue;
+            }
             let operand = self.class_of(operand);
             let cls = self.pointee_of(operand);
             let root = self.find(cls);
@@ -1750,6 +1823,11 @@ impl<'a> Solver<'a> {
                 | (OmegaSeedKind::UnknownOperandEscape, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
                     self.add_class_provenance(class, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
+                    if self.node_is_proven_null(id) {
+                        // Retain the boundary/violation seed in the PAG, but null points to no
+                        // allocation whose address could escape through it.
+                        continue;
+                    }
                     let pointee = self.pointee_of(class);
                     self.add_class_provenance(pointee, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
                     self.set_esc_with_source(
@@ -1809,6 +1887,17 @@ impl<'a> Solver<'a> {
             let Some(operand) = callsite.operand else {
                 continue;
             };
+            if self.node_is_proven_null(operand) {
+                indirect_calls.push(IndirectCallResolution {
+                    callsite_key: callsite.key.clone(),
+                    targets: Vec::new(),
+                    unknown_callee: true,
+                    fallback: false,
+                    prefsa_targets: 0,
+                    fsa_rejected_targets: 0,
+                });
+                continue;
+            }
             let operand = self.class_of(operand);
             let pointee = self.pointee_of(operand);
             let root = self.find(pointee);
@@ -1888,6 +1977,9 @@ impl<'a> Solver<'a> {
                 edge.kind,
                 pangs_pag::EdgeKind::Store | pangs_pag::EdgeKind::Memcpy { .. }
             ) {
+                continue;
+            }
+            if self.node_is_proven_null(edge.dst) {
                 continue;
             }
             let dst = self.class_of(edge.dst);
@@ -1983,6 +2075,13 @@ impl<'a> Solver<'a> {
             } else {
                 let external = self.classes[root].ext;
                 let pointee = self.classes[root].pointee.map(|p| self.find(p));
+                let may_be_null = self.classes[root].may_be_null;
+                let proven_null = may_be_null
+                    && pointee.is_none()
+                    && !external
+                    && !self.classes[root].universal
+                    && self.classes[root].fn_objs.is_empty()
+                    && self.classes[root].global_objs.is_empty();
                 let reaches_function_pointer = pointee
                     .map(|pointee| {
                         if let Some(reaches) = reaches_function_pointer_by_root[pointee] {
@@ -1999,6 +2098,8 @@ impl<'a> Solver<'a> {
                     || self.classes[root].universal;
                 let cached = CachedRootNodeSummary {
                     reaches_function_pointer,
+                    may_be_null,
+                    proven_null,
                     external,
                     pointee,
                 };
@@ -2080,6 +2181,8 @@ impl<'a> Solver<'a> {
                 node.label.clone(),
                 NodeResolution {
                     reaches_function_pointer: summary.reaches_function_pointer,
+                    may_be_null: summary.may_be_null,
+                    proven_null: summary.proven_null,
                     external: summary.external,
                     external_universal: self.classes[root].universal,
                     pointee_globals,
@@ -2114,6 +2217,7 @@ impl<'a> Solver<'a> {
         self.metrics.oversize_fallbacks = 0;
         self.metrics.oversize_fallback_max_size = 0;
         self.metrics.rounds = 1;
+        self.assert_canonical_null_isolated();
         let metrics = self.metrics.clone();
 
         let materialized = match self.points_to_materialization {
@@ -2301,6 +2405,9 @@ impl<'a> Solver<'a> {
                     }
                 }
                 if let Some(ret) = ret_node {
+                    if self.node_is_proven_null(ret) {
+                        continue;
+                    }
                     let class = self.class_of(ret);
                     let pointee = self.pointee_of(class);
                     self.set_esc_sources(pointee, &escape_sources);
@@ -2432,8 +2539,12 @@ impl<'a> Solver<'a> {
             if !self.pointer_transfer(*arg, *param) {
                 continue;
             }
-            let arg = self.class_of(*arg);
             let param = self.class_of(*param);
+            if self.node_is_proven_null(*arg) {
+                self.set_may_be_null(param);
+                continue;
+            }
+            let arg = self.class_of(*arg);
             let mut provenance = PROV_CALL_RETURN;
             if meta_param_is_by_value(&self.function_meta[func_index].sig, index) {
                 provenance |= PROV_BY_VALUE_AGGREGATE;
@@ -2445,6 +2556,10 @@ impl<'a> Solver<'a> {
                 return;
             }
             let result = self.class_of(result);
+            if self.node_is_proven_null(ret) {
+                self.set_may_be_null(result);
+                return;
+            }
             let ret = self.class_of(ret);
             self.join(result, ret, PROV_CALL_RETURN);
         }
@@ -2459,6 +2574,9 @@ impl<'a> Solver<'a> {
         let callsite = self.callsites_by_index[site_index];
         let source = format!("external-call:{}", callsite.key);
         for arg in &callsite.args {
+            if self.node_is_proven_null(*arg) {
+                continue;
+            }
             let arg = self.class_of(*arg);
             let pointee = self.pointee_of(arg);
             self.set_esc_with_source(pointee, source.clone());
@@ -2515,8 +2633,59 @@ impl<'a> Solver<'a> {
             .may_carry_pointer()
     }
 
+    fn node_is_proven_null(&self, node: NodeId) -> bool {
+        matches!(
+            self.storage_roots.states.get(node.0 as usize),
+            Some(StorageRootState::ProvenNull)
+        )
+    }
+
     fn pointer_transfer(&self, src: NodeId, dst: NodeId) -> bool {
         self.node_may_carry_pointer(src) && self.node_may_carry_pointer(dst)
+    }
+
+    fn set_may_be_null(&mut self, class: usize) {
+        let root = self.find(class);
+        self.classes[root].may_be_null = true;
+    }
+
+    fn propagate_nullability(&mut self) {
+        let edges = self.null_copy_edges.clone();
+        loop {
+            let mut changed = false;
+            for &(src, dst) in &edges {
+                let src = self.find(src);
+                let dst = self.find(dst);
+                if self.classes[src].may_be_null && !self.classes[dst].may_be_null {
+                    self.classes[dst].may_be_null = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn assert_canonical_null_isolated(&mut self) {
+        let canonical_nulls = self
+            .pag
+            .nodes
+            .iter()
+            .filter(|node| node.canonical_pointer_null)
+            .map(|node| (node.id, node.label.clone()))
+            .collect::<Vec<_>>();
+        for (node, label) in canonical_nulls {
+            let root = self.class_of(node);
+            assert!(self.classes[root].may_be_null, "{label} lost its null fact");
+            assert!(
+                self.classes[root].pointee.is_none()
+                    && !self.classes[root].ext
+                    && !self.classes[root].universal
+                    && !self.classes[root].esc,
+                "canonical-null class was contaminated: {label}"
+            );
+        }
     }
 
     fn pointee_of(&mut self, class: usize) -> usize {
@@ -2677,6 +2846,7 @@ impl<'a> Solver<'a> {
         self.classes[b].parent = a;
         self.classes[a].size += self.classes[b].size;
         self.classes[a].node_count += self.classes[b].node_count;
+        self.classes[a].may_be_null |= self.classes[b].may_be_null;
         self.classes[a].ext |= self.classes[b].ext;
         self.classes[a].universal |= self.classes[b].universal;
         let other_universal_sources = std::mem::take(&mut self.classes[b].universal_sources);
@@ -2920,6 +3090,63 @@ mod tests {
             let pointer = solved.nodes.get("val:f:%f::pointer").unwrap();
             assert!(pointer.pointee_globals.iter().any(|key| key == "target"));
         }
+    }
+
+    #[test]
+    fn positive_null_fact_does_not_bridge_unrelated_allocations() {
+        let mut pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"positive-null",
+                "globals":[{"key":"Cell"},{"key":"A"},{"key":"B"}],
+                "functions":[{"key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                    {"kind":"store","address":"@Cell","value":"@A","access_bytes":8},
+                    {"kind":"store","address":"@Cell","value":"null","access_bytes":8},
+                    {"kind":"load","dest":"loaded","address":"@Cell","access_bytes":8},
+                    {"kind":"assign","dest":"maybe-b","sources":["@B","null"]}
+                ]}]
+            }"#,
+        )
+        .unwrap();
+        pir.lowering.semantic_value_kinds.extend([
+            ("null".into(), ValueKind::Pointer),
+            ("loaded".into(), ValueKind::Pointer),
+            ("maybe-b".into(), ValueKind::Pointer),
+        ]);
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        assert!(pag.edges.iter().any(|edge| {
+            edge.kind == pangs_pag::EdgeKind::Store
+                && pag.nodes[edge.src.0 as usize].canonical_pointer_null
+        }));
+
+        let solved = solve_steensgaard_with_points_to(&pir, &pag, BuildMode::Executable);
+        let null = &solved.nodes["val:f:null"];
+        assert!(null.may_be_null);
+        assert!(null.proven_null);
+        assert!(!null.external);
+        assert_eq!(
+            solved.node_points_to["val:f:loaded"],
+            BTreeSet::from(["A".to_string()])
+        );
+        assert_eq!(
+            solved.node_points_to["val:f:maybe-b"],
+            BTreeSet::from(["B".to_string()])
+        );
+        assert!(solved.nodes["val:f:loaded"].may_be_null);
+        assert!(!solved.nodes["val:f:loaded"].proven_null);
+        assert!(solved.nodes["val:f:maybe-b"].may_be_null);
+        assert!(!solved.nodes["val:f:maybe-b"].proven_null);
+
+        let (_, classes) = solve_steensgaard_with_classes(&pir, &pag, BuildMode::Executable);
+        let null_node = pag
+            .nodes
+            .iter()
+            .find(|node| node.canonical_pointer_null)
+            .unwrap();
+        let null_class = classes.class_of(null_node.id);
+        assert!(classes.pointee[null_class].is_none());
+        assert!(!classes.ext[null_class]);
+        assert!(!classes.universal[null_class]);
+        assert!(!classes.esc[null_class]);
     }
 
     #[test]

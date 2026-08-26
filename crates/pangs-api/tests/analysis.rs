@@ -3681,6 +3681,79 @@ fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
 }
 
 #[test]
+fn canonical_null_store_retains_modref_rows_in_pointer_stages() {
+    let mut pir = Pir {
+        module: "null-store-modref".into(),
+        source: None,
+        lowering: Default::default(),
+        target: None,
+        functions: vec![Func {
+            key: "main".into(),
+            sig: sig(AbiClass::Void, Vec::new()),
+            param_names: Vec::new(),
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: false,
+            body: vec![
+                Stmt::Assign {
+                    dest: "%cell".into(),
+                    sources: vec!["@Cell".into()],
+                    loc: None,
+                },
+                Stmt::Store {
+                    address: "%cell".into(),
+                    value: "null".into(),
+                    volatile: false,
+                    access_bytes: Some(8),
+                    loc: Some(pangs_pir::Loc {
+                        file: "null-store.c".into(),
+                        line: 7,
+                        col: 3,
+                        dir: None,
+                        filename: None,
+                    }),
+                },
+            ],
+        }],
+        globals: vec![Global {
+            key: "@Cell".into(),
+            mutable: true,
+            ..Global::default()
+        }],
+        global_init: Vec::new(),
+    };
+    pir.lowering
+        .semantic_value_kinds
+        .insert("null".into(), pangs_pir::ValueKind::Pointer);
+
+    for stage in [Stage::Steens, Stage::Andersen] {
+        let analysis = Analysis::run(
+            &pir,
+            &Opts {
+                stage,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let main = analysis.lookup_func("main").unwrap();
+        let cell = analysis.lookup_global("@Cell").unwrap();
+        assert!(
+            analysis.modrefs().iter().any(|row| {
+                row.func == main
+                    && row.global == pangs_api::GlobalTarget::Name(cell)
+                    && row.access == Access::Mod
+                    && row.witness.as_deref() == Some("main@null-store.c:7:3#0")
+            }),
+            "{stage:?} dropped the Mod row for a null-valued store: {:#?}",
+            analysis.modrefs()
+        );
+    }
+}
+
+#[test]
 fn steens_memcpy_modref_exports_aliased_direct_symbol_and_unknown_rows() {
     let fixture = m1_6_fixture("memcpy_modref.pir.json");
     let analysis = Analysis::run(

@@ -564,6 +564,16 @@ explicit supported-program contracts below. One policy exception does not clear 
 violation taint: `localize` may filter the single internal-unmodeled-vararg finding kind
 as specified in `20260818_LOCALIZATION_VIOLATION_TAINT_v3.md`.
 
+Canonical LLVM pointer-null operands carry an explicit positive nullability fact; they are not
+modeled as an absent or unknown points-to producer. Under the supported-program contract, address
+zero is not a valid program allocation and a canonical null value designates no object. Assign,
+memory, and internal call-binding rules propagate nullability without unifying the shared null
+node with allocation-bearing classes, while the original PAG edges remain available to boundary,
+ModRef, and completeness audits. Dereference, memcpy, or pointer arithmetic through a proven-null
+address is outside that contract and fails closed; in particular, GEP-off-null remains unknown
+rather than inheriting canonical-null status. `undef` and `poison` are separate values and never
+acquire the null certificate.
+
 For localization, the supported program must not invoke a callback after passing that
 callback, directly or through an aggregate, as a variadic actual to an internal vararg
 consumer whose consumption is unmodeled. Such a hidden invocation can retain the old ABI
