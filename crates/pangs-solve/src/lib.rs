@@ -906,6 +906,10 @@ struct Solver<'a> {
     empty_witness_copy_edges: Vec<(usize, usize)>,
     field_classes: HashMap<(NodeId, FieldRegion), usize>,
     fields_by_root: HashMap<NodeId, Vec<usize>>,
+    /// Export seeds are allocation-specific even when legacy unification later merges the
+    /// allocation's class with unrelated objects. Retain that precision for fields created after
+    /// seeding instead of copying the merged class's whole boundary envelope.
+    exported_field_escape_sources: HashMap<NodeId, BTreeSet<String>>,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
     worklist: VecDeque<usize>,
     queued: Vec<bool>,
@@ -1561,6 +1565,7 @@ impl<'a> Solver<'a> {
             empty_witness_copy_edges: Vec::new(),
             field_classes: HashMap::new(),
             fields_by_root: HashMap::new(),
+            exported_field_escape_sources: HashMap::new(),
             callsites_by_index,
             worklist: VecDeque::new(),
             queued,
@@ -1819,7 +1824,17 @@ impl<'a> Solver<'a> {
                     } else {
                         format!("imported-symbol:{label}")
                     };
-                    self.set_esc_with_source(class, source);
+                    self.set_esc_with_source(class, source.clone());
+                    if seed.kind == OmegaSeedKind::ExportedSymbol {
+                        self.exported_field_escape_sources
+                            .entry(id)
+                            .or_default()
+                            .insert(source.clone());
+                        let fields = self.fields_by_root.get(&id).cloned().unwrap_or_default();
+                        for field in fields {
+                            self.set_esc_with_source(field, source.clone());
+                        }
+                    }
                 }
                 (OmegaSeedKind::PtrToInt, SeedTarget::Node(id))
                 | (OmegaSeedKind::UnknownOperandEscape, SeedTarget::Node(id)) => {
@@ -2784,8 +2799,13 @@ impl<'a> Solver<'a> {
             ..ClassData::default()
         };
         let root_class = self.class_of(root);
-        data.global_objs
-            .extend(self.classes[root_class].global_objs.iter().copied());
+        let owner = self.classes[root_class].clone();
+        data.global_objs.extend(owner.global_objs.iter().copied());
+        data.fn_objs.extend(owner.fn_objs.iter().copied());
+        if let Some(sources) = self.exported_field_escape_sources.get(&root) {
+            data.esc = true;
+            data.escape_sources.extend(sources.iter().cloned());
+        }
         self.classes.push(data);
         self.queued.push(false);
         self.field_classes.insert((root, region), id);

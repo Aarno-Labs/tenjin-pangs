@@ -627,3 +627,53 @@ Vim O1, debug-info Vim O1, and OpenSSL O1 took 359 s, 232 s, and 365 s and peake
 2.14 GiB, 1.96 GiB, and 1.84 GiB RSS. Those three modules accounted for about 99% of summed
 analysis wall time. The result therefore rescues B3 from the old "always zero" conclusion but
 does not establish KELP-like yield or acceptable large-module scaling.
+
+### Legacy field-owner boundary propagation (2026-08-29)
+
+Revision `ztpk` replaced an unknown constant-expression fallback with explicit `ptrtoint`
+lowering. That correctly stopped recursively treating every function referenced by the
+initializer of `@defaults` as an escaped operand, but it exposed a pre-existing soundness hole:
+legacy field classes copied allocation-owner tags without inheriting the owner's exported escape
+boundary. An internal callback stored at a nonzero offset in an exported constant table could
+therefore lack its `address_escapes_to_external` caller. A reduced exported-table fixture failed
+under production Steensgaard before the repair.
+
+The first repair reused the separate-storage-v2 field-owner closure in the legacy solver. Every
+field inherited its owner's external, universal, and escape envelope at creation, and a fixed
+point propagated facts acquired later. This passed the reduced fixture but was too broad because
+the legacy owner's union-find class may already contain unrelated allocations. Copying that
+merged class envelope back into each allocation-relative field discarded the very allocation
+identity represented by `fields_by_root`.
+
+The partial corpus sweep rejected the prototype on both correctness and cost:
+
+- `exe-yapteaparprfotci-O1-g` newly panicked on the Andersen/Steensgaard unfiltered ModRef
+  envelope assertion, while the parent completed.
+- Unknown-caller growth spread well beyond the exported tables being repaired: jq gained 132
+  edges in each build, Lua gained 150--151, and tmux gained 80. This removed four chibicc O1
+  localization dispositions, fifteen curl immutable dispositions in each build, and thirteen
+  tmux dispositions in each build.
+- Resource growth was structural on affected modules. Tmux O1 moved from 7.53 s / 478 MB to
+  10.11 s / 838 MB, and libcurl O1 from 16.26 s / 658 MB to 28.83 s / 1,877 MB in the paired
+  diagnostic run.
+
+The owner-class propagation was deleted. The shipped repair instead retains the exact exported
+allocation `NodeId`: an `ExportedSymbol` seed escapes only fields recorded for that allocation,
+and its source is remembered so fields materialized later inherit the same boundary. An
+unexported-table negative control prevents the original broadening.
+
+The refined 53-module paired corpus completed and validated. Only libcurl O0/O1, libplacebo, and
+tfpsacrypto changed semantically. It added 392 sound `address_escapes_to_external` edges for
+callbacks stored in exported aggregate fields; libplacebo gained 41, including `perceptual` and
+`spline`. The 624,414-row ModRef inventory was unchanged, while 730 rows improved from
+`module-wide` to `finite` candidate scope. Rewritable coverage stayed 60/1,761, and all 1,795
+disposition choices stayed identical (566 handled). Chibicc and libusb were byte-identical on
+every semantic export.
+
+After excluding one demonstrably noisy `exe-tree-O0` sample, summed internal analysis time was
++0.70%, solver time +0.37%, and end-to-end analysis plus disposition time +1.44%; median RSS
+ratio was 1.0016. Libplacebo's three-run end-to-end mean was 41.759 +/- 0.385 s versus
+42.422 +/- 1.355 s for the parent, with +0.08% peak RSS in the paired corpus run. The two Vim
+artifacts and OpenSSL remained outside the comparable 53-module disposition set: the parent Vim
+runs hit an existing ModRef-envelope assertion, and the bounded OpenSSL diagnostic exceeded
+fifteen minutes.

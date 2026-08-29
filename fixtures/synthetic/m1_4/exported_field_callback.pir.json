@@ -1,0 +1,27 @@
+{
+  "module": "exported-field-callback",
+  "functions": [
+    {
+      "key": "cb",
+      "sig": {"ret": {"class": "void"}, "params": [], "cc": "ccc"},
+      "address_taken": true,
+      "body": []
+    },
+    {
+      "key": "local_cb",
+      "sig": {"ret": {"class": "void"}, "params": [], "cc": "ccc"},
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": [
+    {"key": "@table", "exported": true, "mutable": false, "init_refs": ["cb"]},
+    {"key": "@local_table", "exported": false, "mutable": false, "init_refs": ["local_cb"]}
+  ],
+  "global_init": [
+    {"kind": "gep", "dest": "%field", "base": "@table", "byte_off": 8},
+    {"kind": "store", "address": "%field", "value": "cb", "access_bytes": 8},
+    {"kind": "gep", "dest": "%local_field", "base": "@local_table", "byte_off": 8},
+    {"kind": "store", "address": "%local_field", "value": "local_cb", "access_bytes": 8}
+  ]
+}

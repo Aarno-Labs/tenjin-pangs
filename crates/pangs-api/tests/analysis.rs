@@ -1999,6 +1999,40 @@ fn steens_uses_escape_bits_for_unknown_callers_and_never_written() {
 }
 
 #[test]
+fn exported_aggregate_field_makes_stored_callback_external_callable() {
+    let pir = Pir::from_path(m1_4_fixture("exported_field_callback.pir.json")).unwrap();
+
+    for stage in [Stage::Steens, Stage::Andersen] {
+        let analysis = Analysis::run(
+            &pir,
+            &Opts {
+                stage,
+                build_mode: BuildMode::Library,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+
+        let cb = analysis.lookup_func("cb").unwrap();
+        let local_cb = analysis.lookup_func("local_cb").unwrap();
+        assert!(
+            analysis.callers(cb).any(unknown_caller),
+            "{stage:?} failed to propagate the exported table boundary through its nonzero field"
+        );
+        assert!(analysis.functions()[cb].address_escaped, "{stage:?}");
+        assert!(analysis.functions()[cb]
+            .escape_witness
+            .as_deref()
+            .is_some_and(|source| source.starts_with("exported-symbol:obj:global:")));
+        assert!(
+            !analysis.callers(local_cb).any(unknown_caller),
+            "{stage:?} over-propagated the boundary to an unexported table"
+        );
+        assert!(!analysis.functions()[local_cb].address_escaped, "{stage:?}");
+    }
+}
+
+#[test]
 fn allocation_provenance_separates_dynamic_gep_global_from_coarse_class_taint() {
     let pir = Pir::from_path(m1_4_fixture("allocation_isolation.pir.json")).unwrap();
     for stage in [Stage::Steens, Stage::Andersen] {
