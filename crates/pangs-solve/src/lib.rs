@@ -494,7 +494,8 @@ pub struct SteensClasses {
     pub node_class: Vec<usize>,
     /// `pointee[root] = Some(pointee root)` when the class points somewhere.
     pub pointee: Vec<Option<usize>>,
-    /// `ext[root]` — class members may point to external/escaped memory (PIP `p ⊒ Ω`).
+    /// `ext[root]` — the class identity may denote external memory (PIP `p ⊒ Ω`).
+    /// Externally reachable local storage remains represented separately by `esc`.
     pub ext: Vec<bool>,
     /// `universal[root]` — external provenance includes an integer-forged pointer and may
     /// therefore designate any client allocation.
@@ -2073,7 +2074,11 @@ impl<'a> Solver<'a> {
             let summary = if let Some(cached) = &node_summary_by_root[root] {
                 cached.clone()
             } else {
-                let external = self.classes[root].ext;
+                // The legacy load rule unifies a loaded value with its storage class. `esc`
+                // therefore means externally writable contents when this root is observed
+                // through a value-like node. Keep that interpretation separate from `ext`,
+                // which says the class identity itself may be an external target.
+                let external = self.classes[root].ext || self.classes[root].esc;
                 let pointee = self.classes[root].pointee.map(|p| self.find(p));
                 let may_be_null = self.classes[root].may_be_null;
                 let proven_null = may_be_null
@@ -2095,7 +2100,8 @@ impl<'a> Solver<'a> {
                         }
                     })
                     .unwrap_or(false)
-                    || self.classes[root].universal;
+                    || self.classes[root].universal
+                    || self.classes[root].esc;
                 let cached = CachedRootNodeSummary {
                     reaches_function_pointer,
                     may_be_null,
@@ -2311,11 +2317,24 @@ impl<'a> Solver<'a> {
             // the reachable memory object/class; its pointee is what that memory may store.
             // This is registry-only targeted output: the existing diagnostic/global accessors
             // retain their original output shape and cost.
-            if mode == PointsToMaterialization::Targeted && self.classes[pointee].ext {
-                pointee_external
-                    .entry(node.label.clone())
-                    .or_insert_with(BTreeSet::new)
-                    .insert("omega:reachable-memory".to_string());
+            if mode == PointsToMaterialization::Targeted {
+                if self.classes[pointee].ext {
+                    pointee_external
+                        .entry(node.label.clone())
+                        .or_insert_with(BTreeSet::new)
+                        .insert("omega:reachable-memory".to_string());
+                }
+                if self.classes[pointee].esc {
+                    let sources = if self.classes[pointee].escape_sources.is_empty() {
+                        BTreeSet::from(["derived:external-pointee".to_string()])
+                    } else {
+                        self.classes[pointee].escape_sources.clone()
+                    };
+                    pointee_external
+                        .entry(node.label.clone())
+                        .or_insert_with(BTreeSet::new)
+                        .extend(sources);
+                }
             }
             if mode == PointsToMaterialization::Targeted {
                 let storage_classes = storage_by_object
@@ -4012,7 +4031,7 @@ mod tests {
     }
 
     #[test]
-    fn ptrtoint_marks_the_pointee_class_escaped() {
+    fn ptrtoint_escapes_data_pointee_without_making_address_a_function_pointer() {
         let pir = Pir::from_path(fixture("ptrtoint_escape.pir.json")).unwrap();
         let pag = Pag::from_pir(&pir, &PagOpts::default());
 
@@ -4021,6 +4040,9 @@ mod tests {
         assert!(result.unknown_callers.is_empty());
         assert!(result.globals["@G"].escape_external);
         assert!(!result.globals["@G"].never_written);
+        let pointer = &result.nodes["val:driver:%p"];
+        assert!(!pointer.external);
+        assert!(!pointer.reaches_function_pointer);
     }
 
     #[test]
@@ -4134,6 +4156,44 @@ mod tests {
         assert!(!result.globals["@Esc"].never_written);
         assert!(!result.globals["@Local"].escape_external);
         assert!(result.globals["@Local"].never_written);
+    }
+
+    #[test]
+    fn external_output_pointer_load_is_unknown_in_steens_envelope() {
+        let mut pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"external-output-pointer",
+                "functions":[
+                    {"key":"ext","external":true,
+                     "sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},
+                     "body":[]},
+                    {"key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"alloca","dest":"slot","ty":"ptr"},
+                        {"kind":"call_direct","callee":"ext",
+                         "sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},
+                         "args":["slot"]},
+                        {"kind":"load","dest":"loaded","address":"slot","access_bytes":8},
+                        {"kind":"load","dest":"byte","address":"loaded","access_bytes":1}
+                    ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        pir.lowering.semantic_value_kinds.extend([
+            ("slot".into(), ValueKind::Pointer),
+            ("loaded".into(), ValueKind::Pointer),
+        ]);
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        for solved in [
+            solve_steensgaard(&pir, &pag, BuildMode::Executable),
+            solve_andersen(&pir, &pag, BuildMode::Executable, u64::MAX),
+        ] {
+            let loaded = &solved.nodes["val:f:loaded"];
+            assert!(loaded.external);
+            assert!(!loaded.external_universal);
+            assert!(loaded.reaches_function_pointer);
+        }
     }
 
     #[test]
