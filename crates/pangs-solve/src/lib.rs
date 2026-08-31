@@ -1589,13 +1589,19 @@ impl<'a> Solver<'a> {
         self.apply_seeds();
         self.seed_main_entry_params();
 
-        while let Some(class) = self.worklist.pop_front() {
-            self.metrics.steens_worklist_pops += 1;
-            self.queued[class] = false;
-            let root = self.find(class);
-            self.process_class(root);
+        loop {
+            while let Some(class) = self.worklist.pop_front() {
+                self.metrics.steens_worklist_pops += 1;
+                self.queued[class] = false;
+                let root = self.find(class);
+                self.process_class(root);
+            }
+            if !self.propagate_field_owner_facts() {
+                break;
+            }
         }
         self.propagate_empty_witnesses();
+        self.assert_field_owner_coherence();
         self.assert_canonical_null_isolated();
         self.print_steens_profile("done");
     }
@@ -2713,6 +2719,89 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// Allocation-relative fields inherit their allocation owner's complete tag and boundary
+    /// envelope. The owner may gain facts after the field was created, so this is part of the
+    /// solve fixed point rather than a creation-time snapshot.
+    fn propagate_field_owner_facts(&mut self) -> bool {
+        let edges = self
+            .fields_by_root
+            .iter()
+            .flat_map(|(&owner, fields)| fields.iter().copied().map(move |field| (owner, field)))
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (owner_node, field) in edges {
+            let owner = self.class_of(owner_node);
+            let field = self.find(field);
+            if owner == field {
+                continue;
+            }
+            let owner_data = self.classes[owner].clone();
+            let old_globals = self.classes[field].global_objs.len();
+            let old_functions = self.classes[field].fn_objs.len();
+            self.classes[field]
+                .global_objs
+                .extend(owner_data.global_objs.iter().copied());
+            self.classes[field]
+                .fn_objs
+                .extend(owner_data.fn_objs.iter().copied());
+            if self.classes[field].global_objs.len() != old_globals
+                || self.classes[field].fn_objs.len() != old_functions
+            {
+                changed = true;
+                self.enqueue(field);
+            }
+            let old_boundary = (
+                self.classes[field].ext,
+                self.classes[field].universal,
+                self.classes[field].universal_sources.len(),
+                self.classes[field].esc,
+                self.classes[field].escape_sources.len(),
+            );
+            if owner_data.universal {
+                self.set_universal_ext_with_sources(field, &owner_data.universal_sources);
+            } else if owner_data.ext {
+                self.set_ext(field);
+            }
+            if owner_data.esc {
+                self.set_esc_sources(field, &owner_data.escape_sources);
+            }
+            let field = self.find(field);
+            changed |= old_boundary
+                != (
+                    self.classes[field].ext,
+                    self.classes[field].universal,
+                    self.classes[field].universal_sources.len(),
+                    self.classes[field].esc,
+                    self.classes[field].escape_sources.len(),
+                );
+        }
+        changed
+    }
+
+    fn assert_field_owner_coherence(&mut self) {
+        let edges = self
+            .fields_by_root
+            .iter()
+            .flat_map(|(&owner, fields)| fields.iter().copied().map(move |field| (owner, field)))
+            .collect::<Vec<_>>();
+        for (owner_node, field) in edges {
+            let owner = self.class_of(owner_node);
+            let field = self.find(field);
+            assert!(
+                self.classes[owner]
+                    .global_objs
+                    .is_subset(&self.classes[field].global_objs)
+                    && self.classes[owner]
+                        .fn_objs
+                        .is_subset(&self.classes[field].fn_objs)
+                    && (!self.classes[owner].ext || self.classes[field].ext)
+                    && (!self.classes[owner].universal || self.classes[field].universal)
+                    && (!self.classes[owner].esc || self.classes[field].esc),
+                "allocation-relative field class {field} lost owner envelope from class {owner}"
+            );
+        }
+    }
+
     fn assert_canonical_null_isolated(&mut self) {
         let canonical_nulls = self
             .pag
@@ -2813,9 +2902,15 @@ impl<'a> Solver<'a> {
         let owner = self.classes[root_class].clone();
         data.global_objs.extend(owner.global_objs.iter().copied());
         data.fn_objs.extend(owner.fn_objs.iter().copied());
+        data.ext = owner.ext;
+        data.universal = owner.universal;
+        data.universal_sources = owner.universal_sources;
         if let Some(sources) = self.exported_field_escape_sources.get(&root) {
             data.esc = true;
             data.escape_sources.extend(sources.iter().cloned());
+        } else {
+            data.esc = owner.esc;
+            data.escape_sources = owner.escape_sources;
         }
         self.classes.push(data);
         self.queued.push(false);
@@ -3244,6 +3339,65 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn fields_inherit_late_owner_tags_and_boundary_closure() {
+        let pir = Pir {
+            module: "field-owner-coherence".into(),
+            source: None,
+            lowering: Default::default(),
+            target: None,
+            functions: Vec::new(),
+            globals: vec![
+                Global {
+                    key: "A".into(),
+                    ..Global::default()
+                },
+                Global {
+                    key: "B".into(),
+                    ..Global::default()
+                },
+            ],
+            global_init: Vec::new(),
+        };
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let object = |key: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == format!("obj:global:{key}"))
+                .unwrap()
+                .id
+        };
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Library);
+        let field = solver.field_class(object("A"), FieldRegion::address(FieldLocation::Exact(8)));
+        let contents = solver.pointee_of(field);
+        let a = solver.class_of(object("A"));
+        let b = solver.class_of(object("B"));
+        let owner = solver.join(a, b, PROV_DIRECT_ADDRESS);
+        solver.set_universal_ext_with_sources(
+            owner,
+            &BTreeSet::from(["omega:test-owner".to_string()]),
+        );
+        solver.set_esc_with_source(owner, "test:owner-escape".into());
+
+        while solver.propagate_field_owner_facts() {
+            while let Some(class) = solver.worklist.pop_front() {
+                solver.queued[class] = false;
+                let root = solver.find(class);
+                solver.process_class(root);
+            }
+        }
+        solver.assert_field_owner_coherence();
+
+        let field = solver.find(field);
+        assert_eq!(solver.classes[field].global_objs.len(), 2);
+        assert!(solver.classes[field].ext);
+        assert!(solver.classes[field].universal);
+        assert!(solver.classes[field].esc);
+        let contents = solver.find(contents);
+        assert!(solver.classes[contents].ext);
+        assert!(solver.classes[contents].esc);
     }
 
     #[test]
