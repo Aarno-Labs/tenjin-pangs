@@ -882,6 +882,7 @@ struct CachedRootNodeSummary {
     has_empty_witness: bool,
     proven_empty: bool,
     external: bool,
+    universal: bool,
     pointee: Option<usize>,
 }
 
@@ -2090,17 +2091,22 @@ impl<'a> Solver<'a> {
             let summary = if let Some(cached) = &node_summary_by_root[root] {
                 cached.clone()
             } else {
-                // The legacy load rule unifies a loaded value with its storage class. `esc`
-                // therefore means externally writable contents when this root is observed
-                // through a value-like node. Keep that interpretation separate from `ext`,
-                // which says the class identity itself may be an external target.
-                let external = self.classes[root].ext || self.classes[root].esc;
                 let pointee = self.classes[root].pointee.map(|p| self.find(p));
+                // Boundary facts can be attached before or after the pointee class is
+                // materialized. Read both locations so GEP and other target-preserving flows do
+                // not lose an external/universal boundary. `esc` remains separate from `ext`: it
+                // means externally writable contents only when this root is observed through a
+                // value-like node, not that a pointed-to local identity is itself external.
+                let pointee_external = pointee.is_some_and(|pointee| self.classes[pointee].ext);
+                let pointee_universal =
+                    pointee.is_some_and(|pointee| self.classes[pointee].universal);
+                let external = self.classes[root].ext || self.classes[root].esc || pointee_external;
+                let universal = self.classes[root].universal || pointee_universal;
                 let has_empty_witness = self.classes[root].has_empty_witness;
                 let proven_empty = has_empty_witness
                     && pointee.is_none()
                     && !external
-                    && !self.classes[root].universal
+                    && !universal
                     && self.classes[root].fn_objs.is_empty()
                     && self.classes[root].global_objs.is_empty();
                 let reaches_function_pointer = pointee
@@ -2116,13 +2122,14 @@ impl<'a> Solver<'a> {
                         }
                     })
                     .unwrap_or(false)
-                    || self.classes[root].universal
+                    || universal
                     || self.classes[root].esc;
                 let cached = CachedRootNodeSummary {
                     reaches_function_pointer,
                     has_empty_witness,
                     proven_empty,
                     external,
+                    universal,
                     pointee,
                 };
                 node_summary_by_root[root] = Some(cached.clone());
@@ -2146,7 +2153,7 @@ impl<'a> Solver<'a> {
                             globals
                         };
                     if matches!(self.violation_exposure, ViolationExposure::ModuleWide)
-                        || self.classes[root].universal
+                        || summary.universal
                     {
                         return (unfiltered, SharedStringList::default());
                     }
@@ -2190,7 +2197,7 @@ impl<'a> Solver<'a> {
                 let key = (
                     self.classes[root].provenance | pointee_mask,
                     summary.external,
-                    self.classes[root].universal,
+                    summary.universal,
                 );
                 pointee_provenance_by_key
                     .entry(key)
@@ -2206,7 +2213,7 @@ impl<'a> Solver<'a> {
                     has_empty_witness: summary.has_empty_witness,
                     proven_empty: summary.proven_empty,
                     external: summary.external,
-                    external_universal: self.classes[root].universal,
+                    external_universal: summary.universal,
                     pointee_globals,
                     pointee_globals_unfiltered,
                     pointee_provenance,
@@ -2215,10 +2222,14 @@ impl<'a> Solver<'a> {
                     } else {
                         Vec::new()
                     },
-                    universal_sources: self.classes[root]
-                        .universal_sources
-                        .iter()
+                    universal_sources: summary
+                        .pointee
+                        .into_iter()
+                        .flat_map(|pointee| self.classes[pointee].universal_sources.iter())
+                        .chain(self.classes[root].universal_sources.iter())
                         .cloned()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
                         .collect(),
                 },
             );
@@ -3219,7 +3230,7 @@ mod tests {
             .omega_seeds
             .iter()
             .any(|seed| seed.kind == OmegaSeedKind::IntToPtr));
- 
+
         let solved = solve_steensgaard_with_points_to(&pir, &pag, BuildMode::Executable);
         for label in ["val:f:sentinel", "val:f:copied", "val:f:loaded"] {
             let resolution = &solved.nodes[label];
@@ -3234,7 +3245,7 @@ mod tests {
             );
         }
     }
- 
+
     #[test]
     fn affine_gep_lanes_alias_only_matching_residue_classes() {
         let fn_lane = FieldLocation::Lane(pangs_pir::GepLane::new(24, 8).unwrap());
@@ -4411,5 +4422,64 @@ mod tests {
 
         let result = solve_steensgaard(&pir, &pag, BuildMode::Library);
         assert!(result.unknown_callers.contains("cb"));
+    }
+
+    #[test]
+    fn external_pointer_boundary_survives_gep_in_steens_envelope() {
+        let mut pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"external-gep",
+                "functions":[
+                  {"key":"external_ptr","sig":{"ret":{"class":"integer"},"params":[]},
+                   "external":true,"body":[]},
+                  {"key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                    {"kind":"call_direct","callee":"external_ptr",
+                     "sig":{"ret":{"class":"integer"},"params":[]},"args":[],"dest":"ret"},
+                    {"kind":"gep","dest":"derived","base":"ret","byte_off":0},
+                    {"kind":"load","dest":"byte","address":"derived","access_bytes":1}
+                  ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        pir.lowering.semantic_value_kinds.extend([
+            ("ret".into(), ValueKind::Pointer),
+            ("derived".into(), ValueKind::Pointer),
+        ]);
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let solved = solve_steensgaard(&pir, &pag, BuildMode::Executable);
+        assert!(solved.nodes["val:f:derived"].external);
+    }
+
+    #[test]
+    fn universal_pointer_boundary_survives_gep_in_steens_envelope() {
+        let mut pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"universal-gep",
+                "functions":[{
+                  "key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                    {"kind":"int_to_ptr","dest":"forged","source":"bits"},
+                    {"kind":"gep","dest":"derived","base":"forged","byte_off":0},
+                    {"kind":"load","dest":"byte","address":"derived","access_bytes":1}
+                  ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        pir.lowering.semantic_value_kinds.extend([
+            ("forged".into(), ValueKind::Pointer),
+            ("derived".into(), ValueKind::Pointer),
+        ]);
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+
+        let solved = solve_steensgaard(&pir, &pag, BuildMode::Executable);
+        let derived = &solved.nodes["val:f:derived"];
+        assert!(derived.external);
+        assert!(derived.external_universal);
+        assert_eq!(
+            derived.universal_sources,
+            ["omega:inttoptr:val:f:forged".to_string()]
+        );
     }
 }
