@@ -241,8 +241,9 @@ roots forward. A separate provenance-only PAG record also forwards roots through
 `inttoptr(ptrtoint(p) xor c)` retain `p`'s allocation root without asserting that the reconstructed
 pointer is an exact copy of `p`. Unknown integer leaves preserve any positive roots already found
 but prevent completeness. Loads and other unsupported producers likewise prevent completeness.
-Null is the complete empty set. At most 64 roots are retained per value; seeing another root sets
-`complete = false` rather than silently truncating the abstract value.
+A positive empty witness denotes the complete empty allocation-root set; canonical null is the
+only source of that witness in the current pipeline. At most 64 roots are retained per value;
+seeing another root sets `complete = false` rather than silently truncating the abstract value.
 
 A complete row seeds exactly its named allocation roots into the receiver-relative
 payload cell. An incomplete row seeds all retained positive roots plus a distinct
@@ -564,15 +565,17 @@ explicit supported-program contracts below. One policy exception does not clear 
 violation taint: `localize` may filter the single internal-unmodeled-vararg finding kind
 as specified in `20260818_LOCALIZATION_VIOLATION_TAINT_v3.md`.
 
-Canonical LLVM pointer-null operands carry an explicit positive nullability fact; they are not
-modeled as an absent or unknown points-to producer. Under the supported-program contract, address
-zero is not a valid program allocation and a canonical null value designates no object. Assign,
-memory, and internal call-binding rules propagate nullability without unifying the shared null
-node with allocation-bearing classes, while the original PAG edges remain available to boundary,
-ModRef, and completeness audits. Dereference, memcpy, or pointer arithmetic through a proven-null
-address is outside that contract and fails closed; in particular, GEP-off-null remains unknown
-rather than inheriting canonical-null status. `undef` and `poison` are separate values and never
-acquire the null certificate.
+Pointer values carry a positive `has_empty_witness` fact independently of their allocation
+points-to set, so an empty set is never overloaded as either certified emptiness or analysis
+silence. Canonical LLVM pointer-null operands are the current source of that witness. Under the
+supported-program contract, address zero is not a valid program allocation and a canonical null
+value designates no object. Assign, memory, and internal call-binding rules propagate the witness
+without unifying empty values with allocation-bearing classes, while the original PAG edges remain
+available to boundary, ModRef, and completeness audits. A value is `proven_empty` only when it has
+an empty witness, no allocation pointee, and no external or forged provenance. Dereference, memcpy,
+or pointer arithmetic through a proven-empty address is outside that contract and fails closed; in
+particular, GEP-off-null remains unknown rather than inheriting the empty witness. `undef` and
+`poison` are separate values and never acquire an empty witness.
 
 For localization, the supported program must not invoke a callback after passing that
 callback, directly or through an aggregate, as a variadic actual to an internal vararg

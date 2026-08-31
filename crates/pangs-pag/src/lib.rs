@@ -576,7 +576,7 @@ impl StorageRoot {
 pub enum StorageRootState {
     #[default]
     Unknown,
-    ProvenNull,
+    ProvenEmpty,
     Root(StorageRoot),
 }
 
@@ -682,7 +682,7 @@ pub fn allocation_storage_roots(pir: &Pir, pag: &Pag) -> StorageRoots {
         .iter()
         .map(|node| {
             is_canonical_pointer_null(node)
-                .then_some(StorageRootState::ProvenNull)
+                .then_some(StorageRootState::ProvenEmpty)
                 .unwrap_or_default()
         })
         .collect::<Vec<_>>();
@@ -722,8 +722,8 @@ pub fn allocation_storage_roots(pir: &Pir, pag: &Pag) -> StorageRoots {
                 EdgeKind::Gep { .. } if incoming.len() == 1 => {
                     match &states[incoming[0].src.0 as usize] {
                         StorageRootState::Root(root) => StorageRootState::Root(root.clone()),
-                        // Pointer arithmetic on null is not a canonical null constant.
-                        StorageRootState::ProvenNull => continue,
+                        // Pointer arithmetic does not preserve a certified empty value.
+                        StorageRootState::ProvenEmpty => continue,
                         StorageRootState::Unknown => continue,
                     }
                 }
@@ -742,7 +742,7 @@ pub fn allocation_storage_roots(pir: &Pir, pag: &Pag) -> StorageRoots {
                     for edge in incoming {
                         match &states[edge.src.0 as usize] {
                             StorageRootState::Unknown => has_unknown = true,
-                            StorageRootState::ProvenNull => {}
+                            StorageRootState::ProvenEmpty => {}
                             StorageRootState::Root(root) => match common {
                                 None => common = Some(root),
                                 Some(first) if first == root => {}
@@ -756,7 +756,7 @@ pub fn allocation_storage_roots(pir: &Pir, pag: &Pag) -> StorageRoots {
                     common
                         .cloned()
                         .map(StorageRootState::Root)
-                        .unwrap_or(StorageRootState::ProvenNull)
+                        .unwrap_or(StorageRootState::ProvenEmpty)
                 }
                 _ => continue,
             };
@@ -777,7 +777,7 @@ pub fn allocation_storage_roots(pir: &Pir, pag: &Pag) -> StorageRoots {
             for source in &origin.sources {
                 match &states[source.0 as usize] {
                     StorageRootState::Unknown => unknown = true,
-                    StorageRootState::ProvenNull => {}
+                    StorageRootState::ProvenEmpty => {}
                     StorageRootState::Root(root) => match common {
                         None => common = Some(root),
                         Some(first) if first == root => {}
@@ -791,7 +791,7 @@ pub fn allocation_storage_roots(pir: &Pir, pag: &Pag) -> StorageRoots {
             states[destination] = common
                 .cloned()
                 .map(StorageRootState::Root)
-                .unwrap_or(StorageRootState::ProvenNull);
+                .unwrap_or(StorageRootState::ProvenEmpty);
             changed = true;
         }
         if !changed {
@@ -4270,8 +4270,8 @@ mod tests {
             StorageRootState::Root(StorageRoot::Global { .. })
         ));
         assert_eq!(state("val:f:maybe"), state("val:f:elt"));
-        assert_eq!(state("val:f:null"), &StorageRootState::ProvenNull);
-        assert_eq!(state("val:f:both-null"), &StorageRootState::ProvenNull);
+        assert_eq!(state("val:f:null"), &StorageRootState::ProvenEmpty);
+        assert_eq!(state("val:f:both-null"), &StorageRootState::ProvenEmpty);
         assert_eq!(state("val:f:bad-null-gep"), &StorageRootState::Unknown);
     }
 
