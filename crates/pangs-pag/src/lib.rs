@@ -544,10 +544,18 @@ pub struct Node {
     /// explicit so allocation-root proofs never infer nullness from a user-controlled label.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub canonical_pointer_null: bool,
+    /// Positive evidence that this value denotes no allocation or function object. Canonical
+    /// null and target-contract reserved addresses seed this fact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_empty_witness: bool,
 }
 
 pub fn is_canonical_pointer_null(node: &Node) -> bool {
     node.canonical_pointer_null
+}
+
+pub fn has_empty_witness(node: &Node) -> bool {
+    node.has_empty_witness
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -681,9 +689,11 @@ pub fn allocation_storage_roots(pir: &Pir, pag: &Pag) -> StorageRoots {
         .nodes
         .iter()
         .map(|node| {
-            is_canonical_pointer_null(node)
-                .then_some(StorageRootState::ProvenEmpty)
-                .unwrap_or_default()
+            if has_empty_witness(node) {
+                StorageRootState::ProvenEmpty
+            } else {
+                StorageRootState::Unknown
+            }
         })
         .collect::<Vec<_>>();
     let mut force_exposed_globals = BTreeSet::new();
@@ -1176,6 +1186,72 @@ fn is_integer_literal(value: &str) -> bool {
     !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+const RESERVED_LOW_ADDRESS_LIMIT: u128 = 4096;
+
+fn parse_unsigned_integer_literal(token: &str) -> Option<u128> {
+    let token = token.strip_prefix('+').unwrap_or(token);
+    if let Some(hex) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
+        (!hex.is_empty())
+            .then(|| u128::from_str_radix(hex, 16).ok())
+            .flatten()
+    } else {
+        token.parse().ok()
+    }
+}
+
+/// Recognize the conventional-architecture addresses reserved by the supported-program
+/// contract. The integer and pointer representations must already have the same width in the
+/// default integral address space; missing target facts fail closed.
+fn is_reserved_non_address_inttoptr(
+    pir: &Pir,
+    source: &str,
+    integer_bits: Option<u32>,
+    pointer_bits: Option<u32>,
+    pointer_address_space: Option<u32>,
+) -> bool {
+    let (Some(integer_bits), Some(pointer_bits), Some(0)) =
+        (integer_bits, pointer_bits, pointer_address_space)
+    else {
+        return false;
+    };
+    if integer_bits != pointer_bits || integer_bits == 0 || integer_bits > 128 {
+        return false;
+    }
+    let Some(target) = pir.target.as_ref() else {
+        return false;
+    };
+    let default_space_is_non_integral = target
+        .data_layout
+        .split('-')
+        .find_map(|part| part.strip_prefix("ni:"))
+        .into_iter()
+        .flat_map(|spaces| spaces.split(':'))
+        .any(|space| space == "0");
+    if default_space_is_non_integral {
+        return false;
+    }
+
+    let token = source.split_whitespace().last().unwrap_or(source);
+    if let Some(magnitude) = token.strip_prefix('-') {
+        return parse_unsigned_integer_literal(magnitude)
+            .is_some_and(|magnitude| magnitude < RESERVED_LOW_ADDRESS_LIMIT);
+    }
+    let Some(value) = parse_unsigned_integer_literal(token) else {
+        return false;
+    };
+    let all_ones = if integer_bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << integer_bits) - 1
+    };
+    let is_small_negative_bit_pattern =
+        value <= all_ones && all_ones - value < RESERVED_LOW_ADDRESS_LIMIT - 1;
+    value < RESERVED_LOW_ADDRESS_LIMIT || is_small_negative_bit_pattern
+}
+
 /// Recover pointer provenance through the integer side of an `inttoptr`. Unlike the lossless
 /// round-trip proof above, scalar arithmetic does not become an ordinary pointer assignment: it
 /// only records allocation origins for the positive origin analyses. Unknown leaves make the
@@ -1610,7 +1686,13 @@ impl<'a> Builder<'a> {
                 }
             }
             Stmt::IntToPtr {
-                dest, source, loc, ..
+                dest,
+                source,
+                integer_bits,
+                pointer_bits,
+                pointer_address_space,
+                loc,
+                ..
             } => {
                 self.operand_node(func_index, owner_scope(&owner), source);
                 let dst = self.value_node(func_index, owner_scope(&owner), dest);
@@ -1621,6 +1703,14 @@ impl<'a> Builder<'a> {
                 {
                     let src = self.operand_node(func_index, owner_scope(&owner), &original);
                     self.add_edge(EdgeKind::Assign, src, dst, owner, loc.clone());
+                } else if is_reserved_non_address_inttoptr(
+                    self.pir,
+                    source,
+                    *integer_bits,
+                    *pointer_bits,
+                    *pointer_address_space,
+                ) {
+                    self.nodes[dst.0 as usize].has_empty_witness = true;
                 } else {
                     if let Some(proof) = self
                         .pointer_integer_origin_proofs
@@ -2048,16 +2138,18 @@ impl<'a> Builder<'a> {
         }
         let id = NodeId(self.nodes.len() as u32);
         let value_kind = self.value_kind(&key, &kind);
+        let canonical_pointer_null = matches!(
+            &key,
+            NodeKey::FunctionValue(_, value) | NodeKey::GlobalInitValue(value)
+                if value == "null" && value_kind == ValueKind::Pointer
+        );
         self.nodes.push(Node {
             id,
             label,
             kind,
             value_kind,
-            canonical_pointer_null: matches!(
-                &key,
-                NodeKey::FunctionValue(_, value) | NodeKey::GlobalInitValue(value)
-                    if value == "null" && value_kind == ValueKind::Pointer
-            ),
+            canonical_pointer_null,
+            has_empty_witness: canonical_pointer_null,
         });
         self.node_ids.insert(key, id);
         id
@@ -4133,6 +4225,103 @@ mod tests {
             .edges
             .iter()
             .any(|edge| { edge.kind == EdgeKind::Assign && edge.src == p && edge.dst == q }));
+    }
+
+    #[test]
+    fn reserved_inttoptr_literals_are_certified_empty_without_omega() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"reserved-addresses",
+                "target":{"triple":"x86_64","data_layout":"e-p:64:64-p1:64:64","supported_atomic_widths":[8,16,32,64]},
+                "functions":[{"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                    {"kind":"int_to_ptr","dest":"minus-one","source":"-1","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"zero","source":"0","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"eight","source":"8","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"last-low","source":"4095","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"unsigned-all-ones","source":"18446744073709551615","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"first-high","source":"4096","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"minus-two","source":"-2","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"last-low-negative","source":"-4095","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"first-high-negative","source":"-4096","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"unsigned-minus-two","source":"18446744073709551614","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"unsigned-last-low-negative","source":"18446744073709547521","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"unsigned-first-high-negative","source":"18446744073709547520","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"width-mismatch","source":"8","integer_bits":32,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"other-space","source":"8","integer_bits":64,"pointer_bits":64,"pointer_address_space":1}
+                ]}]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let roots = allocation_storage_roots(&pir, &pag);
+        let node = |dest: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == format!("val:main:{dest}"))
+                .unwrap_or_else(|| panic!("missing {dest}"))
+        };
+
+        for dest in [
+            "minus-one",
+            "zero",
+            "eight",
+            "last-low",
+            "unsigned-all-ones",
+            "minus-two",
+            "last-low-negative",
+            "unsigned-minus-two",
+            "unsigned-last-low-negative",
+        ] {
+            let node = node(dest);
+            assert!(node.has_empty_witness, "{dest}");
+            assert_eq!(
+                roots.states[node.id.0 as usize],
+                StorageRootState::ProvenEmpty,
+                "{dest}"
+            );
+            assert!(!pag.omega_seeds.iter().any(|seed| {
+                seed.kind == OmegaSeedKind::IntToPtr && seed.target == SeedTarget::Node(node.id)
+            }));
+        }
+        for dest in [
+            "first-high",
+            "first-high-negative",
+            "unsigned-first-high-negative",
+            "width-mismatch",
+            "other-space",
+        ] {
+            let node = node(dest);
+            assert!(!node.has_empty_witness, "{dest}");
+            assert!(pag.omega_seeds.iter().any(|seed| {
+                seed.kind == OmegaSeedKind::IntToPtr && seed.target == SeedTarget::Node(node.id)
+            }));
+        }
+
+        for (name, target) in [
+            ("missing-target", "null"),
+            (
+                "non-integral-default",
+                r#"{"triple":"test","data_layout":"e-p:64:64-ni:0","supported_atomic_widths":[]}"#,
+            ),
+        ] {
+            let json = format!(
+                r#"{{
+                    "module":"{name}",
+                    "target":{target},
+                    "functions":[{{"key":"main","sig":{{"ret":{{"class":"void"}},"params":[]}},"body":[
+                        {{"kind":"int_to_ptr","dest":"sentinel","source":"-1","integer_bits":64,"pointer_bits":64,"pointer_address_space":0}}
+                    ]}}]
+                }}"#
+            );
+            let pir: Pir = serde_json::from_str(&json).unwrap();
+            let pag = Pag::from_pir(&pir, &PagOpts::default());
+            assert!(
+                pag.omega_seeds
+                    .iter()
+                    .any(|seed| seed.kind == OmegaSeedKind::IntToPtr),
+                "{name}"
+            );
+        }
     }
 
     #[test]

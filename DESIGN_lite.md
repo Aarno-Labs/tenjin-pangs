@@ -241,9 +241,10 @@ roots forward. A separate provenance-only PAG record also forwards roots through
 `inttoptr(ptrtoint(p) xor c)` retain `p`'s allocation root without asserting that the reconstructed
 pointer is an exact copy of `p`. Unknown integer leaves preserve any positive roots already found
 but prevent completeness. Loads and other unsupported producers likewise prevent completeness.
-A positive empty witness denotes the complete empty allocation-root set; canonical null is the
-only source of that witness in the current pipeline. At most 64 roots are retained per value;
-seeing another root sets `complete = false` rather than silently truncating the abstract value.
+A positive empty witness denotes the complete empty allocation-root set. Canonical null and the
+reserved non-address integer conversions defined below seed that witness. At most 64 roots are
+retained per value; seeing another root sets `complete = false` rather than silently truncating the
+abstract value.
 
 A complete row seeds exactly its named allocation roots into the receiver-relative
 payload cell. An incomplete row seeds all retained positive roots plus a distinct
@@ -557,7 +558,8 @@ soundness-regression tripwires around the one authoritative lite pipeline.
 | Typed heap clones + conservatism dial | Back-propagation pass, clone⁄site duality, per-client mode switch | Heap objects coarser by type. Hurts heap-heavy alias precision; mutable-*globals* client is the least heap-dependent client we have. |
 | KallGraph per-query parallelism | Read-only query pool, shared caches | None at this scale — `DESIGN.md` §1 already called it "overkill insurance" below 1 MLoC. Kahlon partitions leave a clean parallelization seam, but the current D' solve is sequential. |
 
-**Not cut, anywhere:** Ω boundary model, int↔ptr violation detection → Ω-taint, FSA
+**Not cut, anywhere:** Ω boundary model, int↔ptr violation detection → Ω-taint outside the explicit
+reserved non-address contract below, FSA
 envelope, KELP safe-fallback discipline, byte-offset field sensitivity. Bounded domains
 always pair retained positive facts with an explicit incomplete/unknown bit and route
 overflow to a conservative fallback. Soundness is the hard constraint, subject to the
@@ -567,15 +569,23 @@ as specified in `20260818_LOCALIZATION_VIOLATION_TAINT_v3.md`.
 
 Pointer values carry a positive `has_empty_witness` fact independently of their allocation
 points-to set, so an empty set is never overloaded as either certified emptiness or analysis
-silence. Canonical LLVM pointer-null operands are the current source of that witness. Under the
-supported-program contract, address zero is not a valid program allocation and a canonical null
-value designates no object. Assign, memory, and internal call-binding rules propagate the witness
-without unifying empty values with allocation-bearing classes, while the original PAG edges remain
-available to boundary, ModRef, and completeness audits. A value is `proven_empty` only when it has
-an empty witness, no allocation pointee, and no external or forged provenance. Dereference, memcpy,
-or pointer arithmetic through a proven-empty address is outside that contract and fails closed; in
-particular, GEP-off-null remains unknown rather than inheriting the empty witness. `undef` and
-`poison` are separate values and never acquire an empty witness.
+silence. Canonical LLVM pointer-null operands seed that witness. PANGS additionally adopts the
+supported-program assumption that its conventional targets reserve the complete low address page
+`[0, 4096)` and the small negative integer sentinels `(-4096, 0)`: none can denote a program
+allocation or function object in well-defined code in the project settings. An `inttoptr` of an
+exact integer in `(-4096, 4096)` therefore seeds an empty witness without an IntToPtr Ω seed; the
+unsigned pointer-width spellings of the negative integers are recognized as equivalent. This
+requires matching integer and pointer widths, the default integral address space, and complete
+target metadata. Missing or incompatible metadata, non-integral or non-default address spaces, and
+every other integer literal retain normal Ω treatment.
+
+Assign, memory, and internal call-binding rules propagate the witness without unifying empty values
+with allocation-bearing classes, while the original PAG edges remain available to boundary,
+ModRef, and completeness audits. A value is `proven_empty` only when it has an empty witness, no
+allocation pointee, and no external or forged provenance. Dereference, invocation, memcpy, or
+pointer arithmetic through a proven-empty address is outside that contract and fails closed; a GEP
+from such a value remains unknown rather than inheriting the empty witness. `undef` and `poison`
+are separate values and never acquire an empty witness.
 
 For localization, the supported program must not invoke a callback after passing that
 callback, directly or through an aggregate, as a variadic actual to an internal vararg

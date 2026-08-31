@@ -3173,6 +3173,49 @@ mod tests {
     }
 
     #[test]
+    fn reserved_inttoptr_empty_witness_survives_copy_and_memory() {
+        let mut pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"reserved-empty-flow",
+                "target":{"triple":"x86_64","data_layout":"e-p:64:64","supported_atomic_widths":[8,16,32,64]},
+                "functions":[{"key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                    {"kind":"alloca","dest":"slot","ty":"ptr"},
+                    {"kind":"int_to_ptr","dest":"sentinel","source":"8","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"assign","dest":"copied","sources":["sentinel"]},
+                    {"kind":"store","address":"slot","value":"copied","access_bytes":8},
+                    {"kind":"load","dest":"loaded","address":"slot","access_bytes":8}
+                ]}]
+            }"#,
+        )
+        .unwrap();
+        pir.lowering.semantic_value_kinds.extend([
+            ("slot".into(), ValueKind::Pointer),
+            ("sentinel".into(), ValueKind::Pointer),
+            ("copied".into(), ValueKind::Pointer),
+            ("loaded".into(), ValueKind::Pointer),
+        ]);
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        assert!(!pag
+            .omega_seeds
+            .iter()
+            .any(|seed| seed.kind == OmegaSeedKind::IntToPtr));
+ 
+        let solved = solve_steensgaard_with_points_to(&pir, &pag, BuildMode::Executable);
+        for label in ["val:f:sentinel", "val:f:copied", "val:f:loaded"] {
+            let resolution = &solved.nodes[label];
+            assert!(resolution.has_empty_witness, "{label}");
+            assert!(resolution.proven_empty, "{label}");
+            assert!(
+                solved
+                    .node_points_to
+                    .get(label)
+                    .is_none_or(BTreeSet::is_empty),
+                "{label}"
+            );
+        }
+    }
+ 
+    #[test]
     fn affine_gep_lanes_alias_only_matching_residue_classes() {
         let fn_lane = FieldLocation::Lane(pangs_pir::GepLane::new(24, 8).unwrap());
         let used_lane = FieldLocation::Lane(pangs_pir::GepLane::new(24, 16).unwrap());
@@ -3502,6 +3545,7 @@ mod tests {
                 },
                 value_kind: Default::default(),
                 canonical_pointer_null: false,
+                has_empty_witness: false,
             },
             Node {
                 id: NodeId(1),
@@ -3513,6 +3557,7 @@ mod tests {
                 },
                 value_kind: Default::default(),
                 canonical_pointer_null: false,
+                has_empty_witness: false,
             },
             Node {
                 id: NodeId(2),
@@ -3522,6 +3567,7 @@ mod tests {
                 },
                 value_kind: Default::default(),
                 canonical_pointer_null: false,
+                has_empty_witness: false,
             },
             Node {
                 id: NodeId(3),
@@ -3531,6 +3577,7 @@ mod tests {
                 },
                 value_kind: Default::default(),
                 canonical_pointer_null: false,
+                has_empty_witness: false,
             },
             Node {
                 id: NodeId(4),
@@ -3540,6 +3587,7 @@ mod tests {
                 },
                 value_kind: Default::default(),
                 canonical_pointer_null: false,
+                has_empty_witness: false,
             },
             Node {
                 id: NodeId(5),
@@ -3549,6 +3597,7 @@ mod tests {
                 },
                 value_kind: Default::default(),
                 canonical_pointer_null: false,
+                has_empty_witness: false,
             },
         ];
         let edges = vec![
@@ -3909,6 +3958,7 @@ mod tests {
                     },
                     value_kind: Default::default(),
                     canonical_pointer_null: false,
+                    has_empty_witness: false,
                 },
                 Node {
                     id: NodeId(1),
@@ -3918,6 +3968,7 @@ mod tests {
                     },
                     value_kind: Default::default(),
                     canonical_pointer_null: false,
+                    has_empty_witness: false,
                 },
             ],
             edges: Vec::new(),
@@ -3975,6 +4026,7 @@ mod tests {
                     },
                     value_kind: Default::default(),
                     canonical_pointer_null: false,
+                    has_empty_witness: false,
                 },
                 Node {
                     id: NodeId(1),
@@ -3984,6 +4036,7 @@ mod tests {
                     },
                     value_kind: Default::default(),
                     canonical_pointer_null: false,
+                    has_empty_witness: false,
                 },
             ],
             edges: Vec::new(),
