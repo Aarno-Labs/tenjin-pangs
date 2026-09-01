@@ -2,9 +2,13 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::{self, Write};
+use std::ops::Deref;
 use std::path::Path;
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -798,6 +802,57 @@ pub struct GuardFailure {
     pub extra: Extra,
 }
 
+/// Copy-on-write guard-failure set shared by the override report and audit ledger.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharedGuardFailures(Arc<Vec<GuardFailure>>);
+
+impl SharedGuardFailures {
+    pub fn make_mut(&mut self) -> &mut Vec<GuardFailure> {
+        Arc::make_mut(&mut self.0)
+    }
+
+    fn canonicalize(&mut self) {
+        if !self
+            .windows(2)
+            .all(|pair| guard_failure_cmp(&pair[0], &pair[1]) != Ordering::Greater)
+        {
+            self.make_mut().sort_by(guard_failure_cmp);
+        }
+    }
+}
+
+impl From<Vec<GuardFailure>> for SharedGuardFailures {
+    fn from(value: Vec<GuardFailure>) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl Deref for SharedGuardFailures {
+    type Target = [GuardFailure];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_slice()
+    }
+}
+
+impl Serialize for SharedGuardFailures {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedGuardFailures {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<GuardFailure>::deserialize(deserializer).map(Self::from)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OverrideOutcome {
@@ -836,7 +891,7 @@ pub struct OverrideReportEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness: Option<Witness>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub failures: Option<Vec<GuardFailure>>,
+    pub failures: Option<SharedGuardFailures>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -1087,7 +1142,7 @@ impl Manifest {
         if let Some(report) = &mut self.override_report {
             for entry in &mut report.entries {
                 if let Some(failures) = &mut entry.failures {
-                    failures.sort_by(guard_failure_cmp);
+                    failures.canonicalize();
                 }
             }
             report.entries.sort_by(|a, b| {
@@ -1462,20 +1517,345 @@ pub struct AuditRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness: Option<Witness>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub failures: Option<Vec<GuardFailure>>,
+    pub failures: Option<SharedGuardFailures>,
     #[serde(flatten)]
     pub extra: Extra,
 }
 
 impl AuditRecord {
     pub fn regenerate_id(&mut self) -> Result<(), Error> {
-        let mut value = serde_json::to_value(&*self)?;
-        value
-            .as_object_mut()
-            .expect("audit record is an object")
-            .remove("id");
-        let digest = Sha256::digest(serde_json::to_vec(&value)?);
+        let mut hasher = Sha256::new();
+        serde_json::to_writer(DigestWriter(&mut hasher), &AuditRecordContent(self))?;
+        let digest = hasher.finalize();
         self.id = format!("ar-{}", hex_prefix(&digest, 16));
+        Ok(())
+    }
+}
+
+/// Borrowed view of an audit record's ID-covered content. Field names are sorted exactly as
+/// `serde_json::Value` object keys were, preserving existing IDs without cloning a second tree.
+struct AuditRecordContent<'a>(&'a AuditRecord);
+
+enum AuditField<'a> {
+    Kind(&'a str),
+    Scope(&'a AuditScope),
+    Source(AuditSource),
+    Text(&'a str),
+    Witness(&'a Witness),
+    Failures(&'a [GuardFailure]),
+    Extra(&'a Value),
+}
+
+impl Serialize for AuditField<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Kind(value) | Self::Text(value) => value.serialize(serializer),
+            Self::Scope(value) => AuditScopeContent(value).serialize(serializer),
+            Self::Source(value) => value.serialize(serializer),
+            Self::Witness(value) => AuditWitnessContent(value).serialize(serializer),
+            Self::Failures(value) => AuditFailuresContent(value).serialize(serializer),
+            Self::Extra(value) => value.serialize(serializer),
+        }
+    }
+}
+
+struct AuditScopeContent<'a>(&'a AuditScope);
+
+enum AuditScopeField<'a> {
+    String(&'a str),
+    Key(&'a Key),
+    Extra(&'a Value),
+}
+
+impl Serialize for AuditScopeField<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::String(value) => value.serialize(serializer),
+            Self::Key(value) => value.serialize(serializer),
+            Self::Extra(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl Serialize for AuditScopeContent<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (kind, key, extra) = match self.0 {
+            AuditScope::Run { extra } => ("run", None, extra),
+            AuditScope::Global { key, extra } => ("global", Some(AuditScopeField::Key(key)), extra),
+            AuditScope::Group { key, extra } => {
+                ("group", Some(AuditScopeField::String(key)), extra)
+            }
+        };
+        let mut fields = extra
+            .iter()
+            .map(|(name, value)| (name.as_str(), AuditScopeField::Extra(value)))
+            .collect::<Vec<_>>();
+        if !extra.contains_key("kind") {
+            fields.push(("kind", AuditScopeField::String(kind)));
+        }
+        if !extra.contains_key("key") {
+            if let Some(key) = key {
+                fields.push(("key", key));
+            }
+        }
+        fields.sort_by(|left, right| left.0.cmp(right.0));
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for (name, value) in fields {
+            map.serialize_entry(name, &value)?;
+        }
+        map.end()
+    }
+}
+
+struct AuditWitnessContent<'a>(&'a Witness);
+
+enum AuditWitnessField<'a> {
+    String(&'a str),
+    Site(&'a Site),
+    Extra(&'a Value),
+}
+
+impl Serialize for AuditWitnessField<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::String(value) => value.serialize(serializer),
+            Self::Site(value) => AuditSiteContent(value).serialize(serializer),
+            Self::Extra(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl Serialize for AuditWitnessContent<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let witness = self.0;
+        let mut fields = witness
+            .extra
+            .iter()
+            .map(|(name, value)| (name.as_str(), AuditWitnessField::Extra(value)))
+            .collect::<Vec<_>>();
+        if !witness.extra.contains_key("kind") {
+            fields.push(("kind", AuditWitnessField::String(&witness.kind)));
+        }
+        if !witness.extra.contains_key("note") {
+            if let Some(note) = witness.note.as_deref() {
+                fields.push(("note", AuditWitnessField::String(note)));
+            }
+        }
+        if !witness.extra.contains_key("site") {
+            if let Some(site) = &witness.site {
+                fields.push(("site", AuditWitnessField::Site(site)));
+            }
+        }
+        if !witness.extra.contains_key("symbol") {
+            if let Some(symbol) = witness.symbol.as_deref() {
+                fields.push(("symbol", AuditWitnessField::String(symbol)));
+            }
+        }
+        fields.sort_by(|left, right| left.0.cmp(right.0));
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for (name, value) in fields {
+            map.serialize_entry(name, &value)?;
+        }
+        map.end()
+    }
+}
+
+struct AuditSiteContent<'a>(&'a Site);
+
+enum AuditSiteField<'a> {
+    String(&'a str),
+    U32(u32),
+    Extra(&'a Value),
+}
+
+impl Serialize for AuditSiteField<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::String(value) => value.serialize(serializer),
+            Self::U32(value) => value.serialize(serializer),
+            Self::Extra(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl Serialize for AuditSiteContent<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let site = self.0;
+        let mut fields = site
+            .extra
+            .iter()
+            .map(|(name, value)| (name.as_str(), AuditSiteField::Extra(value)))
+            .collect::<Vec<_>>();
+        if !site.extra.contains_key("col") {
+            if let Some(col) = site.col {
+                fields.push(("col", AuditSiteField::U32(col)));
+            }
+        }
+        if !site.extra.contains_key("file") {
+            fields.push(("file", AuditSiteField::String(&site.file)));
+        }
+        if !site.extra.contains_key("function") {
+            if let Some(function) = site.function.as_deref() {
+                fields.push(("function", AuditSiteField::String(function)));
+            }
+        }
+        if !site.extra.contains_key("line") {
+            fields.push(("line", AuditSiteField::U32(site.line)));
+        }
+        fields.sort_by(|left, right| left.0.cmp(right.0));
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for (name, value) in fields {
+            map.serialize_entry(name, &value)?;
+        }
+        map.end()
+    }
+}
+
+struct AuditFailuresContent<'a>(&'a [GuardFailure]);
+
+impl Serialize for AuditFailuresContent<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for failure in self.0 {
+            sequence.serialize_element(&AuditGuardFailureContent(failure))?;
+        }
+        sequence.end()
+    }
+}
+
+struct AuditGuardFailureContent<'a>(&'a GuardFailure);
+
+enum AuditGuardFailureField<'a> {
+    String(&'a str),
+    Key(&'a Key),
+    Witness(&'a Witness),
+    Extra(&'a Value),
+}
+
+impl Serialize for AuditGuardFailureField<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::String(value) => value.serialize(serializer),
+            Self::Key(value) => value.serialize(serializer),
+            Self::Witness(value) => AuditWitnessContent(value).serialize(serializer),
+            Self::Extra(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl Serialize for AuditGuardFailureContent<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let failure = self.0;
+        let mut fields = failure
+            .extra
+            .iter()
+            .map(|(name, value)| (name.as_str(), AuditGuardFailureField::Extra(value)))
+            .collect::<Vec<_>>();
+        if !failure.extra.contains_key("guard") {
+            fields.push(("guard", AuditGuardFailureField::String(&failure.guard)));
+        }
+        if !failure.extra.contains_key("member") {
+            fields.push(("member", AuditGuardFailureField::Key(&failure.member)));
+        }
+        if !failure.extra.contains_key("witness") {
+            fields.push(("witness", AuditGuardFailureField::Witness(&failure.witness)));
+        }
+        fields.sort_by(|left, right| left.0.cmp(right.0));
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for (name, value) in fields {
+            map.serialize_entry(name, &value)?;
+        }
+        map.end()
+    }
+}
+
+impl Serialize for AuditRecordContent<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let record = self.0;
+        let mut fields = Vec::with_capacity(6 + record.extra.len());
+        fields.extend(
+            record
+                .extra
+                .iter()
+                .filter(|(key, _)| key.as_str() != "id")
+                .map(|(key, value)| (key.as_str(), AuditField::Extra(value))),
+        );
+        // Flattened extras were serialized after the typed fields previously, so an extra with a
+        // reserved name replaced that typed field when serde built the temporary JSON object.
+        if !record.extra.contains_key("kind") {
+            fields.push(("kind", AuditField::Kind(&record.kind)));
+        }
+        if !record.extra.contains_key("scope") {
+            fields.push(("scope", AuditField::Scope(&record.scope)));
+        }
+        if !record.extra.contains_key("source") {
+            fields.push(("source", AuditField::Source(record.source)));
+        }
+        if !record.extra.contains_key("text") {
+            fields.push(("text", AuditField::Text(&record.text)));
+        }
+        if !record.extra.contains_key("witness") {
+            if let Some(witness) = &record.witness {
+                fields.push(("witness", AuditField::Witness(witness)));
+            }
+        }
+        if !record.extra.contains_key("failures") {
+            if let Some(failures) = &record.failures {
+                fields.push(("failures", AuditField::Failures(failures)));
+            }
+        }
+        fields.sort_by(|left, right| left.0.cmp(right.0));
+
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for (name, value) in fields {
+            map.serialize_entry(name, &value)?;
+        }
+        map.end()
+    }
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -1483,7 +1863,7 @@ impl AuditRecord {
 pub fn canonicalize_audit(records: &mut Vec<AuditRecord>) -> Result<(), Error> {
     for record in records.iter_mut() {
         if let Some(failures) = &mut record.failures {
-            failures.sort_by(guard_failure_cmp);
+            failures.canonicalize();
         }
         record.regenerate_id()?;
     }
@@ -1611,6 +1991,73 @@ mod tests {
         record.text = "different".into();
         record.regenerate_id().unwrap();
         assert_ne!(record.id, first);
+    }
+
+    #[test]
+    fn borrowed_audit_id_serialization_matches_legacy_value_tree() {
+        let witness = Witness {
+            kind: "guard-failed".into(),
+            site: Some(Site {
+                file: "src/a.c".into(),
+                line: 17,
+                col: Some(9),
+                function: Some("worker".into()),
+                extra: BTreeMap::from([("address".into(), serde_json::json!("0x10"))]),
+            }),
+            symbol: Some("state".into()),
+            note: Some("evidence".into()),
+            extra: BTreeMap::from([("detail".into(), serde_json::json!({"z": 2, "a": 1}))]),
+        };
+        let mut record = AuditRecord {
+            id: "ignored".into(),
+            kind: "override-rejected".into(),
+            scope: AuditScope::Global {
+                key: Key::new("src/a.c", "state").unwrap(),
+                extra: BTreeMap::from([("scope_detail".into(), serde_json::json!(true))]),
+            },
+            source: AuditSource::Override,
+            text: "rejected".into(),
+            witness: Some(witness.clone()),
+            failures: Some(
+                vec![GuardFailure {
+                    member: Key::new("src/a.c", "state").unwrap(),
+                    guard: "access-set-complete".into(),
+                    witness,
+                    extra: BTreeMap::from([("rank".into(), serde_json::json!(1))]),
+                }]
+                .into(),
+            ),
+            extra: BTreeMap::from([("analysis_stage".into(), serde_json::json!("andersen"))]),
+        };
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("id");
+        let digest = Sha256::digest(serde_json::to_vec(&legacy).unwrap());
+        let expected = format!("ar-{}", hex_prefix(&digest, 16));
+
+        record.regenerate_id().unwrap();
+        assert_eq!(record.id, expected);
+    }
+
+    #[test]
+    fn canonical_guard_failure_sets_remain_shared_across_fields() {
+        let failure = GuardFailure {
+            member: Key::new("src/a.c", "state").unwrap(),
+            guard: "written".into(),
+            witness: Witness {
+                kind: "guard-failed".into(),
+                site: None,
+                symbol: Some("state".into()),
+                note: None,
+                extra: Extra::new(),
+            },
+            extra: Extra::new(),
+        };
+        let mut report_failures = SharedGuardFailures::from(vec![failure]);
+        let audit_failures = report_failures.clone();
+
+        report_failures.canonicalize();
+
+        assert!(Arc::ptr_eq(&report_failures.0, &audit_failures.0));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use pangs_manifest::{
     Certificate, DisposeMode, DisposeRun, Disposition, DispositionProvenance, Extra, Facts,
     GroupProvenance, GuardFailure, Key, LocalizationVerdict, Manifest, OnceLockGroupSupport,
     OverrideCounts, OverrideEcho, OverrideOutcome, OverrideReport, OverrideReportEntry,
-    OverrideRequested, OverrideScope, SkipReason, Strategy, Witness,
+    OverrideRequested, OverrideScope, SharedGuardFailures, SkipReason, Strategy, Witness,
 };
 use serde::Deserialize;
 use tempfile::NamedTempFile;
@@ -557,7 +557,8 @@ fn apply_global_override(
             ));
         }
         GuardResult::Failed(guards) => {
-            let failures = guard_failures(&global.key, &global.facts, &guards);
+            let failures =
+                SharedGuardFailures::from(guard_failures(&global.key, &global.facts, &guards));
             if spec.accept_risk {
                 honor_override(disposition, spec, true);
                 entries.push(report_entry(
@@ -681,7 +682,11 @@ fn resolve_groups(
                     ));
                     independent_joint_group_strategy(manifest, group_index, config)
                 } else {
-                    let failures = group_failures(manifest, group_index, spec.disposition);
+                    let failures = SharedGuardFailures::from(group_failures(
+                        manifest,
+                        group_index,
+                        spec.disposition,
+                    ));
                     if failures.is_empty() {
                         record_honored_group(
                             &mut manifest.coupling_groups[group_index],
@@ -996,7 +1001,7 @@ fn report_entry(
     spec: &OverrideSpec,
     outcome: OverrideOutcome,
     reason: Option<String>,
-    failures: Option<Vec<GuardFailure>>,
+    failures: Option<SharedGuardFailures>,
 ) -> OverrideReportEntry {
     OverrideReportEntry {
         scope,
