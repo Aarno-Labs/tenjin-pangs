@@ -835,6 +835,26 @@ struct ClassData {
     provenance: u8,
 }
 
+fn global_storage_roots_index(classes: &[ClassData], global_count: usize) -> Vec<Vec<usize>> {
+    let mut roots_by_global = vec![Vec::new(); global_count];
+    for (candidate, class) in classes.iter().enumerate() {
+        if class.parent != candidate {
+            continue;
+        }
+        for &global_index in &class.global_objs {
+            if let Some(roots) = roots_by_global.get_mut(global_index) {
+                roots.push(candidate);
+            } else {
+                debug_assert!(
+                    false,
+                    "class {candidate} names absent global index {global_index}"
+                );
+            }
+        }
+    }
+    roots_by_global
+}
+
 const PROV_DIRECT_ADDRESS: u8 = 1 << 0;
 const PROV_SCALAR_OR_UNKNOWN_PAYLOAD: u8 = 1 << 1;
 const PROV_BY_VALUE_AGGREGATE: u8 = 1 << 2;
@@ -2010,6 +2030,8 @@ impl<'a> Solver<'a> {
         }
 
         let isolation = allocation_isolation(self.pir, self.pag, &indirect_calls, &unknown_callers);
+        let storage_roots_by_global =
+            global_storage_roots_index(&self.classes, self.pir.globals.len());
 
         let mut globals = BTreeMap::new();
         for (global_index, global) in self.pir.globals.iter().enumerate() {
@@ -2017,14 +2039,7 @@ impl<'a> Solver<'a> {
                 continue;
             };
             let object_root = self.find(class);
-            let mut storage_roots = BTreeSet::new();
-            for candidate in 0..self.classes.len() {
-                if self.find(candidate) == candidate
-                    && self.classes[candidate].global_objs.contains(&global_index)
-                {
-                    storage_roots.insert(candidate);
-                }
-            }
+            let storage_roots = &storage_roots_by_global[global_index];
             debug_assert!(storage_roots.contains(&object_root));
             let mut escape_external = storage_roots
                 .iter()
@@ -3095,6 +3110,24 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/synthetic/m1_4")
             .join(name)
+    }
+
+    #[test]
+    fn global_storage_root_index_inverts_only_root_class_payloads() {
+        let mut classes = vec![ClassData::default(); 5];
+        for (index, class) in classes.iter_mut().enumerate() {
+            class.parent = index;
+        }
+        classes[0].global_objs.extend([0, 2]);
+        classes[2].global_objs.insert(1);
+        classes[3].parent = 2;
+        classes[3].global_objs.insert(2);
+        classes[4].global_objs.extend([0, 1]);
+
+        assert_eq!(
+            global_storage_roots_index(&classes, 3),
+            vec![vec![0, 4], vec![2, 4], vec![0]]
+        );
     }
 
     #[test]
