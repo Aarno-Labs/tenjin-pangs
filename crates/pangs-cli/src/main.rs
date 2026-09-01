@@ -42,6 +42,9 @@ enum Command {
         validate: bool,
         #[arg(long)]
         dispose: bool,
+        /// Emit only the disposition manifest and audit ledger.
+        #[arg(long, requires = "dispose")]
+        manifest_only: bool,
         #[arg(long, requires = "dispose")]
         repo_root: Option<PathBuf>,
         #[arg(long, requires = "dispose")]
@@ -303,6 +306,7 @@ fn run() -> Result<()> {
             partition_budget,
             validate,
             dispose,
+            manifest_only,
             repo_root,
             mode,
             overrides,
@@ -335,14 +339,16 @@ fn run() -> Result<()> {
             } else {
                 Analysis::run(&pir, &opts)?
             };
-            pangs_clients::export_analysis(
-                &analysis,
-                &opts,
-                &module,
-                &out,
-                validate,
-                pipeline_started,
-            )?;
+            if !manifest_only {
+                pangs_clients::export_analysis(
+                    &analysis,
+                    &opts,
+                    &module,
+                    &out,
+                    validate,
+                    pipeline_started,
+                )?;
+            }
             if dispose {
                 let repo_root = repo_root.as_ref().expect("checked above");
                 let target = pir

@@ -2048,6 +2048,52 @@ fn differential_ledger_holds_on_synthetic_suite() {
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
 
 #[test]
+fn analyze_manifest_only_emits_only_disposition_pair() {
+    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
+    let tmp = TempDir::new().unwrap();
+    let bc = tmp.path().join("dispose.bc");
+    let out = tmp.path().join("out");
+    assert!(Command::new(CLANG_14)
+        .args(["-O0", "-g", "-emit-llvm", "-c"])
+        .arg(m1_1_fixture("fp_smoke.c"))
+        .arg("-o")
+        .arg(&bc)
+        .status()
+        .unwrap()
+        .success());
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(&bc)
+        .arg("--out")
+        .arg(&out)
+        .arg("--build-mode")
+        .arg("executable")
+        .arg("--dispose")
+        .arg("--manifest-only")
+        .arg("--repo-root")
+        .arg(&repo_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut files = fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    files.sort();
+    assert_eq!(files, ["pangs-audit.json", "pangs-manifest.json"]);
+    let _: Value =
+        serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
+    let _: Value =
+        serde_json::from_slice(&fs::read(out.join("pangs-audit.json")).unwrap()).unwrap();
+}
+
+#[test]
 fn analyze_dispose_emits_policy_pair_without_indexing_it() {
     assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
