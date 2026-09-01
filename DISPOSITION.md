@@ -356,7 +356,7 @@ accept_risk = true               # REQUIRED when the pin contradicts facts (§4.
 # accept_risk pins are recorded in the soundness inventory, not just the manifest
 
 [groups."grp-cmd"]
-disposition = "once-lock"        # pin a whole coupling group
+disposition = "once-lock"        # pin a joint once-lock or mutex representation
 
 [cascade]                        # optional: REPLACES the mode's default order entirely
 order = ["immutable", "once-lock", "mutex", "localize"]   # e.g., no atomics anywhere
@@ -383,6 +383,11 @@ violation-tainted global. The same applies to group pins. One sharp edge: a *mem
 conflict under rule 3 below — opting one member out of a joint `once-lock`/`mutex`
 representation would split it, exactly what rule 3 exists to prevent; pin the whole
 group instead.
+
+Group scope is representation scope, not shorthand for multiple member pins. It accepts
+only the joint strategies `once-lock` and `mutex`, plus the safe whole-group `unhandled`
+opt-out. `immutable`, `atomic`, and `localize` remain per-global strategies; requesting one
+at group scope is rejected, and callers must pin the desired members individually.
 
 Second, **a pin on a certificate-requiring strategy must have a materialization
 recipe, and `accept_risk` cannot waive that**: a `null` slot is rejected as
@@ -564,35 +569,38 @@ schema compatibility.
 The policy stage resolves a group after computing each member's independent strategy
 support set and individual cascade result:
 
-1. For each configured strategy, compute `group_support(strategy)`. It requires the
-   strategy's own guard to hold for every member, plus any group-specific condition:
-   `once-lock` requires the common-publication-point certificate at
+1. Compute group support only for the joint representations. `once-lock` requires each
+   member's ordinary guard plus the common-publication-point certificate at
    `coupling_groups[].strategy_support.once_lock` — analysis-owned, derived by D2b
    from the members' phase-stationarity certificates (nonempty publication-interval
    intersection in one common publication function; `DISPOSITION_PLAN.md` D2b);
-   `atomic` adds no group-specific guard; and `mutex`
-   requires the group-level reentrancy certificate at `strategy_support.mutex`
-   (reserved, emitted by D4). `unhandled` is always supported. `immutable` and
-   `localize` add no group-specific guard beyond every member's ordinary guard.
-2. Without a group override, choose the first group-supported strategy in the
-   configured cascade. Thus cascade reordering changes preference, never proof. One
-   exception preserves atomic's per-global semantics: if only a subset independently
-   chose `atomic`, leave the group disposition unset and retain every member's
-   independent result rather than demoting the eligible subset.
-3. A group override is honored normally only when that strategy is group-supported.
+   `mutex` requires each member's ordinary guard plus the group-level reentrancy
+   certificate at `strategy_support.mutex` (emitted by D4).
+2. Without a group override, first preserve any member whose independent cascade selected
+   `immutable`, `atomic`, or `localize`; if any such member exists, leave `group_disposition`
+   unset. Otherwise select the first group-supported joint strategy in the configured cascade
+   order, or leave the group disposition unset when neither joint strategy is supported.
+   Thus the three per-global strategies are never promoted, demoted, or made uniform merely
+   because their globals share coupling evidence, while a selected joint representation is
+   necessarily uniform.
+3. A group override may request `once-lock`, `mutex`, or the safe `unhandled` opt-out.
+   Per-global strategies at group scope are rejected. A joint override is honored normally
+   only when that strategy is group-supported.
    If it is not, it follows the ordinary contradictory-facts rule: reject it unless
    `accept_risk = true`, in which case record one accepted-risk audit entry whose
    `failures` list identifies every failed member and group-specific guard
    structurally (one `{member, guard, witness}` record each —
    `DISPOSITION_PLAN.md` §1.8 — never free text).
-4. A member override is applied only if it agrees with the resolved group disposition;
-   otherwise it is a group conflict under §4.2 rule 3.
+4. A member override is constrained only when a joint group representation (or explicit
+   whole-group `unhandled` opt-out) was resolved. It must agree with that disposition;
+   otherwise it is a group conflict under §4.2 rule 3. With no group disposition, member
+   overrides remain independent.
 
 The result is recorded as `group_disposition`; members inherit it in `chosen` with
 `provenance: "group-constraint"` when it differs from their individual cascade
 result, which stays visible untouched in `cascade_chosen` — the trace never has to
-"explain" the inherited choice (a member whose own cascade picked `immutable` has no
-skip reason for it, and needs none: `provenance` plus the group record carry that
+"explain" the inherited choice (a member whose own cascade picked `once-lock` but
+inherits a joint `mutex` has no skip reason for it, and needs none: `provenance` plus the group record carry that
 explanation; §3.2).
 
 Serialization of a *group* override on member records is fixed as follows: members
@@ -604,9 +612,8 @@ once, on the group record (`group_provenance: "override"` /
 echoing a group pin onto N members stores N divergeable copies of one decision; the
 provenance chain member → `group_disposition` → group override reconstructs it
 losslessly.
-For `localize`, membership remains advisory to context-struct field clustering after
-the uniform policy assignment; it does not require the C→C tool to materialize one
-joint runtime object.
+For `localize`, membership remains advisory to context-struct field clustering; it does
+not require uniform selection or a joint runtime object.
 
 ## 7. Soundness matrix
 

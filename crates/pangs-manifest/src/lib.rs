@@ -1295,7 +1295,14 @@ pub fn expected_markers(manifest: &Manifest) -> Result<Vec<ExpectedMarker>, Erro
         };
         let (kind, raw_id, group) = match disposition.chosen {
             Strategy::OnceLock => {
-                let group = global.facts.coupling_group.clone();
+                let group = manifest
+                    .coupling_groups
+                    .iter()
+                    .find(|group| {
+                        group.group_disposition == Some(Strategy::OnceLock)
+                            && group.members.contains(&global.key)
+                    })
+                    .map(|group| group.id.clone());
                 let raw_id = group.clone().unwrap_or_else(|| global.key.to_string());
                 ("publish".to_owned(), raw_id, group)
             }

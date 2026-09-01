@@ -97,9 +97,7 @@ fn contract_manifest() -> Manifest {
                 "id": "grp-members",
                 "members": ["src/toy.c::member_c", "src/toy.c::member_d"],
                 "evidence": [],
-                "strategy_support": { "once_lock": null, "mutex": null },
-                "group_disposition": "immutable",
-                "group_provenance": "cascade"
+                "strategy_support": { "once_lock": null, "mutex": null }
             }
         ]
     }))
@@ -138,8 +136,10 @@ fn mock_materialize(manifest: &mut Manifest, input: &str, failing_keys: &[&str])
                     .iter()
                     .find(|group| &group.id == group_id)
                     .unwrap();
-                demote_keys.extend(group.members.iter().map(ToString::to_string));
-                continue;
+                if group.group_disposition == Some(disposition.chosen) {
+                    demote_keys.extend(group.members.iter().map(ToString::to_string));
+                    continue;
+                }
             }
         }
         demote_keys.insert((*failing).to_owned());
@@ -316,6 +316,45 @@ fn inventory_validation_rejects_a_missing_translated_marker() {
     let missing = observed.pop_first().unwrap();
     let error = validate_marker_inventory(&manifest, observed).unwrap_err();
     assert!(error.to_string().contains(missing));
+}
+
+#[test]
+fn independent_once_lock_in_a_mixed_group_uses_a_member_marker_and_demotes_alone() {
+    let mut manifest = contract_manifest();
+    let member = manifest
+        .globals
+        .iter_mut()
+        .find(|global| global.key.to_string() == "src/toy.c::member_c")
+        .unwrap();
+    let disposition = member.disposition.as_mut().unwrap();
+    disposition.chosen = Strategy::OnceLock;
+    disposition.cascade_chosen = Strategy::OnceLock;
+
+    let marker = expected_markers(&manifest)
+        .unwrap()
+        .into_iter()
+        .find(|marker| marker.key.to_string() == "src/toy.c::member_c")
+        .unwrap();
+    assert_eq!(marker.group, None);
+
+    mock_materialize(
+        &mut manifest,
+        "static int member_c;\nstatic int member_d;\n",
+        &["src/toy.c::member_c"],
+    );
+    let chosen = |key: &str| {
+        manifest
+            .globals
+            .iter()
+            .find(|global| global.key.to_string() == key)
+            .unwrap()
+            .disposition
+            .as_ref()
+            .unwrap()
+            .chosen
+    };
+    assert_eq!(chosen("src/toy.c::member_c"), Strategy::Unhandled);
+    assert_eq!(chosen("src/toy.c::member_d"), Strategy::Immutable);
 }
 
 #[test]

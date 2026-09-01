@@ -624,28 +624,25 @@ fn resolve_groups(
             matched.insert(group_id.clone());
         }
 
-        // Atomic is a per-global representation rewrite. If only some members chose it in their
-        // independent cascades, a hard group for a joint strategy must not demote those members
-        // merely because the other members lack atomic certificates.
-        let independently_atomic = member_keys.iter().any(|key| {
-            manifest
-                .globals
-                .iter()
-                .find(|global| &global.key == key)
-                .and_then(|global| global.disposition.as_ref())
-                .is_some_and(|disposition| disposition.cascade_chosen == Strategy::Atomic)
-        });
-        if override_spec.is_none()
-            && independently_atomic
-            && !group_failures(manifest, group_index, Strategy::Atomic).is_empty()
-        {
-            manifest.coupling_groups[group_index].group_disposition = None;
-            manifest.coupling_groups[group_index].group_provenance = None;
-            continue;
-        }
-
         let chosen = if let Some(spec) = override_spec {
-            if spec.disposition != Strategy::Unhandled && !config.order.contains(&spec.disposition)
+            if matches!(
+                spec.disposition,
+                Strategy::Immutable | Strategy::Atomic | Strategy::Localize
+            ) {
+                entries.push(report_entry(
+                    OverrideScope::Group,
+                    Some(group_id.clone()),
+                    spec,
+                    OverrideOutcome::Rejected,
+                    Some(
+                        "per-global strategy cannot be pinned at group scope; use member overrides"
+                            .into(),
+                    ),
+                    None,
+                ));
+                independent_joint_group_strategy(manifest, group_index, config)
+            } else if spec.disposition != Strategy::Unhandled
+                && !config.order.contains(&spec.disposition)
             {
                 entries.push(report_entry(
                     OverrideScope::Group,
@@ -655,7 +652,7 @@ fn resolve_groups(
                     Some("strategy is omitted from the configured cascade".into()),
                     None,
                 ));
-                first_supported_group_strategy(manifest, group_index, config)
+                independent_joint_group_strategy(manifest, group_index, config)
             } else if spec.disposition == Strategy::Unhandled {
                 record_honored_group(&mut manifest.coupling_groups[group_index], spec, false);
                 entries.push(report_entry(
@@ -666,7 +663,7 @@ fn resolve_groups(
                     None,
                     None,
                 ));
-                Strategy::Unhandled
+                Some(Strategy::Unhandled)
             } else {
                 let availability = group_availability(manifest, group_index, spec.disposition);
                 if let Some(outcome) = availability {
@@ -682,7 +679,7 @@ fn resolve_groups(
                         }),
                         None,
                     ));
-                    first_supported_group_strategy(manifest, group_index, config)
+                    independent_joint_group_strategy(manifest, group_index, config)
                 } else {
                     let failures = group_failures(manifest, group_index, spec.disposition);
                     if failures.is_empty() {
@@ -699,7 +696,7 @@ fn resolve_groups(
                             None,
                             None,
                         ));
-                        spec.disposition
+                        Some(spec.disposition)
                     } else if spec.accept_risk {
                         record_honored_group(
                             &mut manifest.coupling_groups[group_index],
@@ -732,7 +729,7 @@ fn resolve_groups(
                             failures: Some(failures),
                             extra: Extra::new(),
                         });
-                        spec.disposition
+                        Some(spec.disposition)
                     } else {
                         entries.push(report_entry(
                             OverrideScope::Group,
@@ -742,18 +739,23 @@ fn resolve_groups(
                             Some("group strategy guard failed and accept_risk was not set".into()),
                             Some(failures),
                         ));
-                        first_supported_group_strategy(manifest, group_index, config)
+                        independent_joint_group_strategy(manifest, group_index, config)
                     }
                 }
             }
         } else {
-            let chosen = first_supported_group_strategy(manifest, group_index, config);
-            let group = &mut manifest.coupling_groups[group_index];
-            group.group_provenance = Some(GroupProvenance::Cascade);
-            group.r#override = None;
-            chosen
+            independent_joint_group_strategy(manifest, group_index, config)
         };
 
+        let Some(chosen) = chosen else {
+            manifest.coupling_groups[group_index].group_disposition = None;
+            manifest.coupling_groups[group_index].group_provenance = None;
+            manifest.coupling_groups[group_index].r#override = None;
+            continue;
+        };
+        if override_spec.is_none() {
+            manifest.coupling_groups[group_index].group_provenance = Some(GroupProvenance::Cascade);
+        }
         manifest.coupling_groups[group_index].group_disposition = Some(chosen);
         for key in member_keys {
             if let Some(global) = manifest.globals.iter_mut().find(|global| global.key == key) {
@@ -805,17 +807,36 @@ fn record_honored_group(
     });
 }
 
-fn first_supported_group_strategy(
+/// Select an automatic group representation only when it preserves every independently selected
+/// per-global transformation. Once those are excluded, choose the first supported joint strategy
+/// in cascade order and apply it uniformly to the group.
+fn independent_joint_group_strategy(
     manifest: &Manifest,
     group_index: usize,
     config: &CascadeConfig,
-) -> Strategy {
+) -> Option<Strategy> {
+    let group = &manifest.coupling_groups[group_index];
+    for key in &group.members {
+        let chosen = manifest
+            .globals
+            .iter()
+            .find(|global| &global.key == key)?
+            .disposition
+            .as_ref()?
+            .cascade_chosen;
+        if matches!(
+            chosen,
+            Strategy::Immutable | Strategy::Atomic | Strategy::Localize
+        ) {
+            return None;
+        }
+    }
     config
         .order
         .iter()
         .copied()
+        .filter(|strategy| matches!(strategy, Strategy::OnceLock | Strategy::Mutex))
         .find(|strategy| group_failures(manifest, group_index, *strategy).is_empty())
-        .unwrap_or(Strategy::Unhandled)
 }
 
 fn group_availability(
@@ -1829,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_member_group_does_not_veto_atomic() {
+    fn per_global_atomic_results_do_not_create_a_group_disposition() {
         let mut facts = base_facts();
         facts.written.value = true;
         facts.atomic_eligibility = Some(certified());
@@ -1843,14 +1864,169 @@ mod tests {
 
         apply_policy(&mut manifest, &mut ledger, &config, None, None, None).unwrap();
 
-        assert_eq!(
-            manifest.coupling_groups[0].group_disposition,
-            Some(Strategy::Atomic)
-        );
+        assert_eq!(manifest.coupling_groups[0].group_disposition, None);
         assert!(manifest
             .globals
             .iter()
             .all(|global| { global.disposition.as_ref().unwrap().chosen == Strategy::Atomic }));
+    }
+
+    #[test]
+    fn group_preserves_mixed_independent_immutable_results() {
+        let mut manifest = manifest_with(base_facts());
+        add_two_member_group(&mut manifest);
+        manifest.globals[1].facts.written.value = true;
+        let mut ledger = Vec::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Immutable],
+        };
+
+        apply_policy(&mut manifest, &mut ledger, &config, None, None, None).unwrap();
+
+        assert_eq!(manifest.coupling_groups[0].group_disposition, None);
+        assert_eq!(
+            manifest.globals[0].disposition.as_ref().unwrap().chosen,
+            Strategy::Immutable
+        );
+        assert_eq!(
+            manifest.globals[1].disposition.as_ref().unwrap().chosen,
+            Strategy::Unhandled
+        );
+    }
+
+    #[test]
+    fn group_preserves_mixed_independent_localization_results() {
+        let mut facts = base_facts();
+        facts.written.value = true;
+        facts.localization = Some(ok_localization());
+        let mut manifest = manifest_with(facts);
+        add_two_member_group(&mut manifest);
+        manifest.globals[1].facts.localization = None;
+        let mut ledger = Vec::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Localize],
+        };
+
+        apply_policy(&mut manifest, &mut ledger, &config, None, None, None).unwrap();
+
+        assert_eq!(manifest.coupling_groups[0].group_disposition, None);
+        assert_eq!(
+            manifest.globals[0].disposition.as_ref().unwrap().chosen,
+            Strategy::Localize
+        );
+        assert_eq!(
+            manifest.globals[1].disposition.as_ref().unwrap().chosen,
+            Strategy::Unhandled
+        );
+    }
+
+    #[test]
+    fn unanimous_mutex_selection_uses_the_joint_group_representation() {
+        let mut facts = base_facts();
+        facts.written.value = true;
+        facts.mutex_eligibility = Some(certified());
+        let mut manifest = manifest_with(facts);
+        add_two_member_group(&mut manifest);
+        manifest.coupling_groups[0].strategy_support.mutex = Some(certified());
+        let mut ledger = Vec::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Mutex],
+        };
+
+        apply_policy(&mut manifest, &mut ledger, &config, None, None, None).unwrap();
+
+        assert_eq!(
+            manifest.coupling_groups[0].group_disposition,
+            Some(Strategy::Mutex)
+        );
+        assert!(manifest
+            .globals
+            .iter()
+            .all(|global| { global.disposition.as_ref().unwrap().chosen == Strategy::Mutex }));
+    }
+
+    #[test]
+    fn supported_joint_mutex_unifies_non_per_global_fallbacks() {
+        let mut facts = base_facts();
+        facts.written.value = true;
+        facts.phase_stationarity = Some(certified());
+        facts.mutex_eligibility = Some(certified());
+        let mut manifest = manifest_with(facts);
+        add_two_member_group(&mut manifest);
+        manifest.globals[1].facts.phase_stationarity = None;
+        manifest.coupling_groups[0].strategy_support.mutex = Some(certified());
+        let mut ledger = Vec::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::OnceLock, Strategy::Mutex],
+        };
+
+        apply_policy(&mut manifest, &mut ledger, &config, None, None, None).unwrap();
+
+        assert_eq!(
+            manifest.coupling_groups[0].group_disposition,
+            Some(Strategy::Mutex)
+        );
+        assert_eq!(
+            manifest.globals[0]
+                .disposition
+                .as_ref()
+                .unwrap()
+                .cascade_chosen,
+            Strategy::OnceLock
+        );
+        assert!(manifest
+            .globals
+            .iter()
+            .all(|global| { global.disposition.as_ref().unwrap().chosen == Strategy::Mutex }));
+    }
+
+    #[test]
+    fn per_global_strategy_is_rejected_at_group_override_scope() {
+        let mut facts = base_facts();
+        facts.written.value = true;
+        facts.atomic_eligibility = Some(certified());
+        let mut manifest = manifest_with(facts);
+        add_two_member_group(&mut manifest);
+        manifest.globals[1].facts.atomic_eligibility = None;
+        let mut overrides = Overrides::default();
+        overrides.groups.insert(
+            "grp-test".into(),
+            OverrideSpec {
+                disposition: Strategy::Atomic,
+                accept_risk: false,
+                reason: None,
+            },
+        );
+        let mut ledger = Vec::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Atomic],
+        };
+
+        let outcome = apply_policy(
+            &mut manifest,
+            &mut ledger,
+            &config,
+            Some(&overrides),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(outcome.override_problems);
+        assert_eq!(manifest.coupling_groups[0].group_disposition, None);
+        assert_eq!(
+            manifest.globals[0].disposition.as_ref().unwrap().chosen,
+            Strategy::Atomic
+        );
+        assert_eq!(
+            manifest.globals[1].disposition.as_ref().unwrap().chosen,
+            Strategy::Unhandled
+        );
     }
 
     #[test]
