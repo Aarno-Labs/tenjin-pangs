@@ -3928,6 +3928,20 @@ struct IndexedAccessLocation {
     loc: Option<LocInfo>,
 }
 
+fn global_target_bits(
+    global_count: usize,
+    targets: impl IntoIterator<Item = GlobalId>,
+) -> Rc<[u64]> {
+    let mut bits = vec![0; global_count.div_ceil(64)];
+    for global in targets {
+        let index = global.0 as usize;
+        if index < global_count {
+            bits[index / 64] |= 1_u64 << (index % 64);
+        }
+    }
+    bits.into()
+}
+
 /// Builds the compressed access-site relation.  Equal site metadata is unioned before storage,
 /// and equal target bitsets are interned when the finished ledger is assembled.
 struct AccessSiteBuilder {
@@ -3954,6 +3968,39 @@ impl AccessSiteBuilder {
             let index = global.0 as usize;
             if index < self.global_count {
                 bits[index / 64] |= 1_u64 << (index % 64);
+            }
+        }
+    }
+
+    fn push_target_bits(
+        &mut self,
+        key: AccessSiteKey,
+        targets: &[u64],
+        excluded: Option<GlobalId>,
+    ) {
+        let words = self.global_count.div_ceil(64);
+        debug_assert_eq!(targets.len(), words);
+        let bits = self.by_site.entry(key).or_insert_with(|| vec![0; words]);
+        let excluded = excluded.map(|global| global.0 as usize);
+        for (word_index, (bits, &targets)) in bits.iter_mut().zip(targets).enumerate() {
+            let mut targets = targets;
+            if let Some(index) = excluded {
+                if index / 64 == word_index {
+                    targets &= !(1_u64 << (index % 64));
+                }
+            }
+            *bits |= targets;
+        }
+    }
+
+    fn push_all_targets(&mut self, key: AccessSiteKey) {
+        let words = self.global_count.div_ceil(64);
+        let bits = self.by_site.entry(key).or_insert_with(|| vec![0; words]);
+        bits.fill(u64::MAX);
+        if let Some(last) = bits.last_mut() {
+            let tail = self.global_count % 64;
+            if tail != 0 {
+                *last = (1_u64 << tail) - 1;
             }
         }
     }
@@ -4670,6 +4717,7 @@ struct ModRefNodeSummaryData {
     external: bool,
     external_universal: bool,
     pointee_global_ids: Rc<[GlobalId]>,
+    pointee_global_bits: Rc<[u64]>,
     pointee_global_sample: Rc<[String]>,
     pointee_global_count: usize,
     unfiltered_pointee_global_count: usize,
@@ -5144,22 +5192,27 @@ fn build_modref_node_summary_data(
     label: &str,
     resolution: &NodeResolution,
     global_lookup: &HashMap<String, GlobalId>,
-    pointee_global_id_cache: &mut HashMap<(usize, usize), Rc<[GlobalId]>>,
+    pointee_global_cache: &mut HashMap<(usize, usize), (Rc<[GlobalId]>, Rc<[u64]>)>,
 ) -> ModRefNodeSummaryData {
-    let pointee_global_ids =
-        if let Some(ids) = pointee_global_id_cache.get(&resolution.pointee_globals.cache_key()) {
-            Rc::clone(ids)
-        } else {
-            let ids = Rc::<[GlobalId]>::from(
-                resolution
-                    .pointee_globals
-                    .iter()
-                    .filter_map(|global_key| global_lookup.get(global_key).copied())
-                    .collect::<Vec<_>>(),
-            );
-            pointee_global_id_cache.insert(resolution.pointee_globals.cache_key(), Rc::clone(&ids));
-            ids
-        };
+    let (pointee_global_ids, pointee_global_bits) = if let Some((ids, bits)) =
+        pointee_global_cache.get(&resolution.pointee_globals.cache_key())
+    {
+        (Rc::clone(ids), Rc::clone(bits))
+    } else {
+        let ids = Rc::<[GlobalId]>::from(
+            resolution
+                .pointee_globals
+                .iter()
+                .filter_map(|global_key| global_lookup.get(global_key).copied())
+                .collect::<Vec<_>>(),
+        );
+        let bits = global_target_bits(global_lookup.len(), ids.iter().copied());
+        pointee_global_cache.insert(
+            resolution.pointee_globals.cache_key(),
+            (Rc::clone(&ids), Rc::clone(&bits)),
+        );
+        (ids, bits)
+    };
     let direct_symbol_global = label
         .strip_prefix("sym:global:")
         .and_then(|global_key| global_lookup.get(global_key).copied());
@@ -5184,6 +5237,7 @@ fn build_modref_node_summary_data(
         external: resolution.external,
         external_universal: resolution.external_universal,
         pointee_global_ids,
+        pointee_global_bits,
         pointee_global_sample,
         pointee_global_count: resolution.pointee_globals.len(),
         unfiltered_pointee_global_count,
@@ -5330,7 +5384,7 @@ fn push_pointer_modrefs_from_pag(
     let mut node_summaries = Vec::new();
     node_summaries.resize_with(pag.nodes.len(), || None);
     let mut summary_data_by_label = HashMap::new();
-    let mut pointee_global_id_cache = HashMap::new();
+    let mut pointee_global_cache = HashMap::new();
     let mut missing_nodes = vec![false; pag.nodes.len()];
     let mut local_accesses = LocalPointerAccessRows::new(pag.nodes.len());
     let mut local_rows = LocalPointerModRefRows::new(global_lookup.len());
@@ -5378,7 +5432,7 @@ fn push_pointer_modrefs_from_pag(
                         &node.label,
                         resolution,
                         global_lookup,
-                        &mut pointee_global_id_cache,
+                        &mut pointee_global_cache,
                     ));
                     summary_data_by_label.insert(node.label.as_str(), Rc::clone(&data));
                     data
@@ -5447,36 +5501,31 @@ fn push_pointer_modrefs_from_pag(
                 flush_local_pointer_modref_rows(modrefs, active_func, &mut local_rows);
             }
 
-            let mut site_globals = summary
-                .pointee_global_ids
-                .iter()
-                .copied()
-                .filter(|gid| {
-                    !(pointer_access.suppress_direct_symbol
-                        && summary.direct_symbol_global == Some(*gid))
-                })
-                .collect::<Vec<_>>();
-            if summary.external_universal {
-                site_globals.extend((0..global_lookup.len()).map(|index| GlobalId(index as u32)));
-                site_globals.sort();
-                site_globals.dedup();
-            }
-            access_sites.push_targets(
-                AccessSiteKey {
-                    func,
-                    access: pointer_access.access,
-                    via: if summary.external {
-                        Via::Unknown
-                    } else {
-                        Via::Aliased
-                    },
-                    volatile: pointer_access.volatile,
-                    atomic_rmw: None,
-                    loc: site_loc.clone(),
-                    statement_index: None,
+            let site_key = AccessSiteKey {
+                func,
+                access: pointer_access.access,
+                via: if summary.external {
+                    Via::Unknown
+                } else {
+                    Via::Aliased
                 },
-                site_globals,
-            );
+                volatile: pointer_access.volatile,
+                atomic_rmw: None,
+                loc: site_loc.clone(),
+                statement_index: None,
+            };
+            if summary.external_universal {
+                access_sites.push_all_targets(site_key);
+            } else {
+                access_sites.push_target_bits(
+                    site_key,
+                    &summary.pointee_global_bits,
+                    pointer_access
+                        .suppress_direct_symbol
+                        .then_some(summary.direct_symbol_global)
+                        .flatten(),
+                );
+            }
 
             if phase == ModRefSourcePhase::PagPointer {
                 local_accesses.push(
@@ -5636,6 +5685,7 @@ fn push_pointer_memset_modrefs_from_pir(
     noloc_ord: &mut BTreeMap<(String, String), u32>,
 ) {
     let high_fanout_limit = pointer_modref_high_fanout_limit();
+    let mut pointee_global_bits_cache = HashMap::new();
     for func in &module.functions {
         let Some(&func_id) = func_lookup.get(&func.key) else {
             continue;
@@ -5697,32 +5747,35 @@ fn push_pointer_memset_modrefs_from_pir(
                 continue;
             };
             let witness = witness_key(&func.key, loc, noloc_ord, "global");
-            let mut site_globals = resolution
-                .pointee_globals
-                .iter()
-                .filter_map(|key| global_lookup.get(key).copied())
-                .collect::<Vec<_>>();
-            if resolution.external_universal {
-                site_globals.extend((0..global_lookup.len()).map(|index| GlobalId(index as u32)));
-                site_globals.sort();
-                site_globals.dedup();
-            }
-            access_sites.push_targets(
-                AccessSiteKey {
-                    func: func_id,
-                    access: Access::Mod,
-                    via: if resolution.external {
-                        Via::Unknown
-                    } else {
-                        Via::Aliased
-                    },
-                    volatile: false,
-                    atomic_rmw: None,
-                    loc: loc.as_ref().map(loc_info),
-                    statement_index: Some(statement_index as u32),
+            let site_key = AccessSiteKey {
+                func: func_id,
+                access: Access::Mod,
+                via: if resolution.external {
+                    Via::Unknown
+                } else {
+                    Via::Aliased
                 },
-                site_globals,
-            );
+                volatile: false,
+                atomic_rmw: None,
+                loc: loc.as_ref().map(loc_info),
+                statement_index: Some(statement_index as u32),
+            };
+            if resolution.external_universal {
+                access_sites.push_all_targets(site_key);
+            } else {
+                let bits = pointee_global_bits_cache
+                    .entry(resolution.pointee_globals.cache_key())
+                    .or_insert_with(|| {
+                        global_target_bits(
+                            global_lookup.len(),
+                            resolution
+                                .pointee_globals
+                                .iter()
+                                .filter_map(|key| global_lookup.get(key).copied()),
+                        )
+                    });
+                access_sites.push_target_bits(site_key, bits, None);
+            }
             let fanout = resolution
                 .pointee_globals
                 .iter()
@@ -7098,7 +7151,9 @@ mod access_site_tests {
 
     use pangs_pir::Access;
 
-    use super::{AccessSiteBuilder, AccessSiteKey, FuncId, GlobalId, LocInfo, Via};
+    use super::{
+        global_target_bits, AccessSiteBuilder, AccessSiteKey, FuncId, GlobalId, LocInfo, Via,
+    };
 
     fn key(func: u32, statement_index: Option<u32>) -> AccessSiteKey {
         AccessSiteKey {
@@ -7142,6 +7197,26 @@ mod access_site_tests {
 
         let same_targets = sites.iter().find(|site| site.func == FuncId(1)).unwrap();
         assert!(Rc::ptr_eq(&location_only.targets, &same_targets.targets));
+    }
+
+    #[test]
+    fn cached_target_bits_preserve_exclusions_and_module_wide_tail() {
+        let mut builder = AccessSiteBuilder::new(70);
+        let first = global_target_bits(70, [GlobalId(0), GlobalId(1), GlobalId(65)]);
+        let second = global_target_bits(70, [GlobalId(1), GlobalId(2)]);
+        builder.push_target_bits(key(0, None), &first, Some(GlobalId(1)));
+        builder.push_target_bits(key(0, None), &second, Some(GlobalId(2)));
+        builder.push_all_targets(key(1, None));
+
+        let sites = builder.finish();
+        let finite = sites.iter().find(|site| site.func == FuncId(0)).unwrap();
+        assert_eq!(
+            finite.globals().collect::<Vec<_>>(),
+            vec![GlobalId(0), GlobalId(1), GlobalId(65)]
+        );
+        let module_wide = sites.iter().find(|site| site.func == FuncId(1)).unwrap();
+        assert_eq!(module_wide.target_count(), 70);
+        assert_eq!(module_wide.globals().last(), Some(GlobalId(69)));
     }
 }
 
