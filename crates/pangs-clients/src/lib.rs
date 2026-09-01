@@ -2495,6 +2495,10 @@ fn assemble_group_mutex_support(
     globals: &[DispositionGlobal],
     groups: &mut [CouplingGroup],
 ) {
+    if groups.is_empty() {
+        return;
+    }
+
     let global_by_key = globals
         .iter()
         .map(|global| (global.key.clone(), global))
