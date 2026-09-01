@@ -13,7 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 pub type Extra = BTreeMap<String, Value>;
 
 #[derive(Debug, Error)]
@@ -402,7 +402,8 @@ pub enum LocalizationVerdict {
 pub struct Localization {
     pub component: String,
     pub verdict: LocalizationVerdict,
-    pub blockers: Vec<LocalizationBlocker>,
+    pub blocker_count: usize,
+    pub blocker_samples: Vec<LocalizationBlocker>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -483,9 +484,12 @@ impl Facts {
         }
         if let Some(localization) = &self.localization {
             let blockers_expected = localization.verdict == LocalizationVerdict::Blocked;
-            if blockers_expected == localization.blockers.is_empty() {
+            if blockers_expected != (localization.blocker_count > 0)
+                || (localization.blocker_count > 0) != !localization.blocker_samples.is_empty()
+                || localization.blocker_samples.len() > localization.blocker_count
+            {
                 return Err(Error::InvalidInvariant(
-                    "localization blockers must be non-empty exactly when blocked".into(),
+                    "localization blocker count and samples must be present exactly when blocked, and samples cannot exceed the count".into(),
                 ));
             }
         }
@@ -1236,7 +1240,7 @@ fn canonicalize_facts(facts: &mut Facts) {
     }
     if let Some(localization) = &mut facts.localization {
         localization
-            .blockers
+            .blocker_samples
             .sort_by(|a, b| witness_cmp(&a.witness, &b.witness).then_with(|| a.code.cmp(&b.code)));
     }
 }

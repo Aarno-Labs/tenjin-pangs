@@ -146,7 +146,7 @@ Per-global facts, with producers:
 | `atomic_eligibility` | certificate slot | D3 access-lowering pass (§9) | implemented |
 | `mutex_eligibility` | certificate slot | D4 final-call-graph reentrancy pass (§9) | implemented |
 | `coupling_group` | group id | shared coupling analysis (§6) | implemented |
-| `localization` | localization verdict (null \| ok \| blocked+blockers) | existing client (`DESIGN.md` §7) | implemented |
+| `localization` | localization verdict with exact blocker count and deterministic sample | existing client (`DESIGN.md` §7) | implemented |
 
 Rule of construction: every fact is either derivable from the materialized solution in
 one scan, or it does not belong in the vector. Nothing here re-enters the solver.
@@ -266,7 +266,7 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
         "mutex_eligibility": { "status": "certified",
                                "certificate": { /* accessor set + lock recipe */ } },
         "coupling_group": "grp-cmd",
-        "localization": { "component": "comp-17", "verdict": "ok", "blockers": [] }
+        "localization": { "component": "comp-17", "verdict": "ok", "blocker_count": 0, "blocker_samples": [] }
       },
 
       "disposition": {
@@ -670,7 +670,7 @@ None of these amendments change A′–D′ or any solver semantics.
 Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
 
 - **D1 — manifest + policy stage (implemented).** Fact-vector assembly from existing
-  scans; cascade evaluation with trace; schema v5 emission; run-header reproducibility
+  scans; cascade evaluation with trace; schema v6 emission; run-header reproducibility
   fields. No new analysis.
 - **D2 — override machinery (implemented).** TOML parsing, §4.2 validation, override
   report, soundness-inventory append for accepted risks, CI exit-code discipline.

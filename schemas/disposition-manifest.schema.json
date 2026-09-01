@@ -4,7 +4,7 @@
   "type": "object",
   "required": ["schema_version", "run", "globals", "synthetic_globals", "unkeyed_globals", "coupling_groups"],
   "properties": {
-    "schema_version": { "const": 5 },
+    "schema_version": { "const": 6 },
     "run": { "$ref": "#/definitions/run" },
     "globals": {
       "type": "array",
@@ -259,11 +259,23 @@
         { "type": "null" },
         {
           "type": "object",
-          "required": ["component", "verdict", "blockers"],
+          "required": ["component", "verdict", "blocker_count", "blocker_samples"],
           "properties": {
             "component": { "type": "string" },
             "verdict": { "enum": ["ok", "blocked"] },
-            "blockers": { "type": "array" }
+            "blocker_count": { "type": "integer", "minimum": 0 },
+            "blocker_samples": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["code", "witness"],
+                "properties": {
+                  "code": { "type": "string" },
+                  "witness": { "type": "object" }
+                },
+                "additionalProperties": true
+              }
+            }
           },
           "additionalProperties": true
         }

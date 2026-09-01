@@ -59,7 +59,7 @@ fn contract_manifest() -> Manifest {
         })
     };
     serde_json::from_value(json!({
-        "schema_version": 5,
+        "schema_version": 6,
         "run": {
             "analysis": {
                 "pangs_git": "test",

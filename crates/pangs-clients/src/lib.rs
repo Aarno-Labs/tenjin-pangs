@@ -745,7 +745,7 @@ fn fold_localization(
     };
     if owner.component != member.component {
         owner.verdict = LocalizationVerdict::Blocked;
-        owner.blockers.push(LocalizationBlocker {
+        let mismatch = LocalizationBlocker {
             code: "storage-closure-component-mismatch".into(),
             witness: Witness {
                 kind: "storage-closure-component-mismatch".into(),
@@ -758,12 +758,54 @@ fn fold_localization(
                 extra: Extra::new(),
             },
             extra: Extra::new(),
-        });
+        };
+        merge_localization_blockers(&mut owner, 1, vec![mismatch]);
     } else if member.verdict == LocalizationVerdict::Blocked {
         owner.verdict = LocalizationVerdict::Blocked;
-        owner.blockers.extend(member.blockers);
+        merge_localization_blockers(&mut owner, member.blocker_count, member.blocker_samples);
     }
     Some(owner)
+}
+
+fn merge_localization_blockers(
+    owner: &mut Localization,
+    count: usize,
+    samples: Vec<LocalizationBlocker>,
+) {
+    owner.blocker_count = owner
+        .blocker_count
+        .checked_add(count)
+        .expect("localization blocker count overflow");
+    if let Some(sample) = samples
+        .into_iter()
+        .chain(owner.blocker_samples.drain(..))
+        .min_by(localization_blocker_cmp)
+    {
+        owner.blocker_samples.push(sample);
+    }
+}
+
+fn localization_blocker_cmp(
+    left: &LocalizationBlocker,
+    right: &LocalizationBlocker,
+) -> std::cmp::Ordering {
+    (
+        &left.witness.kind,
+        left.witness.site.as_ref().map(|site| &site.file),
+        left.witness.site.as_ref().map(|site| site.line),
+        left.witness.site.as_ref().and_then(|site| site.col),
+        &left.witness.symbol,
+        &left.witness.note,
+    )
+        .cmp(&(
+            &right.witness.kind,
+            right.witness.site.as_ref().map(|site| &site.file),
+            right.witness.site.as_ref().map(|site| site.line),
+            right.witness.site.as_ref().and_then(|site| site.col),
+            &right.witness.symbol,
+            &right.witness.note,
+        ))
+        .then_with(|| left.code.cmp(&right.code))
 }
 
 #[derive(Default)]
@@ -3705,7 +3747,10 @@ fn localization_index(analysis: &Analysis) -> Vec<Option<Localization>> {
     let mut out = vec![None; analysis.globals().len()];
     let plan = analysis.context_rewrite_plan();
     for field in &plan.fields {
-        let blockers = field
+        let blocker_count = field.blockers.len();
+        // Keep samples as an array so a future diagnostic rerun can emit the full blocker list
+        // without another manifest schema change; normal analysis retains only the canonical one.
+        let blocker_samples = field
             .blockers
             .iter()
             .map(|blocker| LocalizationBlocker {
@@ -3726,15 +3771,18 @@ fn localization_index(analysis: &Analysis) -> Vec<Option<Localization>> {
                 },
                 extra: Extra::new(),
             })
-            .collect::<Vec<_>>();
+            .min_by(localization_blocker_cmp)
+            .into_iter()
+            .collect();
         out[field.global.0 as usize] = Some(Localization {
             component: plan.id.clone(),
-            verdict: if blockers.is_empty() {
+            verdict: if blocker_count == 0 {
                 LocalizationVerdict::Ok
             } else {
                 LocalizationVerdict::Blocked
             },
-            blockers,
+            blocker_count,
+            blocker_samples,
             extra: Extra::new(),
         });
     }
@@ -4678,8 +4726,8 @@ mod tests {
     use jsonschema::JSONSchema;
     use pangs_api::{Analysis, BuildMode, GlobalId, Opts, Stage};
     use pangs_manifest::{
-        AuditRecord, Certificate, Extra, GlobalRecord as DispositionGlobal, Key,
-        LocalizationVerdict, Manifest as DispositionManifest, Site,
+        AuditRecord, Certificate, Extra, GlobalRecord as DispositionGlobal, Key, Localization,
+        LocalizationBlocker, LocalizationVerdict, Manifest as DispositionManifest, Site, Witness,
     };
     use pangs_pir::Pir;
     use serde_json::json;
@@ -4688,10 +4736,41 @@ mod tests {
     use super::{
         assemble_disposition_artifacts, atomic_access_recipe, check_traces,
         classify_violation_relevance, coupling_group_id, export_analysis, load_schema_for_artifact,
-        localization_index, once_lock_pair_evidence, report, validate_export_dir,
-        validate_value_against_schema, violation_relevance_witness, CertifiedGroupEvidence,
-        ComponentsRecord, DispositionFactRows, ViolationRelevance,
+        localization_index, merge_localization_blockers, once_lock_pair_evidence, report,
+        validate_export_dir, validate_value_against_schema, violation_relevance_witness,
+        CertifiedGroupEvidence, ComponentsRecord, DispositionFactRows, ViolationRelevance,
     };
+
+    #[test]
+    fn localization_blocker_folding_keeps_exact_count_and_canonical_sample() {
+        let blocker = |kind: &str| LocalizationBlocker {
+            code: kind.into(),
+            witness: Witness {
+                kind: kind.into(),
+                site: None,
+                symbol: None,
+                note: None,
+                extra: Extra::new(),
+            },
+            extra: Extra::new(),
+        };
+        let mut localization = Localization {
+            component: "context-main".into(),
+            verdict: LocalizationVerdict::Blocked,
+            blocker_count: 1,
+            blocker_samples: vec![blocker("z-last")],
+            extra: Extra::new(),
+        };
+
+        merge_localization_blockers(&mut localization, 4, vec![blocker("a-first")]);
+        merge_localization_blockers(&mut localization, 3, Vec::new());
+
+        assert_eq!(localization.blocker_count, 8);
+        assert_eq!(
+            localization.blocker_samples.first().unwrap().code,
+            "a-first"
+        );
+    }
 
     fn group_site(line: u32) -> Site {
         Site {
@@ -5118,17 +5197,12 @@ mod tests {
             .clone();
 
         assert_eq!(localization.verdict, LocalizationVerdict::Blocked);
-        assert_eq!(localization.blockers.len(), 1);
+        assert_eq!(localization.blocker_count, 1);
+        let blocker = localization.blocker_samples.first().unwrap();
+        assert_eq!(blocker.code, "aggregate-initializer-address-dependency");
+        assert_eq!(blocker.witness.symbol.as_deref(), Some("address_table"));
         assert_eq!(
-            localization.blockers[0].code,
-            "aggregate-initializer-address-dependency"
-        );
-        assert_eq!(
-            localization.blockers[0].witness.symbol.as_deref(),
-            Some("address_table")
-        );
-        assert_eq!(
-            localization.blockers[0].witness.note.as_deref(),
+            blocker.witness.note.as_deref(),
             Some("static initializer for address_table retains the address of g_counter")
         );
 

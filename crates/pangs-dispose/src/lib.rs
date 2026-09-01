@@ -1073,7 +1073,7 @@ fn witness_for_guard(facts: &Facts, guard: &str) -> Witness {
         if let Some(witness) = facts
             .localization
             .as_ref()
-            .and_then(|value| value.blockers.first())
+            .and_then(|value| value.blocker_samples.first())
             .map(|blocker| &blocker.witness)
         {
             return witness.clone();
@@ -1333,7 +1333,8 @@ mod tests {
         Localization {
             component: "comp-1".into(),
             verdict: LocalizationVerdict::Ok,
-            blockers: Vec::new(),
+            blocker_count: 0,
+            blocker_samples: Vec::new(),
             extra: Extra::new(),
         }
     }
@@ -1466,7 +1467,8 @@ mod tests {
         facts.localization = Some(Localization {
             component: "comp-1".into(),
             verdict: LocalizationVerdict::Blocked,
-            blockers: vec![LocalizationBlocker {
+            blocker_count: 1,
+            blocker_samples: vec![LocalizationBlocker {
                 code: "unknown-caller-taint".into(),
                 witness: Witness {
                     kind: "unknown-caller-taint".into(),
@@ -1497,7 +1499,8 @@ mod tests {
         facts.localization = Some(Localization {
             component: "comp-1".into(),
             verdict: LocalizationVerdict::Ok,
-            blockers: Vec::new(),
+            blocker_count: 0,
+            blocker_samples: Vec::new(),
             extra: Extra::new(),
         });
         let config = CascadeConfig {
@@ -2088,7 +2091,8 @@ mod tests {
         facts.localization = Some(Localization {
             component: "component-main".into(),
             verdict: LocalizationVerdict::Ok,
-            blockers: Vec::new(),
+            blocker_count: 0,
+            blocker_samples: Vec::new(),
             extra: Extra::new(),
         });
         let mut manifest = manifest_with(facts);
