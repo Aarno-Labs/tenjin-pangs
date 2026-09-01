@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1148,6 +1150,8 @@ pub(crate) fn certificate_slots(
     let mut input_cache = BTreeMap::new();
     let callsites = callsites_by_statement(module);
     let mut descent_cache = DescentCache::default();
+    let callgraph = InternalCallgraph::new(analysis);
+    let mut phase_reachability_cache = BTreeMap::new();
     let mut slots = BTreeMap::new();
     let mut descent_depths = BTreeMap::new();
     let mut descent_exhausted = BTreeSet::new();
@@ -1222,6 +1226,8 @@ pub(crate) fn certificate_slots(
                 selection,
                 spawn_read_callsites,
                 escape_read_callsites,
+                &callgraph,
+                &mut phase_reachability_cache,
             ),
             Err(failure) => Err((selection_code(*failure), selection_witness(*failure))),
         };
@@ -1392,7 +1398,6 @@ fn phase_report(
     })
 }
 
-#[derive(Default)]
 struct PhaseReachability {
     pre: BTreeSet<FuncId>,
     post: BTreeSet<FuncId>,
@@ -1400,7 +1405,30 @@ struct PhaseReachability {
     /// Only direct targets of a pre-publication spine call carry that outer callsite. Functions
     /// reached below them remain in the init subtree with an empty `spine_call_sites` list.
     pre_entry_sites: BTreeMap<FuncId, BTreeSet<CallsiteId>>,
-    internal_edges: BTreeMap<FuncId, BTreeSet<FuncId>>,
+    reverse_pre: ReverseReachability,
+}
+
+struct InternalCallgraph {
+    outgoing: Vec<Vec<FuncId>>,
+}
+
+impl InternalCallgraph {
+    fn new(analysis: &Analysis) -> Self {
+        let mut outgoing = vec![Vec::new(); analysis.functions().len()];
+        for edge in analysis.call_edges() {
+            let (Caller::Func(caller), Callee::Func(callee)) = (&edge.caller, &edge.callee) else {
+                continue;
+            };
+            if !analysis.functions()[*callee].external {
+                outgoing[caller.0 as usize].push(*callee);
+            }
+        }
+        for callees in &mut outgoing {
+            callees.sort_unstable();
+            callees.dedup();
+        }
+        Self { outgoing }
+    }
 }
 
 fn phase_reachability(
@@ -1409,6 +1437,7 @@ fn phase_reachability(
     spine: &SplicedSpine,
     selection: &PublicationSelection,
     dom: &[Vec<bool>],
+    callgraph: &InternalCallgraph,
 ) -> PhaseReachability {
     let spine_functions = spine
         .origins
@@ -1416,19 +1445,10 @@ fn phase_reachability(
         .map(|origin| origin.function)
         .collect::<BTreeSet<_>>();
     let callsites = callsites_by_statement(module);
-    let mut result = PhaseReachability::default();
-    for edge in analysis.call_edges() {
-        let (Caller::Func(caller), Callee::Func(callee)) = (&edge.caller, &edge.callee) else {
-            continue;
-        };
-        if !analysis.functions()[*callee].external {
-            result
-                .internal_edges
-                .entry(*caller)
-                .or_default()
-                .insert(*callee);
-        }
-    }
+    let mut pre = BTreeSet::new();
+    let mut post = BTreeSet::new();
+    let mut incomparable = BTreeSet::new();
+    let mut pre_entry_sites = BTreeMap::<FuncId, BTreeSet<CallsiteId>>::new();
 
     for (composite, origin) in spine.origins.iter().enumerate() {
         let Some(local_cfg) = module
@@ -1463,42 +1483,30 @@ fn phase_reachability(
                 .collect::<BTreeSet<_>>();
             if before {
                 for &root in &roots {
-                    result
-                        .pre_entry_sites
-                        .entry(root)
-                        .or_default()
-                        .insert(callsite);
+                    pre_entry_sites.entry(root).or_default().insert(callsite);
                 }
-                extend_reachable(
-                    &mut result.pre,
-                    &roots,
-                    &result.internal_edges,
-                    &spine_functions,
-                );
+                extend_reachable(&mut pre, &roots, callgraph, &spine_functions);
             } else if after {
-                extend_reachable(
-                    &mut result.post,
-                    &roots,
-                    &result.internal_edges,
-                    &spine_functions,
-                );
+                extend_reachable(&mut post, &roots, callgraph, &spine_functions);
             } else {
-                extend_reachable(
-                    &mut result.incomparable,
-                    &roots,
-                    &result.internal_edges,
-                    &spine_functions,
-                );
+                extend_reachable(&mut incomparable, &roots, callgraph, &spine_functions);
             }
         }
     }
-    result
+    let reverse_pre = ReverseReachability::new(&pre, &spine_functions, callgraph);
+    PhaseReachability {
+        pre,
+        post,
+        incomparable,
+        pre_entry_sites,
+        reverse_pre,
+    }
 }
 
 fn extend_reachable(
     reached: &mut BTreeSet<FuncId>,
     roots: &BTreeSet<FuncId>,
-    edges: &BTreeMap<FuncId, BTreeSet<FuncId>>,
+    callgraph: &InternalCallgraph,
     excluded: &BTreeSet<FuncId>,
 ) {
     let mut pending = roots.iter().copied().collect::<Vec<_>>();
@@ -1506,38 +1514,183 @@ fn extend_reachable(
         if excluded.contains(&function) || !reached.insert(function) {
             continue;
         }
-        pending.extend(edges.get(&function).into_iter().flatten().copied());
+        pending.extend(callgraph.outgoing[function.0 as usize].iter().copied());
     }
 }
 
 fn init_subtree_functions(
     reachability: &PhaseReachability,
     relevant: &BTreeSet<FuncId>,
-    excluded: &BTreeSet<FuncId>,
-) -> BTreeSet<FuncId> {
-    let mut reverse = BTreeMap::<FuncId, BTreeSet<FuncId>>::new();
-    for (&caller, callees) in &reachability.internal_edges {
-        if !reachability.pre.contains(&caller) || excluded.contains(&caller) {
-            continue;
+) -> Rc<[FuncId]> {
+    reachability.reverse_pre.reverse_reachable(relevant)
+}
+
+/// Reverse reachability over the SCC condensation of one distinct pre-publication subgraph.
+/// Queries are keyed by relevant SCCs, and equal result sets share one allocation.
+struct ReverseReachability {
+    scc_of: Vec<usize>,
+    members: Vec<Vec<FuncId>>,
+    predecessors: Vec<Vec<usize>>,
+    query_cache: RefCell<HashMap<Vec<usize>, Rc<[FuncId]>>>,
+    set_interner: RefCell<HashMap<Vec<FuncId>, Rc<[FuncId]>>>,
+}
+
+impl ReverseReachability {
+    fn new(
+        allowed: &BTreeSet<FuncId>,
+        excluded: &BTreeSet<FuncId>,
+        callgraph: &InternalCallgraph,
+    ) -> Self {
+        let mut induced = vec![Vec::new(); callgraph.outgoing.len()];
+        for &caller in allowed {
+            if excluded.contains(&caller) {
+                continue;
+            }
+            induced[caller.0 as usize].extend(
+                callgraph.outgoing[caller.0 as usize]
+                    .iter()
+                    .filter(|callee| allowed.contains(callee) && !excluded.contains(callee))
+                    .map(|callee| callee.0 as usize),
+            );
         }
-        for &callee in callees {
-            if reachability.pre.contains(&callee) && !excluded.contains(&callee) {
-                reverse.entry(callee).or_default().insert(caller);
+        let (raw_members, scc_of) = strongly_connected_components(&induced);
+        let members = raw_members
+            .into_iter()
+            .map(|component| {
+                component
+                    .into_iter()
+                    .map(|index| FuncId(index as u32))
+                    .filter(|function| allowed.contains(function) && !excluded.contains(function))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut predecessors = vec![Vec::new(); members.len()];
+        for (caller, callees) in induced.iter().enumerate() {
+            let caller_scc = scc_of[caller];
+            for &callee in callees {
+                let callee_scc = scc_of[callee];
+                if caller_scc != callee_scc {
+                    predecessors[callee_scc].push(caller_scc);
+                }
+            }
+        }
+        for incoming in &mut predecessors {
+            incoming.sort_unstable();
+            incoming.dedup();
+        }
+        Self {
+            scc_of,
+            members,
+            predecessors,
+            query_cache: RefCell::new(HashMap::new()),
+            set_interner: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn reverse_reachable(&self, relevant: &BTreeSet<FuncId>) -> Rc<[FuncId]> {
+        let mut roots = relevant
+            .iter()
+            .filter(|function| self.members[self.scc_of[function.0 as usize]].contains(function))
+            .map(|function| self.scc_of[function.0 as usize])
+            .collect::<Vec<_>>();
+        roots.sort_unstable();
+        roots.dedup();
+        if let Some(cached) = self.query_cache.borrow().get(&roots) {
+            return Rc::clone(cached);
+        }
+
+        let mut seen = vec![false; self.members.len()];
+        let mut pending = roots.clone();
+        while let Some(scc) = pending.pop() {
+            if seen[scc] {
+                continue;
+            }
+            seen[scc] = true;
+            pending.extend(self.predecessors[scc].iter().copied());
+        }
+        let mut functions = seen
+            .iter()
+            .enumerate()
+            .filter(|(_, reached)| **reached)
+            .flat_map(|(scc, _)| self.members[scc].iter().copied())
+            .collect::<Vec<_>>();
+        functions.sort_unstable();
+        functions.dedup();
+        let existing = self.set_interner.borrow().get(&functions).cloned();
+        let interned = if let Some(existing) = existing {
+            existing
+        } else {
+            let interned = Rc::<[FuncId]>::from(functions.clone());
+            self.set_interner
+                .borrow_mut()
+                .insert(functions, Rc::clone(&interned));
+            interned
+        };
+        self.query_cache
+            .borrow_mut()
+            .insert(roots, Rc::clone(&interned));
+        interned
+    }
+}
+
+fn strongly_connected_components(edges: &[Vec<usize>]) -> (Vec<Vec<usize>>, Vec<usize>) {
+    struct Tarjan<'a> {
+        edges: &'a [Vec<usize>],
+        index: usize,
+        indices: Vec<Option<usize>>,
+        lowlink: Vec<usize>,
+        stack: Vec<usize>,
+        on_stack: Vec<bool>,
+        members: Vec<Vec<usize>>,
+        scc_of: Vec<usize>,
+    }
+    impl<'a> Tarjan<'a> {
+        fn visit(&mut self, node: usize) {
+            self.indices[node] = Some(self.index);
+            self.lowlink[node] = self.index;
+            self.index += 1;
+            self.stack.push(node);
+            self.on_stack[node] = true;
+            for &successor in &self.edges[node] {
+                if self.indices[successor].is_none() {
+                    self.visit(successor);
+                    self.lowlink[node] = self.lowlink[node].min(self.lowlink[successor]);
+                } else if self.on_stack[successor] {
+                    self.lowlink[node] = self.lowlink[node].min(self.indices[successor].unwrap());
+                }
+            }
+            if self.lowlink[node] == self.indices[node].unwrap() {
+                let mut component = Vec::new();
+                loop {
+                    let top = self.stack.pop().expect("SCC root must be on the stack");
+                    self.on_stack[top] = false;
+                    self.scc_of[top] = self.members.len();
+                    component.push(top);
+                    if top == node {
+                        break;
+                    }
+                }
+                component.sort_unstable();
+                self.members.push(component);
             }
         }
     }
-    let mut result = BTreeSet::new();
-    let mut pending = relevant
-        .iter()
-        .filter(|function| reachability.pre.contains(function) && !excluded.contains(function))
-        .copied()
-        .collect::<Vec<_>>();
-    while let Some(function) = pending.pop() {
-        if result.insert(function) {
-            pending.extend(reverse.get(&function).into_iter().flatten().copied());
+    let mut tarjan = Tarjan {
+        edges,
+        index: 0,
+        indices: vec![None; edges.len()],
+        lowlink: vec![0; edges.len()],
+        stack: Vec::new(),
+        on_stack: vec![false; edges.len()],
+        members: Vec::new(),
+        scc_of: vec![0; edges.len()],
+    };
+    for node in 0..edges.len() {
+        if tarjan.indices[node].is_none() {
+            tarjan.visit(node);
         }
     }
-    result
+    (tarjan.members, tarjan.scc_of)
 }
 
 #[allow(clippy::result_large_err)]
@@ -1549,12 +1702,28 @@ fn build_payload(
     selection: &PublicationSelection,
     spawn_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
     escape_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
+    callgraph: &InternalCallgraph,
+    phase_reachability_cache: &mut BTreeMap<(Vec<CallsiteId>, u32), Rc<PhaseReachability>>,
 ) -> Result<Value, (&'static str, Witness)> {
     let publication = boundary_site(analysis, &evaluation.spine, selection.chosen)?;
     let earliest = boundary_site(analysis, &evaluation.spine, selection.earliest)?;
     let latest = boundary_site(analysis, &evaluation.spine, selection.latest)?;
     let dom = dominators(&evaluation.spine.cfg);
-    let reachability = phase_reachability(analysis, module, &evaluation.spine, selection, &dom);
+    let cache_key = (evaluation.path.clone(), selection.chosen);
+    let reachability = if let Some(cached) = phase_reachability_cache.get(&cache_key) {
+        Rc::clone(cached)
+    } else {
+        let computed = Rc::new(phase_reachability(
+            analysis,
+            module,
+            &evaluation.spine,
+            selection,
+            &dom,
+            callgraph,
+        ));
+        phase_reachability_cache.insert(cache_key, Rc::clone(&computed));
+        computed
+    };
     let spine_functions = evaluation
         .spine
         .origins
@@ -1656,7 +1825,7 @@ fn build_payload(
         .take(crate::knobs::PHASE_FUNCTION_SAMPLE_LIMIT)
         .map(|function| analysis.functions()[*function].key.clone())
         .collect::<Vec<_>>();
-    let init_functions = init_subtree_functions(&reachability, &pre_functions, &spine_functions);
+    let init_functions = init_subtree_functions(&reachability, &pre_functions);
     let init_subtree = init_functions
         .into_iter()
         .map(|function| {
@@ -1668,7 +1837,7 @@ fn build_payload(
                 .filter_map(|callsite| analysis.callsites()[*callsite].loc.as_ref())
                 .map(|loc| json!({"file":loc.file,"line":loc.line,"col":loc.col}))
                 .collect::<Vec<_>>();
-            json!({"function": analysis.functions()[function].key, "spine_call_sites": sites})
+            json!({"function": analysis.functions()[*function].key, "spine_call_sites": sites})
         })
         .collect::<Vec<_>>();
     let path = evaluation
@@ -2215,6 +2384,7 @@ impl GlobalBits {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::rc::Rc;
 
     use pangs_api::{Analysis, BuildMode, CallsiteId, Opts, Stage};
     use pangs_manifest::Certificate;
@@ -2224,8 +2394,25 @@ mod tests {
     use super::{
         assemble_spine_inputs, certificate_slots, descent_candidate, evaluate_kill_rules,
         evaluate_with_descent, select_publication, splice_unique_call, FuncId, GlobalAccessSet,
-        GlobalId, Observation, Quiescence, SelectionFailure,
+        GlobalId, InternalCallgraph, Observation, Quiescence, ReverseReachability,
+        SelectionFailure,
     };
+
+    #[test]
+    fn reverse_reachability_collapses_sccs_and_interns_equal_function_sets() {
+        // 0 <-> 1 -> 2. Starting from either {2} or {1, 2} reaches the same predecessor set.
+        let callgraph = InternalCallgraph {
+            outgoing: vec![vec![FuncId(1)], vec![FuncId(0), FuncId(2)], vec![]],
+        };
+        let allowed = BTreeSet::from([FuncId(0), FuncId(1), FuncId(2)]);
+        let index = ReverseReachability::new(&allowed, &BTreeSet::new(), &callgraph);
+
+        let from_leaf = index.reverse_reachable(&BTreeSet::from([FuncId(2)]));
+        let from_cycle_and_leaf = index.reverse_reachable(&BTreeSet::from([FuncId(1), FuncId(2)]));
+
+        assert_eq!(&*from_leaf, &[FuncId(0), FuncId(1), FuncId(2)]);
+        assert!(Rc::ptr_eq(&from_leaf, &from_cycle_and_leaf));
+    }
 
     #[test]
     fn global_access_set_deduplicates_each_access_kind() {
