@@ -1743,6 +1743,55 @@ fn llvm_sys_lowers_global_initializer_select_pointer_flow_from_ll() {
 }
 
 #[test]
+fn llvm_sys_lowers_blockaddress_global_initializer_without_visiting_basic_block_operands() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("global_init_blockaddress.ll");
+    fs::write(
+        &ll_path,
+        r#"
+@dispatch = global [2 x i8*] [
+  i8* blockaddress(@match_at, %left),
+  i8* blockaddress(@match_at, %right)
+]
+
+define void @match_at(i1 %condition) {
+entry:
+  br i1 %condition, label %left, label %right
+
+left:
+  ret void
+
+right:
+  ret void
+}
+"#,
+    )
+    .unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    let block_addresses = pir
+        .global_init
+        .iter()
+        .filter(|stmt| {
+            matches!(
+                stmt,
+                Stmt::Unknown {
+                    op,
+                    operands,
+                    reason,
+                    ..
+                } if op == "constant_expr:constant"
+                    && operands == &["@match_at"]
+                    && reason == "global_initializer_pointer_constant"
+            )
+        })
+        .count();
+
+    assert_eq!(block_addresses, 2);
+    assert_eq!(pir.lowering.modeled_counts["global_init_store"], 2);
+}
+
+#[test]
 fn lowers_global_initializer_pointer_flow_from_ll() {
     let tmp = TempDir::new().unwrap();
     let ll_path = tmp.path().join("global_init.ll");

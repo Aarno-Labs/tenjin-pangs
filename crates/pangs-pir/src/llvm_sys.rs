@@ -4037,6 +4037,13 @@ unsafe fn constant_has_traversable_operands(value: LLVMValueRef) -> bool {
 }
 
 unsafe fn push_operands(value: LLVMValueRef, stack: &mut Vec<LLVMValueRef>) {
+    // BlockAddress has a function and a basic-block operand.  BasicBlock is an LLVM Value but
+    // not a User, so passing it to LLVMGetNumOperands aborts inside LLVM's cast<User>.  The
+    // containing function is the only pointer target relevant to these recursive collectors.
+    if !LLVMIsABlockAddress(value).is_null() {
+        stack.push(LLVMGetOperand(value, 0));
+        return;
+    }
     let count = LLVMGetNumOperands(value);
     for index in (0..count).rev() {
         stack.push(LLVMGetOperand(value, index as u32));
