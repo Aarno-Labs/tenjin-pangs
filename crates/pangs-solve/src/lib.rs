@@ -897,6 +897,7 @@ struct Solver<'a> {
     function_object_nodes: Vec<Option<NodeId>>,
     global_keys: Vec<String>,
     global_object_nodes: Vec<Option<NodeId>>,
+    global_object_index_by_node: Vec<Option<usize>>,
     storage_roots: StorageRoots,
     global_address_exposed: Vec<bool>,
     violation_exposure: ViolationExposure,
@@ -907,10 +908,9 @@ struct Solver<'a> {
     empty_witness_copy_edges: Vec<(usize, usize)>,
     field_classes: HashMap<(NodeId, FieldRegion), usize>,
     fields_by_root: HashMap<NodeId, Vec<usize>>,
-    /// Export seeds are allocation-specific even when legacy unification later merges the
-    /// allocation's class with unrelated objects. Retain that precision for fields created after
-    /// seeding instead of copying the merged class's whole boundary envelope.
-    exported_field_escape_sources: HashMap<NodeId, BTreeSet<String>>,
+    /// Allocation-specific escape sources for certified fields. Retain this precision when
+    /// legacy unification merges the allocation's owner class with unrelated objects.
+    field_escape_sources_by_root: HashMap<NodeId, BTreeSet<String>>,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
     worklist: VecDeque<usize>,
     queued: Vec<bool>,
@@ -1547,6 +1547,12 @@ impl<'a> Solver<'a> {
         let callsites_by_index = pag.callsites.iter().collect();
         let queued = vec![false; classes.len()];
         let exact_addresses = exact_allocation_addresses(pag, &storage_roots);
+        let mut global_object_index_by_node = vec![None; pag.nodes.len()];
+        for (global_index, node) in global_object_nodes.iter().copied().enumerate() {
+            if let Some(node) = node {
+                global_object_index_by_node[node.0 as usize] = Some(global_index);
+            }
+        }
 
         Self {
             pir,
@@ -1559,6 +1565,7 @@ impl<'a> Solver<'a> {
             function_object_nodes,
             global_keys,
             global_object_nodes,
+            global_object_index_by_node,
             storage_roots,
             global_address_exposed,
             violation_exposure,
@@ -1566,7 +1573,7 @@ impl<'a> Solver<'a> {
             empty_witness_copy_edges: Vec::new(),
             field_classes: HashMap::new(),
             fields_by_root: HashMap::new(),
-            exported_field_escape_sources: HashMap::new(),
+            field_escape_sources_by_root: HashMap::new(),
             callsites_by_index,
             worklist: VecDeque::new(),
             queued,
@@ -1589,19 +1596,14 @@ impl<'a> Solver<'a> {
         self.apply_seeds();
         self.seed_main_entry_params();
 
-        loop {
-            while let Some(class) = self.worklist.pop_front() {
-                self.metrics.steens_worklist_pops += 1;
-                self.queued[class] = false;
-                let root = self.find(class);
-                self.process_class(root);
-            }
-            if !self.propagate_field_owner_facts() {
-                break;
-            }
+        while let Some(class) = self.worklist.pop_front() {
+            self.metrics.steens_worklist_pops += 1;
+            self.queued[class] = false;
+            let root = self.find(class);
+            self.process_class(root);
         }
         self.propagate_empty_witnesses();
-        self.assert_field_owner_coherence();
+        self.assert_field_root_coherence();
         self.assert_canonical_null_isolated();
         self.print_steens_profile("done");
     }
@@ -1833,14 +1835,7 @@ impl<'a> Solver<'a> {
                     };
                     self.set_esc_with_source(class, source.clone());
                     if seed.kind == OmegaSeedKind::ExportedSymbol {
-                        self.exported_field_escape_sources
-                            .entry(id)
-                            .or_default()
-                            .insert(source.clone());
-                        let fields = self.fields_by_root.get(&id).cloned().unwrap_or_default();
-                        for field in fields {
-                            self.set_esc_with_source(field, source.clone());
-                        }
+                        self.escape_allocation_fields(id, &BTreeSet::from([source.clone()]));
                     }
                 }
                 (OmegaSeedKind::PtrToInt, SeedTarget::Node(id))
@@ -1853,11 +1848,10 @@ impl<'a> Solver<'a> {
                         continue;
                     }
                     let pointee = self.pointee_of(class);
+                    let source = format!("{:?}:{}", seed.kind, self.pag.nodes[id.0 as usize].label);
+                    self.escape_exact_address_fields(id, &BTreeSet::from([source.clone()]));
                     self.add_class_provenance(pointee, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
-                    self.set_esc_with_source(
-                        pointee,
-                        format!("{:?}:{}", seed.kind, self.pag.nodes[id.0 as usize].label),
-                    );
+                    self.set_esc_with_source(pointee, source);
                 }
                 (OmegaSeedKind::IntToPtr, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
@@ -2460,6 +2454,7 @@ impl<'a> Solver<'a> {
                     if self.node_is_proven_empty(ret) {
                         continue;
                     }
+                    self.escape_exact_address_fields(ret, &escape_sources);
                     let class = self.class_of(ret);
                     let pointee = self.pointee_of(class);
                     self.set_esc_sources(pointee, &escape_sources);
@@ -2625,11 +2620,12 @@ impl<'a> Solver<'a> {
         self.metrics.steens_external_call_applications += 1;
         let callsite = self.callsites_by_index[site_index];
         let source = format!("external-call:{}", callsite.key);
-        for arg in &callsite.args {
-            if self.node_is_proven_empty(*arg) {
+        for &arg_node in &callsite.args {
+            if self.node_is_proven_empty(arg_node) {
                 continue;
             }
-            let arg = self.class_of(*arg);
+            self.escape_exact_address_fields(arg_node, &BTreeSet::from([source.clone()]));
+            let arg = self.class_of(arg_node);
             let pointee = self.pointee_of(arg);
             self.set_esc_with_source(pointee, source.clone());
         }
@@ -2650,6 +2646,7 @@ impl<'a> Solver<'a> {
             .copied()
             .collect::<Vec<_>>();
         for arg in extra_args {
+            self.escape_exact_address_fields(arg, &BTreeSet::from([source.clone()]));
             let class = self.class_of(arg);
             let root = self.find(class);
             let Some(pointee) = self.classes[root].pointee else {
@@ -2719,66 +2716,31 @@ impl<'a> Solver<'a> {
         }
     }
 
-    /// Allocation-relative fields inherit their allocation owner's complete tag and boundary
-    /// envelope. The owner may gain facts after the field was created, so this is part of the
-    /// solve fixed point rather than a creation-time snapshot.
-    fn propagate_field_owner_facts(&mut self) -> bool {
-        let edges = self
-            .fields_by_root
-            .iter()
-            .flat_map(|(&owner, fields)| fields.iter().copied().map(move |field| (owner, field)))
-            .collect::<Vec<_>>();
-        let mut changed = false;
-        for (owner_node, field) in edges {
-            let owner = self.class_of(owner_node);
-            let field = self.find(field);
-            if owner == field {
-                continue;
-            }
-            let owner_data = self.classes[owner].clone();
-            let old_globals = self.classes[field].global_objs.len();
-            let old_functions = self.classes[field].fn_objs.len();
-            self.classes[field]
-                .global_objs
-                .extend(owner_data.global_objs.iter().copied());
-            self.classes[field]
-                .fn_objs
-                .extend(owner_data.fn_objs.iter().copied());
-            if self.classes[field].global_objs.len() != old_globals
-                || self.classes[field].fn_objs.len() != old_functions
-            {
-                changed = true;
-                self.enqueue(field);
-            }
-            let old_boundary = (
-                self.classes[field].ext,
-                self.classes[field].universal,
-                self.classes[field].universal_sources.len(),
-                self.classes[field].esc,
-                self.classes[field].escape_sources.len(),
-            );
-            if owner_data.universal {
-                self.set_universal_ext_with_sources(field, &owner_data.universal_sources);
-            } else if owner_data.ext {
-                self.set_ext(field);
-            }
-            if owner_data.esc {
-                self.set_esc_sources(field, &owner_data.escape_sources);
-            }
-            let field = self.find(field);
-            changed |= old_boundary
-                != (
-                    self.classes[field].ext,
-                    self.classes[field].universal,
-                    self.classes[field].universal_sources.len(),
-                    self.classes[field].esc,
-                    self.classes[field].escape_sources.len(),
-                );
+    fn escape_allocation_fields(&mut self, root: NodeId, sources: &BTreeSet<String>) {
+        let sources_by_root = self.field_escape_sources_by_root.entry(root).or_default();
+        let already_escaped = !sources_by_root.is_empty();
+        sources_by_root.extend(sources.iter().cloned());
+        if already_escaped {
+            return;
         }
-        changed
+        let source = sources
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "derived:allocation-field-escape".into());
+        let fields = self.fields_by_root.get(&root).cloned().unwrap_or_default();
+        for field in fields {
+            self.set_esc_with_source(field, source.clone());
+        }
     }
 
-    fn assert_field_owner_coherence(&mut self) {
+    fn escape_exact_address_fields(&mut self, address: NodeId, sources: &BTreeSet<String>) {
+        if let Some(address) = self.exact_addresses[address.0 as usize] {
+            self.escape_allocation_fields(address.root, sources);
+        }
+    }
+
+    fn assert_field_root_coherence(&mut self) {
         let edges = self
             .fields_by_root
             .iter()
@@ -2787,17 +2749,13 @@ impl<'a> Solver<'a> {
         for (owner_node, field) in edges {
             let owner = self.class_of(owner_node);
             let field = self.find(field);
+            let expected_global = self.global_object_index_by_node[owner_node.0 as usize];
+            let expected_escape = self.field_escape_sources_by_root.contains_key(&owner_node);
             assert!(
-                self.classes[owner]
-                    .global_objs
-                    .is_subset(&self.classes[field].global_objs)
-                    && self.classes[owner]
-                        .fn_objs
-                        .is_subset(&self.classes[field].fn_objs)
-                    && (!self.classes[owner].ext || self.classes[field].ext)
-                    && (!self.classes[owner].universal || self.classes[field].universal)
-                    && (!self.classes[owner].esc || self.classes[field].esc),
-                "allocation-relative field class {field} lost owner envelope from class {owner}"
+                expected_global
+                    .is_none_or(|global| self.classes[field].global_objs.contains(&global))
+                    && (!expected_escape || self.classes[field].esc),
+                "allocation-relative field class {field} lost root envelope from class {owner}"
             );
         }
     }
@@ -2898,19 +2856,18 @@ impl<'a> Solver<'a> {
             size: 1,
             ..ClassData::default()
         };
-        let root_class = self.class_of(root);
-        let owner = self.classes[root_class].clone();
-        data.global_objs.extend(owner.global_objs.iter().copied());
-        data.fn_objs.extend(owner.fn_objs.iter().copied());
-        data.ext = owner.ext;
-        data.universal = owner.universal;
-        data.universal_sources = owner.universal_sources;
-        if let Some(sources) = self.exported_field_escape_sources.get(&root) {
+        if let Some(global_index) = self.global_object_index_by_node[root.0 as usize] {
+            data.global_objs.insert(global_index);
+        }
+        if let Some(sources) = self.field_escape_sources_by_root.get(&root) {
             data.esc = true;
-            data.escape_sources.extend(sources.iter().cloned());
-        } else {
-            data.esc = owner.esc;
-            data.escape_sources = owner.escape_sources;
+            data.escape_sources.insert(
+                sources
+                    .iter()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "derived:allocation-field-escape".into()),
+            );
         }
         self.classes.push(data);
         self.queued.push(false);
@@ -3342,7 +3299,7 @@ mod tests {
     }
 
     #[test]
-    fn fields_inherit_late_owner_tags_and_boundary_closure() {
+    fn fields_keep_exact_tags_and_root_specific_boundary_closure() {
         let pir = Pir {
             module: "field-owner-coherence".into(),
             source: None,
@@ -3380,21 +3337,38 @@ mod tests {
             &BTreeSet::from(["omega:test-owner".to_string()]),
         );
         solver.set_esc_with_source(owner, "test:owner-escape".into());
+        solver.escape_allocation_fields(
+            object("A"),
+            &BTreeSet::from(["test:exact-field-escape".to_string()]),
+        );
+        solver.escape_allocation_fields(
+            object("A"),
+            &BTreeSet::from(["test:later-root-witness".to_string()]),
+        );
 
-        while solver.propagate_field_owner_facts() {
-            while let Some(class) = solver.worklist.pop_front() {
-                solver.queued[class] = false;
-                let root = solver.find(class);
-                solver.process_class(root);
-            }
+        while let Some(class) = solver.worklist.pop_front() {
+            solver.queued[class] = false;
+            let root = solver.find(class);
+            solver.process_class(root);
         }
-        solver.assert_field_owner_coherence();
+        solver.assert_field_root_coherence();
 
         let field = solver.find(field);
-        assert_eq!(solver.classes[field].global_objs.len(), 2);
-        assert!(solver.classes[field].ext);
-        assert!(solver.classes[field].universal);
+        assert_eq!(solver.classes[field].global_objs.len(), 1);
+        assert!(solver.classes[field].global_objs.contains(&0));
+        assert!(solver.classes[field].fn_objs.is_empty());
+        assert!(!solver.classes[field].ext);
+        assert!(!solver.classes[field].universal);
         assert!(solver.classes[field].esc);
+        assert!(solver.classes[field]
+            .escape_sources
+            .contains("test:exact-field-escape"));
+        assert!(!solver.classes[field]
+            .escape_sources
+            .contains("test:later-root-witness"));
+        assert!(
+            solver.field_escape_sources_by_root[&object("A")].contains("test:later-root-witness")
+        );
         let contents = solver.find(contents);
         assert!(solver.classes[contents].ext);
         assert!(solver.classes[contents].esc);
