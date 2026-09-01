@@ -1245,7 +1245,14 @@ impl Analysis {
                                     via: Via::Direct,
                                     volatile: *volatile,
                                     atomic_rmw: (*access == Access::Mod)
-                                        .then(|| direct_atomic_rmw(&func.body, stmt_idx, global))
+                                        .then(|| {
+                                            direct_atomic_rmw(
+                                                &func.body,
+                                                stmt_idx,
+                                                global,
+                                                &module.lowering.scalar_phi_rmw,
+                                            )
+                                        })
                                         .flatten(),
                                     loc: loc.as_ref().map(loc_info),
                                     statement_index: Some(stmt_idx as u32),
@@ -2943,7 +2950,12 @@ fn signature_text(sig: &pangs_pir::Signature) -> String {
     format!("{:?}({:?})", sig.ret, sig.params)
 }
 
-fn direct_atomic_rmw(body: &[Stmt], mod_ref_index: usize, global: &str) -> Option<AtomicRmwAccess> {
+fn direct_atomic_rmw(
+    body: &[Stmt],
+    mod_ref_index: usize,
+    global: &str,
+    scalar_phi_rmw: &BTreeMap<String, pangs_pir::ScalarPhiRmwEvidence>,
+) -> Option<AtomicRmwAccess> {
     let store_index = mod_ref_index.checked_sub(1)?;
     let Stmt::Store {
         address,
@@ -2975,15 +2987,28 @@ fn direct_atomic_rmw(body: &[Stmt], mod_ref_index: usize, global: &str) -> Optio
     let (loaded, operand) = match op {
         ScalarOp::Sub => (lhs, rhs),
         ScalarOp::Add | ScalarOp::And | ScalarOp::Or | ScalarOp::Xor => {
-            if scalar_value_is_direct_global_load(body, operation_index, lhs, global, store_loc) {
+            if scalar_value_is_current_global(
+                body,
+                operation_index,
+                lhs,
+                global,
+                store_loc,
+                scalar_phi_rmw,
+            ) {
                 (lhs, rhs)
             } else {
                 (rhs, lhs)
             }
         }
     };
-    let reference_index =
-        direct_global_load_reference(body, operation_index, loaded, global, store_loc)?;
+    let reference_index = current_global_reference(
+        body,
+        operation_index,
+        loaded,
+        global,
+        store_loc,
+        scalar_phi_rmw,
+    )?;
     Some(AtomicRmwAccess {
         op: *op,
         operand: operand.clone(),
@@ -2992,14 +3017,30 @@ fn direct_atomic_rmw(body: &[Stmt], mod_ref_index: usize, global: &str) -> Optio
     })
 }
 
-fn scalar_value_is_direct_global_load(
+fn scalar_value_is_current_global(
     body: &[Stmt],
     before: usize,
     value: &str,
     global: &str,
     loc: &Option<pangs_pir::Loc>,
+    scalar_phi_rmw: &BTreeMap<String, pangs_pir::ScalarPhiRmwEvidence>,
 ) -> bool {
-    direct_global_load_reference(body, before, value, global, loc).is_some()
+    current_global_reference(body, before, value, global, loc, scalar_phi_rmw).is_some()
+}
+
+fn current_global_reference(
+    body: &[Stmt],
+    before: usize,
+    value: &str,
+    global: &str,
+    loc: &Option<pangs_pir::Loc>,
+    scalar_phi_rmw: &BTreeMap<String, pangs_pir::ScalarPhiRmwEvidence>,
+) -> Option<usize> {
+    direct_global_load_reference(body, before, value, global, loc).or_else(|| {
+        let evidence = scalar_phi_rmw.get(value)?;
+        same_global_address(&evidence.global, global)
+            .then(|| direct_global_load_reference(body, before, &evidence.reference, global, loc))?
+    })
 }
 
 fn direct_global_load_reference(
@@ -3037,6 +3078,89 @@ fn direct_global_load_reference(
 
 fn same_global_address(address: &str, global: &str) -> bool {
     address.strip_prefix('@').unwrap_or(address) == global.strip_prefix('@').unwrap_or(global)
+}
+
+#[cfg(test)]
+mod scalar_phi_rmw_tests {
+    use super::*;
+
+    fn loc() -> Option<pangs_pir::Loc> {
+        Some(pangs_pir::Loc {
+            file: "scalar-phi-rmw.c".into(),
+            line: 10,
+            col: 3,
+            dir: None,
+            filename: None,
+        })
+    }
+
+    fn body() -> Vec<Stmt> {
+        vec![
+            Stmt::Load {
+                dest: "%pre".into(),
+                address: "@g".into(),
+                volatile: false,
+                access_bytes: Some(4),
+                loc: loc(),
+            },
+            Stmt::GlobalRef {
+                global: "g".into(),
+                access: Access::Ref,
+                volatile: false,
+                loc: loc(),
+            },
+            Stmt::ScalarOp {
+                dest: "%next".into(),
+                op: ScalarOp::Add,
+                lhs: "%current".into(),
+                rhs: "1".into(),
+                loc: loc(),
+            },
+            Stmt::Store {
+                address: "@g".into(),
+                value: "%next".into(),
+                volatile: false,
+                access_bytes: Some(4),
+                loc: loc(),
+            },
+            Stmt::GlobalRef {
+                global: "g".into(),
+                access: Access::Mod,
+                volatile: false,
+                loc: loc(),
+            },
+        ]
+    }
+
+    #[test]
+    fn trusted_scalar_phi_evidence_supplies_the_reference_half_of_an_rmw() {
+        let evidence = BTreeMap::from([(
+            "%current".into(),
+            pangs_pir::ScalarPhiRmwEvidence {
+                global: "g".into(),
+                reference: "%pre".into(),
+            },
+        )]);
+
+        let rmw = direct_atomic_rmw(&body(), 4, "g", &evidence).unwrap();
+        assert_eq!(rmw.op, ScalarOp::Add);
+        assert_eq!(rmw.operand, "1");
+        assert_eq!(rmw.reference_statement_index, 1);
+        assert_eq!(rmw.operation_statement_index, 2);
+    }
+
+    #[test]
+    fn scalar_phi_evidence_for_another_global_fails_closed() {
+        let evidence = BTreeMap::from([(
+            "%current".into(),
+            pangs_pir::ScalarPhiRmwEvidence {
+                global: "other".into(),
+                reference: "%pre".into(),
+            },
+        )]);
+
+        assert!(direct_atomic_rmw(&body(), 4, "g", &evidence).is_none());
+    }
 }
 
 fn loc_info(loc: &pangs_pir::Loc) -> LocInfo {

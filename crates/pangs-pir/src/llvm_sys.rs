@@ -21,8 +21,9 @@ use llvm_sys::{
 use crate::knobs::{CONSTANT_EXPR_RECURSION_LIMIT, DEBUG_TYPE_RECURSION_LIMIT};
 use crate::{
     AbiClass, Access, Func, GepLane, Global, IntToPtrProvenanceTrace, Loc, LoweringStats, Param,
-    Pir, PirError, ScalarTypeClass, ScalarTypeEvidence, Signature, StatementBoundary, StatementCfg,
-    Stmt, SymbolLinkage, TargetInfo, TypeQualifiers, ValueKind, VarArgPosition,
+    Pir, PirError, ScalarPhiRmwEvidence, ScalarTypeClass, ScalarTypeEvidence, Signature,
+    StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo, TypeQualifiers, ValueKind,
+    VarArgPosition,
 };
 
 mod ptrint;
@@ -2043,7 +2044,7 @@ unsafe fn lower_instruction(
         LLVMOpcode::LLVMCall => lower_call(ctx, fctx, inst, body, lowering),
         LLVMOpcode::LLVMInvoke => lower_invoke(ctx, fctx, inst, body, lowering),
         LLVMOpcode::LLVMCallBr => lower_callbr(ctx, fctx, inst, body, lowering),
-        LLVMOpcode::LLVMPHI => lower_phi(fctx, inst, body, lowering),
+        LLVMOpcode::LLVMPHI => lower_phi(ctx, fctx, inst, body, lowering),
         LLVMOpcode::LLVMSelect => lower_select(fctx, inst, body, lowering),
         LLVMOpcode::LLVMFreeze => lower_freeze(fctx, inst, body, lowering),
         LLVMOpcode::LLVMExtractElement => lower_extract_element(fctx, inst, body, lowering),
@@ -2247,6 +2248,7 @@ unsafe fn lower_ifunc_call(
 }
 
 unsafe fn lower_phi(
+    ctx: &ModuleCtx,
     fctx: &mut FunctionCtx,
     inst: LLVMValueRef,
     body: &mut Vec<Stmt>,
@@ -2267,9 +2269,324 @@ unsafe fn lower_phi(
     {
         lowering.bump_tainted("phi_pointer_operand_non_pointer_result");
     } else {
+        if let Some((global, reference)) = recognize_scalar_phi_rmw(ctx, inst) {
+            let dest = fctx.local_key(inst);
+            let reference = fctx.operand_key(reference);
+            lowering
+                .scalar_phi_rmw
+                .insert(dest, ScalarPhiRmwEvidence { global, reference });
+        }
         lowering.bump_skipped("phi_non_pointer");
     }
     bump_missing_loc(lowering, "phi", inst);
+}
+
+/// Recognize the narrow PRE shape emitted for a source RMW at a join:
+///
+/// * one incoming edge carries a final, source-mapped direct load of the global;
+/// * the other carries the value of an exact direct load/op/store RMW of that global; and
+/// * the stored arm reaches its PHI edge through a unique predecessor chain containing no
+///   possible intervening write to the global.
+///
+/// This proof deliberately stays in LLVM lowering, where PHI incoming blocks and verified SSA
+/// dominance are available.  Only the representative direct load is retained for the later PIR
+/// access-recipe recognizer; arbitrary scalar PHIs remain unsupported.
+unsafe fn recognize_scalar_phi_rmw(
+    ctx: &ModuleCtx,
+    phi: LLVMValueRef,
+) -> Option<(String, LLVMValueRef)> {
+    if LLVMCountIncoming(phi) != 2 {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    let mut phi_use = LLVMGetFirstUse(phi);
+    while !phi_use.is_null() {
+        let operation = LLVMGetUser(phi_use);
+        if !scalar_operation_uses_current_value(operation, phi) {
+            phi_use = LLVMGetNextUse(phi_use);
+            continue;
+        }
+
+        let mut operation_use = LLVMGetFirstUse(operation);
+        while !operation_use.is_null() {
+            let store = LLVMGetUser(operation_use);
+            if !LLVMIsAInstruction(store).is_null()
+                && LLVMGetInstructionOpcode(store) == LLVMOpcode::LLVMStore
+                && LLVMGetOperand(store, 0) == operation
+            {
+                let address = LLVMGetOperand(store, 1);
+                if let Some(global) = direct_global_operand_name(ctx, address) {
+                    let phi_block = LLVMGetInstructionParent(phi);
+                    if LLVMGetInstructionParent(operation) != phi_block
+                        || LLVMGetInstructionParent(store) != phi_block
+                        || !block_range_preserves_global(
+                            ctx,
+                            LLVMGetNextInstruction(phi),
+                            operation,
+                            &global,
+                        )
+                        || !block_range_preserves_global(
+                            ctx,
+                            LLVMGetNextInstruction(operation),
+                            store,
+                            &global,
+                        )
+                    {
+                        operation_use = LLVMGetNextUse(operation_use);
+                        continue;
+                    }
+                    if let Some(reference) =
+                        scalar_phi_current_global_reference(ctx, phi, store, &global)
+                    {
+                        candidates.push((global, reference));
+                    }
+                }
+            }
+            operation_use = LLVMGetNextUse(operation_use);
+        }
+        phi_use = LLVMGetNextUse(phi_use);
+    }
+
+    candidates.sort_by_key(|(global, reference)| (global.clone(), *reference as usize));
+    candidates.dedup_by_key(|(global, reference)| (global.clone(), *reference as usize));
+    (candidates.len() == 1).then(|| candidates.pop().unwrap())
+}
+
+unsafe fn scalar_operation_uses_current_value(
+    operation: LLVMValueRef,
+    current: LLVMValueRef,
+) -> bool {
+    if LLVMIsAInstruction(operation).is_null() {
+        return false;
+    }
+    match LLVMGetInstructionOpcode(operation) {
+        LLVMOpcode::LLVMSub => LLVMGetOperand(operation, 0) == current,
+        LLVMOpcode::LLVMAdd | LLVMOpcode::LLVMAnd | LLVMOpcode::LLVMOr | LLVMOpcode::LLVMXor => {
+            LLVMGetOperand(operation, 0) == current || LLVMGetOperand(operation, 1) == current
+        }
+        _ => false,
+    }
+}
+
+unsafe fn scalar_phi_current_global_reference(
+    ctx: &ModuleCtx,
+    phi: LLVMValueRef,
+    final_store: LLVMValueRef,
+    global: &str,
+) -> Option<LLVMValueRef> {
+    let mut direct_reference = None;
+    let mut stored_arm = false;
+
+    for index in 0..LLVMCountIncoming(phi) {
+        let value = LLVMGetIncomingValue(phi, index);
+        let incoming_block = LLVMGetIncomingBlock(phi, index);
+        if scalar_phi_direct_load_arm(ctx, value, incoming_block, final_store, global) {
+            if direct_reference.replace(value).is_some() {
+                return None;
+            }
+        } else if scalar_phi_stored_rmw_arm(ctx, value, incoming_block, global) {
+            if stored_arm {
+                return None;
+            }
+            stored_arm = true;
+        } else {
+            return None;
+        }
+    }
+
+    if stored_arm {
+        direct_reference
+    } else {
+        None
+    }
+}
+
+unsafe fn scalar_phi_direct_load_arm(
+    ctx: &ModuleCtx,
+    value: LLVMValueRef,
+    incoming_block: LLVMBasicBlockRef,
+    final_store: LLVMValueRef,
+    global: &str,
+) -> bool {
+    !LLVMIsAInstruction(value).is_null()
+        && LLVMGetInstructionOpcode(value) == LLVMOpcode::LLVMLoad
+        && LLVMGetInstructionParent(value) == incoming_block
+        && direct_global_operand_name(ctx, LLVMGetOperand(value, 0)).as_deref() == Some(global)
+        && loc(value).is_some()
+        && loc(value) == loc(final_store)
+        && block_tail_preserves_global(ctx, LLVMGetNextInstruction(value), global)
+}
+
+unsafe fn scalar_phi_stored_rmw_arm(
+    ctx: &ModuleCtx,
+    value: LLVMValueRef,
+    incoming_block: LLVMBasicBlockRef,
+    global: &str,
+) -> bool {
+    if LLVMIsAInstruction(value).is_null() {
+        return false;
+    }
+    let loaded = match LLVMGetInstructionOpcode(value) {
+        LLVMOpcode::LLVMSub => scalar_direct_global_load(ctx, LLVMGetOperand(value, 0), global),
+        LLVMOpcode::LLVMAdd | LLVMOpcode::LLVMAnd | LLVMOpcode::LLVMOr | LLVMOpcode::LLVMXor => {
+            scalar_direct_global_load(ctx, LLVMGetOperand(value, 0), global)
+                .or_else(|| scalar_direct_global_load(ctx, LLVMGetOperand(value, 1), global))
+        }
+        _ => None,
+    };
+    let Some(loaded) = loaded else {
+        return false;
+    };
+    let value_block = LLVMGetInstructionParent(value);
+    if LLVMGetInstructionParent(loaded) != value_block
+        || !block_range_preserves_global(ctx, LLVMGetNextInstruction(loaded), value, global)
+    {
+        return false;
+    }
+
+    let store = next_non_debug_instruction(LLVMGetNextInstruction(value));
+    if store.is_null()
+        || LLVMGetInstructionOpcode(store) != LLVMOpcode::LLVMStore
+        || LLVMGetOperand(store, 0) != value
+        || direct_global_operand_name(ctx, LLVMGetOperand(store, 1)).as_deref() != Some(global)
+        || loc(value) != loc(store)
+    {
+        return false;
+    }
+
+    unique_predecessor_path_preserves_global(ctx, store, incoming_block, global)
+}
+
+unsafe fn scalar_direct_global_load(
+    ctx: &ModuleCtx,
+    value: LLVMValueRef,
+    global: &str,
+) -> Option<LLVMValueRef> {
+    (!LLVMIsAInstruction(value).is_null()
+        && LLVMGetInstructionOpcode(value) == LLVMOpcode::LLVMLoad
+        && direct_global_operand_name(ctx, LLVMGetOperand(value, 0)).as_deref() == Some(global))
+    .then_some(value)
+}
+
+unsafe fn direct_global_operand_name(ctx: &ModuleCtx, value: LLVMValueRef) -> Option<String> {
+    if LLVMIsAGlobalVariable(value).is_null() {
+        return None;
+    }
+    resolve_global_name(ctx, &value_name(value))
+}
+
+unsafe fn unique_predecessor_path_preserves_global(
+    ctx: &ModuleCtx,
+    store: LLVMValueRef,
+    incoming_block: LLVMBasicBlockRef,
+    global: &str,
+) -> bool {
+    let store_block = LLVMGetInstructionParent(store);
+    if !block_tail_preserves_global(ctx, LLVMGetNextInstruction(store), global) {
+        return false;
+    }
+
+    let function = LLVMGetBasicBlockParent(store_block);
+    let mut path = Vec::new();
+    let mut current = incoming_block;
+    let mut seen = BTreeSet::new();
+    while current != store_block {
+        if current.is_null() || !seen.insert(current as usize) {
+            return false;
+        }
+        path.push(current);
+        let predecessors = basic_block_predecessors(function, current);
+        if predecessors.len() != 1 {
+            return false;
+        }
+        current = predecessors[0];
+    }
+
+    path.into_iter()
+        .all(|block| block_tail_preserves_global(ctx, LLVMGetFirstInstruction(block), global))
+}
+
+unsafe fn basic_block_predecessors(
+    function: LLVMValueRef,
+    target: LLVMBasicBlockRef,
+) -> Vec<LLVMBasicBlockRef> {
+    let mut out = Vec::new();
+    let mut block = LLVMGetFirstBasicBlock(function);
+    while !block.is_null() {
+        let terminator = LLVMGetBasicBlockTerminator(block);
+        if !terminator.is_null()
+            && (0..LLVMGetNumSuccessors(terminator))
+                .any(|index| LLVMGetSuccessor(terminator, index) == target)
+        {
+            out.push(block);
+        }
+        block = LLVMGetNextBasicBlock(block);
+    }
+    out
+}
+
+unsafe fn block_range_preserves_global(
+    ctx: &ModuleCtx,
+    mut instruction: LLVMValueRef,
+    end: LLVMValueRef,
+    global: &str,
+) -> bool {
+    while !instruction.is_null() && instruction != end {
+        if instruction_may_write_global(ctx, instruction, global) {
+            return false;
+        }
+        instruction = LLVMGetNextInstruction(instruction);
+    }
+    instruction == end
+}
+
+unsafe fn block_tail_preserves_global(
+    ctx: &ModuleCtx,
+    mut instruction: LLVMValueRef,
+    global: &str,
+) -> bool {
+    while !instruction.is_null() {
+        if instruction_may_write_global(ctx, instruction, global) {
+            return false;
+        }
+        instruction = LLVMGetNextInstruction(instruction);
+    }
+    true
+}
+
+unsafe fn instruction_may_write_global(
+    ctx: &ModuleCtx,
+    instruction: LLVMValueRef,
+    global: &str,
+) -> bool {
+    match LLVMGetInstructionOpcode(instruction) {
+        LLVMOpcode::LLVMStore => direct_global_operand_name(ctx, LLVMGetOperand(instruction, 1))
+            .as_deref()
+            .is_none_or(|written| written == global),
+        LLVMOpcode::LLVMAtomicRMW | LLVMOpcode::LLVMAtomicCmpXchg => {
+            direct_global_operand_name(ctx, LLVMGetOperand(instruction, 0))
+                .as_deref()
+                .is_none_or(|written| written == global)
+        }
+        LLVMOpcode::LLVMCall | LLVMOpcode::LLVMInvoke | LLVMOpcode::LLVMCallBr => {
+            !direct_symbol_name(LLVMGetCalledValue(instruction))
+                .is_some_and(|callee| callee.starts_with("llvm.dbg."))
+        }
+        LLVMOpcode::LLVMVAArg => true,
+        _ => false,
+    }
+}
+
+unsafe fn next_non_debug_instruction(mut instruction: LLVMValueRef) -> LLVMValueRef {
+    while !instruction.is_null()
+        && LLVMGetInstructionOpcode(instruction) == LLVMOpcode::LLVMCall
+        && direct_symbol_name(LLVMGetCalledValue(instruction))
+            .is_some_and(|callee| callee.starts_with("llvm.dbg."))
+    {
+        instruction = LLVMGetNextInstruction(instruction);
+    }
+    instruction
 }
 
 unsafe fn lower_select(

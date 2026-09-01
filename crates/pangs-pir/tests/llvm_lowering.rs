@@ -1791,6 +1791,62 @@ right:
     assert_eq!(pir.lowering.modeled_counts["global_init_store"], 2);
 }
 
+fn scalar_phi_rmw_ir() -> String {
+    fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/disposition/scalar_phi_rmw.ll"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn llvm_sys_retains_trusted_current_global_evidence_for_narrow_scalar_phi_rmw() {
+    let tmp = TempDir::new().unwrap();
+    let ll_path = tmp.path().join("scalar_phi_rmw.ll");
+    fs::write(&ll_path, scalar_phi_rmw_ir()).unwrap();
+
+    let pir = pir_from_llvm_sys(&ll_path);
+    let evidence = &pir.lowering.scalar_phi_rmw["%update::current"];
+    assert_eq!(evidence.global, "g");
+    assert_eq!(evidence.reference, "%update::pre");
+
+    let serialized = serde_json::to_string(&pir).unwrap();
+    let round_tripped: Pir = serde_json::from_str(&serialized).unwrap();
+    assert!(round_tripped.lowering.scalar_phi_rmw.is_empty());
+}
+
+#[test]
+fn llvm_sys_rejects_scalar_phi_rmw_with_a_stale_or_arbitrary_arm() {
+    let variants = [
+        scalar_phi_rmw_ir().replace(
+            "  %pre = load i32, i32* @g, align 4, !dbg !10\n  br label %join",
+            "  %pre = load i32, i32* @g, align 4, !dbg !10\n  store i32 7, i32* @g, align 4, !dbg !10\n  br label %join",
+        ),
+        scalar_phi_rmw_ir().replace(
+            "[ %first, %through ]",
+            "[ 7, %through ]",
+        ),
+        scalar_phi_rmw_ir().replace(
+            "through:\n  br label %join",
+            "through:\n  store i32 7, i32* @g, align 4, !dbg !11\n  br label %join",
+        ),
+        scalar_phi_rmw_ir().replace(
+            "  %current = phi i32 [ %pre, %direct ], [ %first, %through ], !dbg !10\n  %next = add",
+            "  %current = phi i32 [ %pre, %direct ], [ %first, %through ], !dbg !10\n  store i32 7, i32* @g, align 4, !dbg !10\n  %next = add",
+        ),
+    ];
+
+    for (index, ir) in variants.into_iter().enumerate() {
+        let tmp = TempDir::new().unwrap();
+        let ll_path = tmp
+            .path()
+            .join(format!("scalar_phi_rmw_rejected_{index}.ll"));
+        fs::write(&ll_path, ir).unwrap();
+        let pir = pir_from_llvm_sys(&ll_path);
+        assert!(pir.lowering.scalar_phi_rmw.is_empty(), "variant {index}");
+    }
+}
+
 #[test]
 fn lowers_global_initializer_pointer_flow_from_ll() {
     let tmp = TempDir::new().unwrap();

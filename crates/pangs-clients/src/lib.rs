@@ -4682,11 +4682,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        assemble_disposition_artifacts, check_traces, classify_violation_relevance,
-        coupling_group_id, export_analysis, load_schema_for_artifact, localization_index,
-        once_lock_pair_evidence, report, validate_export_dir, validate_value_against_schema,
-        violation_relevance_witness, CertifiedGroupEvidence, ComponentsRecord, DispositionFactRows,
-        ViolationRelevance,
+        assemble_disposition_artifacts, atomic_access_recipe, check_traces,
+        classify_violation_relevance, coupling_group_id, export_analysis, load_schema_for_artifact,
+        localization_index, once_lock_pair_evidence, report, validate_export_dir,
+        validate_value_against_schema, violation_relevance_witness, CertifiedGroupEvidence,
+        ComponentsRecord, DispositionFactRows, ViolationRelevance,
     };
 
     fn group_site(line: u32) -> Site {
@@ -5794,6 +5794,24 @@ int call_reader(void) { return read_pointer(&target); }
             panic!("proximity alone must not certify an RMW")
         };
         assert!(codes.iter().any(|code| code == "rmw-shape-unclassified"));
+    }
+
+    #[test]
+    fn scalar_phi_current_global_proof_recovers_the_source_rmw_recipe() {
+        let fixture = workspace_root().join("fixtures/synthetic/disposition/scalar_phi_rmw.ll");
+        let pir = Pir::from_path(&fixture).unwrap();
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let global = analysis.lookup_global("g").unwrap();
+        let sites = analysis.access_sites_for_global(global).collect::<Vec<_>>();
+
+        let (recipe, failures) = atomic_access_recipe(&analysis, &sites, None, "g");
+        assert!(failures.is_empty(), "{failures:#?}");
+        let recipe = recipe.unwrap();
+        assert_eq!(recipe.len(), 2);
+        assert!(recipe.iter().all(|entry| entry["operation"] == "fetch_add"));
+        assert!(recipe.iter().all(|entry| entry["operand"] == "1"));
+        assert!(recipe.iter().any(|entry| entry["site"]["line"] == 10));
     }
 
     #[test]
