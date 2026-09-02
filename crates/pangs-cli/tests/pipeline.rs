@@ -2048,7 +2048,7 @@ fn differential_ledger_holds_on_synthetic_suite() {
 const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
 
 #[test]
-fn analyze_manifest_only_emits_only_disposition_pair() {
+fn analyze_manifest_only_emits_disposition_pair_and_metrics() {
     assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let bc = tmp.path().join("dispose.bc");
@@ -2086,11 +2086,18 @@ fn analyze_manifest_only_emits_only_disposition_pair() {
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .collect::<Vec<_>>();
     files.sort();
-    assert_eq!(files, ["pangs-audit.json", "pangs-manifest.json"]);
+    assert_eq!(
+        files,
+        ["metrics.json", "pangs-audit.json", "pangs-manifest.json"]
+    );
     let _: Value =
         serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
     let _: Value =
         serde_json::from_slice(&fs::read(out.join("pangs-audit.json")).unwrap()).unwrap();
+    let metrics: Value =
+        serde_json::from_slice(&fs::read(out.join("metrics.json")).unwrap()).unwrap();
+    assert!(metrics["analysis_wall_us"].as_u64().unwrap() > 0);
+    assert!(metrics["solve_us"].as_u64().unwrap() > 0);
 }
 
 #[test]

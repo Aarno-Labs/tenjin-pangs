@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use pangs_api::{Analysis, BuildMode, Opts, RegistryApi, Stage};
 use pangs_dispose::{apply_policy, config_with_overrides, parse_overrides, write_artifact_pair};
-use pangs_manifest::DisposeMode;
+use pangs_manifest::{write_canonical_json, DisposeMode};
 use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
 use pangs_pir::Pir;
 use sha2::{Digest, Sha256};
@@ -42,7 +42,7 @@ enum Command {
         validate: bool,
         #[arg(long)]
         dispose: bool,
-        /// Emit only the disposition manifest and audit ledger.
+        /// Emit only the disposition manifest, audit ledger, and analysis metrics.
         #[arg(long, requires = "dispose")]
         manifest_only: bool,
         #[arg(long, requires = "dispose")]
@@ -399,6 +399,9 @@ fn run() -> Result<()> {
                     overrides_sha256,
                 )?;
                 write_artifact_pair(&out, &disposition_manifest, &ledger)?;
+                if manifest_only {
+                    write_canonical_json(&out.join("metrics.json"), analysis.metrics())?;
+                }
                 if outcome.override_problems {
                     anyhow::bail!(
                         "one or more disposition overrides were rejected or unmatched; artifacts were written"
