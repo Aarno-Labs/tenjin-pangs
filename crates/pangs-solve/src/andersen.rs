@@ -5262,6 +5262,10 @@ struct Solve {
     /// Newly inserted copy edges awaiting one full-set seed. Keeping these separate from
     /// `succ` lets established edges consume only deltas without missing old source facts.
     pending_succ: HashMap<Cell, HashSet<Cell>>,
+    /// Exact number of distinct edges across `succ` and `pending_succ`. Copy-edge SCC
+    /// admission is checked after every worklist pop, so deriving this from the maps there
+    /// turns propagation into repeated whole-graph scans.
+    copy_edge_count: usize,
     /// Complex constraints which have already consumed their owner's complete points-to
     /// set. Established constraints consume only later points-to deltas.
     loads: HashMap<Cell, Vec<Cell>>,
@@ -5387,6 +5391,7 @@ impl Solve {
             region_of_cell: HashMap::new(),
             succ: HashMap::new(),
             pending_succ: HashMap::new(),
+            copy_edge_count: 0,
             loads: HashMap::new(),
             stores: HashMap::new(),
             geps: HashMap::new(),
@@ -5444,6 +5449,7 @@ impl Solve {
         self.regions = HashMap::new();
         self.succ = HashMap::new();
         self.pending_succ = HashMap::new();
+        self.copy_edge_count = 0;
         self.loads = HashMap::new();
         self.stores = HashMap::new();
         self.geps = HashMap::new();
@@ -5628,7 +5634,12 @@ impl Solve {
         {
             return;
         }
-        self.pending_succ.entry(from).or_default().insert(to);
+        let inserted = self.pending_succ.entry(from).or_default().insert(to);
+        debug_assert!(inserted, "duplicate copy edge passed the membership checks");
+        self.copy_edge_count = self
+            .copy_edge_count
+            .checked_add(1)
+            .expect("copy-edge count overflow");
         self.copy_edges_inserted = self.copy_edges_inserted.saturating_add(1);
         self.new_copy_edges_since_scc = self.new_copy_edges_since_scc.saturating_add(1);
         // Even an empty source must run once so the edge becomes established before later
@@ -6195,8 +6206,18 @@ impl Solve {
             let old_edges = sources.len().saturating_mul(destinations.len());
             let new_edges = sources.len().saturating_add(destinations.len());
             for &source in &sources {
-                self.succ.remove(&source);
-                self.pending_succ.remove(&source);
+                let removed = self
+                    .succ
+                    .remove(&source)
+                    .map_or(0, |successors| successors.len())
+                    + self
+                        .pending_succ
+                        .remove(&source)
+                        .map_or(0, |successors| successors.len());
+                self.copy_edge_count = self
+                    .copy_edge_count
+                    .checked_sub(removed)
+                    .expect("removed more copy edges than are tracked");
             }
             let union = self.allocate_cell();
             for source in sources {
@@ -6241,7 +6262,12 @@ impl Solve {
             successors.sort_unstable();
             successors.dedup();
         }
-        let old_edge_count = adjacency.iter().map(Vec::len).sum::<usize>();
+        let old_edge_count = self.copy_edge_count;
+        debug_assert_eq!(
+            adjacency.iter().map(Vec::len).sum::<usize>(),
+            old_edge_count,
+            "cached copy-edge count diverged before SCC collapse"
+        );
         self.scc_nodes_scanned = self.scc_nodes_scanned.saturating_add(cell_count);
         self.scc_edges_scanned = self
             .scc_edges_scanned
@@ -6371,6 +6397,7 @@ impl Solve {
         let new_edge_count = condensed_succ.values().map(HashSet::len).sum::<usize>();
         self.succ = condensed_succ;
         self.pending_succ.clear();
+        self.copy_edge_count = new_edge_count;
 
         // Collapsing variables can combine constraints from one old member with pointees
         // from another. Treat every merged complex constraint as new so the complete
@@ -6500,8 +6527,7 @@ impl Solve {
     }
 
     fn copy_edges(&self) -> usize {
-        self.succ.values().map(HashSet::len).sum::<usize>()
-            + self.pending_succ.values().map(HashSet::len).sum::<usize>()
+        self.copy_edge_count
     }
 
     fn copy_sources(&self) -> usize {
@@ -6579,7 +6605,6 @@ impl Solve {
                 .remove(&n)
                 .unwrap_or_else(|| PointSet::new(self.hybrid_points_to));
             let external_delta = self.pending_external_sources.remove(&n).unwrap_or_default();
-            let new_successors = self.pending_succ.remove(&n).unwrap_or_default();
 
             // Established copy edges consume only facts discovered since `n` last ran.
             if let Some(successors) = self.succ.get(&n).cloned() {
@@ -6594,7 +6619,13 @@ impl Solve {
 
             // A new edge predates none of the source's facts, so seed it from the complete
             // set once and only then promote it to the established successor relation.
+            let new_successors = self.pending_succ.remove(&n).unwrap_or_default();
             if !new_successors.is_empty() {
+                let pending_successor_count = new_successors.len();
+                self.copy_edge_count = self
+                    .copy_edge_count
+                    .checked_sub(pending_successor_count)
+                    .expect("promoted more pending copy edges than are tracked");
                 let all_pts = self
                     .pts
                     .get(&n)
@@ -6612,7 +6643,18 @@ impl Solve {
                     self.union_pts_delta(successor, &all_pts);
                     self.add_external_sources(successor, &all_external_sources);
                 }
-                self.succ.entry(n).or_default().extend(new_successors);
+                let successors = self.succ.entry(n).or_default();
+                let established_before = successors.len();
+                successors.extend(new_successors);
+                let promoted = successors.len() - established_before;
+                self.copy_edge_count = self
+                    .copy_edge_count
+                    .checked_add(promoted)
+                    .expect("copy-edge count overflow during promotion");
+                debug_assert_eq!(
+                    promoted, pending_successor_count,
+                    "pending copy edge duplicated an established edge during promotion"
+                );
             }
 
             // n as a load base: p = *n  ⇒  pts(o) ⊆ pts(p)  for o ∈ pts(n)
@@ -6826,6 +6868,12 @@ mod tests {
         let pir = Pir::from_path(fixture(name)).unwrap();
         let pag = Pag::from_pir(&pir, &PagOpts::default());
         (pir, pag)
+    }
+
+    fn assert_copy_edge_count(solve: &Solve) {
+        let derived = solve.succ.values().map(HashSet::len).sum::<usize>()
+            + solve.pending_succ.values().map(HashSet::len).sum::<usize>();
+        assert_eq!(solve.copy_edges(), derived);
     }
 
     #[test]
@@ -7863,6 +7911,46 @@ mod tests {
         assert_eq!(solve.copy_fact_pairs_processed, 8);
         solve.run();
         assert_eq!(solve.copy_fact_pairs_processed, 8);
+    }
+
+    #[test]
+    fn cached_copy_edge_count_tracks_every_graph_mutation() {
+        let mut promoted = Solve::new(4, false);
+        promoted.add_copy(0, 1);
+        promoted.add_copy(0, 2);
+        promoted.add_copy(0, 2);
+        assert_eq!(promoted.copy_edges(), 2);
+        assert_copy_edge_count(&promoted);
+        promoted.run();
+        assert!(promoted.pending_succ.is_empty());
+        assert_eq!(promoted.copy_edges(), 2);
+        assert_copy_edge_count(&promoted);
+
+        let mut collapsed = Solve::new(4, false);
+        collapsed.add_copy(0, 1);
+        collapsed.add_copy(1, 0);
+        collapsed.add_copy(1, 2);
+        assert_eq!(collapsed.copy_edges(), 3);
+        collapsed.collapse_copy_sccs();
+        assert_eq!(collapsed.copy_edges(), 1);
+        assert_copy_edge_count(&collapsed);
+
+        let mut factored = Solve::new(5, false);
+        for source in [0, 1] {
+            for destination in [2, 3, 4] {
+                factored.add_copy(source, destination);
+            }
+        }
+        assert_eq!(factored.copy_edges(), 6);
+        let fixed = HashSet::from([0, 1, 2, 3, 4]);
+        let profile = factored.offline_quotient(&fixed);
+        assert_eq!(profile.factored_groups, 1);
+        assert_eq!(factored.copy_edges(), 5);
+        assert_copy_edge_count(&factored);
+
+        factored.release_propagation_state();
+        assert_eq!(factored.copy_edges(), 0);
+        assert_copy_edge_count(&factored);
     }
 
     #[test]
