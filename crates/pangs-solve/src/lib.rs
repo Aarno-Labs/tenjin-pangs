@@ -2201,16 +2201,12 @@ impl<'a> Solver<'a> {
                 cached.clone()
             } else {
                 let pointee = self.classes[root].pointee.map(|p| self.find(p));
-                // Boundary facts can be attached before or after the pointee class is
-                // materialized. Read both locations so GEP and other target-preserving flows do
-                // not lose an external/universal boundary. `esc` remains separate from `ext`: it
-                // means externally writable contents only when this root is observed through a
-                // value-like node, not that a pointed-to local identity is itself external.
-                let pointee_external = pointee.is_some_and(|pointee| self.classes[pointee].ext);
-                let pointee_universal =
-                    pointee.is_some_and(|pointee| self.classes[pointee].universal);
-                let external = self.classes[root].ext || self.classes[root].esc || pointee_external;
-                let universal = self.classes[root].universal || pointee_universal;
+                // Every value transfer now either joins carriers or has a directed content edge,
+                // so content boundary facts are complete on the carrier. Reading the location
+                // class here would reintroduce container contamination (for example, treating a
+                // pointer stored in external memory as itself external).
+                let external = self.classes[root].ext;
+                let universal = self.classes[root].universal;
                 let has_empty_witness = self.classes[root].has_empty_witness;
                 let pointee_is_empty = pointee.is_none_or(|pointee| {
                     self.classes[pointee].node_count == 0
@@ -2239,8 +2235,7 @@ impl<'a> Solver<'a> {
                         }
                     })
                     .unwrap_or(false)
-                    || universal
-                    || self.classes[root].esc;
+                    || universal;
                 let cached = CachedRootNodeSummary {
                     reaches_function_pointer,
                     has_empty_witness,
