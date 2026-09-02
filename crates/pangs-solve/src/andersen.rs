@@ -20,6 +20,7 @@
 //!   outputs that drive component freezing are taken verbatim from Steensgaard.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs;
 use std::time::Instant;
 
 use pangs_pag::{
@@ -250,6 +251,10 @@ fn finish_andersen_controlled(
     );
     refiner.materialize_global_points_to = materialize_global_points_to;
     let outcome = refiner.run(controls);
+    // `Refiner::run` owns and drops the inclusion graph before returning. Reclaim those arena
+    // pages before folding its compact output into the long-lived public result.
+    let allocator_trimmed = release_allocator_pages();
+    print_process_memory("andersen-state-released", None, Some(allocator_trimmed));
 
     match outcome {
         RefinerOutcome::Complete(refined) => {
@@ -328,6 +333,78 @@ fn finish_andersen_controlled(
         }
     }
     base
+}
+
+/// Return allocator pages made unreachable by a completed Andersen solve to the OS before
+/// downstream clients start building ModRef and disposition state. The inclusion solver uses
+/// many independently allocated hash tables; glibc otherwise tends to retain those freed pages
+/// in its arenas until process exit, making later phases overlap with the solver's RSS.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_allocator_pages() -> bool {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+
+    // SAFETY: malloc_trim is a process-local glibc allocator operation. Calling it after Rust
+    // values have been dropped does not invalidate any live allocation; `pad = 0` requests that
+    // all wholly free pages be returned.
+    unsafe { malloc_trim(0) != 0 }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_allocator_pages() -> bool {
+    false
+}
+
+fn proc_memory_kib() -> Option<(u64, u64, u64)> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let value = |name: &str| {
+        status.lines().find_map(|line| {
+            let rest = line.strip_prefix(name)?.trim();
+            rest.split_whitespace().next()?.parse::<u64>().ok()
+        })
+    };
+    Some((value("VmRSS:")?, value("VmHWM:")?, value("RssAnon:")?))
+}
+
+fn print_process_memory(phase: &str, solve: Option<&Solve>, allocator_trimmed: Option<bool>) {
+    if std::env::var_os(knobs::ENV_MEMORY_PROFILE).is_none() {
+        return;
+    }
+    let (rss_kib, hwm_kib, anonymous_kib) = proc_memory_kib().unwrap_or_default();
+    if let Some(solve) = solve {
+        let external_source_sets = solve.external_sources.len();
+        let external_source_facts = solve
+            .external_sources
+            .values()
+            .map(BTreeSet::len)
+            .sum::<usize>();
+        let external_source_bytes = solve
+            .external_sources
+            .values()
+            .flatten()
+            .map(String::len)
+            .sum::<usize>();
+        eprintln!(
+            "pangs memory profile: phase={phase} rss_kib={rss_kib} hwm_kib={hwm_kib} anonymous_kib={anonymous_kib} pts_entries={} pts_facts={} copy_sources={} copy_edges={} external_source_sets={external_source_sets} external_source_facts={external_source_facts} external_source_bytes={external_source_bytes} representative_cells={} fields={} obj_fields={} loads={} stores={} geps={} memcpys={}",
+            solve.pts.len(),
+            solve.pts_facts(),
+            solve.copy_sources(),
+            solve.copy_edges(),
+            solve.representative.len(),
+            solve.fields.len(),
+            solve.obj_fields.values().map(Vec::len).sum::<usize>(),
+            solve.loads.values().map(Vec::len).sum::<usize>(),
+            solve.stores.values().map(Vec::len).sum::<usize>(),
+            solve.geps.values().map(Vec::len).sum::<usize>(),
+            solve.memcpys.len(),
+        );
+    } else {
+        eprintln!(
+            "pangs memory profile: phase={phase} rss_kib={rss_kib} hwm_kib={hwm_kib} anonymous_kib={anonymous_kib} allocator_trimmed={}",
+            allocator_trimmed.unwrap_or(false),
+        );
+    }
 }
 
 enum RefinerOutcome {
@@ -2607,6 +2684,7 @@ impl<'a> Refiner<'a> {
                 dense_words.saturating_mul(std::mem::size_of::<u64>())
             );
         }
+        print_process_memory("andersen-fixed-point", Some(&solve), None);
         let indirect_calls = self.emit_indirect_calls(
             &in_scope_sites,
             &activated,
@@ -2619,6 +2697,12 @@ impl<'a> Refiner<'a> {
         } else {
             BTreeSet::new()
         };
+        // Call-target discovery and the optional producer/consumer certificates are the only
+        // result families that inspect propagation constraints. Keep just the fixed-point query
+        // tables while materializing per-node and global outputs, so those outputs do not overlap
+        // with copy/load/store/GEP graphs that can be very large on linked applications.
+        solve.release_propagation_state();
+        print_process_memory("andersen-query-state", Some(&solve), None);
         let nodes = self.emit_node_resolutions(&solve);
         let global_points_to = if self.materialize_global_points_to {
             self.emit_global_points_to(&solve)
@@ -2664,7 +2748,7 @@ impl<'a> Refiner<'a> {
                 serde_json::to_string(&record).expect("serialize admission work profile")
             );
         }
-        RefinerOutcome::Complete(RefinerOutput {
+        let output = RefinerOutput {
             indirect_calls,
             closed_consumers,
             nodes,
@@ -2674,7 +2758,13 @@ impl<'a> Refiner<'a> {
             activated_targets,
             oversize_fallbacks: self.oversize_fallbacks,
             oversize_fallback_max_size: self.oversize_fallback_max_size,
-        })
+        };
+        // `self` owns Andersen's prepartition/scope tables and `solve` owns the remaining
+        // fixed-point query state. Drop both before `finish_andersen_controlled` folds `output`
+        // into the public SolveResult, then make the freed pages available to downstream ModRef.
+        drop(solve);
+        drop(self);
+        RefinerOutcome::Complete(output)
     }
 
     fn exhaustion(
@@ -5319,6 +5409,35 @@ impl Solve {
         }
     }
 
+    /// Discard fixed-point machinery that no result query reads. The retained tables are:
+    /// representatives, points-to sets, external-region/provenance facts, and the field-to-base
+    /// inventory used by node/global result materialization.
+    fn release_propagation_state(&mut self) {
+        self.pending_pts = HashMap::new();
+        self.pending_external_sources = HashMap::new();
+        self.regions = HashMap::new();
+        self.succ = HashMap::new();
+        self.pending_succ = HashMap::new();
+        self.loads = HashMap::new();
+        self.stores = HashMap::new();
+        self.geps = HashMap::new();
+        self.pending_loads = HashMap::new();
+        self.pending_stores = HashMap::new();
+        self.pending_geps = HashMap::new();
+        self.memcpys = Vec::new();
+        self.memcpy_by_endpoint = HashMap::new();
+        self.fields = HashMap::new();
+        self.field_location = HashMap::new();
+        self.known_locations = HashSet::new();
+        self.unknown_fields = HashMap::new();
+        self.unknown_field_base = HashMap::new();
+        self.direct_accessed = HashSet::new();
+        self.memcpy_summary_cells = HashSet::new();
+        self.worklist = Vec::new();
+        self.queued = HashSet::new();
+        self.bridged_objects = HashSet::new();
+    }
+
     fn allocate_cell(&mut self) -> Cell {
         let cell = self.next_field;
         self.next_field += 1;
@@ -7693,6 +7812,42 @@ mod tests {
         assert_eq!(solve.copy_fact_pairs_processed, 8);
         solve.run();
         assert_eq!(solve.copy_fact_pairs_processed, 8);
+    }
+
+    #[test]
+    fn result_compaction_releases_propagation_state_but_preserves_queries() {
+        let mut solve = Solve::new(8, false);
+        let external = solve.region(ExternalRegion::ExternalReturn(3));
+        let field = solve.field_of(4, FieldLocation::Exact(8));
+        solve.add_pts_with_source(0, external, Some("external-result"));
+        solve.add_pts(0, field);
+        solve.add_copy(0, 1);
+        solve.add_load(1, 2);
+        solve.run();
+
+        let points_to = solve.points_to(1).unwrap().iter().collect::<HashSet<_>>();
+        let sources = solve.external_sources_for(1).unwrap().clone();
+        assert!(!solve.succ.is_empty());
+        assert!(!solve.loads.is_empty());
+        assert_eq!(solve.field_base.get(&field), Some(&4));
+
+        solve.release_propagation_state();
+
+        assert_eq!(
+            solve.points_to(1).unwrap().iter().collect::<HashSet<_>>(),
+            points_to
+        );
+        assert_eq!(solve.external_sources_for(1), Some(&sources));
+        assert_eq!(
+            solve.external_region(external),
+            Some(ExternalRegion::ExternalReturn(3))
+        );
+        assert_eq!(solve.field_base.get(&field), Some(&4));
+        assert!(solve.obj_fields.get(&4).unwrap().contains(&field));
+        assert!(solve.succ.is_empty());
+        assert!(solve.loads.is_empty());
+        assert!(solve.fields.is_empty());
+        assert!(solve.worklist.is_empty());
     }
 
     fn original_points_to(solve: &Solve, cells: usize) -> Vec<HashSet<Cell>> {

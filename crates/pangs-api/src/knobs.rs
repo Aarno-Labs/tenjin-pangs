@@ -47,6 +47,9 @@ pub(crate) const MODREF_POINTEE_GLOBAL_SAMPLE_LIMIT: usize = 16;
 /// Enables pointer-derived ModRef profiling when present.
 pub(crate) const ENV_POINTER_MODREF_PROFILE: &str = "PANGS_POINTER_MODREF_PROFILE";
 
+/// Emits process resident/high-water memory at solver and ModRef phase boundaries.
+pub(crate) const ENV_MEMORY_PROFILE: &str = "PANGS_MEMORY_PROFILE";
+
 /// Overrides the ModRef profiling progress interval.
 pub(crate) const ENV_POINTER_MODREF_PROFILE_INTERVAL: &str =
     "PANGS_POINTER_MODREF_PROFILE_INTERVAL";

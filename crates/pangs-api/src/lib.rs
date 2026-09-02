@@ -1520,6 +1520,7 @@ impl Analysis {
                     }
                 }
                 enforce_storage_root_identity(module, &pag, &global_lookup, &mut solved);
+                print_memory_profile("api-solver-result");
                 let safe_indirect_varargs = safe_indirect_vararg_callsites(
                     module,
                     &indirect_vararg_keys,
@@ -1716,6 +1717,7 @@ impl Analysis {
                     &solved.nodes,
                 );
                 solver_postprocess_us = solver_postprocess_started.elapsed().as_micros() as u64;
+                print_memory_profile("api-solver-postprocess");
 
                 let pointer_modref_started = Instant::now();
                 modrefs.print_profile("local-start");
@@ -1730,6 +1732,7 @@ impl Analysis {
                     &mut noloc_ord,
                 );
                 modrefs.print_profile("after-pag");
+                print_memory_profile("api-modref-after-pag");
                 push_pointer_memcpy_constexpr_modrefs_from_pir(
                     &mut modrefs,
                     &mut access_sites,
@@ -1748,6 +1751,7 @@ impl Analysis {
                     &mut noloc_ord,
                 );
                 modrefs.print_profile("after-mem");
+                print_memory_profile("api-modref-after-mem");
                 pointer_modref_us = pointer_modref_started.elapsed().as_micros() as u64;
                 if external_policy_census {
                     external_policy_inputs = Some(external_policy_census::collect_solver_inputs(
@@ -1759,6 +1763,7 @@ impl Analysis {
                 }
             }
         }
+        print_memory_profile("api-pointer-state-released");
 
         let callgraph_dedup_started = Instant::now();
         call_edges.sort_by(|left, right| call_edge_cmp(left, right, &functions, &callsites));
@@ -1770,6 +1775,7 @@ impl Analysis {
         let modrefs = modrefs.into_vec();
         let access_sites = access_sites.finish();
         let modref_dedup_us = modref_dedup_started.elapsed().as_micros() as u64;
+        print_memory_profile("api-modref-materialized");
 
         let stationarity_started = Instant::now();
         let (initval_stable_globals, stationarity) = if opts.stage == Stage::Conservative {
@@ -1786,6 +1792,7 @@ impl Analysis {
             )
         };
         let stationarity_us = stationarity_started.elapsed().as_micros() as u64;
+        print_memory_profile("api-stationarity");
         let initval_reapply_started = Instant::now();
         let initval_report = if opts.enable_b1_initval {
             resolve_initval_icalls(module, &simple_icall_queries, &initval_stable_globals)
@@ -1818,6 +1825,7 @@ impl Analysis {
         );
         let transitive_modref_us = transitive_started.elapsed().as_micros() as u64;
         pointer_modref_metrics.merge_closure(closure_modref_metrics);
+        print_memory_profile("api-transitive-modref");
         let findings_dedup_started = Instant::now();
         findings.sort_by_key(|finding| {
             (
@@ -1849,6 +1857,7 @@ impl Analysis {
             &audit_taints,
         );
         let components_us = components_started.elapsed().as_micros() as u64;
+        print_memory_profile("api-components");
         let context_rewrite_plan = compute_context_rewrite_plan(
             &functions,
             &globals,
@@ -2110,6 +2119,7 @@ impl Analysis {
                 module, opts, &analysis, inputs,
             ));
         }
+        print_memory_profile("api-analysis-complete");
         Ok(analysis)
     }
 
@@ -4488,6 +4498,28 @@ impl PointerModRefProfile {
 
 fn pointer_modref_profile_enabled() -> bool {
     std::env::var_os(knobs::ENV_POINTER_MODREF_PROFILE).is_some()
+}
+
+fn print_memory_profile(phase: &str) {
+    if std::env::var_os(knobs::ENV_MEMORY_PROFILE).is_none() {
+        return;
+    }
+    let Some(status) = std::fs::read_to_string("/proc/self/status").ok() else {
+        eprintln!("pangs memory profile: phase={phase} process_memory=unavailable");
+        return;
+    };
+    let value = |name: &str| {
+        status.lines().find_map(|line| {
+            let rest = line.strip_prefix(name)?.trim();
+            rest.split_whitespace().next()?.parse::<u64>().ok()
+        })
+    };
+    eprintln!(
+        "pangs memory profile: phase={phase} rss_kib={} hwm_kib={} anonymous_kib={}",
+        value("VmRSS:").unwrap_or_default(),
+        value("VmHWM:").unwrap_or_default(),
+        value("RssAnon:").unwrap_or_default(),
+    );
 }
 
 fn pointer_modref_profile_interval_attempts() -> u64 {
