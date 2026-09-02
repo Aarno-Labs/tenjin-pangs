@@ -288,6 +288,7 @@ fn finish_andersen_controlled(
             base.metrics.andersen_resume_rounds = refined.resume_rounds;
             base.metrics.andersen_activated_targets = refined.activated_targets;
             base.metrics.andersen_known_unbound_targets = 0;
+            base.metrics.andersen_coarser_than_steens_nodes = refined.coarser_than_steens_nodes;
             base.metrics.oversize_fallbacks = refined.oversize_fallbacks;
             base.metrics.oversize_fallback_max_size = refined.oversize_fallback_max_size;
         }
@@ -424,6 +425,7 @@ struct RefinerOutput {
     activated_targets: usize,
     oversize_fallbacks: usize,
     oversize_fallback_max_size: usize,
+    coarser_than_steens_nodes: usize,
 }
 
 struct ExhaustionDiagnostic {
@@ -2727,7 +2729,7 @@ impl<'a> Refiner<'a> {
         // with copy/load/store/GEP graphs that can be very large on linked applications.
         solve.release_propagation_state();
         print_process_memory("andersen-query-state", Some(&solve), None);
-        let nodes = self.emit_node_resolutions(&solve);
+        let (nodes, coarser_than_steens_nodes) = self.emit_node_resolutions(&solve);
         let global_points_to = if self.materialize_global_points_to {
             self.emit_global_points_to(&solve)
         } else {
@@ -2782,6 +2784,7 @@ impl<'a> Refiner<'a> {
             activated_targets,
             oversize_fallbacks: self.oversize_fallbacks,
             oversize_fallback_max_size: self.oversize_fallback_max_size,
+            coarser_than_steens_nodes,
         };
         // `self` owns Andersen's prepartition/scope tables and `solve` owns the remaining
         // fixed-point query state. Drop both before `finish_andersen_controlled` folds `output`
@@ -4135,7 +4138,7 @@ impl<'a> Refiner<'a> {
         out
     }
 
-    fn emit_node_resolutions(&self, pts: &Solve) -> Vec<RefinedNodeResolution> {
+    fn emit_node_resolutions(&self, pts: &Solve) -> (Vec<RefinedNodeResolution>, usize) {
         let explain_label = std::env::var(knobs::ENV_ANDERSEN_EXPLAIN_NODE).ok();
         let address_exposed = &self.classes.global_address_exposed;
         let violation_module_wide = matches!(
@@ -4144,6 +4147,8 @@ impl<'a> Refiner<'a> {
         );
         let mut pointee_global_interner = RefinedPointeeGlobalInterner::default();
         let mut out = Vec::new();
+        let mut coarser_than_steens_nodes = 0usize;
+        let mut coarser_samples = Vec::new();
         for node in &self.pag.nodes {
             if !node.kind.is_value_like_public() || !self.in_scope[node.id.0 as usize] {
                 continue;
@@ -4155,6 +4160,14 @@ impl<'a> Refiner<'a> {
             let external_universal = set
                 .map(|set| set.iter().any(|cell| pts.is_universal_external(cell)))
                 .unwrap_or(false);
+            if self.base.nodes.get(&node.label).is_some_and(|base| {
+                external && !base.external || external_universal && !base.external_universal
+            }) {
+                coarser_than_steens_nodes += 1;
+                if coarser_samples.len() < 8 {
+                    coarser_samples.push(node.label.clone());
+                }
+            }
             let reaches_function_pointer = set
                 .map(|set| {
                     set.iter().any(|cell| {
@@ -4287,7 +4300,14 @@ impl<'a> Refiner<'a> {
                 universal_sources,
             });
         }
-        out
+        if std::env::var_os(knobs::ENV_ANDERSEN_EXPLAIN_NODE).is_some()
+            && coarser_than_steens_nodes != 0
+        {
+            eprintln!(
+                "pangs andersen coarser than steens: nodes={coarser_than_steens_nodes} sample={coarser_samples:?}"
+            );
+        }
+        (out, coarser_than_steens_nodes)
     }
 
     /// Refined `ptr_points_to` for every in-scope global memory object: the named allocations

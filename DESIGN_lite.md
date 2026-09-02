@@ -149,6 +149,13 @@ refine. It settles no query by certificate. D' no longer has to use a Steensgaar
 equivalence class verbatim as its admission unit: it builds an independent constraint
 prepartition graph and uses Steensgaard at cut boundaries.
 
+Load and store use one-hop target equations rather than unifying a value carrier with a storage
+location: `P(V(load)) ≡ P(S(address))` and `P(S(address)) ≡ P(V(value))`. Unknown-root GEP and
+memcpy use the same target primitive. Directed content edges carry external, universal, and null
+facts along those value transfers. Consequently every union-find class contains either value-like
+carriers or locations (object, pointee, and field classes), never both; debug builds assert this
+carrier/location invariant after every solve.
+
 Its partition boundary is allocation-field aware when the fixed PAG independently proves
 an address root. Constant GEP offsets get distinct synthetic storage classes. LLVM
 lowering preserves a dynamic sequential index as an affine byte lane

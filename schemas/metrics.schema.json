@@ -235,6 +235,10 @@
       "type": "integer",
       "minimum": 0
     },
+    "andersen_coarser_than_steens_nodes": {
+      "type": "integer",
+      "minimum": 0
+    },
     "steens_worklist_pops": {
       "type": "integer",
       "minimum": 0

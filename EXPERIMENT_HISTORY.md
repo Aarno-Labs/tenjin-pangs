@@ -677,3 +677,22 @@ ratio was 1.0016. Libplacebo's three-run end-to-end mean was 41.759 +/- 0.385 s 
 artifacts and OpenSSL remained outside the comparable 53-module disposition set: the parent Vim
 runs hit an existing ModRef-envelope assertion, and the bounded OpenSSL diagnostic exceeded
 fifteen minutes.
+
+### One-hop Steensgaard load/store (2026-09-02)
+
+The production Steensgaard solver stopped equating value carriers with load/store storage
+locations. It now equates only their immediate pointer targets and uses directed content edges to
+carry external, universal, and null facts across load, store, memcpy, and unknown-root GEP. Debug
+builds enforce that no union-find class mixes carriers with object/pointee/field locations. A
+monotone content-edge frontier was required: the naive replay performed 205.6 million pushes on
+SQLite, while the frontier reduced that to 473 thousand with identical results.
+
+The ten-module method-matched full Andersen comparison reduced summed wall time 12.4%, internal
+analysis 9.3%, and solve time 3.9%, with peak RSS down 2.1% and oversize fallbacks unchanged. The
+59-module final candidate completed without failure; peak RSS and Andersen steps fell, although
+its single sequential timing sweep was order-confounded and therefore checked with alternating
+repetitions. Disposition gained 167 handled globals (107 immutable, 58 localized, 2 mutex) with no
+loss. The carrier-only boundary read reduced SQLite module-wide unknown rows only 3.1%, not the
+order of magnitude predicted by the proposal. Andersen was coarser than final Steensgaard external
+facts at 198 nodes in 13 modules. Full results and the soundness audit are in
+`ju_out/steens_onehop_20260902/REPORT.md`.

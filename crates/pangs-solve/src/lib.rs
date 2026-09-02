@@ -87,6 +87,8 @@ pub struct SolveMetrics {
     #[serde(default)]
     pub andersen_known_unbound_targets: usize,
     #[serde(default)]
+    pub andersen_coarser_than_steens_nodes: usize,
+    #[serde(default)]
     pub steens_worklist_pops: u64,
     #[serde(default)]
     pub steens_process_class_calls: u64,

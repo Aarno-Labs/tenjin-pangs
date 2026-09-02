@@ -568,6 +568,8 @@ pub struct Metrics {
     pub andersen_activated_targets: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub andersen_known_unbound_targets: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub andersen_coarser_than_steens_nodes: Option<usize>,
     #[serde(default)]
     pub steens_worklist_pops: u64,
     #[serde(default)]
@@ -1955,6 +1957,7 @@ impl Analysis {
             andersen_resume_rounds: None,
             andersen_activated_targets: None,
             andersen_known_unbound_targets: None,
+            andersen_coarser_than_steens_nodes: None,
             steens_worklist_pops: 0,
             steens_process_class_calls: 0,
             steens_candidate_pairs: 0,
@@ -2044,6 +2047,8 @@ impl Analysis {
                     .then_some(solved.andersen_activated_targets),
                 andersen_known_unbound_targets: (opts.stage == Stage::Andersen)
                     .then_some(solved.andersen_known_unbound_targets),
+                andersen_coarser_than_steens_nodes: (opts.stage == Stage::Andersen)
+                    .then_some(solved.andersen_coarser_than_steens_nodes),
                 steens_worklist_pops: solved.steens_worklist_pops,
                 steens_process_class_calls: solved.steens_process_class_calls,
                 steens_candidate_pairs: solved.steens_candidate_pairs,
