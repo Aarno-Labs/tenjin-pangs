@@ -1252,12 +1252,18 @@ impl<'a> Refiner<'a> {
 
         let (component_of, component_sizes) = directed_sccs(&active, &self.prepartition_flow_edges);
         let mut predecessors = vec![HashSet::new(); component_sizes.len()];
+        // Attribute every edge to its destination SCC. Any admitted component set is
+        // predecessor-closed, so selecting a destination SCC also selects the source SCC of
+        // every edge attributed to it. The induced edge count is therefore the sum of these
+        // weights, without rescanning all flow edges for every candidate closure.
+        let mut component_edge_counts = vec![0u64; component_sizes.len()];
         for &(source, destination) in &self.prepartition_flow_edges {
             if !active[source] || !active[destination] {
                 continue;
             }
             let source_component = component_of[source];
             let destination_component = component_of[destination];
+            component_edge_counts[destination_component] += 1;
             if source_component != destination_component {
                 predecessors[destination_component].insert(source_component);
             }
@@ -1286,27 +1292,26 @@ impl<'a> Refiner<'a> {
         candidates.sort_by_key(|(priority, nodes, seed, _)| (*priority, *nodes, *seed));
 
         let mut components = HashSet::new();
+        let mut selected_nodes = 0u64;
+        let mut selected_edges = 0u64;
         let mut selected_seeds = 0usize;
         for (_, _, _, closure) in candidates {
-            let mut candidate = components.clone();
-            candidate.extend(closure);
-            let nodes = candidate
+            let (added_nodes, added_edges) = closure
                 .iter()
-                .map(|&component| component_sizes[component] as u64)
-                .sum::<u64>();
-            let edges = self
-                .prepartition_flow_edges
-                .iter()
-                .filter(|(source, destination)| {
-                    active[*source]
-                        && active[*destination]
-                        && candidate.contains(&component_of[*source])
-                        && candidate.contains(&component_of[*destination])
-                })
-                .count() as u64;
+                .filter(|&&component| !components.contains(&component))
+                .fold((0u64, 0u64), |(nodes, edges), &component| {
+                    (
+                        nodes + component_sizes[component] as u64,
+                        edges + component_edge_counts[component],
+                    )
+                });
+            let nodes = selected_nodes + added_nodes;
+            let edges = selected_edges + added_edges;
             let cost = nodes.saturating_mul(nodes.saturating_add(edges));
             if cost <= self.budget {
-                components = candidate;
+                components.extend(closure);
+                selected_nodes = nodes;
+                selected_edges = edges;
                 selected_seeds += 1;
             }
         }
@@ -1320,14 +1325,9 @@ impl<'a> Refiner<'a> {
                 (active && components.contains(&component_of[vertex])).then_some(vertex)
             })
             .collect::<HashSet<_>>();
-        let edges = self
-            .prepartition_flow_edges
-            .iter()
-            .filter(|(source, destination)| {
-                vertices.contains(source) && vertices.contains(destination)
-            })
-            .count() as u64;
-        let nodes = vertices.len() as u64;
+        let nodes = selected_nodes;
+        let edges = selected_edges;
+        debug_assert_eq!(nodes, vertices.len() as u64);
         let cost = nodes.saturating_mul(nodes.saturating_add(edges));
         if partition_profile_enabled() || admission_profile_enabled() {
             eprintln!(
