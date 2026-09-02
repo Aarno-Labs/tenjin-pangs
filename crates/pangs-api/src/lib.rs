@@ -4498,6 +4498,27 @@ impl PointerModRefProfile {
             max_rows,
         );
     }
+
+    fn print_closure_interner(
+        &self,
+        label: &str,
+        interner: &TransitiveModRefInterner,
+        payloads: usize,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "pangs pointer modref profile {label}: elapsed_ms={} payloads={} fact_keys={} \
+             strings={} pointee_lists={} candidate_sets={}",
+            self.started.elapsed().as_millis(),
+            payloads,
+            interner.payload_ids.len(),
+            interner.strings.len(),
+            interner.pointee_globals.len(),
+            interner.candidate_sets.len(),
+        );
+    }
 }
 
 fn pointer_modref_profile_enabled() -> bool {
@@ -6587,44 +6608,160 @@ impl TransitiveModRefs {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ModRefFactKey {
-    global: GlobalTarget,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TransitiveModRefFactKey {
+    global_kind: u8,
+    global_value: u32,
     access_rank: u8,
     via_rank: u8,
-    detail: Option<String>,
-    address_node: Option<String>,
-    pointee_globals: Vec<String>,
-    global_candidates: GlobalCandidateSet,
+    detail: u32,
+    address_node: u32,
+    pointee_globals: u32,
+    candidate_kind: u8,
+    candidates: u32,
 }
 
-fn modref_payload_key(payload: &ModRefPayload) -> ModRefFactKey {
-    ModRefFactKey {
-        global: payload.global.clone(),
-        access_rank: access_rank(payload.access),
-        via_rank: via_rank(payload.via),
-        detail: payload.detail.clone(),
-        address_node: payload.address_node.clone(),
-        pointee_globals: payload.pointee_globals.clone(),
-        global_candidates: payload.global_candidates.clone(),
+#[derive(Debug, Default)]
+struct TransitiveModRefInterner {
+    payload_ids: HashMap<TransitiveModRefFactKey, usize>,
+    strings: HashMap<String, u32>,
+    pointee_globals: HashMap<Vec<String>, u32>,
+    candidate_sets: HashMap<Rc<[GlobalId]>, u32>,
+}
+
+impl TransitiveModRefInterner {
+    fn key_for(&mut self, payload: &ModRefPayload) -> TransitiveModRefFactKey {
+        let (global_kind, global_value) = match &payload.global {
+            GlobalTarget::Name(global) => (0, global.0),
+            GlobalTarget::Unknown(reason) => (1, self.intern_str(reason)),
+        };
+        let (candidate_kind, candidates) = match &payload.global_candidates {
+            GlobalCandidateSet::Finite(candidates) => (0, self.intern_candidates(candidates)),
+            GlobalCandidateSet::ModuleWide => (1, 0),
+        };
+        TransitiveModRefFactKey {
+            global_kind,
+            global_value,
+            access_rank: access_rank(payload.access),
+            via_rank: via_rank(payload.via),
+            detail: self.intern_option_str(&payload.detail),
+            address_node: self.intern_option_str(&payload.address_node),
+            pointee_globals: self.intern_pointee_globals(&payload.pointee_globals),
+            candidate_kind,
+            candidates,
+        }
+    }
+
+    fn intern(&mut self, payloads: &mut Vec<ModRefPayload>, payload: ModRefPayload) -> usize {
+        let key = self.key_for(&payload);
+        if let Some(&id) = self.payload_ids.get(&key) {
+            let existing = &mut payloads[id];
+            existing.witness = preferred_modref_witness(existing.witness.take(), payload.witness);
+            id
+        } else {
+            let id = payloads.len();
+            self.payload_ids.insert(key, id);
+            payloads.push(payload);
+            id
+        }
+    }
+
+    fn intern_option_str(&mut self, value: &Option<String>) -> u32 {
+        value.as_deref().map_or(0, |value| self.intern_str(value))
+    }
+
+    fn intern_str(&mut self, value: &str) -> u32 {
+        if let Some(&id) = self.strings.get(value) {
+            return id;
+        }
+        let id = self.strings.len() as u32 + 1;
+        self.strings.insert(value.to_owned(), id);
+        id
+    }
+
+    fn intern_pointee_globals(&mut self, values: &[String]) -> u32 {
+        if values.is_empty() {
+            return 0;
+        }
+        if let Some(&id) = self.pointee_globals.get(values) {
+            return id;
+        }
+        let id = self.pointee_globals.len() as u32 + 1;
+        self.pointee_globals.insert(values.to_vec(), id);
+        id
+    }
+
+    fn intern_candidates(&mut self, values: &Rc<[GlobalId]>) -> u32 {
+        if let Some(&id) = self.candidate_sets.get(values.as_ref()) {
+            return id;
+        }
+        let id = self.candidate_sets.len() as u32 + 1;
+        self.candidate_sets.insert(Rc::clone(values), id);
+        id
     }
 }
 
-fn intern_modref_payload(
-    payload_ids: &mut BTreeMap<ModRefFactKey, usize>,
-    payloads: &mut Vec<ModRefPayload>,
-    payload: ModRefPayload,
-) -> usize {
-    let key = modref_payload_key(&payload);
-    if let Some(&id) = payload_ids.get(&key) {
-        let existing = &mut payloads[id];
-        existing.witness = preferred_modref_witness(existing.witness.take(), payload.witness);
-        id
-    } else {
-        let id = payloads.len();
-        payload_ids.insert(key, id);
-        payloads.push(payload);
-        id
+#[cfg(test)]
+mod transitive_modref_interner_tests {
+    use super::*;
+
+    fn payload(witness: &str, candidates: GlobalCandidateSet) -> ModRefPayload {
+        ModRefPayload {
+            global: GlobalTarget::Unknown("omega_load".to_string()),
+            access: Access::Ref,
+            via: Via::Unknown,
+            witness: Some(witness.to_string()),
+            detail: Some("pointer_load".to_string()),
+            address_node: Some("node:address".to_string()),
+            pointee_globals: vec!["global_a".to_string(), "global_b".to_string()],
+            global_candidates: candidates,
+        }
+    }
+
+    #[test]
+    fn numeric_keys_deduplicate_facts_and_retain_the_preferred_witness() {
+        let candidates = GlobalCandidateSet::Finite(Rc::from([GlobalId(1), GlobalId(2)]));
+        let mut interner = TransitiveModRefInterner::default();
+        let mut payloads = Vec::new();
+
+        let first = interner.intern(&mut payloads, payload("z_witness", candidates.clone()));
+        let duplicate = interner.intern(&mut payloads, payload("a_witness", candidates));
+
+        assert_eq!(first, duplicate);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].witness.as_deref(), Some("a_witness"));
+        assert_eq!(interner.payload_ids.len(), 1);
+        assert_eq!(interner.pointee_globals.len(), 1);
+        assert_eq!(interner.candidate_sets.len(), 1);
+    }
+
+    #[test]
+    fn numeric_keys_preserve_candidate_scope_as_part_of_fact_identity() {
+        let mut interner = TransitiveModRefInterner::default();
+        let mut payloads = Vec::new();
+
+        let finite = interner.intern(
+            &mut payloads,
+            payload(
+                "witness",
+                GlobalCandidateSet::Finite(Rc::from([GlobalId(1), GlobalId(2)])),
+            ),
+        );
+        let different_finite = interner.intern(
+            &mut payloads,
+            payload(
+                "witness",
+                GlobalCandidateSet::Finite(Rc::from([GlobalId(1), GlobalId(3)])),
+            ),
+        );
+        let module_wide = interner.intern(
+            &mut payloads,
+            payload("witness", GlobalCandidateSet::ModuleWide),
+        );
+
+        assert_ne!(finite, different_finite);
+        assert_ne!(finite, module_wide);
+        assert_eq!(payloads.len(), 3);
     }
 }
 
@@ -6745,9 +6882,17 @@ fn compute_transitive_modrefs(
     }
 
     let (scc_members, scc_of_func) = strongly_connected_components(&callees_by_func);
-    let mut payload_ids = BTreeMap::<ModRefFactKey, usize>::new();
+    let mut profile = PointerModRefProfile::from_env();
+    let mut interner = TransitiveModRefInterner::default();
     let mut payloads = Vec::<ModRefPayload>::new();
     let mut local_by_scc = vec![Vec::<usize>::new(); scc_members.len()];
+    profile.print_closure_finalization(
+        "closure-intern-start",
+        scc_members.len(),
+        payloads.len(),
+        0,
+        0,
+    );
     for mr in local_modrefs {
         let payload = ModRefPayload {
             global: mr.global.clone(),
@@ -6759,7 +6904,7 @@ fn compute_transitive_modrefs(
             pointee_globals: mr.pointee_globals.clone(),
             global_candidates: mr.global_candidates.clone(),
         };
-        let id = intern_modref_payload(&mut payload_ids, &mut payloads, payload);
+        let id = interner.intern(&mut payloads, payload);
         local_by_scc[scc_of_func[mr.func.0 as usize]].push(id);
     }
     for rows in &mut local_by_scc {
@@ -6785,7 +6930,6 @@ fn compute_transitive_modrefs(
     let mut metrics = ModRefPhaseMetrics::default();
     let high_fanout_limit = transitive_modref_high_fanout_limit();
     let mut memo = vec![None; scc_members.len()];
-    let mut profile = PointerModRefProfile::from_env();
     profile.print_closure_finalization(
         "closure-collect-start",
         scc_members.len(),
@@ -6799,7 +6943,7 @@ fn compute_transitive_modrefs(
             &local_by_scc,
             &scc_succs,
             &mut memo,
-            &mut payload_ids,
+            &mut interner,
             &mut payloads,
             &mut metrics,
             high_fanout_limit,
@@ -6813,6 +6957,8 @@ fn compute_transitive_modrefs(
         total_closure_rows,
         max_closure_rows,
     );
+    profile.print_closure_interner("closure-intern-done", &interner, payloads.len());
+    drop(interner);
     profile.print_closure_finalization(
         "closure-rank-start",
         scc_members.len(),
@@ -6943,7 +7089,7 @@ struct SccPayloadIds {
 
 fn collapse_high_fanout_transitive_rows(
     rows: &mut Vec<usize>,
-    payload_ids: &mut BTreeMap<ModRefFactKey, usize>,
+    interner: &mut TransitiveModRefInterner,
     payloads: &mut Vec<ModRefPayload>,
     metrics: &mut ModRefPhaseMetrics,
     high_fanout_limit: usize,
@@ -6956,7 +7102,7 @@ fn collapse_high_fanout_transitive_rows(
     let detail = Some(format!(
         "high_fanout_transitive_modref:limit={high_fanout_limit}"
     ));
-    compact_transitive_rows(rows, payload_ids, payloads, detail);
+    compact_transitive_rows(rows, interner, payloads, detail);
     metrics.high_fanout_fallbacks += 1;
     metrics.high_fanout_fallback_rows = metrics
         .high_fanout_fallback_rows
@@ -6966,7 +7112,7 @@ fn collapse_high_fanout_transitive_rows(
 
 fn compact_transitive_rows(
     rows: &mut Vec<usize>,
-    payload_ids: &mut BTreeMap<ModRefFactKey, usize>,
+    interner: &mut TransitiveModRefInterner,
     payloads: &mut Vec<ModRefPayload>,
     detail: Option<String>,
 ) {
@@ -6980,15 +7126,13 @@ fn compact_transitive_rows(
     let mod_candidates = has_mod.then(|| transitive_candidate_union(rows, payloads, Access::Mod));
     let mut fallback_rows = Vec::with_capacity(2);
     if has_ref {
-        fallback_rows.push(intern_modref_payload(
-            payload_ids,
+        fallback_rows.push(interner.intern(
             payloads,
             high_fanout_transitive_payload(Access::Ref, detail.clone(), ref_candidates.unwrap()),
         ));
     }
     if has_mod {
-        fallback_rows.push(intern_modref_payload(
-            payload_ids,
+        fallback_rows.push(interner.intern(
             payloads,
             high_fanout_transitive_payload(Access::Mod, detail, mod_candidates.unwrap()),
         ));
@@ -7050,7 +7194,7 @@ fn collect_scc_payload_ids(
     local_by_scc: &[Vec<usize>],
     scc_succs: &[Vec<usize>],
     memo: &mut [Option<SccPayloadIds>],
-    payload_ids: &mut BTreeMap<ModRefFactKey, usize>,
+    interner: &mut TransitiveModRefInterner,
     payloads: &mut Vec<ModRefPayload>,
     metrics: &mut ModRefPhaseMetrics,
     high_fanout_limit: usize,
@@ -7061,7 +7205,7 @@ fn collect_scc_payload_ids(
     let mut rows = local_by_scc[scc].clone();
     let mut approximate = collapse_high_fanout_transitive_rows(
         &mut rows,
-        payload_ids,
+        interner,
         payloads,
         metrics,
         high_fanout_limit,
@@ -7072,7 +7216,7 @@ fn collect_scc_payload_ids(
             local_by_scc,
             scc_succs,
             memo,
-            payload_ids,
+            interner,
             payloads,
             metrics,
             high_fanout_limit,
@@ -7081,7 +7225,7 @@ fn collect_scc_payload_ids(
         approximate |= succ_rows.approximate;
         approximate |= collapse_high_fanout_transitive_rows(
             &mut rows,
-            payload_ids,
+            interner,
             payloads,
             metrics,
             high_fanout_limit,
@@ -7089,7 +7233,7 @@ fn collect_scc_payload_ids(
         if approximate {
             compact_transitive_rows(
                 &mut rows,
-                payload_ids,
+                interner,
                 payloads,
                 Some("high_fanout_transitive_modref:propagated".to_string()),
             );
