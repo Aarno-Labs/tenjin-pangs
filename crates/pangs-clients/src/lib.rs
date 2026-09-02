@@ -344,14 +344,20 @@ pub fn assemble_disposition_artifacts(
         );
     }
     let mutex_started = Instant::now();
-    let mutex_reachability = MutexReachability::new(analysis);
-    assemble_mutex_eligibility(analysis, &mutex_reachability, &mut globals);
-    assemble_group_mutex_support(
-        analysis,
-        &mutex_reachability,
-        &globals,
-        &mut coupling_groups,
-    );
+    let needs_mutex_reachability =
+        globals.iter().any(mutex_coarse_eligible) || !coupling_groups.is_empty();
+    let mutex_reachability = needs_mutex_reachability.then(|| MutexReachability::new(analysis));
+    assemble_mutex_eligibility(analysis, mutex_reachability.as_ref(), &mut globals);
+    if !coupling_groups.is_empty() {
+        assemble_group_mutex_support(
+            analysis,
+            mutex_reachability
+                .as_ref()
+                .expect("coupling groups require mutex reachability"),
+            &globals,
+            &mut coupling_groups,
+        );
+    }
     if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing mutex-eligibility={}ms certified={}",
@@ -2320,17 +2326,20 @@ pub fn external_policy_d4_census(
 
 fn assemble_mutex_eligibility(
     analysis: &Analysis,
-    reachability: &MutexReachability,
+    reachability: Option<&MutexReachability>,
     globals: &mut [DispositionGlobal],
 ) {
-    let mut accessors_by_global = vec![BTreeSet::new(); analysis.globals().len()];
-    let mut access_site_counts = vec![0_usize; analysis.globals().len()];
-    for site in analysis.access_sites() {
-        for global in site.globals() {
-            accessors_by_global[global.0 as usize].insert(site.func);
-            access_site_counts[global.0 as usize] += 1;
+    let accessor_index = globals.iter().any(mutex_coarse_eligible).then(|| {
+        let mut accessors_by_global = vec![BTreeSet::new(); analysis.globals().len()];
+        let mut access_site_counts = vec![0_usize; analysis.globals().len()];
+        for site in analysis.access_sites() {
+            for global in site.globals() {
+                accessors_by_global[global.0 as usize].insert(site.func);
+                access_site_counts[global.0 as usize] += 1;
+            }
         }
-    }
+        (accessors_by_global, access_site_counts)
+    });
 
     for global in globals {
         let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) else {
@@ -2406,6 +2415,22 @@ fn assemble_mutex_eligibility(
             );
         }
 
+        if !codes.is_empty() {
+            global.facts.mutex_eligibility = Some(Certificate::Failed {
+                codes,
+                witnesses,
+                recipe: None,
+                diagnostics: Some(serde_json::json!({
+                    "reentrancy_check": "skipped-coarse-eligibility-failed",
+                })),
+                extra: Extra::new(),
+            });
+            continue;
+        }
+
+        let (accessors_by_global, access_site_counts) = accessor_index
+            .as_ref()
+            .expect("coarse-eligible mutex global requires an accessor index");
         let closure_gids = storage_closure_gids(analysis, global);
         let accessors = closure_gids
             .iter()
@@ -2416,21 +2441,21 @@ fn assemble_mutex_eligibility(
             .iter()
             .map(|gid| access_site_counts[gid.0 as usize])
             .sum::<usize>();
-        if codes.is_empty() {
-            if let Some(path) = reachability.accessor_path(&accessors) {
-                codes.push("reentrant-access-path".into());
-                witnesses.push(mutex_path_witness(analysis, &global.key.to_string(), &path));
-            }
-            if let Some((path, caller, unknown)) = reachability.unknown_callee_path(&accessors) {
-                codes.push("unknown-callee-reentrancy".into());
-                witnesses.push(mutex_unknown_callee_witness(
-                    analysis,
-                    &global.key.to_string(),
-                    &path,
-                    caller,
-                    &unknown,
-                ));
-            }
+        let reachability =
+            reachability.expect("coarse-eligible mutex global requires call-graph reachability");
+        if let Some(path) = reachability.accessor_path(&accessors) {
+            codes.push("reentrant-access-path".into());
+            witnesses.push(mutex_path_witness(analysis, &global.key.to_string(), &path));
+        }
+        if let Some((path, caller, unknown)) = reachability.unknown_callee_path(&accessors) {
+            codes.push("unknown-callee-reentrancy".into());
+            witnesses.push(mutex_unknown_callee_witness(
+                analysis,
+                &global.key.to_string(),
+                &path,
+                caller,
+                &unknown,
+            ));
         }
 
         let accessor_functions = accessors
@@ -2466,15 +2491,18 @@ fn assemble_mutex_eligibility(
                 diagnostics: Some(serde_json::json!({
                     "access_sites_observed": access_site_count,
                     "accessor_functions": accessor_functions,
-                    "reentrancy_check": if global.facts.access_set_complete.value
-                        && !global.facts.signal_context_access.value
-                        && !global.facts.violation_taint.value
-                    { "performed" } else { "skipped-coarse-eligibility-failed" },
+                    "reentrancy_check": "performed",
                 })),
                 extra: Extra::new(),
             }
         });
     }
+}
+
+fn mutex_coarse_eligible(global: &DispositionGlobal) -> bool {
+    global.facts.access_set_complete.value
+        && !global.facts.signal_context_access.value
+        && !global.facts.violation_taint.value
 }
 
 fn mutex_declaration(
@@ -5757,6 +5785,48 @@ int call_reader(void) { return read_pointer(&target); }
         assert_eq!(
             witness.extra["call_path"][0]["callee"]["unknown"],
             "external_callee"
+        );
+    }
+
+    #[test]
+    fn mutex_eligibility_skips_accessor_analysis_after_a_coarse_failure() {
+        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
+        let mut pir = Pir::from_path(&fixture).unwrap();
+        pir.globals[0].exported = true;
+
+        let opts = Opts::default();
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let target = pangs_pir::TargetInfo {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: String::new(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        };
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+
+        let global = manifest
+            .globals
+            .iter()
+            .find(|global| global.meta.llvm_name == "g_counter")
+            .unwrap();
+        assert!(!global.facts.access_set_complete.value);
+        let Some(Certificate::Failed {
+            codes, diagnostics, ..
+        }) = &global.facts.mutex_eligibility
+        else {
+            panic!("an exported library global must fail mutex eligibility")
+        };
+        assert!(codes.iter().any(|code| code == "access-set-complete"));
+        assert_eq!(
+            diagnostics.as_ref().unwrap(),
+            &json!({"reentrancy_check": "skipped-coarse-eligibility-failed"})
         );
     }
 
