@@ -823,9 +823,9 @@ struct ClassData {
     has_empty_witness: bool,
     ext: bool,
     universal: bool,
-    universal_sources: BTreeSet<String>,
+    universal_sources: BTreeSet<ProvenanceId>,
     esc: bool,
-    escape_sources: BTreeSet<String>,
+    escape_sources: BTreeSet<ProvenanceId>,
     icall_sites: HashSet<usize>,
     fn_objs: HashSet<usize>,
     processed_icall_sites: HashSet<usize>,
@@ -833,6 +833,71 @@ struct ClassData {
     processed_external_icall_sites: HashSet<usize>,
     global_objs: HashSet<usize>,
     provenance: u8,
+}
+
+/// Compact identity for a diagnostic provenance string. Provenance flows through the same hot
+/// union/find worklist as points-to state, but its text is only needed while materializing the
+/// final result. Keeping IDs in classes avoids repeatedly cloning source strings during joins and
+/// propagation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ProvenanceId(u32);
+
+#[derive(Debug, Default)]
+struct ProvenanceInterner {
+    ids: HashMap<Arc<str>, ProvenanceId>,
+    values: Vec<Arc<str>>,
+}
+
+impl ProvenanceInterner {
+    fn intern(&mut self, source: String) -> ProvenanceId {
+        if let Some(&id) = self.ids.get(source.as_str()) {
+            return id;
+        }
+        let value: Arc<str> = source.into();
+        let id = ProvenanceId(
+            self.values
+                .len()
+                .try_into()
+                .expect("too many provenance sources"),
+        );
+        self.values.push(value.clone());
+        self.ids.insert(value, id);
+        id
+    }
+
+    fn get(&self, id: ProvenanceId) -> &str {
+        &self.values[id.0 as usize]
+    }
+
+    fn first_lexicographic<'b>(
+        &self,
+        sources: impl IntoIterator<Item = &'b ProvenanceId>,
+    ) -> Option<ProvenanceId> {
+        sources
+            .into_iter()
+            .copied()
+            .min_by(|left, right| self.get(*left).cmp(self.get(*right)))
+    }
+
+    fn strings<'b>(&self, sources: impl IntoIterator<Item = &'b ProvenanceId>) -> Vec<String> {
+        let mut values = sources
+            .into_iter()
+            .map(|&id| self.get(id).to_owned())
+            .collect::<Vec<_>>();
+        values.sort();
+        values.dedup();
+        values
+    }
+
+    fn string_set<'b>(
+        &self,
+        sources: impl IntoIterator<Item = &'b ProvenanceId>,
+    ) -> BTreeSet<String> {
+        sources
+            .into_iter()
+            .map(|&id| self.get(id).to_owned())
+            .collect()
+    }
 }
 
 fn global_storage_roots_index(classes: &[ClassData], global_count: usize) -> Vec<Vec<usize>> {
@@ -930,7 +995,8 @@ struct Solver<'a> {
     fields_by_root: HashMap<NodeId, Vec<usize>>,
     /// Allocation-specific escape sources for certified fields. Retain this precision when
     /// legacy unification merges the allocation's owner class with unrelated objects.
-    field_escape_sources_by_root: HashMap<NodeId, BTreeSet<String>>,
+    field_escape_sources_by_root: HashMap<NodeId, BTreeSet<ProvenanceId>>,
+    provenance: ProvenanceInterner,
     callsites_by_index: Vec<&'a pangs_pag::Callsite>,
     worklist: VecDeque<usize>,
     queued: Vec<bool>,
@@ -1594,6 +1660,7 @@ impl<'a> Solver<'a> {
             field_classes: HashMap::new(),
             fields_by_root: HashMap::new(),
             field_escape_sources_by_root: HashMap::new(),
+            provenance: ProvenanceInterner::default(),
             callsites_by_index,
             worklist: VecDeque::new(),
             queued,
@@ -1704,7 +1771,7 @@ impl<'a> Solver<'a> {
                             "omega:null_load:{}",
                             self.pag.nodes[edge.src.0 as usize].label
                         );
-                        self.set_universal_ext_with_sources(dst, &BTreeSet::from([source]));
+                        self.set_universal_ext_with_source(dst, source);
                         continue;
                     }
                     // Missing widths occur only in legacy/hand-written PIR. Preserve its
@@ -1750,7 +1817,7 @@ impl<'a> Solver<'a> {
                             "omega:null_gep:{}",
                             self.pag.nodes[edge.src.0 as usize].label
                         );
-                        self.set_universal_ext_with_sources(dst, &BTreeSet::from([source]));
+                        self.set_universal_ext_with_source(dst, source);
                         continue;
                     }
                     let dst_p = self.pointee_of(dst);
@@ -1778,7 +1845,7 @@ impl<'a> Solver<'a> {
                             "omega:null_memcpy_src:{}",
                             self.pag.nodes[edge.src.0 as usize].label
                         );
-                        self.set_universal_ext_with_sources(dst_storage, &BTreeSet::from([source]));
+                        self.set_universal_ext_with_source(dst_storage, source);
                         continue;
                     }
                     let src_storage = self.storage_class_for_address(edge.src, bytes, false);
@@ -1855,7 +1922,7 @@ impl<'a> Solver<'a> {
                     };
                     self.set_esc_with_source(class, source.clone());
                     if seed.kind == OmegaSeedKind::ExportedSymbol {
-                        self.escape_allocation_fields(id, &BTreeSet::from([source.clone()]));
+                        self.escape_allocation_fields_with_source(id, source.clone());
                     }
                 }
                 (OmegaSeedKind::PtrToInt, SeedTarget::Node(id))
@@ -1869,7 +1936,7 @@ impl<'a> Solver<'a> {
                     }
                     let pointee = self.pointee_of(class);
                     let source = format!("{:?}:{}", seed.kind, self.pag.nodes[id.0 as usize].label);
-                    self.escape_exact_address_fields(id, &BTreeSet::from([source.clone()]));
+                    self.escape_exact_address_fields_with_source(id, source.clone());
                     self.add_class_provenance(pointee, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
                     self.set_esc_with_source(pointee, source);
                 }
@@ -1877,7 +1944,7 @@ impl<'a> Solver<'a> {
                     let class = self.class_of(id);
                     self.add_class_provenance(class, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
                     let source = format!("omega:inttoptr:{}", self.pag.nodes[id.0 as usize].label);
-                    self.set_universal_ext_with_sources(class, &BTreeSet::from([source]));
+                    self.set_universal_ext_with_source(class, source);
                 }
                 (OmegaSeedKind::UnknownResultExternal, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
@@ -1990,11 +2057,9 @@ impl<'a> Solver<'a> {
             if self.classes[root].esc {
                 unknown_callers.insert(self.function_keys[func_index].clone());
             }
-            let escape_sources = self.classes[root]
-                .escape_sources
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
+            let escape_sources = self
+                .provenance
+                .strings(self.classes[root].escape_sources.iter());
             let own_export = format!(
                 "exported-symbol:obj:function:{}",
                 self.function_keys[func_index]
@@ -2044,12 +2109,11 @@ impl<'a> Solver<'a> {
             let mut escape_external = storage_roots
                 .iter()
                 .any(|&storage| self.classes[storage].esc);
-            let mut escape_sources = storage_roots
-                .iter()
-                .flat_map(|&storage| self.classes[storage].escape_sources.iter().cloned())
-                .collect::<Vec<_>>();
-            escape_sources.sort();
-            escape_sources.dedup();
+            let mut escape_sources = self.provenance.strings(
+                storage_roots
+                    .iter()
+                    .flat_map(|&storage| self.classes[storage].escape_sources.iter()),
+            );
             let own_export = format!("exported-symbol:obj:global:{}", global.key);
             let mut address_escape = escape_sources.iter().any(|source| source != &own_export);
             let never_written = !escape_external
@@ -2237,15 +2301,13 @@ impl<'a> Solver<'a> {
                     } else {
                         Vec::new()
                     },
-                    universal_sources: summary
-                        .pointee
-                        .into_iter()
-                        .flat_map(|pointee| self.classes[pointee].universal_sources.iter())
-                        .chain(self.classes[root].universal_sources.iter())
-                        .cloned()
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
+                    universal_sources: self.provenance.strings(
+                        summary
+                            .pointee
+                            .into_iter()
+                            .flat_map(|pointee| self.classes[pointee].universal_sources.iter())
+                            .chain(self.classes[root].universal_sources.iter()),
+                    ),
                 },
             );
         }
@@ -2370,7 +2432,8 @@ impl<'a> Solver<'a> {
                     let sources = if self.classes[pointee].escape_sources.is_empty() {
                         BTreeSet::from(["derived:external-pointee".to_string()])
                     } else {
-                        self.classes[pointee].escape_sources.clone()
+                        self.provenance
+                            .string_set(self.classes[pointee].escape_sources.iter())
                     };
                     pointee_external
                         .entry(node.label.clone())
@@ -2395,7 +2458,8 @@ impl<'a> Solver<'a> {
                         let sources = if self.classes[contents].escape_sources.is_empty() {
                             BTreeSet::from(["omega:reachable-contents".to_string()])
                         } else {
-                            self.classes[contents].escape_sources.clone()
+                            self.provenance
+                                .string_set(self.classes[contents].escape_sources.iter())
                         };
                         pointee_external
                             .entry(node.label.clone())
@@ -2639,7 +2703,7 @@ impl<'a> Solver<'a> {
             if self.node_is_proven_empty(arg_node) {
                 continue;
             }
-            self.escape_exact_address_fields(arg_node, &BTreeSet::from([source.clone()]));
+            self.escape_exact_address_fields_with_source(arg_node, source.clone());
             let arg = self.class_of(arg_node);
             let pointee = self.pointee_of(arg);
             self.set_esc_with_source(pointee, source.clone());
@@ -2661,7 +2725,7 @@ impl<'a> Solver<'a> {
             .copied()
             .collect::<Vec<_>>();
         for arg in extra_args {
-            self.escape_exact_address_fields(arg, &BTreeSet::from([source.clone()]));
+            self.escape_exact_address_fields_with_source(arg, source.clone());
             let class = self.class_of(arg);
             let root = self.find(class);
             let Some(pointee) = self.classes[root].pointee else {
@@ -2731,28 +2795,40 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn escape_allocation_fields(&mut self, root: NodeId, sources: &BTreeSet<String>) {
+    fn escape_allocation_fields(&mut self, root: NodeId, sources: &BTreeSet<ProvenanceId>) {
         let sources_by_root = self.field_escape_sources_by_root.entry(root).or_default();
         let already_escaped = !sources_by_root.is_empty();
         sources_by_root.extend(sources.iter().cloned());
         if already_escaped {
             return;
         }
-        let source = sources
-            .iter()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "derived:allocation-field-escape".into());
+        let source = self
+            .provenance
+            .first_lexicographic(sources.iter())
+            .unwrap_or_else(|| {
+                self.provenance
+                    .intern("derived:allocation-field-escape".into())
+            });
         let fields = self.fields_by_root.get(&root).cloned().unwrap_or_default();
         for field in fields {
-            self.set_esc_with_source(field, source.clone());
+            self.set_esc_with_id(field, source);
         }
     }
 
-    fn escape_exact_address_fields(&mut self, address: NodeId, sources: &BTreeSet<String>) {
+    fn escape_allocation_fields_with_source(&mut self, root: NodeId, source: String) {
+        let source = self.provenance.intern(source);
+        self.escape_allocation_fields(root, &BTreeSet::from([source]));
+    }
+
+    fn escape_exact_address_fields(&mut self, address: NodeId, sources: &BTreeSet<ProvenanceId>) {
         if let Some(address) = self.exact_addresses[address.0 as usize] {
             self.escape_allocation_fields(address.root, sources);
         }
+    }
+
+    fn escape_exact_address_fields_with_source(&mut self, address: NodeId, source: String) {
+        let source = self.provenance.intern(source);
+        self.escape_exact_address_fields(address, &BTreeSet::from([source]));
     }
 
     fn assert_field_root_coherence(&mut self) {
@@ -2877,11 +2953,9 @@ impl<'a> Solver<'a> {
         if let Some(sources) = self.field_escape_sources_by_root.get(&root) {
             data.esc = true;
             data.escape_sources.insert(
-                sources
-                    .iter()
-                    .next()
-                    .cloned()
-                    .unwrap_or_else(|| "derived:allocation-field-escape".into()),
+                self.provenance
+                    .first_lexicographic(sources.iter())
+                    .expect("escaped field root has a provenance source"),
             );
         }
         self.classes.push(data);
@@ -2914,7 +2988,12 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn set_universal_ext_with_sources(&mut self, class: usize, sources: &BTreeSet<String>) {
+    fn set_universal_ext_with_source(&mut self, class: usize, source: String) {
+        let source = self.provenance.intern(source);
+        self.set_universal_ext_with_sources(class, &BTreeSet::from([source]));
+    }
+
+    fn set_universal_ext_with_sources(&mut self, class: usize, sources: &BTreeSet<ProvenanceId>) {
         let root = self.find(class);
         let old_sources = self.classes[root].universal_sources.len();
         self.classes[root]
@@ -2931,6 +3010,11 @@ impl<'a> Solver<'a> {
     }
 
     fn set_esc_with_source(&mut self, class: usize, source: String) {
+        let source = self.provenance.intern(source);
+        self.set_esc_with_id(class, source);
+    }
+
+    fn set_esc_with_id(&mut self, class: usize, source: ProvenanceId) {
         let root = self.find(class);
         let changed = self.classes[root].escape_sources.insert(source);
         if !self.classes[root].esc || changed {
@@ -2939,7 +3023,7 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn set_esc_sources(&mut self, class: usize, sources: &BTreeSet<String>) {
+    fn set_esc_sources(&mut self, class: usize, sources: &BTreeSet<ProvenanceId>) {
         let root = self.find(class);
         let old_len = self.classes[root].escape_sources.len();
         self.classes[root]
@@ -2970,13 +3054,25 @@ impl<'a> Solver<'a> {
         self.classes[a].has_empty_witness |= self.classes[b].has_empty_witness;
         self.classes[a].ext |= self.classes[b].ext;
         self.classes[a].universal |= self.classes[b].universal;
-        let other_universal_sources = std::mem::take(&mut self.classes[b].universal_sources);
+        let mut other_universal_sources = std::mem::take(&mut self.classes[b].universal_sources);
+        if self.classes[a].universal_sources.len() < other_universal_sources.len() {
+            std::mem::swap(
+                &mut self.classes[a].universal_sources,
+                &mut other_universal_sources,
+            );
+        }
         self.classes[a]
             .universal_sources
             .extend(other_universal_sources);
         self.classes[a].esc |= self.classes[b].esc;
         self.classes[a].provenance |= self.classes[b].provenance | provenance;
-        let other_escape_sources = std::mem::take(&mut self.classes[b].escape_sources);
+        let mut other_escape_sources = std::mem::take(&mut self.classes[b].escape_sources);
+        if self.classes[a].escape_sources.len() < other_escape_sources.len() {
+            std::mem::swap(
+                &mut self.classes[a].escape_sources,
+                &mut other_escape_sources,
+            );
+        }
         self.classes[a].escape_sources.extend(other_escape_sources);
 
         let other_sites = std::mem::take(&mut self.classes[b].icall_sites);
@@ -3365,18 +3461,15 @@ mod tests {
         let a = solver.class_of(object("A"));
         let b = solver.class_of(object("B"));
         let owner = solver.join(a, b, PROV_DIRECT_ADDRESS);
-        solver.set_universal_ext_with_sources(
-            owner,
-            &BTreeSet::from(["omega:test-owner".to_string()]),
-        );
+        solver.set_universal_ext_with_source(owner, "omega:test-owner".to_string());
         solver.set_esc_with_source(owner, "test:owner-escape".into());
-        solver.escape_allocation_fields(
+        solver.escape_allocation_fields_with_source(
             object("A"),
-            &BTreeSet::from(["test:exact-field-escape".to_string()]),
+            "test:exact-field-escape".to_string(),
         );
-        solver.escape_allocation_fields(
+        solver.escape_allocation_fields_with_source(
             object("A"),
-            &BTreeSet::from(["test:later-root-witness".to_string()]),
+            "test:later-root-witness".to_string(),
         );
 
         while let Some(class) = solver.worklist.pop_front() {
@@ -3395,13 +3488,15 @@ mod tests {
         assert!(solver.classes[field].esc);
         assert!(solver.classes[field]
             .escape_sources
-            .contains("test:exact-field-escape"));
+            .iter()
+            .any(|&source| solver.provenance.get(source) == "test:exact-field-escape"));
         assert!(!solver.classes[field]
             .escape_sources
-            .contains("test:later-root-witness"));
-        assert!(
-            solver.field_escape_sources_by_root[&object("A")].contains("test:later-root-witness")
-        );
+            .iter()
+            .any(|&source| solver.provenance.get(source) == "test:later-root-witness"));
+        assert!(solver.field_escape_sources_by_root[&object("A")]
+            .iter()
+            .any(|&source| solver.provenance.get(source) == "test:later-root-witness"));
         let contents = solver.find(contents);
         assert!(solver.classes[contents].ext);
         assert!(solver.classes[contents].esc);
