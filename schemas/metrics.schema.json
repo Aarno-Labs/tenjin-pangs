@@ -32,6 +32,9 @@
     "steens_join_attempts",
     "steens_join_successes",
     "steens_pointee_classes_created",
+    "steens_content_edges",
+    "steens_content_pushes",
+    "steens_unify_pointees_shared",
     "steens_max_class_icall_sites",
     "steens_max_class_fn_objs",
     "steens_max_class_candidate_pairs",
@@ -285,6 +288,18 @@
       "minimum": 0
     },
     "steens_pointee_classes_created": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_content_edges": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_content_pushes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steens_unify_pointees_shared": {
       "type": "integer",
       "minimum": 0
     },

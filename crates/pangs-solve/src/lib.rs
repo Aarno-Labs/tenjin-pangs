@@ -115,6 +115,12 @@ pub struct SolveMetrics {
     #[serde(default)]
     pub steens_pointee_classes_created: u64,
     #[serde(default)]
+    pub steens_content_edges: u64,
+    #[serde(default)]
+    pub steens_content_pushes: u64,
+    #[serde(default)]
+    pub steens_unify_pointees_shared: u64,
+    #[serde(default)]
     pub steens_max_class_icall_sites: usize,
     #[serde(default)]
     pub steens_max_class_fn_objs: usize,
@@ -836,6 +842,18 @@ struct ClassData {
     processed_external_icall_sites: HashSet<usize>,
     global_objs: HashSet<usize>,
     provenance: u8,
+    /// Classes whose contents include this class's contents. Targets are raw class ids and are
+    /// resolved through `find` when the edge fires, just like the other union-find side tables.
+    content_succ: Vec<usize>,
+    /// Content propagation frontier. Facts are monotone, so unchanged facts need visit only
+    /// successors appended since the previous push. A class join resets this compact frontier.
+    content_pushed_succ_len: usize,
+    content_pushed_ext: bool,
+    content_pushed_universal_sources: usize,
+    content_pushed_empty: bool,
+    /// Debug-only semantic roles. A solved class may contain carriers or locations, never both.
+    has_carrier: bool,
+    has_location: bool,
 }
 
 /// Compact identity for a diagnostic provenance string. Provenance flows through the same hot
@@ -990,10 +1008,6 @@ struct Solver<'a> {
     global_address_exposed: Vec<bool>,
     violation_exposure: ViolationExposure,
     exact_addresses: Vec<Option<ExactAddress>>,
-    /// Directed empty-witness flow for memcpy storage cells. Allocation pointees retain the
-    /// existing Steensgaard join, while this side relation preserves certified emptiness without
-    /// equating the source and destination carrier classes.
-    empty_witness_copy_edges: Vec<(usize, usize)>,
     field_classes: HashMap<(NodeId, FieldRegion), usize>,
     fields_by_root: HashMap<NodeId, Vec<usize>>,
     /// Allocation-specific escape sources for certified fields. Retain this precision when
@@ -1601,22 +1615,27 @@ impl<'a> Solver<'a> {
                 ..ClassData::default()
             };
             match &node.kind {
-                NodeKind::Object { object, key, .. } => match object {
-                    pangs_pag::ObjectKind::Function => {
-                        if let Some(&func_index) = function_name_to_index.get(key) {
-                            data.fn_objs.insert(func_index);
-                            function_object_nodes[func_index] = Some(node.id);
+                NodeKind::Object { object, key, .. } => {
+                    data.has_location = true;
+                    match object {
+                        pangs_pag::ObjectKind::Function => {
+                            if let Some(&func_index) = function_name_to_index.get(key) {
+                                data.fn_objs.insert(func_index);
+                                function_object_nodes[func_index] = Some(node.id);
+                            }
+                        }
+                        pangs_pag::ObjectKind::Global => {
+                            if let Some(&global_index) = global_name_to_index.get(key) {
+                                data.global_objs.insert(global_index);
+                                global_object_nodes[global_index] = Some(node.id);
+                            }
+                        }
+                        pangs_pag::ObjectKind::Alloca | pangs_pag::ObjectKind::ExternalReadonly => {
                         }
                     }
-                    pangs_pag::ObjectKind::Global => {
-                        if let Some(&global_index) = global_name_to_index.get(key) {
-                            data.global_objs.insert(global_index);
-                            global_object_nodes[global_index] = Some(node.id);
-                        }
-                    }
-                    pangs_pag::ObjectKind::Alloca | pangs_pag::ObjectKind::ExternalReadonly => {}
-                },
+                }
                 NodeKind::Param { func, index } => {
+                    data.has_carrier = true;
                     if let Some(&func_index) = function_name_to_index.get(func) {
                         let meta = &mut function_meta[func_index];
                         if meta.param_nodes.len() <= *index as usize {
@@ -1627,11 +1646,12 @@ impl<'a> Solver<'a> {
                     }
                 }
                 NodeKind::Return { func } => {
+                    data.has_carrier = true;
                     if let Some(&func_index) = function_name_to_index.get(func) {
                         function_meta[func_index].ret_node = Some(node.id);
                     }
                 }
-                NodeKind::Value { .. } => {}
+                NodeKind::Value { .. } => data.has_carrier = true,
             }
             classes.push(data);
         }
@@ -1663,7 +1683,6 @@ impl<'a> Solver<'a> {
             global_address_exposed,
             violation_exposure,
             exact_addresses,
-            empty_witness_copy_edges: Vec::new(),
             field_classes: HashMap::new(),
             fields_by_root: HashMap::new(),
             field_escape_sources_by_root: HashMap::new(),
@@ -1696,9 +1715,9 @@ impl<'a> Solver<'a> {
             let root = self.find(class);
             self.process_class(root);
         }
-        self.propagate_empty_witnesses();
         self.assert_field_root_coherence();
         self.assert_canonical_null_isolated();
+        self.assert_one_hop_invariant();
         self.print_steens_profile("done");
     }
 
@@ -1786,11 +1805,12 @@ impl<'a> Solver<'a> {
                     let width =
                         (!edge.access_extent_unknown).then_some(edge.access_bytes.unwrap_or(0));
                     let storage = self.storage_class_for_address(edge.src, width, true);
-                    self.join(
-                        dst,
+                    self.unify_pointees(
                         storage,
+                        dst,
                         PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
                     );
+                    self.add_content_edge(storage, dst);
                 }
                 pangs_pag::EdgeKind::Store => {
                     if self.node_is_proven_empty(edge.dst) {
@@ -1809,11 +1829,12 @@ impl<'a> Solver<'a> {
                         continue;
                     }
                     let src = self.class_of(edge.src);
-                    self.join(
+                    self.unify_pointees(
                         storage,
                         src,
                         PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
                     );
+                    self.add_content_edge(src, storage);
                 }
                 pangs_pag::EdgeKind::Gep { .. } => {
                     let dst = self.class_of(edge.dst);
@@ -1827,15 +1848,15 @@ impl<'a> Solver<'a> {
                         self.set_universal_ext_with_source(dst, source);
                         continue;
                     }
-                    let dst_p = self.pointee_of(dst);
                     if let Some(address) = self.exact_addresses[edge.dst.0 as usize] {
+                        let dst_p = self.pointee_of(dst);
                         let storage =
                             self.field_class(address.root, FieldRegion::address(address.location));
                         self.join(dst_p, storage, PROV_DIRECT_ADDRESS);
                     } else {
                         let src = self.class_of(edge.src);
-                        let src_p = self.pointee_of(src);
-                        self.join(dst_p, src_p, PROV_DIRECT_ADDRESS);
+                        self.unify_pointees(dst, src, PROV_DIRECT_ADDRESS);
+                        self.add_content_edge(src, dst);
                     }
                 }
                 pangs_pag::EdgeKind::Memcpy { bytes } => {
@@ -1856,15 +1877,12 @@ impl<'a> Solver<'a> {
                         continue;
                     }
                     let src_storage = self.storage_class_for_address(edge.src, bytes, false);
-                    self.empty_witness_copy_edges
-                        .push((src_storage, dst_storage));
-                    let dst_content = self.pointee_of(dst_storage);
-                    let src_content = self.pointee_of(src_storage);
-                    self.join(
-                        dst_content,
-                        src_content,
+                    self.unify_pointees(
+                        dst_storage,
+                        src_storage,
                         PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
                     );
+                    self.add_content_edge(src_storage, dst_storage);
                 }
             }
         }
@@ -2123,14 +2141,19 @@ impl<'a> Solver<'a> {
             );
             let own_export = format!("exported-symbol:obj:global:{}", global.key);
             let mut address_escape = escape_sources.iter().any(|source| source != &own_export);
-            let never_written = !escape_external
+            // Imported declarations are storage owned by another module: absence of a local
+            // store is not a proof that they are immutable, and allocation-isolation over this
+            // module cannot discharge their external address/write boundary.
+            let locally_defined = global.is_definition;
+            let never_written = locally_defined
+                && !escape_external
                 && storage_roots
                     .iter()
                     .all(|storage| !stored_classes.contains(storage));
             let mut runtime_written = storage_roots
                 .iter()
                 .any(|storage| runtime_stored_classes.contains(storage));
-            if isolation.address.contains(&global.key) {
+            if locally_defined && isolation.address.contains(&global.key) {
                 // Steensgaard may merge a dynamically-indexed aggregate with an unrelated,
                 // externally exposed pointer class.  A completed allocation-provenance proof
                 // is strictly narrower: every flow of this object's own address was followed
@@ -2140,7 +2163,7 @@ impl<'a> Solver<'a> {
                 address_escape = false;
                 escape_sources.clear();
             }
-            if isolation.write.contains(&global.key) {
+            if locally_defined && isolation.write.contains(&global.key) {
                 runtime_written = false;
             }
             globals.insert(
@@ -2189,8 +2212,16 @@ impl<'a> Solver<'a> {
                 let external = self.classes[root].ext || self.classes[root].esc || pointee_external;
                 let universal = self.classes[root].universal || pointee_universal;
                 let has_empty_witness = self.classes[root].has_empty_witness;
+                let pointee_is_empty = pointee.is_none_or(|pointee| {
+                    self.classes[pointee].node_count == 0
+                        && !self.classes[pointee].ext
+                        && !self.classes[pointee].universal
+                        && !self.classes[pointee].esc
+                        && self.classes[pointee].fn_objs.is_empty()
+                        && self.classes[pointee].global_objs.is_empty()
+                });
                 let proven_empty = has_empty_witness
-                    && pointee.is_none()
+                    && pointee_is_empty
                     && !external
                     && !universal
                     && self.classes[root].fn_objs.is_empty()
@@ -2509,11 +2540,53 @@ impl<'a> Solver<'a> {
                     self.set_ext(pointee);
                 }
                 if escape_sources.is_empty() {
-                    self.set_esc_with_source(pointee, "derived:external-pointee".into());
+                    let pointee = self.find(pointee);
+                    if !self.classes[pointee].esc {
+                        self.set_esc_with_source(pointee, "derived:external-pointee".into());
+                    }
                 } else {
                     self.set_esc_sources(pointee, &escape_sources);
                 }
             }
+        }
+
+        // Load/store/memcpy/unknown-GEP move pointer contents without equating their carrier and
+        // location classes. Propagate exactly the content facts that the old container merge
+        // carried implicitly, in the direction of the value transfer.
+        let has_empty_witness = self.classes[root].has_empty_witness;
+        if ext || esc || universal || has_empty_witness {
+            let facts_changed = (ext || esc) && !self.classes[root].content_pushed_ext
+                || universal_sources.len() > self.classes[root].content_pushed_universal_sources
+                || has_empty_witness && !self.classes[root].content_pushed_empty;
+            let successor_count = self.classes[root].content_succ.len();
+            let first_successor = if facts_changed {
+                0
+            } else {
+                self.classes[root]
+                    .content_pushed_succ_len
+                    .min(successor_count)
+            };
+            let successors = self.classes[root].content_succ[first_successor..].to_vec();
+            for successor in successors {
+                let dst = self.find(successor);
+                if dst == root {
+                    continue;
+                }
+                self.metrics.steens_content_pushes += 1;
+                if ext || esc {
+                    self.set_ext(dst);
+                }
+                if universal {
+                    self.set_universal_ext_with_sources(dst, &universal_sources);
+                }
+                if has_empty_witness {
+                    self.set_empty_witness(dst);
+                }
+            }
+            self.classes[root].content_pushed_succ_len = successor_count;
+            self.classes[root].content_pushed_ext |= ext || esc;
+            self.classes[root].content_pushed_universal_sources = universal_sources.len();
+            self.classes[root].content_pushed_empty |= has_empty_witness;
         }
 
         if esc {
@@ -2781,25 +2854,53 @@ impl<'a> Solver<'a> {
 
     fn set_empty_witness(&mut self, class: usize) {
         let root = self.find(class);
-        self.classes[root].has_empty_witness = true;
+        if !self.classes[root].has_empty_witness {
+            self.classes[root].has_empty_witness = true;
+            self.enqueue(root);
+        }
     }
 
-    fn propagate_empty_witnesses(&mut self) {
-        let edges = self.empty_witness_copy_edges.clone();
-        loop {
-            let mut changed = false;
-            for &(src, dst) in &edges {
-                let src = self.find(src);
-                let dst = self.find(dst);
-                if self.classes[src].has_empty_witness && !self.classes[dst].has_empty_witness {
-                    self.classes[dst].has_empty_witness = true;
-                    changed = true;
-                }
+    /// Equate the pointer targets held in `a` and `b` without equating the cells themselves.
+    fn unify_pointees(&mut self, a: usize, b: usize, provenance: u8) -> usize {
+        let a = self.find(a);
+        let b = self.find(b);
+        if a == b {
+            let pointee = self.pointee_of(a);
+            self.add_class_provenance(pointee, provenance);
+            return pointee;
+        }
+        match (self.classes[a].pointee, self.classes[b].pointee) {
+            (Some(pa), Some(pb)) => self.join(pa, pb, provenance),
+            (Some(p), None) => {
+                let p = self.find(p);
+                self.classes[b].pointee = Some(p);
+                self.add_class_provenance(p, provenance);
+                self.enqueue(b);
+                p
             }
-            if !changed {
-                break;
+            (None, Some(p)) => {
+                let p = self.find(p);
+                self.classes[a].pointee = Some(p);
+                self.add_class_provenance(p, provenance);
+                self.enqueue(a);
+                p
+            }
+            (None, None) => {
+                let p = self.pointee_of(a);
+                self.classes[b].pointee = Some(p);
+                self.add_class_provenance(p, provenance);
+                self.enqueue(b);
+                self.metrics.steens_unify_pointees_shared += 1;
+                p
             }
         }
+    }
+
+    fn add_content_edge(&mut self, src: usize, dst: usize) {
+        let src = self.find(src);
+        self.classes[src].content_succ.push(dst);
+        self.metrics.steens_content_edges += 1;
+        self.enqueue(src);
     }
 
     fn escape_allocation_fields(&mut self, root: NodeId, sources: &BTreeSet<ProvenanceId>) {
@@ -2882,6 +2983,28 @@ impl<'a> Solver<'a> {
         }
     }
 
+    fn assert_one_hop_invariant(&mut self) {
+        #[cfg(debug_assertions)]
+        for class in 0..self.classes.len() {
+            let root = self.find(class);
+            if root != class {
+                continue;
+            }
+            debug_assert!(
+                !(self.classes[root].has_carrier && self.classes[root].has_location),
+                "Steensgaard class {root} mixes value carriers with storage locations"
+            );
+            if self.classes[root].has_carrier {
+                debug_assert!(
+                    !self.classes[root].esc
+                        && self.classes[root].global_objs.is_empty()
+                        && self.classes[root].fn_objs.is_empty(),
+                    "Steensgaard carrier class {root} contains location-only facts"
+                );
+            }
+        }
+    }
+
     fn pointee_of(&mut self, class: usize) -> usize {
         let root = self.find(class);
         if let Some(pointee) = self.classes[root].pointee {
@@ -2892,6 +3015,7 @@ impl<'a> Solver<'a> {
         self.classes.push(ClassData {
             parent: id,
             size: 1,
+            has_location: true,
             ..ClassData::default()
         });
         self.queued.push(false);
@@ -2952,6 +3076,7 @@ impl<'a> Solver<'a> {
         let mut data = ClassData {
             parent: id,
             size: 1,
+            has_location: true,
             ..ClassData::default()
         };
         if let Some(global_index) = self.global_object_index_by_node[root.0 as usize] {
@@ -3047,9 +3172,15 @@ impl<'a> Solver<'a> {
         let mut a = self.find(left);
         let mut b = self.find(right);
         if a == b {
+            debug_assert!(!(self.classes[a].has_carrier && self.classes[a].has_location));
             self.classes[a].provenance |= provenance;
             return a;
         }
+        debug_assert!(
+            !(self.classes[a].has_carrier && self.classes[b].has_location)
+                && !(self.classes[a].has_location && self.classes[b].has_carrier),
+            "attempted to merge Steensgaard carrier class {a} with location class {b}"
+        );
         self.metrics.steens_join_successes += 1;
         if self.classes[a].size < self.classes[b].size {
             std::mem::swap(&mut a, &mut b);
@@ -3058,6 +3189,8 @@ impl<'a> Solver<'a> {
         self.classes[b].parent = a;
         self.classes[a].size += self.classes[b].size;
         self.classes[a].node_count += self.classes[b].node_count;
+        self.classes[a].has_carrier |= self.classes[b].has_carrier;
+        self.classes[a].has_location |= self.classes[b].has_location;
         self.classes[a].has_empty_witness |= self.classes[b].has_empty_witness;
         self.classes[a].ext |= self.classes[b].ext;
         self.classes[a].universal |= self.classes[b].universal;
@@ -3088,6 +3221,15 @@ impl<'a> Solver<'a> {
         self.classes[a].fn_objs.extend(other_fns);
         let other_globals = std::mem::take(&mut self.classes[b].global_objs);
         self.classes[a].global_objs.extend(other_globals);
+        let other_content_succ = std::mem::take(&mut self.classes[b].content_succ);
+        self.classes[a].content_succ.extend(other_content_succ);
+        // The merged fact set must be offered to both roots' successor lists. Most joins happen
+        // before propagation starts, so resetting is both simple and cheap; subsequent unchanged
+        // enqueues use the frontier above.
+        self.classes[a].content_pushed_succ_len = 0;
+        self.classes[a].content_pushed_ext = false;
+        self.classes[a].content_pushed_universal_sources = 0;
+        self.classes[a].content_pushed_empty = false;
         let other_external_sites =
             std::mem::take(&mut self.classes[b].processed_external_icall_sites);
         self.classes[a]
@@ -4775,5 +4917,144 @@ mod tests {
             derived.universal_sources,
             ["omega:inttoptr:val:f:forged".to_string()]
         );
+    }
+
+    #[test]
+    fn one_hop_memory_keeps_carriers_separate_from_locations() {
+        let mut pir: Pir = serde_json::from_str(
+            r#"{
+              "module":"one-hop-memory",
+              "globals":[{"key":"CellA"},{"key":"CellB"},{"key":"A"},{"key":"B"}],
+              "functions":[{"key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                {"kind":"store","address":"@CellA","value":"@A","access_bytes":8},
+                {"kind":"store","address":"@CellB","value":"@B","access_bytes":8},
+                {"kind":"load","dest":"loaded_a","address":"@CellA","access_bytes":8},
+                {"kind":"load","dest":"loaded_b","address":"@CellB","access_bytes":8}
+              ]}]
+            }"#,
+        )
+        .unwrap();
+        pir.lowering.semantic_value_kinds.extend([
+            ("loaded_a".into(), ValueKind::Pointer),
+            ("loaded_b".into(), ValueKind::Pointer),
+        ]);
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let node = |label: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == label)
+                .unwrap()
+                .id
+        };
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+        solver.points_to_materialization = PointsToMaterialization::AllNodes;
+        solver.run();
+
+        for (cell, loaded) in [
+            ("obj:global:CellA", "val:f:loaded_a"),
+            ("obj:global:CellB", "val:f:loaded_b"),
+        ] {
+            let cell = solver.class_of(node(cell));
+            let loaded = solver.class_of(node(loaded));
+            assert_ne!(cell, loaded);
+            assert!(solver.classes[cell].has_location);
+            assert!(!solver.classes[cell].has_carrier);
+            assert!(solver.classes[loaded].has_carrier);
+            assert!(!solver.classes[loaded].has_location);
+            assert!(solver.classes[loaded].global_objs.is_empty());
+            assert!(solver.classes[loaded].fn_objs.is_empty());
+            assert!(!solver.classes[loaded].esc);
+        }
+
+        let solved = solver.finish();
+        assert_eq!(
+            solved.node_points_to["val:f:loaded_a"],
+            BTreeSet::from(["A".to_string()])
+        );
+        assert_eq!(
+            solved.node_points_to["val:f:loaded_b"],
+            BTreeSet::from(["B".to_string()])
+        );
+        assert!(solved.metrics.steens_content_edges >= 4);
+    }
+
+    #[test]
+    fn content_edges_propagate_facts_only_forward() {
+        let pir = Pir {
+            module: "content-edge-direction".into(),
+            source: None,
+            lowering: Default::default(),
+            target: None,
+            functions: Vec::new(),
+            globals: Vec::new(),
+            global_init: Vec::new(),
+        };
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Library);
+        let new_location = ClassData::default;
+        let source = solver.classes.len();
+        let mut source_data = new_location();
+        source_data.parent = source;
+        source_data.size = 1;
+        source_data.has_location = true;
+        solver.classes.push(source_data);
+        solver.queued.push(false);
+        let destination = solver.classes.len();
+        let mut destination_data = new_location();
+        destination_data.parent = destination;
+        destination_data.size = 1;
+        destination_data.has_location = true;
+        solver.classes.push(destination_data);
+        solver.queued.push(false);
+        let unrelated = solver.classes.len();
+        let mut unrelated_data = new_location();
+        unrelated_data.parent = unrelated;
+        unrelated_data.size = 1;
+        unrelated_data.has_location = true;
+        solver.classes.push(unrelated_data);
+        solver.queued.push(false);
+        solver.add_content_edge(source, destination);
+        solver.add_content_edge(unrelated, destination);
+        solver.set_universal_ext_with_source(source, "omega:test-content".into());
+        solver.set_empty_witness(source);
+        while let Some(class) = solver.worklist.pop_front() {
+            solver.queued[class] = false;
+            let root = solver.find(class);
+            solver.process_class(root);
+        }
+        let source = solver.find(source);
+        let destination = solver.find(destination);
+        let unrelated = solver.find(unrelated);
+        assert!(solver.classes[destination].ext);
+        assert!(solver.classes[destination].universal);
+        assert!(solver.classes[destination].has_empty_witness);
+        assert!(!solver.classes[unrelated].ext);
+        assert!(!solver.classes[unrelated].universal);
+        assert!(!solver.classes[unrelated].has_empty_witness);
+        assert!(solver.classes[source].universal);
+    }
+
+    #[test]
+    fn imported_global_is_never_certified_as_isolated_or_never_written() {
+        let pir = Pir {
+            module: "imported-global".into(),
+            source: None,
+            lowering: Default::default(),
+            target: None,
+            functions: Vec::new(),
+            globals: vec![Global {
+                key: "external_slot".into(),
+                exported: true,
+                is_definition: false,
+                mutable: true,
+                ..Global::default()
+            }],
+            global_init: Vec::new(),
+        };
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let solved = solve_steensgaard(&pir, &pag, BuildMode::Executable);
+        let global = &solved.globals["external_slot"];
+        assert!(global.escape_external);
+        assert!(!global.never_written);
     }
 }

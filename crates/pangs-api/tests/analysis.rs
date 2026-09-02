@@ -1987,10 +1987,14 @@ fn steens_uses_escape_bits_for_unknown_callers_and_never_written() {
     assert!(analysis.callers(cb).any(unknown_caller));
     assert!(!analysis.callers(other).any(unknown_caller));
     assert!(analysis.functions()[cb].address_escaped);
-    assert!(analysis.functions()[cb]
-        .escape_witness
-        .as_deref()
-        .is_some_and(|source| source.starts_with("exported-symbol:obj:global:")));
+    assert!(
+        analysis.functions()[cb]
+            .escape_witness
+            .as_deref()
+            .is_some_and(|source| source.starts_with("exported-symbol:obj:global:")),
+        "unexpected escape witness: {:?}",
+        analysis.functions()[cb].escape_witness
+    );
     assert!(!analysis.functions()[other].address_escaped);
     assert_eq!(analysis.escape(exported_slot), EscapeStatus::External);
     assert_eq!(analysis.escape(local), EscapeStatus::Module);

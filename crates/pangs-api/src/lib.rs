@@ -597,6 +597,12 @@ pub struct Metrics {
     #[serde(default)]
     pub steens_pointee_classes_created: u64,
     #[serde(default)]
+    pub steens_content_edges: u64,
+    #[serde(default)]
+    pub steens_content_pushes: u64,
+    #[serde(default)]
+    pub steens_unify_pointees_shared: u64,
+    #[serde(default)]
     pub steens_max_class_icall_sites: usize,
     #[serde(default)]
     pub steens_max_class_fn_objs: usize,
@@ -1963,6 +1969,9 @@ impl Analysis {
             steens_join_attempts: 0,
             steens_join_successes: 0,
             steens_pointee_classes_created: 0,
+            steens_content_edges: 0,
+            steens_content_pushes: 0,
+            steens_unify_pointees_shared: 0,
             steens_max_class_icall_sites: 0,
             steens_max_class_fn_objs: 0,
             steens_max_class_candidate_pairs: 0,
@@ -2049,6 +2058,9 @@ impl Analysis {
                 steens_join_attempts: solved.steens_join_attempts,
                 steens_join_successes: solved.steens_join_successes,
                 steens_pointee_classes_created: solved.steens_pointee_classes_created,
+                steens_content_edges: solved.steens_content_edges,
+                steens_content_pushes: solved.steens_content_pushes,
+                steens_unify_pointees_shared: solved.steens_unify_pointees_shared,
                 steens_max_class_icall_sites: solved.steens_max_class_icall_sites,
                 steens_max_class_fn_objs: solved.steens_max_class_fn_objs,
                 steens_max_class_candidate_pairs: solved.steens_max_class_candidate_pairs,
