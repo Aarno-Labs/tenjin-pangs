@@ -647,7 +647,7 @@ fn allocation_isolation(
         }
     }
 
-    let closure = |seeds: &[NodeId]| {
+    let reachable = |adjacency: &[Vec<NodeId>], seeds: &[NodeId]| {
         let mut reached = vec![false; pag.nodes.len()];
         let mut queue = VecDeque::new();
         for &seed in seeds {
@@ -657,7 +657,7 @@ fn allocation_isolation(
             }
         }
         while let Some(node) = queue.pop_front() {
-            for &next in &flow[node.0 as usize] {
+            for &next in &adjacency[node.0 as usize] {
                 if !reached[next.0 as usize] {
                     reached[next.0 as usize] = true;
                     queue.push_back(next);
@@ -684,7 +684,7 @@ fn allocation_isolation(
                 })
         })
         .collect::<Vec<_>>();
-    let forged = closure(&forged_seeds);
+    let forged = reachable(&flow, &forged_seeds);
 
     let runtime_direct_writes = pir
         .functions
@@ -700,104 +700,107 @@ fn allocation_isolation(
         })
         .collect::<BTreeSet<_>>();
 
+    // A global's forward closure reaches a blocker exactly when its object is in the blocker's
+    // reverse closure. Build the two blocker sets once, then answer every global with two bit
+    // lookups instead of traversing and rescanning the PAG once per global.
+    let mut address_blockers = vec![false; pag.nodes.len()];
+    let mut write_blockers = vec![false; pag.nodes.len()];
+    for (index, &reached) in forged.iter().enumerate() {
+        if reached {
+            address_blockers[index] = true;
+        }
+    }
+
+    for edge in &pag.edges {
+        match edge.kind {
+            pangs_pag::EdgeKind::Store => {
+                // Writing through the derived address is a runtime mutation. Storing the
+                // derived address makes later memory flow relevant, which this proof
+                // intentionally rejects instead of approximating optimistically.
+                address_blockers[edge.src.0 as usize] = true;
+                if matches!(edge.owner, pangs_pag::Owner::Function(_)) {
+                    write_blockers[edge.dst.0 as usize] = true;
+                }
+            }
+            pangs_pag::EdgeKind::Memcpy { .. }
+                if matches!(edge.owner, pangs_pag::Owner::Function(_)) =>
+            {
+                write_blockers[edge.dst.0 as usize] = true;
+            }
+            _ => {}
+        }
+    }
+
+    for seed in &pag.omega_seeds {
+        match seed.target {
+            SeedTarget::Node(node)
+                if matches!(
+                    seed.kind,
+                    OmegaSeedKind::ExportedSymbol
+                        | OmegaSeedKind::PtrToInt
+                        | OmegaSeedKind::UnknownOperandEscape
+                ) =>
+            {
+                address_blockers[node.0 as usize] = true;
+            }
+            SeedTarget::Callsite(id) => {
+                let Some(callsite) = pag.callsites.get(id.0 as usize) else {
+                    // Preserve the existing fail-closed behavior: a malformed callsite seed
+                    // prevents every allocation-isolation certificate.
+                    return AllocationIsolation::default();
+                };
+                for &node in callsite.args.iter().chain(callsite.operand.iter()) {
+                    address_blockers[node.0 as usize] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for callsite in &pag.callsites {
+        if callsite.external_boundary || unsafe_indirect_sites.contains(&callsite.id) {
+            for &node in callsite.args.iter().chain(callsite.operand.iter()) {
+                address_blockers[node.0 as usize] = true;
+            }
+        }
+    }
+
+    for node in &pag.nodes {
+        if matches!(&node.kind, NodeKind::Return { func } if unknown_callers.contains(func)) {
+            address_blockers[node.id.0 as usize] = true;
+        }
+    }
+
+    for (write_blocked, &address_blocked) in write_blockers.iter_mut().zip(&address_blockers) {
+        *write_blocked |= address_blocked;
+    }
+
+    let mut reverse_flow = vec![Vec::<NodeId>::new(); pag.nodes.len()];
+    for (src, destinations) in flow.iter().enumerate() {
+        for &dst in destinations {
+            reverse_flow[dst.0 as usize].push(pag.nodes[src].id);
+        }
+    }
+    let blocker_seeds = |blockers: &[bool]| {
+        blockers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &blocked)| blocked.then_some(pag.nodes[index].id))
+            .collect::<Vec<_>>()
+    };
+    let reaches_address_blocker = reachable(&reverse_flow, &blocker_seeds(&address_blockers));
+    let reaches_write_blocker = reachable(&reverse_flow, &blocker_seeds(&write_blockers));
+
     let mut isolated = AllocationIsolation::default();
     for global in &pir.globals {
         let Some(&object) = global_objects.get(&global.key) else {
             continue;
         };
-        let reached = closure(&[object]);
-        let intersects_forged = reached
-            .iter()
-            .zip(&forged)
-            .any(|(&address_reached, &forged_reached)| address_reached && forged_reached);
-        let mut address_isolated = !intersects_forged;
-        let mut write_isolated =
-            !intersects_forged && !runtime_direct_writes.contains(global.key.as_str());
-
-        for edge in &pag.edges {
-            match edge.kind {
-                pangs_pag::EdgeKind::Store => {
-                    // Writing through the derived address is a runtime mutation.  Storing the
-                    // derived address makes later memory flow relevant, which this proof
-                    // intentionally rejects instead of approximating optimistically.
-                    if matches!(edge.owner, pangs_pag::Owner::Function(_))
-                        && reached[edge.dst.0 as usize]
-                    {
-                        write_isolated = false;
-                    }
-                    if reached[edge.src.0 as usize] {
-                        address_isolated = false;
-                        write_isolated = false;
-                    }
-                }
-                pangs_pag::EdgeKind::Memcpy { .. }
-                    if matches!(edge.owner, pangs_pag::Owner::Function(_))
-                        && reached[edge.dst.0 as usize] =>
-                {
-                    write_isolated = false;
-                }
-                _ => {}
-            }
-        }
-
-        for seed in &pag.omega_seeds {
-            match seed.target {
-                SeedTarget::Node(node)
-                    if reached[node.0 as usize]
-                        && matches!(
-                            seed.kind,
-                            OmegaSeedKind::ExportedSymbol
-                                | OmegaSeedKind::PtrToInt
-                                | OmegaSeedKind::UnknownOperandEscape
-                        ) =>
-                {
-                    address_isolated = false;
-                    write_isolated = false;
-                }
-                SeedTarget::Callsite(id) => {
-                    let Some(callsite) = pag.callsites.get(id.0 as usize) else {
-                        address_isolated = false;
-                        write_isolated = false;
-                        continue;
-                    };
-                    if callsite
-                        .args
-                        .iter()
-                        .chain(callsite.operand.iter())
-                        .any(|node| reached[node.0 as usize])
-                    {
-                        address_isolated = false;
-                        write_isolated = false;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        for callsite in &pag.callsites {
-            if (callsite.external_boundary || unsafe_indirect_sites.contains(&callsite.id))
-                && callsite
-                    .args
-                    .iter()
-                    .chain(callsite.operand.iter())
-                    .any(|node| reached[node.0 as usize])
-            {
-                address_isolated = false;
-                write_isolated = false;
-            }
-        }
-
-        if pag.nodes.iter().any(|node| {
-            matches!(&node.kind, NodeKind::Return { func } if unknown_callers.contains(func))
-                && reached[node.id.0 as usize]
-        }) {
-            address_isolated = false;
-            write_isolated = false;
-        }
-
-        if address_isolated {
+        if !reaches_address_blocker[object.0 as usize] {
             isolated.address.insert(global.key.clone());
-            if write_isolated {
+            if !reaches_write_blocker[object.0 as usize]
+                && !runtime_direct_writes.contains(global.key.as_str())
+            {
                 isolated.write.insert(global.key.clone());
             }
         }
