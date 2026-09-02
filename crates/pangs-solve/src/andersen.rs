@@ -31,7 +31,7 @@ use pangs_pir::Pir;
 use crate::knobs;
 use crate::{
     debug_assert_narrows, exact_allocation_addresses, ExactAddress, FieldLocation, FieldRegion,
-    IndirectCallResolution, SolveResult, SteensClasses,
+    IndirectCallResolution, SharedStringList, SolveResult, SteensClasses,
 };
 
 /// Return the cheap, Steensgaard-derived structural census used to calibrate
@@ -270,8 +270,8 @@ fn finish_andersen_controlled(
                     node.reaches_function_pointer = resolution.reaches_function_pointer;
                     node.external = resolution.external;
                     node.external_universal = resolution.external_universal;
-                    node.pointee_globals = resolution.pointee_globals.into();
-                    node.pointee_globals_unfiltered = resolution.pointee_globals_unfiltered.into();
+                    node.pointee_globals = resolution.pointee_globals;
+                    node.pointee_globals_unfiltered = resolution.pointee_globals_unfiltered;
                     if node.pointee_globals.is_empty() {
                         node.pointee_provenance = Default::default();
                     }
@@ -477,10 +477,34 @@ struct RefinedNodeResolution {
     reaches_function_pointer: bool,
     external: bool,
     external_universal: bool,
-    pointee_globals: Vec<String>,
-    pointee_globals_unfiltered: Vec<String>,
+    pointee_globals: SharedStringList,
+    pointee_globals_unfiltered: SharedStringList,
     external_sources: Vec<String>,
     universal_sources: Vec<String>,
+}
+
+#[derive(Default)]
+struct RefinedPointeeGlobalInterner {
+    by_indices: HashMap<Vec<usize>, SharedStringList>,
+}
+
+impl RefinedPointeeGlobalInterner {
+    fn intern(&mut self, indices: Vec<usize>, pir: &Pir) -> SharedStringList {
+        if indices.is_empty() {
+            return SharedStringList::default();
+        }
+        if let Some(existing) = self.by_indices.get(indices.as_slice()) {
+            return existing.clone();
+        }
+        let globals = SharedStringList::from(
+            indices
+                .iter()
+                .map(|&index| pir.globals[index].key.clone())
+                .collect::<Vec<_>>(),
+        );
+        self.by_indices.insert(indices, globals.clone());
+        globals
+    }
 }
 
 #[derive(Default)]
@@ -4118,13 +4142,7 @@ impl<'a> Refiner<'a> {
             self.classes.violation_exposure,
             crate::ViolationExposure::ModuleWide
         );
-        let global_index_by_key = self
-            .pir
-            .globals
-            .iter()
-            .enumerate()
-            .map(|(index, global)| (global.key.as_str(), index))
-            .collect::<HashMap<_, _>>();
+        let mut pointee_global_interner = RefinedPointeeGlobalInterner::default();
         let mut out = Vec::new();
         for node in &self.pag.nodes {
             if !node.kind.is_value_like_public() || !self.in_scope[node.id.0 as usize] {
@@ -4148,42 +4166,50 @@ impl<'a> Refiner<'a> {
                     })
                 })
                 .unwrap_or(false);
-            let mut globals_unfiltered: Vec<String> = set
+            let mut global_indices_unfiltered: Vec<usize> = set
                 .into_iter()
                 .flat_map(|set| set.iter())
                 .filter_map(|cell| {
                     let root = pts.field_base.get(&cell).copied().unwrap_or(cell);
-                    self.global_of_cell.get(&root)
+                    self.global_of_cell.get(&root).copied()
                 })
-                .map(|&idx| self.pir.globals[idx].key.clone())
                 .collect();
-            globals_unfiltered.sort();
-            globals_unfiltered.dedup();
-            let mut globals = if external_universal || violation_module_wide {
-                globals_unfiltered.clone()
+            global_indices_unfiltered.sort_unstable_by(|&left, &right| {
+                self.pir.globals[left].key.cmp(&self.pir.globals[right].key)
+            });
+            global_indices_unfiltered.dedup();
+            let global_indices = if external_universal || violation_module_wide {
+                global_indices_unfiltered.clone()
             } else {
-                globals_unfiltered
+                global_indices_unfiltered
                     .iter()
-                    .filter(|key| {
-                        global_index_by_key
-                            .get(key.as_str())
-                            .is_some_and(|&index| address_exposed[index])
-                    })
-                    .cloned()
+                    .copied()
+                    .filter(|&index| address_exposed[index])
                     .collect()
             };
-            globals.sort();
-            debug_assert_narrows(
-                &node.label,
-                "address-exposed-andersen",
-                &globals,
-                "andersen",
-                &globals_unfiltered,
-            );
-            let globals_unfiltered = if globals != globals_unfiltered {
-                globals_unfiltered
+            if cfg!(debug_assertions) {
+                let globals = global_indices
+                    .iter()
+                    .map(|&index| self.pir.globals[index].key.clone())
+                    .collect::<Vec<_>>();
+                let globals_unfiltered = global_indices_unfiltered
+                    .iter()
+                    .map(|&index| self.pir.globals[index].key.clone())
+                    .collect::<Vec<_>>();
+                debug_assert_narrows(
+                    &node.label,
+                    "address-exposed-andersen",
+                    &globals,
+                    "andersen",
+                    &globals_unfiltered,
+                );
+            }
+            let same_pointee_globals = global_indices == global_indices_unfiltered;
+            let globals = pointee_global_interner.intern(global_indices, self.pir);
+            let globals_unfiltered = if same_pointee_globals {
+                SharedStringList::default()
             } else {
-                Vec::new()
+                pointee_global_interner.intern(global_indices_unfiltered, self.pir)
             };
             let external_sources = if external {
                 pts.external_sources_for(node.id.0)
@@ -6785,8 +6811,8 @@ mod tests {
         finish_andersen_controlled, hybrid_points_to_enabled_for,
         memcpy_edge_summaries_enabled_for, memcpy_prepartition_carriers_enabled_for,
         solve_andersen, solve_andersen_with_overrides, whole_object_field_bridge_policy_for,
-        AndersenControls, Cell, ExternalRegion, HybridPointSet, PointSet, Refiner, Solve,
-        WholeObjectAccess, WholeObjectBridgePolicy,
+        AndersenControls, Cell, ExternalRegion, HybridPointSet, PointSet,
+        RefinedPointeeGlobalInterner, Refiner, Solve, WholeObjectAccess, WholeObjectBridgePolicy,
     };
     use crate::{solve_steensgaard, FieldLocation, PointsToMaterialization};
 
@@ -6800,6 +6826,31 @@ mod tests {
         let pir = Pir::from_path(fixture(name)).unwrap();
         let pag = Pag::from_pir(&pir, &PagOpts::default());
         (pir, pag)
+    }
+
+    #[test]
+    fn refined_pointee_global_interner_shares_identical_name_lists() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"pointee-interner",
+                "globals":[
+                    {"key":"global_a","mutable":true},
+                    {"key":"global_b","mutable":true},
+                    {"key":"global_c","mutable":true}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut interner = RefinedPointeeGlobalInterner::default();
+
+        let first = interner.intern(vec![0, 2], &pir);
+        let duplicate = interner.intern(vec![0, 2], &pir);
+        let distinct = interner.intern(vec![1, 2], &pir);
+
+        assert_eq!(first.cache_key(), duplicate.cache_key());
+        assert_ne!(first.cache_key(), distinct.cache_key());
+        assert_eq!(&*first, &["global_a".to_string(), "global_c".to_string()]);
+        assert_eq!(interner.by_indices.len(), 2);
     }
 
     #[test]
