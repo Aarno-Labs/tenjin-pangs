@@ -242,6 +242,10 @@ pub struct ModRef {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_node: Option<String>,
+    /// A bounded, deterministic diagnostic sample of resolved pointee globals.
+    ///
+    /// This is not the authoritative target set. Use [`ModRef::affected_globals`] for the
+    /// complete semantic scope.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pointee_globals: Vec<String>,
     #[serde(skip)]
@@ -5248,14 +5252,10 @@ fn build_modref_node_summary_data(
     let direct_symbol_global = label
         .strip_prefix("sym:global:")
         .and_then(|global_key| global_lookup.get(global_key).copied());
-    let pointee_global_sample = Rc::<[String]>::from(
-        resolution
-            .pointee_globals
-            .iter()
-            .take(knobs::MODREF_POINTEE_GLOBAL_SAMPLE_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
+    let pointee_global_sample = Rc::<[String]>::from(pointee_global_sample(
+        resolution.pointee_globals.iter(),
+        global_lookup,
+    ));
     let pointee_has_string = resolution
         .pointee_globals
         .iter()
@@ -5306,20 +5306,12 @@ fn append_address_filter_counts(detail: &mut String, filtered: usize, unfiltered
     ));
 }
 
-fn global_key_by_id(global_lookup: &HashMap<String, GlobalId>) -> Vec<String> {
-    let mut keys = vec![String::new(); global_lookup.len()];
-    for (key, &gid) in global_lookup {
-        if let Some(slot) = keys.get_mut(gid.0 as usize) {
-            *slot = key.clone();
-        }
-    }
-    keys
-}
-
-fn global_keys_for_ids(ids: &[GlobalId], global_key_by_id: &[String]) -> Vec<String> {
-    ids.iter()
-        .filter_map(|gid| global_key_by_id.get(gid.0 as usize))
-        .filter(|key| !key.is_empty())
+fn pointee_global_sample<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    global_lookup: &HashMap<String, GlobalId>,
+) -> Vec<String> {
+    keys.filter(|key| global_lookup.contains_key(*key))
+        .take(knobs::MODREF_POINTEE_GLOBAL_SAMPLE_LIMIT)
         .cloned()
         .collect()
 }
@@ -5332,6 +5324,47 @@ fn global_ids_for_keys<'a>(
         keys.filter_map(|key| global_lookup.get(key).copied())
             .collect::<Vec<_>>(),
     )
+}
+
+#[cfg(test)]
+mod pointee_global_sample_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_sample_is_bounded_without_truncating_semantic_candidates() {
+        let keys = (0..24)
+            .map(|index| format!("global_{index:02}"))
+            .collect::<Vec<_>>();
+        let global_lookup = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.clone(), GlobalId(index as u32)))
+            .collect::<HashMap<_, _>>();
+
+        let sample = pointee_global_sample(keys.iter(), &global_lookup);
+        let candidates = global_ids_for_keys(keys.iter(), &global_lookup);
+
+        assert_eq!(sample.len(), knobs::MODREF_POINTEE_GLOBAL_SAMPLE_LIMIT);
+        assert_eq!(sample, keys[..knobs::MODREF_POINTEE_GLOBAL_SAMPLE_LIMIT]);
+        assert_eq!(candidates.len(), keys.len());
+    }
+
+    #[test]
+    fn diagnostic_sample_ignores_untracked_pointees_before_applying_its_limit() {
+        let keys = (0..20)
+            .flat_map(|index| [format!("external_{index:02}"), format!("global_{index:02}")])
+            .collect::<Vec<_>>();
+        let global_lookup = (0..20)
+            .map(|index| (format!("global_{index:02}"), GlobalId(index)))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            pointee_global_sample(keys.iter(), &global_lookup),
+            (0..knobs::MODREF_POINTEE_GLOBAL_SAMPLE_LIMIT)
+                .map(|index| format!("global_{index:02}"))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 /// Validate the in-memory root certificate before any solver result is consumed.  A mismatch
@@ -5423,7 +5456,6 @@ fn push_pointer_modrefs_from_pag(
     let mut access_profile = PointerAccessEmitterProfile::from_env(global_lookup);
     let high_fanout_limit = pointer_modref_high_fanout_limit();
     let precise_storage_addresses = precise_storage_addresses(pag, global_lookup, storage_roots);
-    let global_key_by_id = global_key_by_id(global_lookup);
     let mut active_func = None;
     for edge in &pag.edges {
         let Some((owner, func, accesses)) = edge_accesses(edge, func_lookup) else {
@@ -5631,10 +5663,7 @@ fn push_pointer_modrefs_from_pag(
                         witness: witness.clone(),
                         detail: Some(detail),
                         address_node: Some(summary.label.to_string()),
-                        pointee_globals: global_keys_for_ids(
-                            &summary.pointee_global_ids,
-                            &global_key_by_id,
-                        ),
+                        pointee_globals: summary.pointee_global_sample.to_vec(),
                         global_candidates: finite_or_module_wide(
                             Rc::clone(&summary.pointee_global_ids),
                             summary.external_universal,
@@ -5891,7 +5920,10 @@ fn push_pointer_memset_modrefs_from_pir(
                         witness,
                         detail: Some(detail),
                         address_node: Some(label.clone()),
-                        pointee_globals: resolution.pointee_globals.to_vec(),
+                        pointee_globals: pointee_global_sample(
+                            resolution.pointee_globals.iter(),
+                            global_lookup,
+                        ),
                         global_candidates: finite_or_module_wide(
                             global_ids_for_keys(resolution.pointee_globals.iter(), global_lookup),
                             resolution.external_universal,
