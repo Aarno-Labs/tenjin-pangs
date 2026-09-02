@@ -87,10 +87,11 @@ struct SimpleResolver<'a> {
     functions: HashMap<&'a str, usize>,
     globals: HashSet<&'a str>,
     definitions: Vec<HashMap<&'a str, usize>>,
+    global_init_definitions: HashMap<&'a str, Vec<usize>>,
     reachable: Vec<bool>,
     externally_callable: Vec<bool>,
     externally_writable_globals: HashSet<String>,
-    global_safety_cache: RefCell<HashMap<String, bool>>,
+    preanalysis: SimplePreanalysis<'a>,
     function_escape_cache: RefCell<HashMap<String, bool>>,
 }
 
@@ -98,6 +99,69 @@ struct SimpleResolver<'a> {
 struct SubObj {
     root: String,
     byte_off: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActualSite<'a> {
+    caller_index: usize,
+    stmt_index: usize,
+    actual: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StoreSite {
+    Function {
+        func_index: usize,
+        stmt_index: usize,
+    },
+    GlobalInit {
+        stmt_index: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SymbolUseSite {
+    Function {
+        func_index: usize,
+        stmt_index: usize,
+    },
+    GlobalInit {
+        stmt_index: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReturnConsumer<'a> {
+    caller_index: usize,
+    dest: &'a str,
+}
+
+/// Query-facing relationships materialized by one pass over the PIR. Function indices preserve
+/// module order, so indexed walks retain the previous scan order and deterministic witnesses.
+struct SimplePreanalysis<'a> {
+    direct_call_count: Vec<usize>,
+    direct_actuals: HashMap<(usize, usize), Vec<ActualSite<'a>>>,
+    stores_by_place: HashMap<SubObj, Vec<StoreSite>>,
+    function_symbol_uses: Vec<Vec<SymbolUseSite>>,
+    local_uses: Vec<HashMap<&'a str, Vec<usize>>>,
+    return_consumers: Vec<Vec<ReturnConsumer<'a>>>,
+    address_taken_sites: BTreeMap<String, BTreeSet<String>>,
+    unsafe_globals: HashSet<String>,
+}
+
+impl SimplePreanalysis<'_> {
+    fn empty(function_count: usize) -> Self {
+        Self {
+            direct_call_count: vec![0; function_count],
+            direct_actuals: HashMap::new(),
+            stores_by_place: HashMap::new(),
+            function_symbol_uses: vec![Vec::new(); function_count],
+            local_uses: vec![HashMap::new(); function_count],
+            return_consumers: vec![Vec::new(); function_count],
+            address_taken_sites: BTreeMap::new(),
+            unsafe_globals: HashSet::new(),
+        }
+    }
 }
 
 impl<'a> SimpleResolver<'a> {
@@ -131,6 +195,12 @@ impl<'a> SimpleResolver<'a> {
                 defs
             })
             .collect();
+        let mut global_init_definitions = HashMap::<&str, Vec<usize>>::new();
+        for (index, stmt) in module.global_init.iter().enumerate() {
+            if let Some(dest) = stmt_dest(stmt) {
+                global_init_definitions.entry(dest).or_default().push(index);
+            }
+        }
         let externally_callable = module
             .functions
             .iter()
@@ -153,17 +223,280 @@ impl<'a> SimpleResolver<'a> {
             })
             .map(|global| canonical_symbol(&global.key).to_string())
             .collect();
-        Self {
+        let mut resolver = Self {
             module,
             context_depth,
             functions,
             globals,
             definitions,
+            global_init_definitions,
             reachable,
             externally_callable,
             externally_writable_globals,
-            global_safety_cache: RefCell::new(HashMap::new()),
+            preanalysis: SimplePreanalysis::empty(module.functions.len()),
             function_escape_cache: RefCell::new(HashMap::new()),
+        };
+        resolver.preanalysis = resolver.build_preanalysis();
+        resolver
+    }
+
+    fn build_preanalysis(&self) -> SimplePreanalysis<'a> {
+        let module: &'a Pir = self.module;
+        let mut index = SimplePreanalysis::empty(module.functions.len());
+
+        for (func_index, func) in module.functions.iter().enumerate() {
+            for (stmt_index, stmt) in func.body.iter().enumerate() {
+                for operand in stmt_operands(stmt) {
+                    index.local_uses[func_index]
+                        .entry(operand)
+                        .or_default()
+                        .push(stmt_index);
+                }
+
+                if let Stmt::CallDirect {
+                    callee, args, dest, ..
+                } = stmt
+                {
+                    if let Some(callee_index) = self.exact_function_index(callee) {
+                        if self.reachable[func_index] {
+                            index.direct_call_count[callee_index] += 1;
+                            for (param_index, actual) in args.iter().enumerate() {
+                                index
+                                    .direct_actuals
+                                    .entry((callee_index, param_index))
+                                    .or_default()
+                                    .push(ActualSite {
+                                        caller_index: func_index,
+                                        stmt_index,
+                                        actual,
+                                    });
+                            }
+                        }
+                        if let Some(dest) = dest {
+                            index.return_consumers[callee_index].push(ReturnConsumer {
+                                caller_index: func_index,
+                                dest,
+                            });
+                        }
+                    }
+                }
+
+                if self.reachable[func_index] {
+                    if let Stmt::Store { address, .. } = stmt {
+                        if let Some(place) = self.function_place(func_index, stmt_index, address) {
+                            index.stores_by_place.entry(place).or_default().push(
+                                StoreSite::Function {
+                                    func_index,
+                                    stmt_index,
+                                },
+                            );
+                        }
+                    }
+                    self.record_function_unsafe_globals(
+                        func_index,
+                        stmt_index,
+                        stmt,
+                        &mut index.unsafe_globals,
+                    );
+                }
+
+                let mut target_indices = Vec::new();
+                for operand in function_symbol_value_operands(stmt) {
+                    if let Some(&target_index) = self.functions.get(canonical_symbol(operand)) {
+                        if !target_indices.contains(&target_index) {
+                            target_indices.push(target_index);
+                        }
+                    }
+                }
+                for target_index in target_indices {
+                    let target = &module.functions[target_index].key;
+                    index
+                        .address_taken_sites
+                        .entry(target.clone())
+                        .or_default()
+                        .insert(format!("function:{target}@{}", self.owner_key(func_index)));
+                    if self.reachable[func_index] {
+                        index.function_symbol_uses[target_index].push(SymbolUseSite::Function {
+                            func_index,
+                            stmt_index,
+                        });
+                    }
+                }
+            }
+        }
+
+        for (stmt_index, stmt) in module.global_init.iter().enumerate() {
+            if let Stmt::Store { address, .. } = stmt {
+                if let Some(place) = self.global_init_place(stmt_index, address) {
+                    index
+                        .stores_by_place
+                        .entry(place)
+                        .or_default()
+                        .push(StoreSite::GlobalInit { stmt_index });
+                }
+            }
+            self.record_global_init_unsafe_globals(stmt_index, stmt, &mut index.unsafe_globals);
+
+            let mut address_target_indices = Vec::new();
+            for operand in function_symbol_value_operands(stmt) {
+                if let Some(&target_index) = self.functions.get(canonical_symbol(operand)) {
+                    if !address_target_indices.contains(&target_index) {
+                        address_target_indices.push(target_index);
+                    }
+                }
+            }
+            for target_index in address_target_indices {
+                let target = &module.functions[target_index].key;
+                index
+                    .address_taken_sites
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(format!("function:{target}@global_init"));
+            }
+
+            let mut escape_target_indices = Vec::new();
+            for operand in global_init_function_escape_operands(stmt) {
+                if let Some(&target_index) = self.functions.get(canonical_symbol(operand)) {
+                    if !escape_target_indices.contains(&target_index) {
+                        escape_target_indices.push(target_index);
+                    }
+                }
+            }
+            for target_index in escape_target_indices {
+                index.function_symbol_uses[target_index]
+                    .push(SymbolUseSite::GlobalInit { stmt_index });
+            }
+        }
+
+        index
+    }
+
+    fn exact_function_index(&self, callee: &str) -> Option<usize> {
+        let &index = self.functions.get(canonical_symbol(callee))?;
+        (self.module.functions[index].key == callee).then_some(index)
+    }
+
+    fn record_function_unsafe_globals(
+        &self,
+        func_index: usize,
+        stmt_index: usize,
+        stmt: &Stmt,
+        unsafe_globals: &mut HashSet<String>,
+    ) {
+        match stmt {
+            Stmt::Load { address, .. } => {
+                if self
+                    .function_place(func_index, stmt_index, address)
+                    .is_none()
+                {
+                    self.record_direct_global(address, unsafe_globals);
+                }
+            }
+            Stmt::Store { address, value, .. } => {
+                if self
+                    .function_place(func_index, stmt_index, address)
+                    .is_none()
+                {
+                    self.record_direct_global(address, unsafe_globals);
+                }
+                self.record_function_operand_global(func_index, stmt_index, value, unsafe_globals);
+            }
+            Stmt::Gep {
+                base,
+                byte_off: Some(_),
+                ..
+            } => {
+                if self.function_place(func_index, stmt_index, base).is_none() {
+                    self.record_direct_global(base, unsafe_globals);
+                }
+            }
+            Stmt::Gep { base, .. } => {
+                self.record_function_operand_global(func_index, stmt_index, base, unsafe_globals)
+            }
+            Stmt::GlobalRef { .. } => {}
+            _ => {
+                for operand in stmt_operands(stmt) {
+                    self.record_function_operand_global(
+                        func_index,
+                        stmt_index,
+                        operand,
+                        unsafe_globals,
+                    );
+                }
+            }
+        }
+    }
+
+    fn record_global_init_unsafe_globals(
+        &self,
+        stmt_index: usize,
+        stmt: &Stmt,
+        unsafe_globals: &mut HashSet<String>,
+    ) {
+        match stmt {
+            Stmt::Load { address, .. } => {
+                if self.global_init_place(stmt_index, address).is_none() {
+                    self.record_direct_global(address, unsafe_globals);
+                }
+            }
+            Stmt::Store { address, value, .. } => {
+                if self.global_init_place(stmt_index, address).is_none() {
+                    self.record_direct_global(address, unsafe_globals);
+                }
+                self.record_global_init_operand_global(stmt_index, value, unsafe_globals);
+            }
+            Stmt::Gep {
+                base,
+                byte_off: Some(_),
+                ..
+            } => {
+                if self.global_init_place(stmt_index, base).is_none() {
+                    self.record_direct_global(base, unsafe_globals);
+                }
+            }
+            Stmt::Gep { base, .. } => {
+                self.record_global_init_operand_global(stmt_index, base, unsafe_globals);
+            }
+            Stmt::GlobalRef { .. } => {}
+            _ => {
+                for operand in stmt_operands(stmt) {
+                    self.record_global_init_operand_global(stmt_index, operand, unsafe_globals);
+                }
+            }
+        }
+    }
+
+    fn record_function_operand_global(
+        &self,
+        func_index: usize,
+        stmt_index: usize,
+        operand: &str,
+        unsafe_globals: &mut HashSet<String>,
+    ) {
+        if let Some(place) = self.function_place(func_index, stmt_index, operand) {
+            unsafe_globals.insert(place.root);
+        } else {
+            self.record_direct_global(operand, unsafe_globals);
+        }
+    }
+
+    fn record_global_init_operand_global(
+        &self,
+        stmt_index: usize,
+        operand: &str,
+        unsafe_globals: &mut HashSet<String>,
+    ) {
+        if let Some(place) = self.global_init_place(stmt_index, operand) {
+            unsafe_globals.insert(place.root);
+        } else {
+            self.record_direct_global(operand, unsafe_globals);
+        }
+    }
+
+    fn record_direct_global(&self, operand: &str, unsafe_globals: &mut HashSet<String>) {
+        let global = canonical_symbol(operand);
+        if self.globals.contains(global) {
+            unsafe_globals.insert(global.to_string());
         }
     }
 
@@ -363,44 +696,33 @@ impl<'a> SimpleResolver<'a> {
         if depth > self.context_depth {
             return WalkResult::Complex;
         }
-        let callee = self.module.functions[callee_index].key.clone();
         if self.externally_callable[callee_index] {
             return WalkResult::Complex;
         }
-        let mut saw_call = false;
-        for caller_index in 0..self.module.functions.len() {
-            if !self.reachable[caller_index] {
-                continue;
-            }
-            let body_len = self.module.functions[caller_index].body.len();
-            for stmt_index in 0..body_len {
-                let Stmt::CallDirect {
-                    callee: called,
-                    args,
-                    ..
-                } = &self.module.functions[caller_index].body[stmt_index]
-                else {
-                    continue;
-                };
-                if called != &callee {
-                    continue;
-                }
-                let Some(actual) = args.get(param_index).cloned() else {
-                    return WalkResult::Complex;
-                };
-                saw_call = true;
-                if self.resolve_value(caller_index, stmt_index, &actual, depth, visiting, out)
-                    == WalkResult::Complex
-                {
-                    return WalkResult::Complex;
-                }
+        let call_count = self.preanalysis.direct_call_count[callee_index];
+        let actuals = self
+            .preanalysis
+            .direct_actuals
+            .get(&(callee_index, param_index))
+            .cloned()
+            .unwrap_or_default();
+        if call_count == 0 || actuals.len() != call_count {
+            return WalkResult::Complex;
+        }
+        for actual in actuals {
+            if self.resolve_value(
+                actual.caller_index,
+                actual.stmt_index,
+                actual.actual,
+                depth,
+                visiting,
+                out,
+            ) == WalkResult::Complex
+            {
+                return WalkResult::Complex;
             }
         }
-        if saw_call {
-            WalkResult::Simple
-        } else {
-            WalkResult::Complex
-        }
+        WalkResult::Simple
     }
 
     fn resolve_global(
@@ -431,56 +753,47 @@ impl<'a> SimpleResolver<'a> {
         if depth > self.context_depth || !self.global_place_is_simple(place) {
             return WalkResult::Complex;
         }
-        let mut saw_store = false;
-        for func_index in 0..self.module.functions.len() {
-            if !self.reachable[func_index] {
-                continue;
-            }
-            let body_len = self.module.functions[func_index].body.len();
-            for stmt_index in 0..body_len {
-                let Stmt::Store { address, value, .. } =
-                    &self.module.functions[func_index].body[stmt_index]
-                else {
-                    continue;
-                };
-                let Some(address_place) = self.function_place(func_index, stmt_index, address)
-                else {
-                    continue;
-                };
-                if &address_place != place {
-                    continue;
+        let stores = self
+            .preanalysis
+            .stores_by_place
+            .get(place)
+            .cloned()
+            .unwrap_or_default();
+        if stores.is_empty() {
+            return WalkResult::Complex;
+        }
+        for store in stores {
+            match store {
+                StoreSite::Function {
+                    func_index,
+                    stmt_index,
+                } => {
+                    let Stmt::Store { value, .. } =
+                        &self.module.functions[func_index].body[stmt_index]
+                    else {
+                        unreachable!("store index must reference a store statement");
+                    };
+                    let value = value.clone();
+                    if self.resolve_value(func_index, stmt_index, &value, depth, visiting, out)
+                        == WalkResult::Complex
+                    {
+                        return WalkResult::Complex;
+                    }
                 }
-                saw_store = true;
-                let value = value.clone();
-                if self.resolve_value(func_index, stmt_index, &value, depth, visiting, out)
-                    == WalkResult::Complex
-                {
-                    return WalkResult::Complex;
+                StoreSite::GlobalInit { stmt_index } => {
+                    let Stmt::Store { value, .. } = &self.module.global_init[stmt_index] else {
+                        unreachable!("store index must reference a global initializer store");
+                    };
+                    let value = value.clone();
+                    if self.resolve_global_init_value(stmt_index, &value, depth, visiting, out)
+                        == WalkResult::Complex
+                    {
+                        return WalkResult::Complex;
+                    }
                 }
             }
         }
-        for (stmt_index, stmt) in self.module.global_init.iter().enumerate() {
-            let Stmt::Store { address, value, .. } = stmt else {
-                continue;
-            };
-            let Some(address_place) = self.global_init_place(stmt_index, address) else {
-                continue;
-            };
-            if &address_place != place {
-                continue;
-            }
-            saw_store = true;
-            if self.resolve_global_init_value(stmt_index, value, depth, visiting, out)
-                == WalkResult::Complex
-            {
-                return WalkResult::Complex;
-            }
-        }
-        if saw_store {
-            WalkResult::Simple
-        } else {
-            WalkResult::Complex
-        }
+        WalkResult::Simple
     }
 
     fn resolve_global_init_value(
@@ -501,24 +814,18 @@ impl<'a> SimpleResolver<'a> {
         if self.globals.contains(canonical_symbol(value)) {
             return self.resolve_global(canonical_symbol(value), depth + 1, visiting, out);
         }
-        for stmt_index in (0..before_stmt).rev() {
-            let Some(dest) = stmt_dest(&self.module.global_init[stmt_index]) else {
-                continue;
-            };
-            if dest != value {
-                continue;
+        let Some(stmt_index) = self.global_init_definition_before(value, before_stmt) else {
+            return WalkResult::Complex;
+        };
+        match &self.module.global_init[stmt_index] {
+            Stmt::Assign { sources, .. } => {
+                self.resolve_all_global_init_sources(stmt_index, sources, depth, visiting, out)
             }
-            return match &self.module.global_init[stmt_index] {
-                Stmt::Assign { sources, .. } => {
-                    self.resolve_all_global_init_sources(stmt_index, sources, depth, visiting, out)
-                }
-                Stmt::Gep { base, .. } => {
-                    self.resolve_global_init_value(stmt_index, base, depth, visiting, out)
-                }
-                _ => WalkResult::Complex,
-            };
+            Stmt::Gep { base, .. } => {
+                self.resolve_global_init_value(stmt_index, base, depth, visiting, out)
+            }
+            _ => WalkResult::Complex,
         }
-        WalkResult::Complex
     }
 
     fn resolve_all_global_init_sources(
@@ -544,34 +851,9 @@ impl<'a> SimpleResolver<'a> {
 
     fn global_is_never_address_taken(&self, global: &str) -> bool {
         let global = canonical_symbol(global);
-        if let Some(&safe) = self.global_safety_cache.borrow().get(global) {
-            return safe;
-        }
-        let safe = !self.externally_writable_globals.contains(global)
+        !self.externally_writable_globals.contains(global)
             && self.globals.contains(global)
-            && self
-                .module
-                .functions
-                .iter()
-                .enumerate()
-                .filter(|(func_index, _)| self.reachable[*func_index])
-                .all(|(func_index, func)| {
-                    func.body.iter().enumerate().all(|(stmt_index, stmt)| {
-                        self.function_global_use_is_safe(func_index, stmt_index, stmt, global)
-                    })
-                })
-            && self
-                .module
-                .global_init
-                .iter()
-                .enumerate()
-                .all(|(stmt_index, stmt)| {
-                    self.global_init_global_use_is_safe(stmt_index, stmt, global)
-                });
-        self.global_safety_cache
-            .borrow_mut()
-            .insert(global.to_string(), safe);
-        safe
+            && !self.preanalysis.unsafe_globals.contains(global)
     }
 
     fn global_place_is_simple(&self, place: &SubObj) -> bool {
@@ -591,29 +873,30 @@ impl<'a> SimpleResolver<'a> {
     }
 
     fn compute_function_has_unsafe_escape(&self, target: &str) -> bool {
+        let Some(&target_index) = self.functions.get(target) else {
+            return true;
+        };
         let mut visiting = HashSet::new();
-        for (func_index, func) in self.module.functions.iter().enumerate() {
-            if !self.reachable[func_index] {
-                continue;
-            }
-            for (stmt_index, stmt) in func.body.iter().enumerate() {
-                if self.function_symbol_use_escapes(
+        self.preanalysis.function_symbol_uses[target_index]
+            .iter()
+            .any(|site| match *site {
+                SymbolUseSite::Function {
                     func_index,
                     stmt_index,
-                    stmt,
+                } => self.function_symbol_use_escapes(
+                    func_index,
+                    stmt_index,
+                    &self.module.functions[func_index].body[stmt_index],
                     target,
                     0,
                     &mut visiting,
-                ) {
-                    return true;
+                ),
+                SymbolUseSite::GlobalInit { stmt_index } => {
+                    function_use_is_unsafe(&self.module.global_init[stmt_index], target, |global| {
+                        self.global_is_never_address_taken(global)
+                    })
                 }
-            }
-        }
-        self.module.global_init.iter().any(|stmt| {
-            function_use_is_unsafe(stmt, target, |global| {
-                self.global_is_never_address_taken(global)
             })
-        })
     }
 
     fn function_symbol_use_escapes(
@@ -693,12 +976,19 @@ impl<'a> SimpleResolver<'a> {
         if !visiting.insert((func_index, value.to_string(), depth)) {
             return false;
         }
-        let escapes = self.module.functions[func_index]
-            .body
-            .iter()
-            .enumerate()
-            .any(|(stmt_index, stmt)| {
-                self.local_value_use_escapes(func_index, stmt_index, stmt, value, depth, visiting)
+        let escapes = self.preanalysis.local_uses[func_index]
+            .get(value)
+            .is_some_and(|uses| {
+                uses.iter().any(|&stmt_index| {
+                    self.local_value_use_escapes(
+                        func_index,
+                        stmt_index,
+                        &self.module.functions[func_index].body[stmt_index],
+                        value,
+                        depth,
+                        visiting,
+                    )
+                })
             });
         visiting.remove(&(func_index, value.to_string(), depth));
         escapes
@@ -803,59 +1093,17 @@ impl<'a> SimpleResolver<'a> {
         if self.externally_callable[func_index] || func.address_taken {
             return true;
         }
-        let mut saw_caller = false;
-        for caller_index in 0..self.module.functions.len() {
-            for stmt in &self.module.functions[caller_index].body {
-                let Stmt::CallDirect {
-                    callee,
-                    dest: Some(dest),
-                    ..
-                } = stmt
-                else {
-                    continue;
-                };
-                if callee != &func.key {
-                    continue;
-                }
-                saw_caller = true;
-                if self.local_value_escapes(caller_index, dest, depth + 1, visiting) {
-                    return true;
-                }
+        let consumers = &self.preanalysis.return_consumers[func_index];
+        for consumer in consumers {
+            if self.local_value_escapes(consumer.caller_index, consumer.dest, depth + 1, visiting) {
+                return true;
             }
         }
-        !saw_caller && !value.is_empty()
+        consumers.is_empty() && !value.is_empty()
     }
 
-    fn address_taken_sites(&self) -> BTreeMap<String, BTreeSet<String>> {
-        let mut sites = BTreeMap::<String, BTreeSet<String>>::new();
-        for (func_index, func) in self.module.functions.iter().enumerate() {
-            for stmt in &func.body {
-                for target in function_symbol_value_operands(stmt) {
-                    let target = canonical_symbol(target);
-                    if let Some(&target_index) = self.functions.get(target) {
-                        let target = &self.module.functions[target_index].key;
-                        sites.entry(target.clone()).or_default().insert(format!(
-                            "function:{}@{}",
-                            target,
-                            self.owner_key(func_index)
-                        ));
-                    }
-                }
-            }
-        }
-        for stmt in &self.module.global_init {
-            for target in function_symbol_value_operands(stmt) {
-                let target = canonical_symbol(target);
-                if let Some(&target_index) = self.functions.get(target) {
-                    let target = &self.module.functions[target_index].key;
-                    sites
-                        .entry(target.clone())
-                        .or_default()
-                        .insert(format!("function:{target}@global_init"));
-                }
-            }
-        }
-        sites
+    fn address_taken_sites(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.preanalysis.address_taken_sites
     }
 
     fn function_place(&self, func_index: usize, before_stmt: usize, value: &str) -> Option<SubObj> {
@@ -895,111 +1143,21 @@ impl<'a> SimpleResolver<'a> {
                 byte_off: 0,
             });
         }
-        for stmt_index in (0..before_stmt).rev() {
-            let Some(dest) = stmt_dest(&self.module.global_init[stmt_index]) else {
-                continue;
-            };
-            if dest != value {
-                continue;
-            }
-            return match &self.module.global_init[stmt_index] {
-                Stmt::Gep {
-                    base,
-                    byte_off: Some(byte_off),
-                    ..
-                } => {
-                    let mut base = self.global_init_place(stmt_index, base)?;
-                    base.byte_off = base.byte_off.checked_add(*byte_off)?;
-                    Some(base)
-                }
-                Stmt::Assign { sources, .. } if sources.len() == 1 => {
-                    self.global_init_place(stmt_index, &sources[0])
-                }
-                _ => None,
-            };
-        }
-        None
-    }
-
-    fn function_global_use_is_safe(
-        &self,
-        func_index: usize,
-        stmt_index: usize,
-        stmt: &Stmt,
-        global: &str,
-    ) -> bool {
-        match stmt {
-            Stmt::Load { address, .. } => self
-                .function_place(func_index, stmt_index, address)
-                .map(|_| true)
-                .unwrap_or_else(|| !operand_mentions_global(address, global)),
-            Stmt::Store { address, value, .. } => {
-                let address_safe = self
-                    .function_place(func_index, stmt_index, address)
-                    .map(|_| true)
-                    .unwrap_or_else(|| !operand_mentions_global(address, global));
-                address_safe
-                    && self
-                        .function_place(func_index, stmt_index, value)
-                        .map(|place| place.root != global)
-                        .unwrap_or_else(|| !operand_mentions_global(value, global))
-            }
+        let stmt_index = self.global_init_definition_before(value, before_stmt)?;
+        match &self.module.global_init[stmt_index] {
             Stmt::Gep {
                 base,
-                byte_off: Some(_),
+                byte_off: Some(byte_off),
                 ..
-            } => self
-                .function_place(func_index, stmt_index, base)
-                .map(|_| true)
-                .unwrap_or_else(|| !operand_mentions_global(base, global)),
-            Stmt::Gep { base, .. } => self
-                .function_place(func_index, stmt_index, base)
-                .map(|place| place.root != global)
-                .unwrap_or_else(|| !operand_mentions_global(base, global)),
-            Stmt::GlobalRef { .. } => true,
-            _ => stmt_operands(stmt).into_iter().all(|operand| {
-                self.function_place(func_index, stmt_index, operand)
-                    .map(|place| place.root != global)
-                    .unwrap_or_else(|| !operand_mentions_global(operand, global))
-            }),
-        }
-    }
-
-    fn global_init_global_use_is_safe(&self, stmt_index: usize, stmt: &Stmt, global: &str) -> bool {
-        match stmt {
-            Stmt::Load { address, .. } => self
-                .global_init_place(stmt_index, address)
-                .map(|_| true)
-                .unwrap_or_else(|| !operand_mentions_global(address, global)),
-            Stmt::Store { address, value, .. } => {
-                let address_safe = self
-                    .global_init_place(stmt_index, address)
-                    .map(|_| true)
-                    .unwrap_or_else(|| !operand_mentions_global(address, global));
-                address_safe
-                    && self
-                        .global_init_place(stmt_index, value)
-                        .map(|place| place.root != global)
-                        .unwrap_or_else(|| !operand_mentions_global(value, global))
+            } => {
+                let mut base = self.global_init_place(stmt_index, base)?;
+                base.byte_off = base.byte_off.checked_add(*byte_off)?;
+                Some(base)
             }
-            Stmt::Gep {
-                base,
-                byte_off: Some(_),
-                ..
-            } => self
-                .global_init_place(stmt_index, base)
-                .map(|_| true)
-                .unwrap_or_else(|| !operand_mentions_global(base, global)),
-            Stmt::Gep { base, .. } => self
-                .global_init_place(stmt_index, base)
-                .map(|place| place.root != global)
-                .unwrap_or_else(|| !operand_mentions_global(base, global)),
-            Stmt::GlobalRef { .. } => true,
-            _ => stmt_operands(stmt).into_iter().all(|operand| {
-                self.global_init_place(stmt_index, operand)
-                    .map(|place| place.root != global)
-                    .unwrap_or_else(|| !operand_mentions_global(operand, global))
-            }),
+            Stmt::Assign { sources, .. } if sources.len() == 1 => {
+                self.global_init_place(stmt_index, &sources[0])
+            }
+            _ => None,
         }
     }
 
@@ -1008,6 +1166,14 @@ impl<'a> SimpleResolver<'a> {
             .param_names
             .iter()
             .position(|param| param == value)
+    }
+
+    fn global_init_definition_before(&self, value: &str, before_stmt: usize) -> Option<usize> {
+        let definitions = self.global_init_definitions.get(value)?;
+        let position = definitions.partition_point(|&stmt_index| stmt_index < before_stmt);
+        position
+            .checked_sub(1)
+            .map(|position| definitions[position])
     }
 
     fn owner_key(&self, func_index: usize) -> &str {
@@ -1097,8 +1263,45 @@ fn function_symbol_value_operands(stmt: &Stmt) -> Vec<&str> {
     }
 }
 
-fn operand_mentions_global(operand: &str, global: &str) -> bool {
-    same_symbol(operand, global)
+fn global_init_function_escape_operands(stmt: &Stmt) -> Vec<&str> {
+    match stmt {
+        Stmt::Assign { .. } | Stmt::GlobalRef { .. } => Vec::new(),
+        Stmt::ScalarOp { dest, lhs, rhs, .. } => {
+            vec![dest.as_str(), lhs.as_str(), rhs.as_str()]
+        }
+        Stmt::Store { value, .. } => vec![value.as_str()],
+        Stmt::CallIndirect {
+            operand,
+            args,
+            dest,
+            ..
+        } => std::iter::once(operand.as_str())
+            .chain(args.iter().map(String::as_str))
+            .chain(dest.as_deref())
+            .collect(),
+        Stmt::Load { address, .. } => vec![address.as_str()],
+        Stmt::Gep { base, .. } => vec![base.as_str()],
+        Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => {
+            vec![source.as_str()]
+        }
+        Stmt::Memcpy { dst, src, .. } => vec![dst.as_str(), src.as_str()],
+        Stmt::Memset { dst, value, .. } => vec![dst.as_str(), value.as_str()],
+        Stmt::Unknown {
+            operands, results, ..
+        } => operands
+            .iter()
+            .chain(results.iter())
+            .map(String::as_str)
+            .collect(),
+        Stmt::Return { value, .. } => value.as_deref().into_iter().collect(),
+        Stmt::CallDirect {
+            callee, args, dest, ..
+        } => std::iter::once(callee.as_str())
+            .chain(args.iter().map(String::as_str))
+            .chain(dest.as_deref())
+            .collect(),
+        Stmt::Alloca { dest, .. } | Stmt::VarArg { dest, .. } => vec![dest.as_str()],
+    }
 }
 
 fn canonical_symbol(value: &str) -> &str {
@@ -1216,5 +1419,109 @@ where
         Stmt::Alloca { dest, .. } => same_symbol(dest, target),
         Stmt::VarArg { dest, .. } => same_symbol(dest, target),
         Stmt::GlobalRef { .. } => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn fixture(name: &str) -> Pir {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/m2_2")
+            .join(name);
+        Pir::from_path(path).unwrap()
+    }
+
+    fn resolver(module: &Pir) -> SimpleResolver<'_> {
+        SimpleResolver::new(module, 4, BuildMode::Executable, &BTreeSet::new())
+    }
+
+    #[test]
+    fn preanalysis_indexes_parameter_actuals_symbol_uses_and_local_uses() {
+        let module = fixture("simple_param_actual.pir.json");
+        let resolver = resolver(&module);
+        let invoke = resolver.functions["invoke"];
+        let cb = resolver.functions["cb"];
+
+        assert_eq!(resolver.preanalysis.direct_call_count[invoke], 1);
+        let actuals = &resolver.preanalysis.direct_actuals[&(invoke, 0)];
+        assert_eq!(actuals.len(), 1);
+        assert_eq!(actuals[0].actual, "cb");
+        assert_eq!(resolver.preanalysis.local_uses[invoke]["fp"], [0]);
+        assert!(matches!(
+            resolver.preanalysis.function_symbol_uses[cb].as_slice(),
+            [SymbolUseSite::Function {
+                func_index: 0,
+                stmt_index: 0
+            }]
+        ));
+    }
+
+    #[test]
+    fn preanalysis_indexes_subobject_stores_and_return_consumers() {
+        let fields = fixture("simple_global_fields.pir.json");
+        let fields_resolver = resolver(&fields);
+        assert_eq!(
+            fields_resolver.preanalysis.stores_by_place[&SubObj {
+                root: "Table".into(),
+                byte_off: 0,
+            }]
+                .len(),
+            1
+        );
+        assert_eq!(
+            fields_resolver.preanalysis.stores_by_place[&SubObj {
+                root: "Table".into(),
+                byte_off: 8,
+            }]
+                .len(),
+            1
+        );
+
+        let mut initializer = fixture("simple_global_fields.pir.json");
+        initializer.functions[0].body.clear();
+        initializer.global_init = vec![
+            Stmt::Assign {
+                dest: "%slot".into(),
+                sources: vec!["@Table".into()],
+                loc: None,
+            },
+            Stmt::Store {
+                address: "%slot".into(),
+                value: "cb".into(),
+                volatile: false,
+                access_bytes: None,
+                loc: None,
+            },
+            Stmt::Assign {
+                dest: "%slot".into(),
+                sources: vec!["@Table".into()],
+                loc: None,
+            },
+        ];
+        let initializer_resolver = resolver(&initializer);
+        assert_eq!(
+            initializer_resolver.global_init_definitions["%slot"],
+            [0, 2]
+        );
+        assert!(matches!(
+            initializer_resolver.preanalysis.stores_by_place[&SubObj {
+                root: "Table".into(),
+                byte_off: 0,
+            }]
+                .as_slice(),
+            [StoreSite::GlobalInit { stmt_index: 1 }]
+        ));
+
+        let returns = fixture("simple_return_value.pir.json");
+        let returns_resolver = resolver(&returns);
+        let choose = returns_resolver.functions["choose"];
+        let consumers = &returns_resolver.preanalysis.return_consumers[choose];
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(consumers[0].caller_index, 0);
+        assert_eq!(consumers[0].dest, "%fp");
     }
 }
