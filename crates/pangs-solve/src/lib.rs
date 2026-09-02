@@ -1431,36 +1431,40 @@ fn global_address_exposure(pir: &Pir, pag: &Pag, roots: &StorageRoots) -> Vec<bo
             }
         }
     }
-    // Memset lowers to an ordinary synthetic Store, so distinguish it at PIR level.  Exact
-    // function/global-init labels are used; direct global spellings are handled canonically.
-    let mut expose_memset = |owner: &str, dst: &str| {
+    // Memset lowers to an ordinary synthetic Store, so distinguish it at PIR level. Index its
+    // exact function/global-init value labels and canonical global spellings first, then scan
+    // the PAG nodes once instead of once per memset.
+    let function_memsets = pir.functions.iter().flat_map(|function| {
+        function.body.iter().filter_map(|stmt| match stmt {
+            pangs_pir::Stmt::Memset { dst, .. } => Some((function.key.as_str(), dst.as_str())),
+            _ => None,
+        })
+    });
+    let global_init_memsets = pir.global_init.iter().filter_map(|stmt| match stmt {
+        pangs_pir::Stmt::Memset { dst, .. } => Some(("global_init", dst.as_str())),
+        _ => None,
+    });
+    let mut memset_value_labels = HashSet::new();
+    let mut memset_global_names = HashSet::new();
+    for (owner, dst) in function_memsets.chain(global_init_memsets) {
         let bare = dst.strip_prefix('@').unwrap_or(dst);
         if let Some(&index) = global_by_key.get(dst).or_else(|| global_by_key.get(bare)) {
             exposed[index] = true;
         }
-        let value_label = format!("val:{owner}:{dst}");
+        memset_value_labels.insert(format!("val:{owner}:{dst}"));
+        memset_global_names.insert(bare);
+    }
+
+    if !memset_value_labels.is_empty() {
         for node in &pag.nodes {
-            if node.label == value_label
-                || node
-                    .label
-                    .strip_prefix("sym:global:")
-                    .map(|key| key.strip_prefix('@').unwrap_or(key) == bare)
-                    .unwrap_or(false)
-            {
+            let is_memset_global = node
+                .label
+                .strip_prefix("sym:global:")
+                .map(|key| key.strip_prefix('@').unwrap_or(key))
+                .is_some_and(|key| memset_global_names.contains(key));
+            if memset_value_labels.contains(node.label.as_str()) || is_memset_global {
                 expose(&mut exposed, roots, node.id);
             }
-        }
-    };
-    for function in &pir.functions {
-        for stmt in &function.body {
-            if let pangs_pir::Stmt::Memset { dst, .. } = stmt {
-                expose_memset(&function.key, dst);
-            }
-        }
-    }
-    for stmt in &pir.global_init {
-        if let pangs_pir::Stmt::Memset { dst, .. } = stmt {
-            expose_memset("global_init", dst);
         }
     }
     exposed
@@ -4036,6 +4040,37 @@ mod tests {
         assert_eq!(
             global_address_exposure(&safe_only, &pag, &roots),
             vec![false]
+        );
+    }
+
+    #[test]
+    fn memset_exposure_indexes_direct_and_global_init_destinations() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+              "module":"memset-exposure-index",
+              "globals":[
+                {"key":"direct","mutable":true},
+                {"key":"init_derived","mutable":true},
+                {"key":"untouched","mutable":true}
+              ],
+              "functions":[
+                {"key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                  {"kind":"memset","dst":"@direct","value":"0","bytes":8}
+                ]}
+              ],
+              "global_init":[
+                {"kind":"gep","dest":"init.elt","base":"@init_derived"},
+                {"kind":"memset","dst":"init.elt","value":"0","bytes":8}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &pangs_pag::PagOpts::default());
+        let roots = allocation_storage_roots(&pir, &pag);
+
+        assert_eq!(
+            global_address_exposure(&pir, &pag, &roots),
+            vec![true, true, false]
         );
     }
 
