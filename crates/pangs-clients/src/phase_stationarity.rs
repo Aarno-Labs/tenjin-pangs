@@ -2845,7 +2845,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_site_ledger_maps_alias_and_top_writes_to_exact_boundaries() {
+    fn pointer_site_ledger_excludes_unscoped_forged_writes() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/synthetic/m1_6/aliased_unknown_modref.pir.json");
         let pir = pangs_pir::Pir::from_path(fixture).unwrap();
@@ -2880,10 +2880,9 @@ mod tests {
             source_mapping_available: true,
         };
         let inputs = assemble_spine_inputs(&analysis, &pir, FuncId(0), &cfg, &BTreeMap::new());
-        let direct = analysis.lookup_global("@Direct").unwrap();
         let aliased = analysis.lookup_global("@Aliased").unwrap();
         assert_eq!(inputs.generated_writes[3], vec![aliased]);
-        assert_eq!(inputs.generated_writes[6], vec![direct, aliased]);
+        assert!(inputs.generated_writes[6].is_empty());
         assert!(inputs.generated_writes[..3].iter().all(Vec::is_empty));
         assert!(inputs.generated_writes[4..6].iter().all(Vec::is_empty));
     }

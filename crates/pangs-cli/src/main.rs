@@ -434,26 +434,27 @@ fn run() -> Result<()> {
             let transitive_rows = analysis.transitive_modref_count();
             let mut unknown_rows = 0usize;
             let mut module_wide_rows = 0usize;
-            let mut unknown_rows_with_universal_sources = 0usize;
-            let mut universal_source_rows = BTreeMap::<String, usize>::new();
+            let mut forged_scope_rows = 0usize;
+            let mut forged_scope_candidate_sizes = BTreeMap::<usize, usize>::new();
             for row in analysis.modrefs() {
                 if !matches!(&row.global, GlobalTarget::Unknown(_)) {
                     continue;
                 }
                 unknown_rows += 1;
-                if matches!(analysis.affected_globals(row), AffectedGlobals::ModuleWide) {
-                    module_wide_rows += 1;
-                }
-                let Some((_, sources)) = row
-                    .detail
-                    .as_deref()
-                    .and_then(|detail| detail.split_once(":universal_sources="))
-                else {
-                    continue;
-                };
-                unknown_rows_with_universal_sources += 1;
-                for source in sources.split(',').filter(|source| !source.is_empty()) {
-                    *universal_source_rows.entry(source.to_string()).or_default() += 1;
+                match analysis.affected_globals(row) {
+                    AffectedGlobals::ModuleWide => module_wide_rows += 1,
+                    AffectedGlobals::Finite(globals)
+                        if row
+                            .detail
+                            .as_deref()
+                            .is_some_and(|detail| detail.contains(":escaped_union=")) =>
+                    {
+                        forged_scope_rows += 1;
+                        *forged_scope_candidate_sizes
+                            .entry(globals.len())
+                            .or_default() += 1;
+                    }
+                    AffectedGlobals::Finite(_) => {}
                 }
             }
             println!(
@@ -463,8 +464,8 @@ fn run() -> Result<()> {
                     "local_modref_rows": analysis.modrefs().len(),
                     "unknown_modref_rows": unknown_rows,
                     "module_wide_modref_rows": module_wide_rows,
-                    "unknown_rows_with_universal_sources": unknown_rows_with_universal_sources,
-                    "universal_source_rows": universal_source_rows,
+                    "forged_scope_rows": forged_scope_rows,
+                    "forged_scope_candidate_sizes": forged_scope_candidate_sizes,
                     "transitive_modref_rows": transitive_rows,
                     "metrics": analysis.metrics(),
                 }))?

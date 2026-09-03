@@ -1963,7 +1963,7 @@ mod tests {
     }
 
     #[test]
-    fn cc2json_high_fanout_with_string_pointee_is_not_mutation_evidence() {
+    fn cc2json_high_fanout_ignores_an_unexposed_string_pointee() {
         let mut body = vec![Stmt::Alloca {
             dest: "%slot".to_string(),
             ty: "i8*".to_string(),
@@ -2048,7 +2048,13 @@ mod tests {
         )
         .unwrap();
         let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(json["mutated_globals"], serde_json::json!([]), "{rendered}");
+        assert_eq!(
+            json["mutated_globals"],
+            serde_json::json!((0..=16)
+                .map(|idx| format!("@G{idx:02}"))
+                .collect::<Vec<_>>()),
+            "{rendered}"
+        );
     }
 
     #[test]

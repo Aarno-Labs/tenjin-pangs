@@ -2513,7 +2513,7 @@ fn audit_global_flow(
                 .iter()
                 .filter_map(|key| global_lookup.get(key).copied()),
         );
-        if summary.external_universal {
+        if summary.external_escaped_union {
             globals.extend(escaped_external_globals.iter().copied());
         }
     }
@@ -4068,18 +4068,6 @@ impl AccessSiteBuilder {
         }
     }
 
-    fn push_all_targets(&mut self, key: AccessSiteKey) {
-        let words = self.global_count.div_ceil(64);
-        let bits = self.by_site.entry(key).or_insert_with(|| vec![0; words]);
-        bits.fill(u64::MAX);
-        if let Some(last) = bits.last_mut() {
-            let tail = self.global_count % 64;
-            if tail != 0 {
-                *last = (1_u64 << tail) - 1;
-            }
-        }
-    }
-
     fn finish(mut self) -> Vec<AccessSite> {
         // Preserve the historical cleanup rule: an exact statement-indexed site supersedes an
         // otherwise equal location-only site for the globals covered by that exact record.
@@ -4833,7 +4821,7 @@ struct PointerAccess {
 #[derive(Debug, Clone)]
 struct ModRefNodeSummaryData {
     external: bool,
-    universal_sources: Rc<[String]>,
+    external_escaped_union: bool,
     class_pointee_global_ids: Rc<[GlobalId]>,
     pointee_global_ids: Rc<[GlobalId]>,
     pointee_global_bits: Rc<[u64]>,
@@ -5248,9 +5236,12 @@ fn push_high_fanout_pointer_modref_fallback(
         summary.class_pointee_global_count,
         summary.unfiltered_pointee_global_count,
     );
-    append_escaped_union_count(&mut detail, summary.escaped_union_count);
+    append_escaped_union_count(
+        &mut detail,
+        summary.external_escaped_union,
+        summary.escaped_union_count,
+    );
     append_pointee_provenance(&mut detail, &summary.pointee_provenance);
-    append_universal_sources(&mut detail, &summary.universal_sources);
     modrefs.push_with_phase(
         ModRef {
             func,
@@ -5329,7 +5320,7 @@ fn build_modref_node_summary_data(
         global_ids_for_keys(resolution.pointee_globals.iter(), global_lookup);
     let cache_key = (
         resolution.pointee_globals.cache_key(),
-        resolution.external_universal,
+        resolution.external_escaped_union,
     );
     let (pointee_global_ids, pointee_global_bits) =
         if let Some((ids, bits)) = pointee_global_cache.get(&cache_key) {
@@ -5337,7 +5328,7 @@ fn build_modref_node_summary_data(
         } else {
             let mut ids = class_pointee_global_ids.to_vec();
             let mut bits = global_target_bits(global_lookup.len(), ids.iter().copied()).to_vec();
-            if resolution.external_universal {
+            if resolution.external_escaped_union {
                 ids.extend(escaped_external_globals.ids.iter().copied());
                 ids.sort();
                 ids.dedup();
@@ -5359,7 +5350,7 @@ fn build_modref_node_summary_data(
         .filter(|key| global_lookup.contains_key(*key))
         .cloned()
         .collect::<BTreeSet<_>>();
-    if resolution.external_universal {
+    if resolution.external_escaped_union {
         pointee_global_keys.extend(escaped_external_globals.keys.iter().cloned());
     }
     let pointee_global_sample = Rc::<[String]>::from(pointee_global_sample(
@@ -5375,7 +5366,7 @@ fn build_modref_node_summary_data(
     } else {
         resolution.pointee_globals_unfiltered.len()
     };
-    let escaped_union_count = if resolution.external_universal {
+    let escaped_union_count = if resolution.external_escaped_union {
         escaped_external_globals
             .ids
             .iter()
@@ -5387,7 +5378,7 @@ fn build_modref_node_summary_data(
     let pointee_global_count = pointee_global_ids.len();
     ModRefNodeSummaryData {
         external: resolution.external,
-        universal_sources: Rc::from(resolution.universal_sources.clone()),
+        external_escaped_union: resolution.external_escaped_union,
         class_pointee_global_ids,
         pointee_global_ids,
         pointee_global_bits,
@@ -5419,17 +5410,6 @@ fn append_pointee_provenance(detail: &mut String, provenance: &[PointeeProvenanc
     }
 }
 
-fn append_universal_sources(detail: &mut String, sources: &[String]) {
-    if sources.is_empty() {
-        return;
-    }
-    let mut sources = sources.to_vec();
-    sources.sort();
-    sources.dedup();
-    detail.push_str(":universal_sources=");
-    detail.push_str(&sources.join(","));
-}
-
 fn append_address_filter_counts(detail: &mut String, filtered: usize, unfiltered: usize) {
     if unfiltered <= filtered {
         return;
@@ -5440,8 +5420,8 @@ fn append_address_filter_counts(detail: &mut String, filtered: usize, unfiltered
     ));
 }
 
-fn append_escaped_union_count(detail: &mut String, count: usize) {
-    if count > 0 {
+fn append_escaped_union_count(detail: &mut String, applied: bool, count: usize) {
+    if applied {
         detail.push_str(&format!(":escaped_union={count}"));
     }
 }
@@ -5485,7 +5465,7 @@ mod pointee_global_sample_tests {
         );
         let resolution = NodeResolution {
             external: true,
-            external_universal: true,
+            external_escaped_union: true,
             pointee_globals: vec!["open".to_string()].into(),
             pointee_globals_unfiltered: vec!["closed".to_string(), "open".to_string()].into(),
             ..NodeResolution::default()
@@ -5513,7 +5493,11 @@ mod pointee_global_sample_tests {
             summary.class_pointee_global_count,
             summary.unfiltered_pointee_global_count,
         );
-        append_escaped_union_count(&mut detail, summary.escaped_union_count);
+        append_escaped_union_count(
+            &mut detail,
+            summary.external_escaped_union,
+            summary.escaped_union_count,
+        );
         assert_eq!(
             detail,
             "edge:load:prefilter_pointee_count=2:address_filtered_count=1:escaped_union=1"
@@ -5841,9 +5825,12 @@ fn push_pointer_modrefs_from_pag(
                     summary.class_pointee_global_count,
                     summary.unfiltered_pointee_global_count,
                 );
-                append_escaped_union_count(&mut detail, summary.escaped_union_count);
+                append_escaped_union_count(
+                    &mut detail,
+                    summary.external_escaped_union,
+                    summary.escaped_union_count,
+                );
                 append_pointee_provenance(&mut detail, &summary.pointee_provenance);
-                append_universal_sources(&mut detail, &summary.universal_sources);
                 modrefs.push_with_phase(
                     ModRef {
                         func,
@@ -6038,9 +6025,12 @@ fn push_pointer_memset_modrefs_from_pir(
                     summary.class_pointee_global_count,
                     summary.unfiltered_pointee_global_count,
                 );
-                append_escaped_union_count(&mut detail, summary.escaped_union_count);
+                append_escaped_union_count(
+                    &mut detail,
+                    summary.external_escaped_union,
+                    summary.escaped_union_count,
+                );
                 append_pointee_provenance(&mut detail, &summary.pointee_provenance);
-                append_universal_sources(&mut detail, &summary.universal_sources);
                 modrefs.push_with_phase(
                     ModRef {
                         func: func_id,
@@ -6079,9 +6069,12 @@ fn push_pointer_memset_modrefs_from_pir(
                     summary.class_pointee_global_count,
                     summary.unfiltered_pointee_global_count,
                 );
-                append_escaped_union_count(&mut detail, summary.escaped_union_count);
+                append_escaped_union_count(
+                    &mut detail,
+                    summary.external_escaped_union,
+                    summary.escaped_union_count,
+                );
                 append_pointee_provenance(&mut detail, &summary.pointee_provenance);
-                append_universal_sources(&mut detail, &summary.universal_sources);
                 modrefs.push_with_phase(
                     ModRef {
                         func: func_id,
@@ -7546,13 +7539,12 @@ mod access_site_tests {
     }
 
     #[test]
-    fn cached_target_bits_preserve_exclusions_and_module_wide_tail() {
+    fn cached_target_bits_preserve_exclusions() {
         let mut builder = AccessSiteBuilder::new(70);
         let first = global_target_bits(70, [GlobalId(0), GlobalId(1), GlobalId(65)]);
         let second = global_target_bits(70, [GlobalId(1), GlobalId(2)]);
         builder.push_target_bits(key(0, None), &first, Some(GlobalId(1)));
         builder.push_target_bits(key(0, None), &second, Some(GlobalId(2)));
-        builder.push_all_targets(key(1, None));
 
         let sites = builder.finish();
         let finite = sites.iter().find(|site| site.func == FuncId(0)).unwrap();
@@ -7560,9 +7552,6 @@ mod access_site_tests {
             finite.globals().collect::<Vec<_>>(),
             vec![GlobalId(0), GlobalId(1), GlobalId(65)]
         );
-        let module_wide = sites.iter().find(|site| site.func == FuncId(1)).unwrap();
-        assert_eq!(module_wide.target_count(), 70);
-        assert_eq!(module_wide.globals().last(), Some(GlobalId(69)));
     }
 }
 

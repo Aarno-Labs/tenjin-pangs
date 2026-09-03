@@ -1894,11 +1894,6 @@ impl MutexReachability {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalPolicyD4Census {
     pub globals: Vec<ExternalPolicyD4GlobalRow>,
-    pub module_wide_leave_one_out: Vec<ModuleWideLeaveOneOutRow>,
-    pub forged_pointer_group_counterfactuals: Vec<ForgedPointerGroupCounterfactual>,
-    pub module_wide_remove_all_counterfactual: ModuleWideSetCounterfactual,
-    pub feasible_forged_groups_counterfactual: ModuleWideSetCounterfactual,
-    pub bounded_constant_groups_counterfactual: ModuleWideSetCounterfactual,
     pub summary: ExternalPolicyD4Summary,
 }
 
@@ -1912,16 +1907,6 @@ pub struct ExternalPolicyD4Summary {
     pub accessor_reaching_pairs: usize,
     pub incomplete_control_pairs: usize,
     pub ideal_newly_mutex_eligible: usize,
-    pub module_wide_leave_one_out_newly_access_complete: usize,
-    pub module_wide_leave_one_out_newly_mutex_eligible_under_strict_reentry: usize,
-    pub forged_pointer_group_newly_access_complete: usize,
-    pub forged_pointer_group_newly_mutex_eligible_under_strict_reentry: usize,
-    pub module_wide_remove_all_newly_access_complete: usize,
-    pub module_wide_remove_all_newly_mutex_eligible_under_strict_reentry: usize,
-    pub feasible_forged_groups_newly_access_complete: usize,
-    pub feasible_forged_groups_newly_mutex_eligible_under_strict_reentry: usize,
-    pub bounded_constant_groups_newly_access_complete: usize,
-    pub bounded_constant_groups_newly_mutex_eligible_under_strict_reentry: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1945,35 +1930,6 @@ pub struct ExternalPolicyD4UnknownCall {
     pub principal: Option<String>,
     pub control_closure_complete: bool,
     pub reaches_accessor: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ModuleWideLeaveOneOutRow {
-    pub modref_row_index: usize,
-    pub seed_kinds: Vec<String>,
-    pub poisoned_globals: usize,
-    pub newly_access_complete_globals: Vec<String>,
-    pub newly_mutex_eligible_under_strict_reentry: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ForgedPointerGroupCounterfactual {
-    pub group: String,
-    pub feasibly_certifiable: bool,
-    pub removed_modref_rows: usize,
-    pub remaining_module_wide_rows: usize,
-    pub finite_candidate_globals: Vec<String>,
-    pub newly_access_complete_globals: Vec<String>,
-    pub newly_mutex_eligible_under_strict_reentry: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ModuleWideSetCounterfactual {
-    pub removed_groups: usize,
-    pub removed_modref_rows: usize,
-    pub remaining_module_wide_rows: usize,
-    pub newly_access_complete_globals: Vec<String>,
-    pub newly_mutex_eligible_under_strict_reentry: Vec<String>,
 }
 
 /// Counterfactual D4 census for the proposed conventional external-code policy.
@@ -2082,163 +2038,6 @@ pub fn external_policy_d4_census(
         });
     }
 
-    let row_by_global = rows
-        .iter()
-        .map(|row| (row.global.as_str(), row))
-        .collect::<BTreeMap<_, _>>();
-    let module_wide_leave_one_out = analysis
-        .external_policy_census()
-        .into_iter()
-        .flat_map(|census| &census.module_wide_rows)
-        .map(|row| {
-            let newly_access_complete_globals = row.exclusively_poisoned_globals.clone();
-            let newly_mutex_eligible_under_strict_reentry = newly_access_complete_globals
-                .iter()
-                .filter(|global| {
-                    let Some(record) = manifest
-                        .globals
-                        .iter()
-                        .find(|record| record.meta.llvm_name.as_str() == global.as_str())
-                    else {
-                        return false;
-                    };
-                    let Some(d4) = row_by_global.get(global.as_str()) else {
-                        return false;
-                    };
-                    !record.facts.signal_context_access.value
-                        && !record.facts.violation_taint.value
-                        && !d4.known_accessor_reentry
-                        && d4.unknown_calls.is_empty()
-                })
-                .cloned()
-                .collect();
-            ModuleWideLeaveOneOutRow {
-                modref_row_index: row.row_index,
-                seed_kinds: row.seed_kinds.clone(),
-                poisoned_globals: row.poisoned_globals,
-                newly_access_complete_globals,
-                newly_mutex_eligible_under_strict_reentry,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let core_census = analysis.external_policy_census();
-    let module_wide_row_count = core_census
-        .map(|census| census.module_wide_rows.len())
-        .unwrap_or(0);
-    let counterfactual_for_remaining = |remaining_module_wide_rows: usize| {
-        let newly_access_complete_globals = if remaining_module_wide_rows == 0 {
-            analysis
-                .globals()
-                .iter()
-                .filter(|info| {
-                    let currently_incomplete = manifest.globals.iter().any(|global| {
-                        global.meta.llvm_name == info.key && !global.facts.access_set_complete.value
-                    });
-                    currently_incomplete
-                        && !info.address_escaped
-                        && !(core_census
-                            .is_some_and(|census| census.build_mode == BuildMode::Library)
-                            && info.exported)
-                })
-                .map(|info| info.key.clone())
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let newly_mutex_eligible_under_strict_reentry = newly_access_complete_globals
-            .iter()
-            .filter(|global| {
-                let Some(record) = manifest
-                    .globals
-                    .iter()
-                    .find(|record| record.meta.llvm_name.as_str() == global.as_str())
-                else {
-                    return false;
-                };
-                let Some(d4) = row_by_global.get(global.as_str()) else {
-                    return false;
-                };
-                !record.facts.signal_context_access.value
-                    && !record.facts.violation_taint.value
-                    && !d4.known_accessor_reentry
-                    && d4.unknown_calls.is_empty()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        (
-            newly_access_complete_globals,
-            newly_mutex_eligible_under_strict_reentry,
-        )
-    };
-    let forged_pointer_group_counterfactuals = core_census
-        .into_iter()
-        .flat_map(|census| &census.forged_pointer_groups)
-        .map(|group| {
-            let removed = group.modref_row_indices.len();
-            let remaining = module_wide_row_count.saturating_sub(removed);
-            let (newly_access_complete_globals, newly_mutex_eligible_under_strict_reentry) =
-                counterfactual_for_remaining(remaining);
-            ForgedPointerGroupCounterfactual {
-                group: group.group.clone(),
-                feasibly_certifiable: group.feasibly_certifiable,
-                removed_modref_rows: removed,
-                remaining_module_wide_rows: remaining,
-                finite_candidate_globals: group.finite_candidate_globals.clone(),
-                newly_access_complete_globals,
-                newly_mutex_eligible_under_strict_reentry,
-            }
-        })
-        .collect::<Vec<_>>();
-    let group_count = forged_pointer_group_counterfactuals.len();
-    let feasible_groups = core_census
-        .into_iter()
-        .flat_map(|census| &census.forged_pointer_groups)
-        .filter(|group| group.feasibly_certifiable)
-        .collect::<Vec<_>>();
-    let feasible_removed_rows = feasible_groups
-        .iter()
-        .map(|group| group.modref_row_indices.len())
-        .sum::<usize>();
-    let feasible_remaining_rows = module_wide_row_count.saturating_sub(feasible_removed_rows);
-    let (feasible_new_access, feasible_new_mutex) =
-        counterfactual_for_remaining(feasible_remaining_rows);
-    let feasible_forged_groups_counterfactual = ModuleWideSetCounterfactual {
-        removed_groups: feasible_groups.len(),
-        removed_modref_rows: feasible_removed_rows,
-        remaining_module_wide_rows: feasible_remaining_rows,
-        newly_access_complete_globals: feasible_new_access,
-        newly_mutex_eligible_under_strict_reentry: feasible_new_mutex,
-    };
-    let bounded_constant_groups = core_census
-        .into_iter()
-        .flat_map(|census| &census.forged_pointer_groups)
-        .filter(|group| group.feasibly_certifiable || group.bounded_constant_candidate)
-        .collect::<Vec<_>>();
-    let bounded_constant_removed_rows = bounded_constant_groups
-        .iter()
-        .map(|group| group.modref_row_indices.len())
-        .sum::<usize>();
-    let bounded_constant_remaining_rows =
-        module_wide_row_count.saturating_sub(bounded_constant_removed_rows);
-    let (bounded_constant_new_access, bounded_constant_new_mutex) =
-        counterfactual_for_remaining(bounded_constant_remaining_rows);
-    let bounded_constant_groups_counterfactual = ModuleWideSetCounterfactual {
-        removed_groups: bounded_constant_groups.len(),
-        removed_modref_rows: bounded_constant_removed_rows,
-        remaining_module_wide_rows: bounded_constant_remaining_rows,
-        newly_access_complete_globals: bounded_constant_new_access,
-        newly_mutex_eligible_under_strict_reentry: bounded_constant_new_mutex,
-    };
-    let (all_new_access, all_new_mutex) = counterfactual_for_remaining(0);
-    let module_wide_remove_all_counterfactual = ModuleWideSetCounterfactual {
-        removed_groups: group_count,
-        removed_modref_rows: module_wide_row_count,
-        remaining_module_wide_rows: 0,
-        newly_access_complete_globals: all_new_access,
-        newly_mutex_eligible_under_strict_reentry: all_new_mutex,
-    };
-
     let summary = ExternalPolicyD4Summary {
         globals_evaluated: rows.len(),
         strict_mutex_eligible: rows
@@ -2273,53 +2072,9 @@ pub fn external_policy_d4_census(
             .iter()
             .filter(|row| row.ideal_newly_mutex_eligible)
             .count(),
-        module_wide_leave_one_out_newly_access_complete: module_wide_leave_one_out
-            .iter()
-            .map(|row| row.newly_access_complete_globals.len())
-            .sum(),
-        module_wide_leave_one_out_newly_mutex_eligible_under_strict_reentry:
-            module_wide_leave_one_out
-                .iter()
-                .map(|row| row.newly_mutex_eligible_under_strict_reentry.len())
-                .sum(),
-        forged_pointer_group_newly_access_complete: forged_pointer_group_counterfactuals
-            .iter()
-            .map(|row| row.newly_access_complete_globals.len())
-            .sum(),
-        forged_pointer_group_newly_mutex_eligible_under_strict_reentry:
-            forged_pointer_group_counterfactuals
-                .iter()
-                .map(|row| row.newly_mutex_eligible_under_strict_reentry.len())
-                .sum(),
-        module_wide_remove_all_newly_access_complete: module_wide_remove_all_counterfactual
-            .newly_access_complete_globals
-            .len(),
-        module_wide_remove_all_newly_mutex_eligible_under_strict_reentry:
-            module_wide_remove_all_counterfactual
-                .newly_mutex_eligible_under_strict_reentry
-                .len(),
-        feasible_forged_groups_newly_access_complete: feasible_forged_groups_counterfactual
-            .newly_access_complete_globals
-            .len(),
-        feasible_forged_groups_newly_mutex_eligible_under_strict_reentry:
-            feasible_forged_groups_counterfactual
-                .newly_mutex_eligible_under_strict_reentry
-                .len(),
-        bounded_constant_groups_newly_access_complete: bounded_constant_groups_counterfactual
-            .newly_access_complete_globals
-            .len(),
-        bounded_constant_groups_newly_mutex_eligible_under_strict_reentry:
-            bounded_constant_groups_counterfactual
-                .newly_mutex_eligible_under_strict_reentry
-                .len(),
     };
     ExternalPolicyD4Census {
         globals: rows,
-        module_wide_leave_one_out,
-        forged_pointer_group_counterfactuals,
-        module_wide_remove_all_counterfactual,
-        feasible_forged_groups_counterfactual,
-        bounded_constant_groups_counterfactual,
         summary,
     }
 }

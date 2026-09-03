@@ -55,7 +55,7 @@ fn m1_7_fixture(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn external_policy_census_is_observational_and_attributes_inttoptr_rows() {
+fn external_policy_census_is_observational_after_forged_rows_become_finite() {
     let pir = Pir::from_path(m1_6_fixture("aliased_unknown_modref.pir.json")).unwrap();
     let opts = Opts {
         stage: Stage::Andersen,
@@ -82,12 +82,8 @@ fn external_policy_census_is_observational_and_attributes_inttoptr_rows() {
 
     let census = instrumented.external_policy_census().unwrap();
     assert_eq!(census.summary.module_wide_rows, 0);
-    assert_eq!(census.summary.module_wide_inttoptr_rows, 0);
     assert_eq!(census.summary.distinct_module_wide_poisoned_globals, 0);
     assert!(census.module_wide_rows.is_empty());
-    assert_eq!(census.summary.forged_pointer_seeds, 0);
-    assert_eq!(census.summary.forged_pointer_groups, 0);
-    assert!(census.forged_pointer_groups.is_empty());
 }
 
 fn unknown_candidate_keys(analysis: &Analysis) -> Vec<Vec<String>> {
@@ -1007,10 +1003,7 @@ fn m2_4_forged_runtime_mod_does_not_block_an_unexposed_table() {
         mr.access == Access::Mod
             && matches!(mr.global, pangs_api::GlobalTarget::Unknown(_))
             && mr.detail.as_deref()
-                == Some(
-                    "edge:store|omega:inttoptr|pointee_count=0:\
-                     universal_sources=omega:inttoptr:val:driver:%unknown_ptr",
-                )
+                == Some("edge:store|omega:inttoptr|pointee_count=0:escaped_union=0")
     }));
 }
 
@@ -2393,7 +2386,7 @@ fn steens_inttoptr_keeps_unknown_indirect_callee_without_concrete_targets() {
 }
 
 #[test]
-fn steens_lossless_fnptr_round_trip_preserves_target_without_universal_omega() {
+fn steens_lossless_fnptr_round_trip_preserves_target_without_forged_omega() {
     let mut pir = Pir::from_path(m1_5_fixture("fnptr_int_punning.pir.json")).unwrap();
     pir.target = Some(pangs_pir::TargetInfo {
         triple: "x86_64-unknown-linux-gnu".into(),
@@ -3768,10 +3761,7 @@ fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("main@m1_6.c:6:1#0")
             && mr.detail.as_deref()
-                == Some(
-                    "edge:load|omega:steens_external|pointee_count=0:\
-                     universal_sources=omega:inttoptr:val:main:%unk",
-                )
+                == Some("edge:load|omega:steens_external|pointee_count=0:escaped_union=0")
     }));
     assert!(raw_modrefs.iter().any(|mr| {
         mr.func == main
@@ -3780,10 +3770,7 @@ fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("main@m1_6.c:7:1#0")
             && mr.detail.as_deref()
-                == Some(
-                    "edge:store|omega:steens_external|pointee_count=0:\
-                     universal_sources=omega:inttoptr:val:main:%unk",
-                )
+                == Some("edge:store|omega:steens_external|pointee_count=0:escaped_union=0")
     }));
     assert!(steens.access_sites().iter().any(|site| {
         site.func == main
@@ -3967,10 +3954,7 @@ fn steens_memcpy_modref_exports_aliased_direct_symbol_and_unknown_rows() {
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:6:1#0")
             && mr.detail.as_deref()
-                == Some(
-                    "edge:memcpy_src|omega:steens_external|pointee_count=0:\
-                     universal_sources=omega:inttoptr:val:main:%unksrc",
-                )
+                == Some("edge:memcpy_src|omega:steens_external|pointee_count=0:escaped_union=0")
     }));
     assert!(raw_modrefs.iter().any(|mr| {
         mr.func == main
@@ -3979,11 +3963,7 @@ fn steens_memcpy_modref_exports_aliased_direct_symbol_and_unknown_rows() {
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("main@m1_6_memcpy.c:6:1#0")
             && mr.detail.as_deref()
-                == Some(
-                    "edge:memcpy_dst|omega:steens_external|pointee_count=0:\
-                     universal_sources=omega:inttoptr:val:main:%unkdst,\
-                     omega:inttoptr:val:main:%unksrc",
-                )
+                == Some("edge:memcpy_dst|omega:steens_external|pointee_count=0:escaped_union=0")
     }));
 
     let component = analysis
@@ -4046,10 +4026,7 @@ fn steens_modref_closure_carries_pointer_rows_through_direct_and_indirect_calls(
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("target@m1_6_icall.c:23:1#0")
             && mr.detail.as_deref()
-                == Some(
-                    "edge:store|omega:steens_external|pointee_count=0:\
-                     universal_sources=omega:inttoptr:val:target:%unk",
-                )
+                == Some("edge:store|omega:steens_external|pointee_count=0:escaped_union=0")
     }));
     assert!(raw_modrefs.iter().any(|mr| {
         mr.func == other
@@ -4074,10 +4051,7 @@ fn steens_modref_closure_carries_pointer_rows_through_direct_and_indirect_calls(
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("target@m1_6_icall.c:23:1#0")
             && mr.detail.as_deref()
-                == Some(
-                    "edge:store|omega:steens_external|pointee_count=0:\
-                     universal_sources=omega:inttoptr:val:target:%unk",
-                )
+                == Some("edge:store|omega:steens_external|pointee_count=0:escaped_union=0")
     }));
     assert!(!setup_modrefs.iter().any(|mr| {
         mr.global == pangs_api::GlobalTarget::Name(noise)
@@ -4099,10 +4073,7 @@ fn steens_modref_closure_carries_pointer_rows_through_direct_and_indirect_calls(
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("target@m1_6_icall.c:23:1#0")
             && mr.detail.as_deref()
-                == Some(
-                    "edge:store|omega:steens_external|pointee_count=0:\
-                     universal_sources=omega:inttoptr:val:target:%unk",
-                )
+                == Some("edge:store|omega:steens_external|pointee_count=0:escaped_union=0")
     }));
     assert!(!main_modrefs.iter().any(|mr| {
         mr.global == pangs_api::GlobalTarget::Name(noise)
@@ -4142,11 +4113,7 @@ fn steens_memset_modref_exports_direct_aliased_and_unknown_store_rows() {
             && mr.access == Access::Mod
             && mr.via == pangs_api::Via::Unknown
             && mr.witness.as_deref() == Some("main@m1_6_memset.c:4:1#0")
-            && mr.detail.as_deref()
-                == Some(
-                    "stmt:memset_dst|omega:steens_external:\
-                     universal_sources=omega:inttoptr:val:main:%unk",
-                )
+            && mr.detail.as_deref() == Some("stmt:memset_dst|omega:steens_external:escaped_union=0")
     }));
     assert!(raw_modrefs.iter().any(|mr| {
         mr.func == main

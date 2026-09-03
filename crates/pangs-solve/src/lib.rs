@@ -227,17 +227,15 @@ pub struct NodeResolution {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_empty_witness: bool,
     /// The value is proven empty: it has an empty witness, no allocation pointee, and carries no
-    /// external/forged provenance.
+    /// external provenance.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub proven_empty: bool,
     #[serde(default)]
     pub external: bool,
-    /// True only when the external provenance can denote an arbitrary client allocation
-    /// (currently integer-forged pointers and conservative Steensgaard fallbacks).  Other
-    /// external regions denote foreign storage and contribute only explicitly connected
-    /// named allocations.
-    #[serde(default)]
-    pub external_universal: bool,
+    /// Internal scope selector for external rows that explicitly include every externally
+    /// escaped global. This is not provenance and is not serialized by any artifact.
+    #[serde(skip)]
+    pub external_escaped_union: bool,
     #[serde(default)]
     pub pointee_globals: SharedStringList,
     /// The pre-filter solver enumeration, emitted only when address-exposure
@@ -252,10 +250,6 @@ pub struct NodeResolution {
     pub pointee_provenance: SharedProvenanceList,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_sources: Vec<String>,
-    /// Diagnostic-only seed support for `external_universal`. Kept separate from ordinary
-    /// external sources so more precise attribution does not change ModRef details or solving.
-    #[serde(skip)]
-    pub universal_sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -267,7 +261,6 @@ pub enum PointeeProvenance {
     MemoryMerging,
     CallReturnMerging,
     FiniteExternalRegion,
-    UniversalOrigin,
 }
 
 impl PointeeProvenance {
@@ -279,7 +272,6 @@ impl PointeeProvenance {
             Self::MemoryMerging => "memory_merging",
             Self::CallReturnMerging => "call_return_merging",
             Self::FiniteExternalRegion => "finite_external_region",
-            Self::UniversalOrigin => "universal_origin",
         }
     }
 }
@@ -505,9 +497,6 @@ pub struct SteensClasses {
     /// `ext[root]` — the class identity may denote external memory (PIP `p ⊒ Ω`).
     /// Externally reachable local storage remains represented separately by `esc`.
     pub ext: Vec<bool>,
-    /// `universal[root]` — external provenance includes an integer-forged pointer and may
-    /// therefore designate any client allocation.
-    pub universal: Vec<bool>,
     /// `esc[root]` — class members are reachable by external code (PIP `Ω ⊒ {x}`).
     pub esc: Vec<bool>,
     /// The class contains a global allocation or one of its allocation-relative fields.
@@ -833,8 +822,7 @@ struct ClassData {
     pointee: Option<usize>,
     has_empty_witness: bool,
     ext: bool,
-    universal: bool,
-    universal_sources: BTreeSet<ProvenanceId>,
+    external_escaped_union: bool,
     esc: bool,
     escape_sources: BTreeSet<ProvenanceId>,
     icall_sites: HashSet<usize>,
@@ -851,7 +839,7 @@ struct ClassData {
     /// successors appended since the previous push. A class join resets this compact frontier.
     content_pushed_succ_len: usize,
     content_pushed_ext: bool,
-    content_pushed_universal_sources: usize,
+    content_pushed_external_escaped_union: bool,
     content_pushed_empty: bool,
     /// Debug-only semantic roles. A solved class may contain carriers or locations, never both.
     has_carrier: bool,
@@ -955,7 +943,7 @@ fn meta_param_is_by_value(sig: &Signature, index: usize) -> bool {
         .is_some_and(|param| matches!(param, pangs_pir::Param::Byval { .. }))
 }
 
-fn pointee_provenance_labels(mask: u8, external: bool, universal: bool) -> Vec<PointeeProvenance> {
+fn pointee_provenance_labels(mask: u8, external: bool) -> Vec<PointeeProvenance> {
     let mut labels = Vec::new();
     for (bit, label) in [
         (PROV_DIRECT_ADDRESS, PointeeProvenance::DirectAddressFlow),
@@ -974,9 +962,7 @@ fn pointee_provenance_labels(mask: u8, external: bool, universal: bool) -> Vec<P
             labels.push(label);
         }
     }
-    if universal {
-        labels.push(PointeeProvenance::UniversalOrigin);
-    } else if external {
+    if external {
         labels.push(PointeeProvenance::FiniteExternalRegion);
     }
     labels.sort();
@@ -990,7 +976,7 @@ struct CachedRootNodeSummary {
     has_empty_witness: bool,
     proven_empty: bool,
     external: bool,
-    universal: bool,
+    external_escaped_union: bool,
     pointee: Option<usize>,
 }
 
@@ -1734,7 +1720,6 @@ impl<'a> Solver<'a> {
         }
         let mut pointee = vec![None; total];
         let mut ext = vec![false; total];
-        let mut universal = vec![false; total];
         let mut esc = vec![false; total];
         let mut global_storage = vec![false; total];
         for i in 0..total {
@@ -1742,7 +1727,6 @@ impl<'a> Solver<'a> {
             if root == i {
                 pointee[i] = self.classes[i].pointee.map(|p| self.find(p));
                 ext[i] = self.classes[i].ext;
-                universal[i] = self.classes[i].universal;
                 esc[i] = self.classes[i].esc;
                 global_storage[i] = !self.classes[i].global_objs.is_empty();
             }
@@ -1751,7 +1735,6 @@ impl<'a> Solver<'a> {
             node_class,
             pointee,
             ext,
-            universal,
             esc,
             global_storage,
             global_address_exposed: self.global_address_exposed.clone(),
@@ -1795,11 +1778,7 @@ impl<'a> Solver<'a> {
                     }
                     let dst = self.class_of(edge.dst);
                     if self.node_is_proven_empty(edge.src) {
-                        let source = format!(
-                            "omega:null_load:{}",
-                            self.pag.nodes[edge.src.0 as usize].label
-                        );
-                        self.set_universal_ext_with_source(dst, source);
+                        self.set_external_escaped_union(dst);
                         continue;
                     }
                     // Missing widths occur only in legacy/hand-written PIR. Preserve its
@@ -1843,11 +1822,7 @@ impl<'a> Solver<'a> {
                     if self.node_is_proven_empty(edge.src) {
                         // Pointer arithmetic on an empty address is outside the contract. Keep the
                         // empty class isolated and fail closed on the derived value.
-                        let source = format!(
-                            "omega:null_gep:{}",
-                            self.pag.nodes[edge.src.0 as usize].label
-                        );
-                        self.set_universal_ext_with_source(dst, source);
+                        self.set_external_escaped_union(dst);
                         continue;
                     }
                     if let Some(address) = self.exact_addresses[edge.dst.0 as usize] {
@@ -1870,12 +1845,8 @@ impl<'a> Solver<'a> {
                     let dst_storage = self.storage_class_for_address(edge.dst, bytes, false);
                     if self.node_is_proven_empty(edge.src) {
                         // Reading bytes from an empty address is unsupported. Preserve the access
-                        // edge and conservatively make the destination contents universal.
-                        let source = format!(
-                            "omega:null_memcpy_src:{}",
-                            self.pag.nodes[edge.src.0 as usize].label
-                        );
-                        self.set_universal_ext_with_source(dst_storage, source);
+                        // edge and conservatively make the destination contents external.
+                        self.set_external_escaped_union(dst_storage);
                         continue;
                     }
                     let src_storage = self.storage_class_for_address(edge.src, bytes, false);
@@ -1970,8 +1941,7 @@ impl<'a> Solver<'a> {
                 (OmegaSeedKind::IntToPtr, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
                     self.add_class_provenance(class, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
-                    let source = format!("omega:inttoptr:{}", self.pag.nodes[id.0 as usize].label);
-                    self.set_universal_ext_with_source(class, source);
+                    self.set_external_escaped_union(class);
                 }
                 (OmegaSeedKind::UnknownResultExternal, SeedTarget::Node(id)) => {
                     let class = self.class_of(id);
@@ -2186,8 +2156,7 @@ impl<'a> Solver<'a> {
             vec![None; self.classes.len()];
         let mut reaches_function_pointer_by_root: Vec<Option<bool>> =
             vec![None; self.classes.len()];
-        let mut pointee_provenance_by_key =
-            HashMap::<(u8, bool, bool), SharedProvenanceList>::new();
+        let mut pointee_provenance_by_key = HashMap::<(u8, bool), SharedProvenanceList>::new();
         let mut node_summary_by_root: Vec<Option<CachedRootNodeSummary>> =
             vec![None; self.classes.len()];
         let mut nodes = BTreeMap::new();
@@ -2208,12 +2177,11 @@ impl<'a> Solver<'a> {
                 // class here would reintroduce container contamination (for example, treating a
                 // pointer stored in external memory as itself external).
                 let external = self.classes[root].ext;
-                let universal = self.classes[root].universal;
+                let external_escaped_union = self.classes[root].external_escaped_union;
                 let has_empty_witness = self.classes[root].has_empty_witness;
                 let pointee_is_empty = pointee.is_none_or(|pointee| {
                     self.classes[pointee].node_count == 0
                         && !self.classes[pointee].ext
-                        && !self.classes[pointee].universal
                         && !self.classes[pointee].esc
                         && self.classes[pointee].fn_objs.is_empty()
                         && self.classes[pointee].global_objs.is_empty()
@@ -2221,7 +2189,6 @@ impl<'a> Solver<'a> {
                 let proven_empty = has_empty_witness
                     && pointee_is_empty
                     && !external
-                    && !universal
                     && self.classes[root].fn_objs.is_empty()
                     && self.classes[root].global_objs.is_empty();
                 let reaches_function_pointer = pointee
@@ -2236,14 +2203,13 @@ impl<'a> Solver<'a> {
                             reaches
                         }
                     })
-                    .unwrap_or(false)
-                    || universal;
+                    .unwrap_or(false);
                 let cached = CachedRootNodeSummary {
                     reaches_function_pointer,
                     has_empty_witness,
                     proven_empty,
                     external,
-                    universal,
+                    external_escaped_union,
                     pointee,
                 };
                 node_summary_by_root[root] = Some(cached.clone());
@@ -2309,12 +2275,11 @@ impl<'a> Solver<'a> {
                 let key = (
                     self.classes[root].provenance | pointee_mask,
                     summary.external,
-                    summary.universal,
                 );
                 pointee_provenance_by_key
                     .entry(key)
                     .or_insert_with(|| {
-                        SharedProvenanceList::from(pointee_provenance_labels(key.0, key.1, key.2))
+                        SharedProvenanceList::from(pointee_provenance_labels(key.0, key.1))
                     })
                     .clone()
             };
@@ -2325,7 +2290,7 @@ impl<'a> Solver<'a> {
                     has_empty_witness: summary.has_empty_witness,
                     proven_empty: summary.proven_empty,
                     external: summary.external,
-                    external_universal: summary.universal,
+                    external_escaped_union: summary.external_escaped_union,
                     pointee_globals,
                     pointee_globals_unfiltered,
                     pointee_provenance,
@@ -2334,13 +2299,6 @@ impl<'a> Solver<'a> {
                     } else {
                         Vec::new()
                     },
-                    universal_sources: self.provenance.strings(
-                        summary
-                            .pointee
-                            .into_iter()
-                            .flat_map(|pointee| self.classes[pointee].universal_sources.iter())
-                            .chain(self.classes[root].universal_sources.iter()),
-                    ),
                 },
             );
         }
@@ -2522,15 +2480,14 @@ impl<'a> Solver<'a> {
         self.metrics.steens_process_class_calls += 1;
         let root = self.find(class);
         let ext = self.classes[root].ext;
-        let universal = self.classes[root].universal;
-        let universal_sources = self.classes[root].universal_sources.clone();
+        let external_escaped_union = self.classes[root].external_escaped_union;
         let esc = self.classes[root].esc;
         let escape_sources = self.classes[root].escape_sources.clone();
 
         if ext || esc {
             if let Some(pointee) = self.classes[root].pointee {
-                if universal {
-                    self.set_universal_ext_with_sources(pointee, &universal_sources);
+                if external_escaped_union {
+                    self.set_external_escaped_union(pointee);
                 } else {
                     self.set_ext(pointee);
                 }
@@ -2549,9 +2506,10 @@ impl<'a> Solver<'a> {
         // location classes. Propagate exactly the content facts that the old container merge
         // carried implicitly, in the direction of the value transfer.
         let has_empty_witness = self.classes[root].has_empty_witness;
-        if ext || esc || universal || has_empty_witness {
+        if ext || esc || external_escaped_union || has_empty_witness {
             let facts_changed = (ext || esc) && !self.classes[root].content_pushed_ext
-                || universal_sources.len() > self.classes[root].content_pushed_universal_sources
+                || external_escaped_union
+                    && !self.classes[root].content_pushed_external_escaped_union
                 || has_empty_witness && !self.classes[root].content_pushed_empty;
             let successor_count = self.classes[root].content_succ.len();
             let first_successor = if facts_changed {
@@ -2571,8 +2529,8 @@ impl<'a> Solver<'a> {
                 if ext || esc {
                     self.set_ext(dst);
                 }
-                if universal {
-                    self.set_universal_ext_with_sources(dst, &universal_sources);
+                if external_escaped_union {
+                    self.set_external_escaped_union(dst);
                 }
                 if has_empty_witness {
                     self.set_empty_witness(dst);
@@ -2580,7 +2538,7 @@ impl<'a> Solver<'a> {
             }
             self.classes[root].content_pushed_succ_len = successor_count;
             self.classes[root].content_pushed_ext |= ext || esc;
-            self.classes[root].content_pushed_universal_sources = universal_sources.len();
+            self.classes[root].content_pushed_external_escaped_union |= external_escaped_union;
             self.classes[root].content_pushed_empty |= has_empty_witness;
         }
 
@@ -2971,7 +2929,6 @@ impl<'a> Solver<'a> {
             assert!(
                 self.classes[root].pointee.is_none()
                     && !self.classes[root].ext
-                    && !self.classes[root].universal
                     && !self.classes[root].esc,
                 "canonical-null class was contaminated: {label}"
             );
@@ -3115,23 +3072,11 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn set_universal_ext_with_source(&mut self, class: usize, source: String) {
-        let source = self.provenance.intern(source);
-        self.set_universal_ext_with_sources(class, &BTreeSet::from([source]));
-    }
-
-    fn set_universal_ext_with_sources(&mut self, class: usize, sources: &BTreeSet<ProvenanceId>) {
+    fn set_external_escaped_union(&mut self, class: usize) {
         let root = self.find(class);
-        let old_sources = self.classes[root].universal_sources.len();
-        self.classes[root]
-            .universal_sources
-            .extend(sources.iter().cloned());
-        let changed = !self.classes[root].ext
-            || !self.classes[root].universal
-            || self.classes[root].universal_sources.len() != old_sources;
-        self.classes[root].ext = true;
-        self.classes[root].universal = true;
-        if changed {
+        if !self.classes[root].ext || !self.classes[root].external_escaped_union {
+            self.classes[root].ext = true;
+            self.classes[root].external_escaped_union = true;
             self.enqueue(root);
         }
     }
@@ -3188,17 +3133,7 @@ impl<'a> Solver<'a> {
         self.classes[a].has_location |= self.classes[b].has_location;
         self.classes[a].has_empty_witness |= self.classes[b].has_empty_witness;
         self.classes[a].ext |= self.classes[b].ext;
-        self.classes[a].universal |= self.classes[b].universal;
-        let mut other_universal_sources = std::mem::take(&mut self.classes[b].universal_sources);
-        if self.classes[a].universal_sources.len() < other_universal_sources.len() {
-            std::mem::swap(
-                &mut self.classes[a].universal_sources,
-                &mut other_universal_sources,
-            );
-        }
-        self.classes[a]
-            .universal_sources
-            .extend(other_universal_sources);
+        self.classes[a].external_escaped_union |= self.classes[b].external_escaped_union;
         self.classes[a].esc |= self.classes[b].esc;
         self.classes[a].provenance |= self.classes[b].provenance | provenance;
         let mut other_escape_sources = std::mem::take(&mut self.classes[b].escape_sources);
@@ -3223,7 +3158,7 @@ impl<'a> Solver<'a> {
         // enqueues use the frontier above.
         self.classes[a].content_pushed_succ_len = 0;
         self.classes[a].content_pushed_ext = false;
-        self.classes[a].content_pushed_universal_sources = 0;
+        self.classes[a].content_pushed_external_escaped_union = false;
         self.classes[a].content_pushed_empty = false;
         let other_external_sites =
             std::mem::take(&mut self.classes[b].processed_external_icall_sites);
@@ -3524,7 +3459,6 @@ mod tests {
         let null_class = classes.class_of(null_node.id);
         assert!(classes.pointee[null_class].is_none());
         assert!(!classes.ext[null_class]);
-        assert!(!classes.universal[null_class]);
         assert!(!classes.esc[null_class]);
     }
 
@@ -3605,7 +3539,7 @@ mod tests {
         let a = solver.class_of(object("A"));
         let b = solver.class_of(object("B"));
         let owner = solver.join(a, b, PROV_DIRECT_ADDRESS);
-        solver.set_universal_ext_with_source(owner, "omega:test-owner".to_string());
+        solver.set_ext(owner);
         solver.set_esc_with_source(owner, "test:owner-escape".into());
         solver.escape_allocation_fields_with_source(
             object("A"),
@@ -3628,7 +3562,6 @@ mod tests {
         assert!(solver.classes[field].global_objs.contains(&0));
         assert!(solver.classes[field].fn_objs.is_empty());
         assert!(!solver.classes[field].ext);
-        assert!(!solver.classes[field].universal);
         assert!(solver.classes[field].esc);
         assert!(solver.classes[field]
             .escape_sources
@@ -3937,7 +3870,7 @@ mod tests {
         }
     }
 
-    fn address_exposure_filter_fixture(tainted: bool, universal: bool) -> NodeResolution {
+    fn address_exposure_filter_fixture(tainted: bool) -> NodeResolution {
         let pir = Pir {
             module: "address_exposure".into(),
             source: None,
@@ -4091,13 +4024,12 @@ mod tests {
         let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
         let pointee = solver.join(0, 1, 0);
         solver.classes[4].pointee = Some(pointee);
-        solver.classes[4].universal = universal;
         solver.finish().nodes.remove("val:query").unwrap()
     }
 
     #[test]
     fn finite_class_enumeration_drops_globals_without_address_exposure() {
-        let resolution = address_exposure_filter_fixture(false, false);
+        let resolution = address_exposure_filter_fixture(false);
         assert_eq!(&*resolution.pointee_globals, &["exposed".to_string()]);
         assert_eq!(
             &*resolution.pointee_globals_unfiltered,
@@ -4287,19 +4219,8 @@ mod tests {
     }
 
     #[test]
-    fn forged_enumeration_is_filtered_but_violation_taint_still_bypasses() {
-        let universal = address_exposure_filter_fixture(false, true);
-        assert_eq!(
-            universal.pointee_provenance,
-            vec![PointeeProvenance::UniversalOrigin]
-        );
-        assert_eq!(&*universal.pointee_globals, &["exposed".to_string()]);
-        assert_eq!(
-            &*universal.pointee_globals_unfiltered,
-            &["closed".to_string(), "exposed".to_string()]
-        );
-
-        let violation_tainted = address_exposure_filter_fixture(true, false);
+    fn violation_taint_still_bypasses_address_exposure_filtering() {
+        let violation_tainted = address_exposure_filter_fixture(true);
         assert_eq!(
             &*violation_tainted.pointee_globals,
             &["closed".to_string(), "exposed".to_string()]
@@ -4388,7 +4309,6 @@ mod tests {
                     | PROV_MEMORY_MERGING
                     | PROV_CALL_RETURN,
                 true,
-                false,
             ),
             vec![
                 PointeeProvenance::DirectAddressFlow,
@@ -4715,7 +4635,6 @@ mod tests {
         ] {
             let loaded = &solved.nodes["val:f:loaded"];
             assert!(loaded.external);
-            assert!(!loaded.external_universal);
             assert!(loaded.reaches_function_pointer);
         }
     }
@@ -4889,10 +4808,10 @@ mod tests {
     }
 
     #[test]
-    fn universal_pointer_boundary_survives_gep_in_steens_envelope() {
+    fn forged_pointer_boundary_survives_gep_as_external_flow() {
         let mut pir: Pir = serde_json::from_str(
             r#"{
-                "module":"universal-gep",
+                "module":"forged-gep",
                 "functions":[{
                   "key":"f","sig":{"ret":{"class":"void"},"params":[]},"body":[
                     {"kind":"int_to_ptr","dest":"forged","source":"bits"},
@@ -4912,11 +4831,6 @@ mod tests {
         let solved = solve_steensgaard(&pir, &pag, BuildMode::Executable);
         let derived = &solved.nodes["val:f:derived"];
         assert!(derived.external);
-        assert!(derived.external_universal);
-        assert_eq!(
-            derived.universal_sources,
-            ["omega:inttoptr:val:f:forged".to_string()]
-        );
     }
 
     #[test]
@@ -5015,7 +4929,7 @@ mod tests {
         solver.queued.push(false);
         solver.add_content_edge(source, destination);
         solver.add_content_edge(unrelated, destination);
-        solver.set_universal_ext_with_source(source, "omega:test-content".into());
+        solver.set_ext(source);
         solver.set_empty_witness(source);
         while let Some(class) = solver.worklist.pop_front() {
             solver.queued[class] = false;
@@ -5026,12 +4940,10 @@ mod tests {
         let destination = solver.find(destination);
         let unrelated = solver.find(unrelated);
         assert!(solver.classes[destination].ext);
-        assert!(solver.classes[destination].universal);
         assert!(solver.classes[destination].has_empty_witness);
         assert!(!solver.classes[unrelated].ext);
-        assert!(!solver.classes[unrelated].universal);
         assert!(!solver.classes[unrelated].has_empty_witness);
-        assert!(solver.classes[source].universal);
+        assert!(solver.classes[source].ext);
     }
 
     #[test]

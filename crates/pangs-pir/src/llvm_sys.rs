@@ -4375,7 +4375,7 @@ unsafe fn is_pointer_like_type(ty: LLVMTypeRef) -> bool {
 /// Pointer-width integers arriving from memory, calls, arguments, or aggregate operations stay
 /// unknown: front ends may use those values as ABI-coerced aggregate carriers.  Narrow integers
 /// and values of intrinsically scalar types are proven non-pointer.  Integer-to-pointer recovery
-/// remains protected independently by the existing universal Ω seed.
+/// remains protected independently by the existing forged-pointer Ω seed.
 unsafe fn semantic_value_kind_for_value(
     data_layout: LLVMTargetDataRef,
     value: LLVMValueRef,

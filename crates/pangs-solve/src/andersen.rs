@@ -269,14 +269,13 @@ fn finish_andersen_controlled(
                 if let Some(node) = base.nodes.get_mut(&resolution.label) {
                     node.reaches_function_pointer = resolution.reaches_function_pointer;
                     node.external = resolution.external;
-                    node.external_universal = resolution.external_universal;
+                    node.external_escaped_union = resolution.external_escaped_union;
                     node.pointee_globals = resolution.pointee_globals;
                     node.pointee_globals_unfiltered = resolution.pointee_globals_unfiltered;
                     if node.pointee_globals.is_empty() {
                         node.pointee_provenance = Default::default();
                     }
                     node.external_sources = resolution.external_sources;
-                    node.universal_sources = resolution.universal_sources;
                 }
             }
             for (label, allocs) in refined.global_points_to {
@@ -478,11 +477,10 @@ struct RefinedNodeResolution {
     label: String,
     reaches_function_pointer: bool,
     external: bool,
-    external_universal: bool,
+    external_escaped_union: bool,
     pointee_globals: SharedStringList,
     pointee_globals_unfiltered: SharedStringList,
     external_sources: Vec<String>,
-    universal_sources: Vec<String>,
 }
 
 #[derive(Default)]
@@ -655,10 +653,6 @@ enum ExternalRegion {
 }
 
 impl ExternalRegion {
-    fn is_universal(self) -> bool {
-        matches!(self, Self::ForgedPointer(_))
-    }
-
     fn may_contain_function_pointer(self) -> bool {
         !matches!(self, Self::EntryArguments)
     }
@@ -4157,12 +4151,22 @@ impl<'a> Refiner<'a> {
             let external = set
                 .map(|set| set.iter().any(|cell| pts.is_external(cell)))
                 .unwrap_or(false);
-            let external_universal = set
-                .map(|set| set.iter().any(|cell| pts.is_universal_external(cell)))
+            let external_escaped_union = set
+                .map(|set| {
+                    set.iter().any(|cell| {
+                        matches!(
+                            pts.external_region(cell),
+                            Some(ExternalRegion::ForgedPointer(_))
+                        )
+                    })
+                })
                 .unwrap_or(false);
-            if self.base.nodes.get(&node.label).is_some_and(|base| {
-                external && !base.external || external_universal && !base.external_universal
-            }) {
+            if self
+                .base
+                .nodes
+                .get(&node.label)
+                .is_some_and(|base| external && !base.external)
+            {
                 coarser_than_steens_nodes += 1;
                 if coarser_samples.len() < 8 {
                     coarser_samples.push(node.label.clone());
@@ -4262,42 +4266,23 @@ impl<'a> Refiner<'a> {
                     .cloned()
                     .collect::<Vec<_>>();
                 eprintln!(
-                    "pangs andersen explain node={} reaches_function_pointer={} external={} external_universal={} allocations={:?} omega_source_count={} omega_source_sample={:?}",
+                    "pangs andersen explain node={} reaches_function_pointer={} external={} allocations={:?} omega_source_count={} omega_source_sample={:?}",
                     node.label,
                     reaches_function_pointer,
                     external,
-                    external_universal,
                     allocations,
                     source_count,
                     source_sample
                 );
             }
-            let universal_sources = if external_universal {
-                set.into_iter()
-                    .flat_map(|set| set.iter())
-                    .filter_map(|cell| match pts.external_region(cell) {
-                        Some(ExternalRegion::ForgedPointer(node)) => self
-                            .pag
-                            .nodes
-                            .get(node as usize)
-                            .map(|node| format!("omega:inttoptr:{}", node.label)),
-                        _ => None,
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect()
-            } else {
-                Vec::new()
-            };
             out.push(RefinedNodeResolution {
                 label: node.label.clone(),
                 reaches_function_pointer,
                 external,
-                external_universal,
+                external_escaped_union,
                 pointee_globals: globals,
                 pointee_globals_unfiltered: globals_unfiltered,
                 external_sources,
-                universal_sources,
             });
         }
         if std::env::var_os(knobs::ENV_ANDERSEN_EXPLAIN_NODE).is_some()
@@ -5528,11 +5513,6 @@ impl Solve {
 
     fn is_external(&self, cell: Cell) -> bool {
         self.region_of_cell.contains_key(&cell)
-    }
-
-    fn is_universal_external(&self, cell: Cell) -> bool {
-        self.external_region(cell)
-            .is_some_and(ExternalRegion::is_universal)
     }
 
     fn enqueue(&mut self, cell: Cell) {
@@ -7521,17 +7501,14 @@ mod tests {
         // acquiring @G. This is the distinction the former single Ω object could not express.
         let path = &result.nodes["val:main:%path"];
         assert!(path.external);
-        assert!(!path.external_universal);
         assert!(path.pointee_globals.is_empty());
 
         let external_result = &result.nodes["val:main:%external_result"];
         assert!(external_result.external);
-        assert!(!external_result.external_universal);
         assert!(external_result.pointee_globals.is_empty());
 
         let forged = &result.nodes["val:main:%forged"];
         assert!(forged.external);
-        assert!(forged.external_universal);
     }
 
     #[test]
