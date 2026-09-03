@@ -2266,9 +2266,7 @@ impl<'a> Solver<'a> {
                             unfiltered_pointee_globals_by_root[pointee] = Some(globals.clone());
                             globals
                         };
-                    if matches!(self.violation_exposure, ViolationExposure::ModuleWide)
-                        || summary.universal
-                    {
+                    if matches!(self.violation_exposure, ViolationExposure::ModuleWide) {
                         return (unfiltered, SharedStringList::default());
                     }
                     let filtered = if let Some(globals) = &exposed_pointee_globals_by_root[pointee]
@@ -4289,19 +4287,24 @@ mod tests {
     }
 
     #[test]
-    fn universal_or_violation_tainted_enumeration_keeps_unexposed_globals() {
+    fn forged_enumeration_is_filtered_but_violation_taint_still_bypasses() {
         let universal = address_exposure_filter_fixture(false, true);
         assert_eq!(
             universal.pointee_provenance,
             vec![PointeeProvenance::UniversalOrigin]
         );
-        for resolution in [universal, address_exposure_filter_fixture(true, false)] {
-            assert_eq!(
-                &*resolution.pointee_globals,
-                &["closed".to_string(), "exposed".to_string()]
-            );
-            assert!(resolution.pointee_globals_unfiltered.is_empty());
-        }
+        assert_eq!(&*universal.pointee_globals, &["exposed".to_string()]);
+        assert_eq!(
+            &*universal.pointee_globals_unfiltered,
+            &["closed".to_string(), "exposed".to_string()]
+        );
+
+        let violation_tainted = address_exposure_filter_fixture(true, false);
+        assert_eq!(
+            &*violation_tainted.pointee_globals,
+            &["closed".to_string(), "exposed".to_string()]
+        );
+        assert!(violation_tainted.pointee_globals_unfiltered.is_empty());
     }
 
     #[test]

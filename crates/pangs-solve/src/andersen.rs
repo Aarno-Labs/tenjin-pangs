@@ -4191,7 +4191,7 @@ impl<'a> Refiner<'a> {
                 self.pir.globals[left].key.cmp(&self.pir.globals[right].key)
             });
             global_indices_unfiltered.dedup();
-            let global_indices = if external_universal || violation_module_wide {
+            let global_indices = if violation_module_wide {
                 global_indices_unfiltered.clone()
             } else {
                 global_indices_unfiltered

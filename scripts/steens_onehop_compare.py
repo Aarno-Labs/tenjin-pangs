@@ -8,8 +8,10 @@ JSON/JSONL exports. The output is deterministic JSON suitable for the experiment
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -34,11 +36,49 @@ def edge_key(row: dict[str, Any]) -> str:
     )
 
 
+def unknown_row_key(row: dict[str, Any]) -> str:
+    return json.dumps(
+        {key: row.get(key) for key in ("func", "access", "witness", "address_node")},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def pointee_count(row: dict[str, Any]) -> int | None:
+    match = re.search(r"(?:^|[|:])pointee_count=(\d+)(?:$|[|:])", row.get("detail", ""))
+    return int(match.group(1)) if match else None
+
+
 def module_summary(baseline: Path, candidate: Path) -> dict[str, Any]:
     baseline_metrics = json.loads((baseline / "metrics.json").read_text(encoding="utf-8"))
     candidate_metrics = json.loads((candidate / "metrics.json").read_text(encoding="utf-8"))
     baseline_modref = jsonl(baseline / "modref.jsonl")
     candidate_modref = jsonl(candidate / "modref.jsonl")
+    baseline_unknown = {
+        unknown_row_key(row): row
+        for row in baseline_modref
+        if "unknown" in row.get("global", {})
+    }
+    candidate_unknown = {
+        unknown_row_key(row): row
+        for row in candidate_modref
+        if "unknown" in row.get("global", {})
+    }
+    formerly_module_wide = {
+        key for key, row in baseline_unknown.items() if row.get("candidate_scope") == "module-wide"
+    }
+    former_scope_counts = Counter(
+        candidate_unknown[key].get("candidate_scope", "missing")
+        for key in formerly_module_wide
+        if key in candidate_unknown
+    )
+    former_finite_sizes = Counter(
+        size
+        for key in formerly_module_wide
+        if key in candidate_unknown
+        and candidate_unknown[key].get("candidate_scope") != "module-wide"
+        and (size := pointee_count(candidate_unknown[key])) is not None
+    )
 
     def modref_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
         unknown = [row for row in rows if "unknown" in row.get("global", {})]
@@ -112,6 +152,15 @@ def module_summary(baseline: Path, candidate: Path) -> dict[str, Any]:
         "modref": {
             "baseline": modref_counts(baseline_modref),
             "candidate": modref_counts(candidate_modref),
+            "unknown_identity_added": sorted(candidate_unknown.keys() - baseline_unknown.keys()),
+            "unknown_identity_removed": sorted(baseline_unknown.keys() - candidate_unknown.keys()),
+            "formerly_module_wide": {
+                "rows": len(formerly_module_wide),
+                "candidate_scopes": dict(sorted(former_scope_counts.items())),
+                "finite_candidate_sizes": {
+                    str(size): count for size, count in sorted(former_finite_sizes.items())
+                },
+            },
         },
         "transitions": {
             "escape_external_to_module": escape_narrowed,

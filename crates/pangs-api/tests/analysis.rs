@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use pangs_api::{
-    run_m2_ablation, Analysis, BuildMode, Caller, EscapeStatus, M2AblationMode, Opts, Stage,
-    StationarityReason,
+    run_m2_ablation, AffectedGlobals, Analysis, BuildMode, Caller, EscapeStatus, M2AblationMode,
+    Opts, Stage, StationarityReason,
 };
 use pangs_pir::{AbiClass, Access, Func, Global, Param, Pir, Signature, Stmt, VarArgPosition};
 
@@ -81,28 +81,118 @@ fn external_policy_census_is_observational_and_attributes_inttoptr_rows() {
     }
 
     let census = instrumented.external_policy_census().unwrap();
-    assert_eq!(census.summary.module_wide_rows, 2);
-    assert_eq!(census.summary.module_wide_inttoptr_rows, 2);
-    assert_eq!(census.summary.distinct_module_wide_poisoned_globals, 2);
-    assert!(census
-        .module_wide_rows
+    assert_eq!(census.summary.module_wide_rows, 0);
+    assert_eq!(census.summary.module_wide_inttoptr_rows, 0);
+    assert_eq!(census.summary.distinct_module_wide_poisoned_globals, 0);
+    assert!(census.module_wide_rows.is_empty());
+    assert_eq!(census.summary.forged_pointer_seeds, 0);
+    assert_eq!(census.summary.forged_pointer_groups, 0);
+    assert!(census.forged_pointer_groups.is_empty());
+}
+
+fn unknown_candidate_keys(analysis: &Analysis) -> Vec<Vec<String>> {
+    analysis
+        .modrefs()
         .iter()
-        .all(|row| row.seed_kinds == ["int_to_ptr"]));
-    assert!(census.module_wide_rows.iter().all(|row| {
-        !row.external_sources.is_empty()
-            && row
-                .external_sources
+        .filter(|row| matches!(row.global, pangs_api::GlobalTarget::Unknown(_)))
+        .map(|row| match analysis.affected_globals(row) {
+            AffectedGlobals::Finite(ids) => ids
                 .iter()
-                .all(|source| source.starts_with("omega:inttoptr:"))
-    }));
-    assert_eq!(census.summary.forged_pointer_seeds, 1);
-    assert_eq!(census.summary.forged_pointer_groups, 1);
-    assert_eq!(census.forged_pointer_groups[0].modref_row_indices.len(), 2);
-    assert!(!census.forged_pointer_groups[0].feasibly_certifiable);
-    assert!(census
-        .module_wide_rows
-        .iter()
-        .all(|row| { row.forged_pointer_group.as_deref() == Some("forged-group:0") }));
+                .map(|&id| analysis.globals()[id].key.clone())
+                .collect(),
+            AffectedGlobals::ModuleWide => panic!("forged row remained module-wide"),
+        })
+        .collect()
+}
+
+#[test]
+fn forged_rows_union_an_escaped_global_outside_the_pointee_class() {
+    let mut pir = Pir::from_path(m1_6_fixture("aliased_unknown_modref.pir.json")).unwrap();
+    pir.globals.push(Global {
+        key: "@Leaked".into(),
+        ..Global::default()
+    });
+    pir.functions.push(Func {
+        key: "external_sink".into(),
+        sig: sig(AbiClass::Void, vec![Param::Integer]),
+        param_names: vec!["p".into()],
+        file: None,
+        line: None,
+        external: true,
+        exported: false,
+        address_taken: false,
+        body: Vec::new(),
+    });
+    pir.functions[0].body.insert(
+        4,
+        Stmt::CallDirect {
+            callee: "external_sink".into(),
+            sig: sig(AbiClass::Void, vec![Param::Integer]),
+            args: vec!["@Leaked".into()],
+            dest: None,
+            loc: None,
+        },
+    );
+
+    for stage in [Stage::Steens, Stage::Andersen] {
+        let analysis = Analysis::run(
+            &pir,
+            &Opts {
+                stage,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let leaked = analysis.lookup_global("@Leaked").unwrap();
+        assert_eq!(analysis.escape(leaked), EscapeStatus::External);
+        assert_eq!(
+            unknown_candidate_keys(&analysis),
+            vec![vec!["@Leaked".to_string()]; 2]
+        );
+        assert!(analysis
+            .modrefs()
+            .iter()
+            .filter(|row| matches!(row.global, pangs_api::GlobalTarget::Unknown(_)))
+            .all(|row| {
+                row.detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains(":escaped_union=1"))
+            }));
+        assert!(analysis.access_sites().iter().any(|site| {
+            site.func == analysis.lookup_func("main").unwrap()
+                && site.via == pangs_api::Via::Unknown
+                && site.affects(leaked)
+        }));
+    }
+}
+
+#[test]
+fn forged_rows_union_an_exported_global_in_library_mode() {
+    let mut pir = Pir::from_path(m1_6_fixture("aliased_unknown_modref.pir.json")).unwrap();
+    pir.globals.push(Global {
+        key: "@Table".into(),
+        exported: true,
+        ..Global::default()
+    });
+
+    for stage in [Stage::Steens, Stage::Andersen] {
+        let analysis = Analysis::run(
+            &pir,
+            &Opts {
+                stage,
+                build_mode: BuildMode::Library,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let table = analysis.lookup_global("@Table").unwrap();
+        assert_eq!(analysis.escape(table), EscapeStatus::External);
+        assert_eq!(
+            unknown_candidate_keys(&analysis),
+            vec![vec!["@Table".to_string()]; 2]
+        );
+    }
 }
 
 fn m2_2_fixture(name: &str) -> std::path::PathBuf {
@@ -885,7 +975,7 @@ fn m2_4_external_unknown_store_without_global_pointees_does_not_block_stationari
 }
 
 #[test]
-fn m2_4_unknown_runtime_mod_blocks_stationarity() {
+fn m2_4_forged_runtime_mod_does_not_block_an_unexposed_table() {
     let pir = Pir::from_path(m2_4_fixture(
         "initval_unknown_runtime_mod_blocks_stationarity.pir.json",
     ))
@@ -902,21 +992,17 @@ fn m2_4_unknown_runtime_mod_blocks_stationarity() {
 
     let table = analysis.lookup_global("@Table").unwrap();
     assert!(analysis.globals()[table].mutable);
-    assert!(!analysis.globals()[table].initval_stable);
+    assert!(analysis.globals()[table].initval_stable);
     let verdict = analysis
         .stationarity_verdicts()
         .iter()
         .find(|verdict| verdict.global == table)
         .unwrap();
     assert!(verdict.complete_initval);
-    assert_eq!(verdict.reason, StationarityReason::UnknownRuntimeWriter);
-    assert!(verdict
-        .runtime_writers
-        .iter()
-        .any(|writer| matches!(writer.global, pangs_api::GlobalTarget::Unknown(_))));
+    assert_eq!(verdict.reason, StationarityReason::Stationary);
+    assert!(verdict.runtime_writers.is_empty());
     assert_eq!(analysis.metrics().globals_with_complete_initval, 1);
-    assert_eq!(analysis.metrics().initval_stable_globals, 0);
-    assert_eq!(analysis.metrics().icalls_simple, 0);
+    assert_eq!(analysis.metrics().initval_stable_globals, 1);
     assert!(analysis.modrefs().iter().any(|mr| {
         mr.access == Access::Mod
             && matches!(mr.global, pangs_api::GlobalTarget::Unknown(_))
@@ -3710,7 +3796,7 @@ fn steens_modref_is_a_superset_of_syntactic_and_exports_aliased_unknown_rows() {
                 .is_some_and(|loc| loc.file == "m1_6.c" && loc.line == 4)
     }));
     for global in [direct, aliased] {
-        assert!(steens.access_sites().iter().any(|site| {
+        assert!(!steens.access_sites().iter().any(|site| {
             site.func == main
                 && site.affects(global)
                 && site.access == Access::Mod

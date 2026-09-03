@@ -286,7 +286,7 @@ fn analyze_exports_m2_4_initval_dispatch_table_resolution() {
 }
 
 #[test]
-fn analyze_exports_m2_5_stationarity_unknown_writer_evidence() {
+fn analyze_exports_m2_5_stationarity_excludes_an_unscoped_forged_writer() {
     let fixture = m2_4_fixture("initval_unknown_runtime_mod_blocks_stationarity.pir.json");
     let tmp = TempDir::new().unwrap();
     let out = tmp.path().join("out");
@@ -301,17 +301,12 @@ fn analyze_exports_m2_5_stationarity_unknown_writer_evidence() {
     assert_eq!(stationarity.len(), 1, "{stationarity:#?}");
     assert_eq!(stationarity[0]["global"], "@Table");
     assert_eq!(stationarity[0]["complete_initval"], true);
-    assert_eq!(stationarity[0]["stationary"], false);
-    assert_eq!(stationarity[0]["reason"], "unknown_runtime_writer");
+    assert_eq!(stationarity[0]["stationary"], true);
+    assert_eq!(stationarity[0]["reason"], "stationary");
     assert!(stationarity[0]["runtime_writers"]
         .as_array()
         .unwrap()
-        .iter()
-        .any(|writer| {
-            writer["func"] == "driver"
-                && writer["global"]["unknown"] == "omega_store"
-                && writer["access"] == "mod"
-        }));
+        .is_empty());
 
     let modref: Vec<Value> = fs::read_to_string(out.join("modref.jsonl"))
         .unwrap()
@@ -1517,7 +1512,7 @@ fn analyze_steens_exports_pointer_aware_modref_and_freezes_unknown_global_compon
 }
 
 #[test]
-fn modref_summary_counts_module_wide_rows_by_universal_source() {
+fn modref_summary_counts_unknown_rows_by_universal_source() {
     let fixture = m1_6_fixture("aliased_unknown_modref.pir.json");
     let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
         .arg("modref-summary")
@@ -1532,8 +1527,8 @@ fn modref_summary_counts_module_wide_rows_by_universal_source() {
     );
     let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(summary["unknown_modref_rows"], 2);
-    assert_eq!(summary["module_wide_modref_rows"], 2);
-    assert_eq!(summary["module_wide_rows_with_universal_sources"], 2);
+    assert_eq!(summary["module_wide_modref_rows"], 0);
+    assert_eq!(summary["unknown_rows_with_universal_sources"], 2);
     assert_eq!(
         summary["universal_source_rows"]["omega:inttoptr:val:main:%unk"],
         2
