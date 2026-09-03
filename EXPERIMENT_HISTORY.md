@@ -693,6 +693,23 @@ analysis 9.3%, and solve time 3.9%, with peak RSS down 2.1% and oversize fallbac
 its single sequential timing sweep was order-confounded and therefore checked with alternating
 repetitions. Disposition gained 167 handled globals (107 immutable, 58 localized, 2 mutex) with no
 loss. The carrier-only boundary read reduced SQLite module-wide unknown rows only 3.1%, not the
-order of magnitude predicted by the proposal. Andersen was coarser than final Steensgaard external
+order of magnitude predicted by the proposal. **The proposal's 2,740-row target is retired.** It
+came from a scratch build that dropped the pointee read while GEP still had no carrier-level
+transfer, so it measured the missing GEP transfer rather than the pointee read and must not be
+used as a precision expectation.
+A follow-up reading of the R2 artifacts against a PAG dump found that 42,772 of SQLite's 43,886
+unknown rows address one location class holding 1,192 globals. That class carries universal
+provenance from the module's thirteen `inttoptr` sites (the `P4_INT32` union idiom, sorter-thread
+return codes, and `sqlite3_get_table`'s row count), and the addresses trace back to about 25,000
+distinct origin nodes, so the residual is the external/universal push-down closure rather than any
+single merge. Exact source export then attributed all 288,548 module-wide rows in a 59-module
+Steensgaard sweep. On SQLite, 43,112 of 43,113 such rows carried all thirteen seeds; twelve
+leave-one-out ablations changed zero rows, while removing the sole seed with one exclusive row
+changed exactly one. The P4 sites therefore have broad support but no independently measurable
+marginal contribution after the seeds meet. An all-seed universal-to-external counterfactual
+converted all 43,113 rows to finite scope (43,112 to one shared 53-global set and one to empty),
+but did not shrink or split Andersen's 91,618-node oversize component. SQLite disposition moved
+only three globals from unhandled to atomic, leaving 37 of 40 unhandled. Full results are in
+`ju_out/universal_closure_20260902/REPORT.md`. Andersen was coarser than final Steensgaard external
 facts at 198 nodes in 13 modules. Full results and the soundness audit are in
 `ju_out/steens_onehop_20260902/REPORT.md`.

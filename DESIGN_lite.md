@@ -697,7 +697,9 @@ Post-filter node resolutions also carry non-authoritative `pointee_provenance` d
 solver accumulates whether the surviving class involved direct address flow, scalar/unknown
 payload flow, by-value aggregate binding, memory merging, or call/return merging, then adds the
 finite-external or universal-origin classification. High-fanout ModRef rows append these labels to
-their detail string; unknown external rows do the same. When filtering changed the class envelope,
+their detail string; unknown external rows do the same. Universal rows additionally append the
+sorted exact IntToPtr seed support as `universal_sources`, preserving overlapping sources rather
+than selecting one explanation. This is diagnostic provenance only. When filtering changed the class envelope,
 the detail also reports `prefilter_pointee_count` and `address_filtered_count`. The labels diagnose
 where precision was lost; they are intentionally excluded from every soundness guard and
 eligibility predicate.

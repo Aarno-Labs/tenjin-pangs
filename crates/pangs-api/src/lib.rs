@@ -4790,6 +4790,7 @@ struct PointerAccess {
 struct ModRefNodeSummaryData {
     external: bool,
     external_universal: bool,
+    universal_sources: Rc<[String]>,
     pointee_global_ids: Rc<[GlobalId]>,
     pointee_global_bits: Rc<[u64]>,
     pointee_global_sample: Rc<[String]>,
@@ -5195,6 +5196,7 @@ fn push_high_fanout_pointer_modref_fallback(
         summary.unfiltered_pointee_global_count,
     );
     append_pointee_provenance(&mut detail, &summary.pointee_provenance);
+    append_universal_sources(&mut detail, &summary.universal_sources);
     modrefs.push_with_phase(
         ModRef {
             func,
@@ -5306,6 +5308,7 @@ fn build_modref_node_summary_data(
     ModRefNodeSummaryData {
         external: resolution.external,
         external_universal: resolution.external_universal,
+        universal_sources: Rc::from(resolution.universal_sources.clone()),
         pointee_global_ids,
         pointee_global_bits,
         pointee_global_sample,
@@ -5332,6 +5335,17 @@ fn append_pointee_provenance(detail: &mut String, provenance: &[PointeeProvenanc
         }
         detail.push_str(label.as_str());
     }
+}
+
+fn append_universal_sources(detail: &mut String, sources: &[String]) {
+    if sources.is_empty() {
+        return;
+    }
+    let mut sources = sources.to_vec();
+    sources.sort();
+    sources.dedup();
+    detail.push_str(":universal_sources=");
+    detail.push_str(&sources.join(","));
 }
 
 fn append_address_filter_counts(detail: &mut String, filtered: usize, unfiltered: usize) {
@@ -5692,6 +5706,7 @@ fn push_pointer_modrefs_from_pag(
                     summary.unfiltered_pointee_global_count,
                 );
                 append_pointee_provenance(&mut detail, &summary.pointee_provenance);
+                append_universal_sources(&mut detail, &summary.universal_sources);
                 modrefs.push_with_phase(
                     ModRef {
                         func,
@@ -5902,6 +5917,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     },
                 );
                 append_pointee_provenance(&mut detail, &resolution.pointee_provenance);
+                append_universal_sources(&mut detail, &resolution.universal_sources);
                 modrefs.push_with_phase(
                     ModRef {
                         func: func_id,
@@ -5949,6 +5965,7 @@ fn push_pointer_memset_modrefs_from_pir(
                     },
                 );
                 append_pointee_provenance(&mut detail, &resolution.pointee_provenance);
+                append_universal_sources(&mut detail, &resolution.universal_sources);
                 modrefs.push_with_phase(
                     ModRef {
                         func: func_id,
