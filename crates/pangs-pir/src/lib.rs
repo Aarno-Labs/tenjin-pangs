@@ -49,6 +49,14 @@ pub enum ExternalCaptureContract {
     RetainedArgument(usize),
 }
 
+/// Pointer-bearing memory copied synchronously by a trusted external call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalCopyContract {
+    pub destination: usize,
+    pub source: usize,
+    pub byte_count: usize,
+}
+
 /// Complete client-memory contract for an exact-name external declaration.
 ///
 /// Presence in this table proves that the function neither retains client pointers nor invokes a
@@ -62,7 +70,7 @@ pub struct ExternalCallContract {
     pub vararg: bool,
     pub result: ExternalResultContract,
     pub effects: &'static [ExternalArgEffect],
-    pub copy: Option<(usize, usize)>,
+    pub copy: Option<ExternalCopyContract>,
     pub pointer_store: Option<(usize, usize)>,
     pub capture: ExternalCaptureContract,
     pub policy: ExternalContractPolicy,
@@ -154,7 +162,11 @@ pub fn external_call_contract(callee: &str) -> Option<ExternalCallContract> {
         "strcpy" => contract(2, false, Result::AliasArg(0), W0_R1),
         "strncpy" => contract(3, false, Result::AliasArg(0), W0_R1),
         "memcpy" | "memmove" => ExternalCallContract {
-            copy: Some((0, 1)),
+            copy: Some(ExternalCopyContract {
+                destination: 0,
+                source: 1,
+                byte_count: 2,
+            }),
             ..contract(3, false, Result::AliasArg(0), NONE)
         },
         "memset" => contract(3, false, Result::AliasArg(0), W0),

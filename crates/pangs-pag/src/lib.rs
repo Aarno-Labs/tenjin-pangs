@@ -1932,15 +1932,27 @@ impl<'a> Builder<'a> {
                         );
                     }
 
-                    if let Some((dst, src)) = contract.copy {
-                        if let (Some(&dst), Some(&src)) = (arg_nodes.get(dst), arg_nodes.get(src)) {
-                            self.add_edge(
-                                EdgeKind::Memcpy { bytes: None },
-                                src,
-                                dst,
-                                owner.clone(),
-                                loc.clone(),
-                            );
+                    if let Some(copy) = contract.copy {
+                        if let (Some(&dst), Some(&src)) =
+                            (arg_nodes.get(copy.destination), arg_nodes.get(copy.source))
+                        {
+                            let bytes = args
+                                .get(copy.byte_count)
+                                .and_then(|value| {
+                                    parse_unsigned_integer_literal(
+                                        value.split_whitespace().last().unwrap_or(value),
+                                    )
+                                })
+                                .and_then(|value| u64::try_from(value).ok());
+                            if bytes != Some(0) {
+                                self.add_edge(
+                                    EdgeKind::Memcpy { bytes },
+                                    src,
+                                    dst,
+                                    owner.clone(),
+                                    loc.clone(),
+                                );
+                            }
                         }
                     }
                     if let Some((source, destination)) = contract.pointer_store {
@@ -4376,6 +4388,39 @@ mod tests {
                 && edge.dst == result
                 && matches!(pag.nodes[edge.src.0 as usize].kind, NodeKind::Object { .. })
         }));
+    }
+
+    #[test]
+    fn external_copy_contract_preserves_constant_extent_and_zero_is_a_noop() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"external-copy-contract",
+                "functions":[
+                    {"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"call_direct","callee":"memcpy","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"},{"class":"integer"}]},"args":["%dst","%src","i64 16"],"dest":"%r0"},
+                        {"kind":"call_direct","callee":"memcpy","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"},{"class":"integer"}]},"args":["%dst","%src","%n"],"dest":"%r1"},
+                        {"kind":"call_direct","callee":"memcpy","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"},{"class":"integer"}]},"args":["%dst","%src","0"],"dest":"%r2"}
+                    ]},
+                    {"key":"memcpy","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"},{"class":"integer"}]},"body":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let copies = pag
+            .edges
+            .iter()
+            .filter_map(|edge| match edge.kind {
+                EdgeKind::Memcpy { bytes } => Some(bytes),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(copies, vec![Some(16), None]);
+        assert!(pag
+            .callsites
+            .iter()
+            .all(|callsite| !callsite.external_boundary));
     }
 
     #[test]
