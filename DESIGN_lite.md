@@ -156,6 +156,17 @@ facts along those value transfers. Consequently every union-find class contains 
 carriers or locations (object, pointee, and field classes), never both; debug builds assert this
 carrier/location invariant after every solve.
 
+Content facts also push down through pointer targets. When a class is external or escaped, its
+pointee class becomes external and escaped, and universal when the class is universal. Everything
+reachable from an external, escaped, or integer-forged pointer is therefore external, and every
+value loaded from such storage is external through its content edge. A value node reads its
+external and universal facts from its own carrier class only; escape, named-object, and callsite
+facts stay on location classes. The push-down and the content edges compose into a closure that
+the one-hop rules do not narrow: in library mode the storage reachable from an exported function's
+pointer parameters, and every value loaded from it, is external. On SQLite that closure, seeded by
+thirteen `inttoptr` sites, is what remains behind nearly every module-wide unknown mod/ref row
+after the 2026-09-02 change (`EXPERIMENT_HISTORY.md`).
+
 Its partition boundary is allocation-field aware when the fixed PAG independently proves
 an address root. Constant GEP offsets get distinct synthetic storage classes. LLVM
 lowering preserves a dynamic sequential index as an affine byte lane
@@ -173,10 +184,14 @@ with an opaque-pointer front end.
 
 ### D'. The one real solver
 Partition-scoped, inclusion-based, PIP internals (implicit-Ω constraint forms and
-per-variable points-to sets). Every interesting partition (one reachable from
-client-relevant pointers: icall operands, mutable globals and what they reach, or
-escape-relevant objects) is considered without certificate-residue routing; the admission
-policy below decides whether Andersen or the Steensgaard fallback supplies its answer.
+per-variable points-to sets). Every interesting partition is considered without
+certificate-residue routing; the admission policy below decides whether Andersen or the
+Steensgaard fallback supplies its answer. A prepartition component is interesting when it
+contains an indirect-call operand, a global object or synthetic global field, a
+receiver-payload support vertex, or any node whose Steensgaard class is external or escaped.
+Since the one-hop change, escape is set only on location classes, so that last criterion
+admits value nodes through their external content fact alone and locations through either
+bit.
 The current implementation runs admitted regions in one sequential solve. The
 implementation keeps the optimization surface narrow, but profiles of dense promoted
 regions justified two general mechanisms: semi-naive constraint joins and
@@ -495,7 +510,11 @@ With an exhaustive materialized solution, every client is a scan, not a query en
 - **Escape and immutability:** Ω bits from C'/D' are narrowed per allocation by an
   independent address-flow proof when Steensgaard has merged unrelated storage.
   Address isolation and write isolation are separate facts: a known runtime write does
-  not by itself make the allocation's address externally reachable. Certified
+  not by itself make the allocation's address externally reachable. Both proofs, and the
+  never-written verdict, apply only to globals this module defines. An imported declaration is
+  storage owned by another module: the absence of a local store does not make it never-written,
+  and allocation isolation over this module cannot discharge its external address or write
+  boundary. Certified
   initializer/callback-table aggregate copies and allocation provenance may establish
   immutable contents without treating arbitrary runtime aggregate memory as precise.
 - **Globals localization:** the one-`Context` rewrite graph from `DESIGN.md` §7 starts
