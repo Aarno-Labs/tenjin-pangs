@@ -149,6 +149,112 @@ pub(crate) struct SpineInputs {
     pub(crate) observations: BTreeMap<GlobalId, Vec<Observation>>,
 }
 
+struct SpineInputBuilder {
+    global_count: usize,
+    generated_writes: Vec<Vec<u64>>,
+    routable_reads: Vec<Vec<u64>>,
+    nonroutable_reads: Vec<Vec<u64>>,
+}
+
+impl SpineInputBuilder {
+    fn new(boundary_count: usize, global_count: usize) -> Self {
+        let words = global_count.div_ceil(64);
+        Self {
+            global_count,
+            generated_writes: vec![vec![0; words]; boundary_count],
+            routable_reads: vec![vec![0; words]; boundary_count],
+            nonroutable_reads: vec![vec![0; words]; boundary_count],
+        }
+    }
+
+    fn set(bits: &mut [u64], global: GlobalId) {
+        let index = global.0 as usize;
+        if let Some(word) = bits.get_mut(index / 64) {
+            *word |= 1_u64 << (index % 64);
+        }
+    }
+
+    fn add_access(
+        &mut self,
+        boundary: u32,
+        global: GlobalId,
+        access: Access,
+        routable_pre_p: bool,
+    ) {
+        let boundary = boundary as usize;
+        match access {
+            Access::Mod => Self::set(&mut self.generated_writes[boundary], global),
+            Access::Ref if routable_pre_p => Self::set(&mut self.routable_reads[boundary], global),
+            Access::Ref => Self::set(&mut self.nonroutable_reads[boundary], global),
+        }
+    }
+
+    fn add_unknown_call(&mut self, boundary: u32) {
+        self.generated_writes[boundary as usize].fill(u64::MAX);
+        self.routable_reads[boundary as usize].fill(u64::MAX);
+    }
+
+    fn add_access_site(&mut self, boundary: u32, site: &pangs_api::AccessSite) {
+        let target = match site.access {
+            Access::Mod => &mut self.generated_writes[boundary as usize],
+            Access::Ref => &mut self.routable_reads[boundary as usize],
+        };
+        site.union_targets_into(target);
+    }
+
+    fn globals(bits: &[u64], global_count: usize) -> impl Iterator<Item = GlobalId> + '_ {
+        bits.iter()
+            .enumerate()
+            .flat_map(move |(word_index, &word)| {
+                let mut word = word;
+                std::iter::from_fn(move || {
+                    while word != 0 {
+                        let bit = word.trailing_zeros() as usize;
+                        word &= word - 1;
+                        let index = word_index * 64 + bit;
+                        if index < global_count {
+                            return Some(GlobalId(index as u32));
+                        }
+                    }
+                    None
+                })
+            })
+    }
+
+    fn finish(self) -> SpineInputs {
+        let generated_writes = self
+            .generated_writes
+            .iter()
+            .map(|bits| Self::globals(bits, self.global_count).collect())
+            .collect();
+        let mut observations = vec![Vec::new(); self.global_count];
+        for boundary in 0..self.routable_reads.len() {
+            for global in Self::globals(&self.nonroutable_reads[boundary], self.global_count) {
+                observations[global.0 as usize].push(Observation {
+                    boundary: boundary as u32,
+                    routable_pre_p: false,
+                });
+            }
+            for global in Self::globals(&self.routable_reads[boundary], self.global_count) {
+                observations[global.0 as usize].push(Observation {
+                    boundary: boundary as u32,
+                    routable_pre_p: true,
+                });
+            }
+        }
+        SpineInputs {
+            generated_writes: Arc::new(generated_writes),
+            observations: observations
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, observations)| {
+                    (!observations.is_empty()).then_some((GlobalId(index as u32), observations))
+                })
+                .collect(),
+        }
+    }
+}
+
 /// The transitive read/write membership needed at a call boundary.
 ///
 /// Mod/ref rows retain provenance, so a function can have many rows that describe the same
@@ -702,13 +808,7 @@ pub(crate) fn assemble_spine_inputs(
     pseudo_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
 ) -> SpineInputs {
     let global_count = analysis.globals().len();
-    let all_globals = || {
-        (0..global_count)
-            .map(|index| GlobalId(index as u32))
-            .collect::<Vec<_>>()
-    };
-    let mut generated = vec![BTreeSet::new(); cfg.boundaries.len()];
-    let mut observations = BTreeMap::<GlobalId, BTreeSet<Observation>>::new();
+    let mut inputs = SpineInputBuilder::new(cfg.boundaries.len(), global_count);
     let mut statement_boundary = BTreeMap::new();
     for boundary in &cfg.boundaries {
         for &statement in &boundary.stmt_indices {
@@ -732,6 +832,7 @@ pub(crate) fn assemble_spine_inputs(
         };
     };
 
+    let stage_started = Instant::now();
     for (&statement, &boundary) in &statement_boundary {
         let Some(stmt) = body.get(statement as usize) else {
             continue;
@@ -741,14 +842,7 @@ pub(crate) fn assemble_spine_inputs(
                 let Some(global) = analysis.lookup_global(global) else {
                     continue;
                 };
-                add_access(
-                    &mut generated[boundary as usize],
-                    &mut observations,
-                    boundary,
-                    global,
-                    *access,
-                    true,
-                );
+                inputs.add_access(boundary, global, *access, true);
             }
             Stmt::CallDirect { .. } | Stmt::CallIndirect { .. } => {
                 let Some(&callsite) = callsites_by_statement.get(&(function, statement)) else {
@@ -799,13 +893,7 @@ pub(crate) fn assemble_spine_inputs(
                     }
                 }
                 if has_unknown || !has_callee {
-                    for global in all_globals() {
-                        generated[boundary as usize].insert(global);
-                        observations.entry(global).or_default().insert(Observation {
-                            boundary,
-                            routable_pre_p: true,
-                        });
-                    }
+                    inputs.add_unknown_call(boundary);
                     continue;
                 }
                 for callee in internal_callees {
@@ -813,24 +901,19 @@ pub(crate) fn assemble_spine_inputs(
                         GlobalAccessSet::from_transitive_accesses(analysis, callee)
                     });
                     for (global, access) in accesses.accesses() {
-                        add_access(
-                            &mut generated[boundary as usize],
-                            &mut observations,
-                            boundary,
-                            global,
-                            access,
-                            true,
-                        );
+                        inputs.add_access(boundary, global, access, true);
                     }
                 }
             }
             _ => {}
         }
     }
+    trace_timing("spine-statement-effects", stage_started);
 
     // The unaggregated site ledger is authoritative for pointer accesses. A statement index is
     // exact; otherwise every boundary at the same debug location is used. Missing/unmatched
     // locations conservatively affect the whole function.
+    let stage_started = Instant::now();
     for site in analysis
         .access_sites()
         .iter()
@@ -857,19 +940,12 @@ pub(crate) fn assemble_spine_inputs(
             boundaries.extend(cfg.boundaries.iter().map(|boundary| boundary.id));
         }
         for boundary in boundaries {
-            for global in site.globals() {
-                add_access(
-                    &mut generated[boundary as usize],
-                    &mut observations,
-                    boundary,
-                    global,
-                    site.access,
-                    true,
-                );
-            }
+            inputs.add_access_site(boundary, site);
         }
     }
+    trace_timing("spine-pointer-sites", stage_started);
 
+    let stage_started = Instant::now();
     let boundary_by_callsite = callsites_by_statement
         .iter()
         .filter_map(|(&(owner, statement), &callsite)| {
@@ -885,25 +961,31 @@ pub(crate) fn assemble_spine_inputs(
     for (&global, callsites) in pseudo_read_callsites {
         for callsite in callsites {
             if let Some(&boundary) = boundary_by_callsite.get(callsite) {
-                observations.entry(global).or_default().insert(Observation {
-                    boundary,
-                    routable_pre_p: false,
-                });
+                inputs.add_access(boundary, global, Access::Ref, false);
             }
         }
     }
+    trace_timing("spine-pseudo-reads", stage_started);
 
     // An escaped reader is observable at each known external-call escape site on this spine.
     // Do not project a registration in an unrelated function onto this function's entry: that
     // incorrectly makes a callback registered after initialization observable before `main`
     // begins. Source-less escapes remain conservative at the reader's own entry. In particular,
     // `main` is the executable entry point, not a callback.
+    let stage_started = Instant::now();
     let callsite_by_key = analysis
         .callsites()
         .iter()
         .enumerate()
         .map(|(index, callsite)| (callsite.key.as_str(), CallsiteId(index as u32)))
         .collect::<BTreeMap<_, _>>();
+    let complete_external_callsites = callsites_by_statement
+        .iter()
+        .filter_map(|(&(function, statement), &callsite)| {
+            callsite_has_complete_external_contract(analysis, module, callsite, function, statement)
+                .then_some(callsite)
+        })
+        .collect::<BTreeSet<_>>();
     for (index, escaped) in analysis.functions().iter().enumerate() {
         if !escaped.address_escaped {
             continue;
@@ -912,9 +994,6 @@ pub(crate) fn assemble_spine_inputs(
         if reader == function && escaped.key == "main" {
             continue;
         }
-        let accesses = callee_access_cache
-            .entry(reader)
-            .or_insert_with(|| GlobalAccessSet::from_transitive_accesses(analysis, reader));
         let escape_boundaries = escaped
             .escape_sources
             .iter()
@@ -923,9 +1002,7 @@ pub(crate) fn assemble_spine_inputs(
                     .strip_prefix("external-call:")
                     .or_else(|| source.strip_prefix("vararg-call:"))
                     .and_then(|key| callsite_by_key.get(key))
-                    .filter(|callsite| {
-                        !callsite_has_complete_external_contract(analysis, module, **callsite)
-                    })
+                    .filter(|callsite| !complete_external_callsites.contains(callsite))
                     .and_then(|callsite| boundary_by_callsite.get(callsite))
                     .copied()
             })
@@ -935,28 +1012,24 @@ pub(crate) fn assemble_spine_inputs(
         } else {
             escape_boundaries
         };
+        if escape_boundaries.is_empty() {
+            continue;
+        }
+        let accesses = callee_access_cache
+            .entry(reader)
+            .or_insert_with(|| GlobalAccessSet::from_transitive_accesses(analysis, reader));
         for global in accesses.globals(Access::Ref) {
             for &boundary in &escape_boundaries {
-                observations.entry(global).or_default().insert(Observation {
-                    boundary,
-                    routable_pre_p: false,
-                });
+                inputs.add_access(boundary, global, Access::Ref, false);
             }
         }
     }
+    trace_timing("spine-escaped-readers", stage_started);
 
-    SpineInputs {
-        generated_writes: Arc::new(
-            generated
-                .into_iter()
-                .map(|globals| globals.into_iter().collect())
-                .collect(),
-        ),
-        observations: observations
-            .into_iter()
-            .map(|(global, sites)| (global, sites.into_iter().collect()))
-            .collect(),
-    }
+    let stage_started = Instant::now();
+    let inputs = inputs.finish();
+    trace_timing("spine-finish", stage_started);
+    inputs
 }
 
 /// Whether this exact direct callsite has the shared complete external contract. Unknown and
@@ -966,13 +1039,9 @@ fn callsite_has_complete_external_contract(
     analysis: &Analysis,
     module: &Pir,
     callsite: CallsiteId,
+    function: FuncId,
+    statement: u32,
 ) -> bool {
-    let Some((&(function, statement), _)) = callsites_by_statement(module)
-        .iter()
-        .find(|(_, candidate)| **candidate == callsite)
-    else {
-        return false;
-    };
     let Some(Stmt::CallDirect {
         callee,
         sig,
@@ -1001,27 +1070,6 @@ fn callsite_has_complete_external_contract(
         }
     }
     has_target
-}
-
-fn add_access(
-    writes: &mut BTreeSet<GlobalId>,
-    observations: &mut BTreeMap<GlobalId, BTreeSet<Observation>>,
-    boundary: u32,
-    global: GlobalId,
-    access: Access,
-    routable_pre_p: bool,
-) {
-    match access {
-        Access::Mod => {
-            writes.insert(global);
-        }
-        Access::Ref => {
-            observations.entry(global).or_default().insert(Observation {
-                boundary,
-                routable_pre_p,
-            });
-        }
-    }
 }
 
 fn callsites_by_statement(module: &Pir) -> BTreeMap<(FuncId, u32), CallsiteId> {

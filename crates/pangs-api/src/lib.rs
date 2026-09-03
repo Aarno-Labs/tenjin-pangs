@@ -314,6 +314,14 @@ impl AccessSite {
             .map(|word| word.count_ones() as usize)
             .sum()
     }
+
+    /// Union this site's compressed global target set into an equally sized client bitset.
+    pub fn union_targets_into(&self, target: &mut [u64]) {
+        assert_eq!(target.len(), self.targets.len());
+        for (target, source) in target.iter_mut().zip(self.targets.iter()) {
+            *target |= source;
+        }
+    }
 }
 
 struct SetBits(u64);
