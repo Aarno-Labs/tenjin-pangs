@@ -4608,6 +4608,29 @@ mod tests {
             .unwrap()
     }
 
+    fn external_result_after_escape_artifacts(stage: Stage) -> (Analysis, DispositionManifest) {
+        let fixture =
+            workspace_root().join("fixtures/synthetic/disposition/external_result_after_escape.ll");
+        let pir = Pir::from_path(&fixture).unwrap();
+        let target = pir.target.clone().unwrap();
+        let opts = Opts {
+            stage,
+            build_mode: BuildMode::Executable,
+            ..Opts::default()
+        };
+        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
+        let (manifest, _) = assemble_disposition_artifacts(
+            &analysis,
+            &pir,
+            &opts,
+            &fixture,
+            &workspace_root(),
+            &target,
+        )
+        .unwrap();
+        (analysis, manifest)
+    }
+
     fn add_disconnected_and_connected_audits(pir: &mut Pir) {
         let sig = pir
             .functions
@@ -5788,6 +5811,89 @@ int call_reader(void) { return read_pointer(&target); }
             manifest.run.analysis.extra["phase_stationarity_report"]["bounded_indirect_accesses"]
                 ["globals"],
             17
+        );
+    }
+
+    #[test]
+    fn external_result_store_stays_finite_and_escape_blocks_atomic_and_mutex() {
+        for stage in [Stage::Steens, Stage::Andersen] {
+            let (analysis, manifest) = external_result_after_escape_artifacts(stage);
+            let gid = analysis.lookup_global("g").unwrap();
+            let info = &analysis.globals()[gid];
+            assert_eq!(info.escape, pangs_api::EscapeStatus::External, "{stage:?}");
+            assert!(info.address_escaped, "{stage:?}");
+
+            let external_store = analysis
+                .modrefs()
+                .iter()
+                .find(|row| {
+                    matches!(&row.global, pangs_api::GlobalTarget::Unknown(reason) if reason == "omega_store")
+                        && row.address_node.as_deref() == Some("val:main:%main::p")
+                })
+                .unwrap();
+            let pangs_api::AffectedGlobals::Finite(_candidates) =
+                analysis.affected_globals(external_store)
+            else {
+                panic!("ordinary external-result store became module-wide at {stage:?}")
+            };
+
+            let global = manifest_global_by_llvm_name(&manifest, "g");
+            assert!(global.facts.written.value, "{stage:?}");
+            assert!(global.facts.omega_escaped_address.value, "{stage:?}");
+            assert!(!global.facts.access_set_complete.value, "{stage:?}");
+            assert!(global.facts.word_sized_scalar.value, "{stage:?}");
+            for (name, certificate) in [
+                ("atomic", &global.facts.atomic_eligibility),
+                ("mutex", &global.facts.mutex_eligibility),
+            ] {
+                let Some(Certificate::Failed { codes, .. }) = certificate else {
+                    panic!("{name} must fail closed at {stage:?}: {certificate:?}")
+                };
+                assert!(
+                    codes.iter().any(|code| code == "access-set-complete"),
+                    "{name} omitted the escape blocker at {stage:?}: {codes:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "known soundness gap: phase stationarity and localization ignore external address escape"]
+    fn external_result_store_cannot_certify_an_escaped_global() {
+        let mut unexpected = Vec::new();
+        for stage in [Stage::Steens, Stage::Andersen] {
+            let (_, manifest) = external_result_after_escape_artifacts(stage);
+            let global = manifest_global_by_llvm_name(&manifest, "g");
+            if matches!(
+                global.facts.phase_stationarity.as_ref(),
+                Some(Certificate::Certified { .. })
+            ) {
+                unexpected.push(format!("{stage:?}:phase_stationarity"));
+            }
+            if matches!(
+                global.facts.atomic_eligibility.as_ref(),
+                Some(Certificate::Certified { .. })
+            ) {
+                unexpected.push(format!("{stage:?}:atomic_eligibility"));
+            }
+            if matches!(
+                global.facts.mutex_eligibility.as_ref(),
+                Some(Certificate::Certified { .. })
+            ) {
+                unexpected.push(format!("{stage:?}:mutex_eligibility"));
+            }
+            if global
+                .facts
+                .localization
+                .as_ref()
+                .is_some_and(|localization| localization.verdict == LocalizationVerdict::Ok)
+            {
+                unexpected.push(format!("{stage:?}:localization"));
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "certified externally mutable g via {unexpected:?}"
         );
     }
 
