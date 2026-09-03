@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pangs_pir::{
-    external_return_alias_arg, AbiClass, GepLane, Loc, Param, Pir, Signature, Stmt, ValueKind,
+    external_call_contract, ExternalArgEffect, ExternalCallContract, ExternalCaptureContract,
+    ExternalContractPolicy, ExternalResultContract, GepLane, Loc, Pir, Signature, Stmt, ValueKind,
     VarArgPosition,
 };
 use serde::{Deserialize, Serialize};
@@ -1056,6 +1057,7 @@ enum NodeKey {
     SymbolValue(SymbolKind, usize),
     FunctionValue(usize, String),
     ExternalNonPointerWrite(usize, usize),
+    ExternalStateAddress(String),
     GlobalInitValue(String),
 }
 
@@ -1848,112 +1850,102 @@ impl<'a> Builder<'a> {
                 let result = dest
                     .as_ref()
                     .map(|dest| self.value_node(func_index, owner_scope(&owner), dest));
-                let fresh_allocation = is_fresh_allocator(callee) && result.is_some();
                 let is_external = direct_callee_is_external(self.pir, callee);
-                let trusted_free =
-                    trusted_free_call(self.pir, callee, sig, args.len(), dest.is_some());
-                let return_alias = is_external
-                    .then(|| external_return_alias_arg(callee))
-                    .flatten()
-                    .and_then(|arg_index| {
-                        result
-                            .zip(arg_nodes.get(arg_index).copied())
-                            .map(|(result, arg)| (arg, result))
-                    });
-                let external_readonly_result = is_external
-                    .then(|| external_readonly_result_model(callee))
-                    .flatten()
-                    .zip(result);
-                let pure_constant_external = is_external && external_constant_result_model(callee);
-                let printf_effect = is_external
-                    .then(|| proven_printf_effect(self.pir, callee, args))
-                    .flatten();
-                let scanf_destination_start = coarse_scanf_fixed_args(callee)
-                    .filter(|&fixed| is_external && sig.vararg && sig.params.len() == fixed);
-                let external_boundary = !fresh_allocation
-                    && return_alias.is_none()
-                    && external_readonly_result.is_none()
-                    && !pure_constant_external
-                    && printf_effect.is_none()
-                    && scanf_destination_start.is_none()
-                    && !trusted_free
-                    && is_external;
-                if let Some((arg, result)) = return_alias {
-                    self.add_edge(EdgeKind::Assign, arg, result, owner.clone(), loc.clone());
-                }
-                if let Some((model, result)) = external_readonly_result {
-                    let slot = self.external_readonly_object(&format!("{model}:slot"));
-                    let table = self.external_readonly_object(&format!("{model}:table"));
-                    self.add_edge(EdgeKind::AddrOf, slot, result, owner.clone(), loc.clone());
-                    self.add_edge(EdgeKind::AddrOf, table, slot, owner.clone(), loc.clone());
-                }
-                if let Some(result) = result.filter(|_| fresh_allocation) {
-                    let object = self.add_node(
-                        NodeKey::HeapObject(func_index, stmt_index),
-                        format!("obj:heap:{}:{stmt_index}", owner_name(&owner)),
-                        NodeKind::Object {
-                            object: ObjectKind::Alloca,
-                            key: format!("{callee}@{stmt_index}"),
-                            owner: Some(owner_name(&owner).to_string()),
-                        },
-                    );
-                    self.add_edge(EdgeKind::AddrOf, object, result, owner.clone(), loc.clone());
-                }
-                let callsite = self.add_callsite(
-                    func_index,
-                    CallKind::Direct,
-                    Some(callee.clone()),
-                    None,
-                    arg_nodes.clone(),
-                    result,
-                    sig.clone(),
-                    external_boundary,
-                    loc.clone(),
-                );
-                if let Some(ProvenPrintfEffect::WritesArg { index }) = printf_effect {
-                    if let Some(&destination) = arg_nodes.get(index) {
-                        let source = self.add_node(
-                            NodeKey::ExternalNonPointerWrite(func_index, stmt_index),
-                            format!(
-                                "val:{}:@external-nonpointer-write:{stmt_index}",
-                                owner_name(&owner)
-                            ),
-                            NodeKind::Value {
-                                scope: owner_scope(&owner),
+                let contract =
+                    proven_external_call_contract(self.pir, callee, sig, args, dest.is_some());
+                let external_boundary = is_external && contract.is_none();
+
+                if let Some(contract) = contract {
+                    if let Some(result) = result {
+                        match contract.result {
+                            ExternalResultContract::AliasArg(index)
+                            | ExternalResultContract::AliasArgOrFresh(index) => {
+                                if let Some(&arg) = arg_nodes.get(index) {
+                                    self.add_edge(
+                                        EdgeKind::Assign,
+                                        arg,
+                                        result,
+                                        owner.clone(),
+                                        loc.clone(),
+                                    );
+                                }
+                            }
+                            ExternalResultContract::ExternalObject => {
+                                let object = self.external_readonly_object(&format!(
+                                    "external-contract:{callee}"
+                                ));
+                                self.add_edge(
+                                    EdgeKind::AddrOf,
+                                    object,
+                                    result,
+                                    owner.clone(),
+                                    loc.clone(),
+                                );
+                            }
+                            ExternalResultContract::CtypeTable => {
+                                let slot = self.external_readonly_object("glibc-ctype-b:slot");
+                                let table = self.external_readonly_object("glibc-ctype-b:table");
+                                self.add_edge(
+                                    EdgeKind::AddrOf,
+                                    slot,
+                                    result,
+                                    owner.clone(),
+                                    loc.clone(),
+                                );
+                                self.add_edge(
+                                    EdgeKind::AddrOf,
+                                    table,
+                                    slot,
+                                    owner.clone(),
+                                    loc.clone(),
+                                );
+                            }
+                            ExternalResultContract::Void
+                            | ExternalResultContract::Scalar
+                            | ExternalResultContract::Fresh
+                            | ExternalResultContract::RetainedState => {}
+                        }
+                    }
+                    if result.is_some()
+                        && matches!(
+                            contract.result,
+                            ExternalResultContract::Fresh
+                                | ExternalResultContract::AliasArgOrFresh(_)
+                        )
+                    {
+                        let object = self.add_node(
+                            NodeKey::HeapObject(func_index, stmt_index),
+                            format!("obj:heap:{}:{stmt_index}", owner_name(&owner)),
+                            NodeKind::Object {
+                                object: ObjectKind::Alloca,
+                                key: format!("{callee}@{stmt_index}"),
+                                owner: Some(owner_name(&owner).to_string()),
                             },
                         );
                         self.add_edge(
-                            EdgeKind::Store,
-                            source,
-                            destination,
+                            EdgeKind::AddrOf,
+                            object,
+                            result.expect("checked above"),
                             owner.clone(),
                             loc.clone(),
                         );
                     }
-                }
-                if let Some(start) = scanf_destination_start {
-                    let destinations = arg_nodes
-                        .iter()
-                        .copied()
-                        .skip(start)
-                        .filter(|destination| {
-                            self.nodes[destination.0 as usize]
-                                .value_kind
-                                .may_carry_pointer()
-                        })
-                        .collect::<Vec<_>>();
-                    if !destinations.is_empty() {
-                        let source = self.add_node(
-                            NodeKey::ExternalNonPointerWrite(func_index, stmt_index),
-                            format!(
-                                "val:{}:@scanf-nonpointer-write:{stmt_index}",
-                                owner_name(&owner)
-                            ),
-                            NodeKind::Value {
-                                scope: owner_scope(&owner),
-                            },
-                        );
-                        for destination in destinations {
+
+                    if let Some((dst, src)) = contract.copy {
+                        if let (Some(&dst), Some(&src)) = (arg_nodes.get(dst), arg_nodes.get(src)) {
+                            self.add_edge(
+                                EdgeKind::Memcpy { bytes: None },
+                                src,
+                                dst,
+                                owner.clone(),
+                                loc.clone(),
+                            );
+                        }
+                    }
+                    if let Some((source, destination)) = contract.pointer_store {
+                        if let (Some(&source), Some(&destination)) =
+                            (arg_nodes.get(source), arg_nodes.get(destination))
+                        {
                             let edge = self.add_memory_edge(
                                 EdgeKind::Store,
                                 source,
@@ -1967,7 +1959,119 @@ impl<'a> Builder<'a> {
                             self.edges[edge.0 as usize].modeled_external_write = true;
                         }
                     }
+                    if let ExternalCaptureContract::RetainedArgument(index) = contract.capture {
+                        let state = self.external_state_address(callee);
+                        if let Some(&argument) = arg_nodes.get(index) {
+                            let edge = self.add_memory_edge(
+                                EdgeKind::Store,
+                                argument,
+                                state,
+                                owner.clone(),
+                                None,
+                                true,
+                                false,
+                                loc.clone(),
+                            );
+                            self.edges[edge.0 as usize].modeled_external_write = true;
+                        }
+                        if let Some(result) = result {
+                            self.add_memory_edge(
+                                EdgeKind::Load,
+                                state,
+                                result,
+                                owner.clone(),
+                                None,
+                                true,
+                                false,
+                                loc.clone(),
+                            );
+                        }
+                    }
+
+                    let mut effects = contract.effects.to_vec();
+                    match contract.policy {
+                        ExternalContractPolicy::Printf => {
+                            let safe_format =
+                                proven_printf_effect(self.pir, callee, args).is_some();
+                            effects.extend((contract.fixed_params..arg_nodes.len()).map(|index| {
+                                if safe_format {
+                                    ExternalArgEffect::Read(index)
+                                } else {
+                                    ExternalArgEffect::ReadWrite(index)
+                                }
+                            }));
+                        }
+                        ExternalContractPolicy::Scanf => effects.extend(
+                            (contract.fixed_params..arg_nodes.len()).map(ExternalArgEffect::Write),
+                        ),
+                        ExternalContractPolicy::Plain
+                        | ExternalContractPolicy::NoVariadicActuals => {}
+                    }
+                    if !effects.is_empty() {
+                        let value = self.add_node(
+                            NodeKey::ExternalNonPointerWrite(func_index, stmt_index),
+                            format!(
+                                "val:{}:@external-contract-effect:{stmt_index}",
+                                owner_name(&owner)
+                            ),
+                            NodeKind::Value {
+                                scope: owner_scope(&owner),
+                            },
+                        );
+                        for effect in effects {
+                            let (index, read, write) = match effect {
+                                ExternalArgEffect::Read(index) => (index, true, false),
+                                ExternalArgEffect::Write(index) => (index, false, true),
+                                ExternalArgEffect::ReadWrite(index) => (index, true, true),
+                            };
+                            let Some(&argument) = arg_nodes.get(index) else {
+                                continue;
+                            };
+                            if !self.nodes[argument.0 as usize]
+                                .value_kind
+                                .may_carry_pointer()
+                            {
+                                continue;
+                            }
+                            if read {
+                                self.add_memory_edge(
+                                    EdgeKind::Load,
+                                    argument,
+                                    value,
+                                    owner.clone(),
+                                    None,
+                                    true,
+                                    false,
+                                    loc.clone(),
+                                );
+                            }
+                            if write {
+                                let edge = self.add_memory_edge(
+                                    EdgeKind::Store,
+                                    value,
+                                    argument,
+                                    owner.clone(),
+                                    None,
+                                    true,
+                                    false,
+                                    loc.clone(),
+                                );
+                                self.edges[edge.0 as usize].modeled_external_write = true;
+                            }
+                        }
+                    }
                 }
+                let callsite = self.add_callsite(
+                    func_index,
+                    CallKind::Direct,
+                    Some(callee.clone()),
+                    None,
+                    arg_nodes.clone(),
+                    result,
+                    sig.clone(),
+                    external_boundary,
+                    loc.clone(),
+                );
                 if let Some(callee_index) = self.functions.get(callee).copied() {
                     if let Some(callee_func) = self.pir.functions.get(callee_index) {
                         if !callee_func.external {
@@ -2166,6 +2270,7 @@ impl<'a> Builder<'a> {
                 .copied()
                 .unwrap_or(ValueKind::Unknown),
             NodeKey::ExternalNonPointerWrite(..) => ValueKind::NonPointer,
+            NodeKey::ExternalStateAddress(_) => ValueKind::Pointer,
             NodeKey::Param(func_index, param_index) => self
                 .pir
                 .functions
@@ -2196,9 +2301,7 @@ impl<'a> Builder<'a> {
             .and_then(|index| self.pir.functions.get(*index))
             .map(|func| func.external)
             .unwrap_or(true);
-        if external
-            && coarse_scanf_fixed_args(callee).is_some_and(|fixed| sig.params.len() == fixed)
-        {
+        if external && proven_external_call_contract(self.pir, callee, sig, args, false).is_some() {
             return false;
         }
         if self.vararg_call_proof.is_benign(callee, args) {
@@ -2427,13 +2530,23 @@ impl<'a> Builder<'a> {
             },
         )
     }
-}
 
-fn is_fresh_allocator(callee: &str) -> bool {
-    matches!(
-        callee.strip_prefix('@').unwrap_or(callee),
-        "malloc" | "calloc" | "aligned_alloc"
-    )
+    fn external_state_address(&mut self, key: &str) -> NodeId {
+        let node_key = NodeKey::ExternalStateAddress(key.into());
+        if let Some(&node) = self.node_ids.get(&node_key) {
+            return node;
+        }
+        let object = self.external_readonly_object(&format!("external-state:{key}"));
+        let address = self.add_node(
+            node_key,
+            format!("val:external-state:{key}"),
+            NodeKind::Value {
+                scope: Scope::Module,
+            },
+        );
+        self.add_edge(EdgeKind::AddrOf, object, address, Owner::Module, None);
+        address
+    }
 }
 
 /// Whether a direct callee is outside the analyzed module. Missing declarations retain the
@@ -2457,33 +2570,46 @@ pub fn trusted_free_call(
     arg_count: usize,
     has_result: bool,
 ) -> bool {
-    pir.functions
+    let declared = pir
+        .functions
         .iter()
         .find(|function| function.key == callee)
-        .is_some_and(|function| function.external)
+        .is_some_and(|function| function.external && function.sig == *sig);
+    declared
         && callee.strip_prefix('@').unwrap_or(callee) == "free"
-        && arg_count == 1
-        && matches!(sig.params.as_slice(), [Param::Integer])
-        && !sig.vararg
-        && sig.ret == AbiClass::Void
-        && !has_result
+        && external_call_contract(callee)
+            .is_some_and(|contract| contract.matches_signature(sig, arg_count, has_result))
 }
 
-/// Exact-name external functions whose pointer result leads only to stable external readonly
-/// storage. The returned slot and its table are represented as non-client objects, so reads of
-/// libc classification data cannot become module-global accesses.
-fn external_readonly_result_model(callee: &str) -> Option<&'static str> {
-    matches!(callee.strip_prefix('@').unwrap_or(callee), "__ctype_b_loc").then_some("glibc-ctype-b")
-}
-
-/// Glibc's `__ctype_get_*` accessors return process-invariant scalar values.  They do not
-/// observe or modify client storage, so treating them as an external boundary would introduce
-/// spurious module-wide effects into disposition analysis.
-fn external_constant_result_model(callee: &str) -> bool {
-    callee
-        .strip_prefix('@')
-        .unwrap_or(callee)
-        .starts_with("__ctype_get_")
+/// Validate a shared external-call contract against the exact declaration and this callsite.
+/// This is the sole admission path used by PAG construction and disposition certificate
+/// assembly. A missing declaration, a module-local replacement, an ABI mismatch, or a dynamic
+/// printf formats remain complete by conservatively treating pointer variadic actuals as possible
+/// `%n` destinations; the format proof is used only to sharpen those effects.
+pub fn proven_external_call_contract(
+    pir: &Pir,
+    callee: &str,
+    sig: &Signature,
+    args: &[String],
+    has_result: bool,
+) -> Option<ExternalCallContract> {
+    let declaration = pir
+        .functions
+        .iter()
+        .find(|function| function.key == callee)?;
+    if !declaration.external || declaration.sig != *sig {
+        return None;
+    }
+    let contract = external_call_contract(callee)?;
+    if !contract.matches_signature(sig, args.len(), has_result) {
+        return None;
+    }
+    if contract.policy == ExternalContractPolicy::NoVariadicActuals
+        && args.len() != contract.fixed_params
+    {
+        return None;
+    }
+    Some(contract)
 }
 
 fn printf_format_arg(callee: &str) -> Option<usize> {
@@ -2501,19 +2627,6 @@ fn printf_format_arg(callee: &str) -> Option<usize> {
 /// conditional, and unused conversions without turning a non-capturing libc contract into an
 /// address escape. `v*scanf` entry points are excluded because their destinations are hidden in a
 /// `va_list` rather than present as positional callsite actuals.
-fn coarse_scanf_fixed_args(callee: &str) -> Option<usize> {
-    let callee = callee.strip_prefix('@').unwrap_or(callee);
-    let base = callee
-        .strip_prefix("__isoc99_")
-        .or_else(|| callee.strip_prefix("__isoc23_"))
-        .unwrap_or(callee);
-    match base {
-        "scanf" | "wscanf" => Some(1),
-        "fscanf" | "sscanf" | "fwscanf" | "swscanf" => Some(2),
-        _ => None,
-    }
-}
-
 fn owner_scope(owner: &Owner) -> Scope {
     match owner {
         Owner::Module => Scope::Module,
@@ -3537,11 +3650,12 @@ fn is_exported_global(marked: bool, key: &str, opts: &PagOpts) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        allocation_storage_roots, direct_vararg_call_is_benign, trusted_free_call, Edge, EdgeId,
-        EdgeKind, NodeKind, ObjectKind, OmegaSeedKind, Owner, Pag, PagOpts, PointerIntegerOrigin,
-        SeedTarget, StorageRoot, StorageRootState, VarargCallProof,
+        allocation_storage_roots, direct_vararg_call_is_benign, proven_external_call_contract,
+        trusted_free_call, CallKind, Edge, EdgeId, EdgeKind, NodeKind, ObjectKind, OmegaSeedKind,
+        Owner, Pag, PagOpts, PointerIntegerOrigin, SeedTarget, StorageRoot, StorageRootState,
+        VarargCallProof,
     };
-    use pangs_pir::{Global, Pir, Stmt, ValueKind};
+    use pangs_pir::{ExternalArgEffect, Global, Pir, Stmt, ValueKind};
     use std::collections::BTreeSet;
 
     #[test]
@@ -4016,14 +4130,22 @@ mod tests {
                             .any(|callsite| seed.target == SeedTarget::Callsite(callsite.id))
                 })
                 .count(),
-            2,
-            "%n and dynamic formats must fail closed"
+            0,
+            "%n-capable formats are represented by conservative read/write effects"
         );
         for callsite in &fprintf_calls[1..] {
-            assert!(callsite.external_boundary);
-            assert!(pag.omega_seeds.iter().any(|seed| {
-                seed.kind == OmegaSeedKind::ExternalCallBoundary
-                    && seed.target == SeedTarget::Callsite(callsite.id)
+            assert!(!callsite.external_boundary);
+            assert!(!pag.omega_seeds.iter().any(|seed| {
+                matches!(
+                    seed.kind,
+                    OmegaSeedKind::ExternalCallBoundary | OmegaSeedKind::VarargCallBoundary
+                ) && seed.target == SeedTarget::Callsite(callsite.id)
+            }));
+            assert!(pag.edges.iter().any(|edge| {
+                edge.kind == EdgeKind::Store
+                    && callsite.args[2..]
+                        .iter()
+                        .any(|argument| *argument == edge.dst)
             }));
         }
 
@@ -4119,6 +4241,86 @@ mod tests {
             seed.kind == OmegaSeedKind::ExternalCallBoundary
                 && seed.target == SeedTarget::Callsite(unresolved_free.id)
         }));
+    }
+
+    #[test]
+    fn complete_output_contract_records_write_and_rejects_untrusted_shapes() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"external-output-contract",
+                "globals":[{"key":"@out","mutable":true}],
+                "functions":[
+                    {"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"call_direct","callee":"gethostname","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["@out","64"],"dest":"status"},
+                        {"kind":"call_indirect","operand":"fp","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["@out","64"],"dest":"indirect_status"}
+                    ]},
+                    {"key":"gethostname","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"body":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let direct = match &pir.functions[0].body[0] {
+            Stmt::CallDirect {
+                callee,
+                sig,
+                args,
+                dest,
+                ..
+            } => proven_external_call_contract(&pir, callee, sig, args, dest.is_some()).unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(direct.effects, &[ExternalArgEffect::Write(0)]);
+
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let callsite = &pag.callsites[0];
+        assert!(!callsite.external_boundary);
+        assert!(pag.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Store
+                && edge.dst == callsite.args[0]
+                && edge.modeled_external_write
+        }));
+        assert!(!pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::ExternalCallBoundary
+                && seed.target == SeedTarget::Callsite(callsite.id)
+        }));
+        assert_eq!(pag.callsites[1].kind, CallKind::Indirect);
+
+        let mut replacement = pir.clone();
+        replacement.functions[1].external = false;
+        let Stmt::CallDirect {
+            callee,
+            sig,
+            args,
+            dest,
+            ..
+        } = &replacement.functions[0].body[0]
+        else {
+            unreachable!()
+        };
+        assert!(
+            proven_external_call_contract(&replacement, callee, sig, args, dest.is_some())
+                .is_none()
+        );
+
+        let mut wrong_signature = pir.clone();
+        let Stmt::CallDirect { sig, .. } = &mut wrong_signature.functions[0].body[0] else {
+            unreachable!()
+        };
+        sig.ret = pangs_pir::AbiClass::Void;
+        let Stmt::CallDirect {
+            callee,
+            sig,
+            args,
+            dest,
+            ..
+        } = &wrong_signature.functions[0].body[0]
+        else {
+            unreachable!()
+        };
+        assert!(
+            proven_external_call_contract(&wrong_signature, callee, sig, args, dest.is_some())
+                .is_none()
+        );
     }
 
     #[test]

@@ -8,15 +8,255 @@ use thiserror::Error;
 mod knobs;
 mod llvm_sys;
 
-/// Exact-name external functions whose nullable pointer result is derived from one pointer
-/// argument. These shared semantic facts are consumed by PAG boundary modeling and structural
-/// pointer-provenance validation in the LLVM front end.
+/// A synchronous access made through a pointer argument of a trusted external call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalArgEffect {
+    Read(usize),
+    Write(usize),
+    ReadWrite(usize),
+}
+
+/// Proven provenance of a trusted external call's result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalResultContract {
+    Void,
+    Scalar,
+    Fresh,
+    ExternalObject,
+    CtypeTable,
+    RetainedState,
+    AliasArg(usize),
+    AliasArgOrFresh(usize),
+}
+
+/// Callsite-dependent part of an external contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalContractPolicy {
+    Plain,
+    /// Variadic pointer actuals are reads when `%n` is excluded and read/write otherwise.
+    Printf,
+    /// Every pointer-valued variadic actual is a synchronous output destination.
+    Scanf,
+    /// A variadic declaration whose contract applies only when no variadic actual is present.
+    NoVariadicActuals,
+}
+
+/// Explicitly modeled pointer retention. Most complete contracts retain nothing; `strtok` uses a
+/// library-owned slot whose stores and result loads are represented in the PAG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalCaptureContract {
+    None,
+    RetainedArgument(usize),
+}
+
+/// Complete client-memory contract for an exact-name external declaration.
+///
+/// Presence in this table proves that the function neither retains client pointers nor invokes a
+/// client callback. `effects` and `copy` describe every synchronous access to client storage;
+/// `result` describes all pointer provenance returned to the caller. Calls which do not meet the
+/// exact ABI shape, indirect calls, replacement definitions, and functions with callbacks or
+/// retained pointers deliberately have no usable contract and therefore fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalCallContract {
+    pub fixed_params: usize,
+    pub vararg: bool,
+    pub result: ExternalResultContract,
+    pub effects: &'static [ExternalArgEffect],
+    pub copy: Option<(usize, usize)>,
+    pub pointer_store: Option<(usize, usize)>,
+    pub capture: ExternalCaptureContract,
+    pub policy: ExternalContractPolicy,
+}
+
+impl ExternalCallContract {
+    pub fn matches_signature(&self, sig: &Signature, arg_count: usize, has_result: bool) -> bool {
+        if sig.cc != "ccc"
+            || sig.vararg != self.vararg
+            || sig.params.len() != self.fixed_params
+            || sig.params.iter().any(|param| *param != Param::Integer)
+            || (!self.vararg && arg_count != self.fixed_params)
+            || (self.vararg && arg_count < self.fixed_params)
+        {
+            return false;
+        }
+        match self.result {
+            ExternalResultContract::Void => sig.ret == AbiClass::Void && !has_result,
+            _ => sig.ret == AbiClass::Integer,
+        }
+    }
+}
+
+const NONE: &[ExternalArgEffect] = &[];
+const R0: &[ExternalArgEffect] = &[ExternalArgEffect::Read(0)];
+const R1: &[ExternalArgEffect] = &[ExternalArgEffect::Read(1)];
+const R01: &[ExternalArgEffect] = &[ExternalArgEffect::Read(0), ExternalArgEffect::Read(1)];
+const W0: &[ExternalArgEffect] = &[ExternalArgEffect::Write(0)];
+const W2: &[ExternalArgEffect] = &[ExternalArgEffect::Write(2)];
+const R0_W1: &[ExternalArgEffect] = &[ExternalArgEffect::Read(0), ExternalArgEffect::Write(1)];
+const R01_W2: &[ExternalArgEffect] = &[
+    ExternalArgEffect::Read(0),
+    ExternalArgEffect::Read(1),
+    ExternalArgEffect::Write(2),
+];
+const W0_R1: &[ExternalArgEffect] = &[ExternalArgEffect::Write(0), ExternalArgEffect::Read(1)];
+const W0_R12: &[ExternalArgEffect] = &[
+    ExternalArgEffect::Write(0),
+    ExternalArgEffect::Read(1),
+    ExternalArgEffect::Read(2),
+];
+const W0_R123: &[ExternalArgEffect] = &[
+    ExternalArgEffect::Write(0),
+    ExternalArgEffect::Read(1),
+    ExternalArgEffect::Read(2),
+    ExternalArgEffect::Read(3),
+];
+const R1_W2: &[ExternalArgEffect] = &[ExternalArgEffect::Read(1), ExternalArgEffect::Write(2)];
+
+fn contract(
+    fixed_params: usize,
+    vararg: bool,
+    result: ExternalResultContract,
+    effects: &'static [ExternalArgEffect],
+) -> ExternalCallContract {
+    ExternalCallContract {
+        fixed_params,
+        vararg,
+        result,
+        effects,
+        copy: None,
+        pointer_store: None,
+        capture: ExternalCaptureContract::None,
+        policy: ExternalContractPolicy::Plain,
+    }
+}
+
+/// Look up the one shared exact-name external-call contract table.
+pub fn external_call_contract(callee: &str) -> Option<ExternalCallContract> {
+    use ExternalResultContract as Result;
+
+    let callee = callee.strip_prefix('@').unwrap_or(callee);
+    let value = match callee {
+        "malloc" => contract(1, false, Result::Fresh, NONE),
+        "calloc" | "aligned_alloc" => contract(2, false, Result::Fresh, NONE),
+        "realloc" => ExternalCallContract {
+            result: Result::AliasArgOrFresh(0),
+            ..contract(2, false, Result::Fresh, NONE)
+        },
+        "free" => contract(1, false, Result::Void, NONE),
+
+        "strchr" | "strrchr" | "memchr" => contract(2, false, Result::AliasArg(0), R0),
+        "strstr" | "strpbrk" => contract(2, false, Result::AliasArg(0), R01),
+        "strlen" | "atoi" | "atol" | "atoll" => contract(1, false, Result::Scalar, R0),
+        "strcmp" | "strcasecmp" | "strcoll" | "strverscmp" => {
+            contract(2, false, Result::Scalar, R01)
+        }
+        "strncmp" | "memcmp" => contract(3, false, Result::Scalar, R01),
+        "strcpy" => contract(2, false, Result::AliasArg(0), W0_R1),
+        "strncpy" => contract(3, false, Result::AliasArg(0), W0_R1),
+        "memcpy" | "memmove" => ExternalCallContract {
+            copy: Some((0, 1)),
+            ..contract(3, false, Result::AliasArg(0), NONE)
+        },
+        "memset" => contract(3, false, Result::AliasArg(0), W0),
+        "mbstowcs" => contract(3, false, Result::Scalar, W0_R1),
+        "strtok" => ExternalCallContract {
+            capture: ExternalCaptureContract::RetainedArgument(0),
+            ..contract(
+                2,
+                false,
+                Result::RetainedState,
+                &[ExternalArgEffect::ReadWrite(0), ExternalArgEffect::Read(1)],
+            )
+        },
+        "strtoul" => ExternalCallContract {
+            pointer_store: Some((0, 1)),
+            ..contract(3, false, Result::Scalar, R0)
+        },
+
+        "__errno_location" => contract(0, false, Result::ExternalObject, NONE),
+        "__ctype_b_loc" => contract(0, false, Result::CtypeTable, NONE),
+        name if name.starts_with("__ctype_get_") => contract(0, false, Result::Scalar, NONE),
+        "getenv" => contract(1, false, Result::ExternalObject, R0),
+        "getgrgid" | "getpwuid" => contract(1, false, Result::ExternalObject, NONE),
+        "localtime" => contract(1, false, Result::ExternalObject, R0),
+        "nl_langinfo" => contract(1, false, Result::ExternalObject, NONE),
+        "setlocale" => contract(2, false, Result::ExternalObject, R1),
+
+        "fopen" | "fopen64" => contract(2, false, Result::ExternalObject, R01),
+        "fdopen" => contract(2, false, Result::ExternalObject, R1),
+        "opendir" => contract(1, false, Result::ExternalObject, R0),
+        "readdir" | "readdir64" => contract(1, false, Result::ExternalObject, NONE),
+        "closedir" | "fclose" => contract(1, false, Result::Scalar, NONE),
+        "fgets" => contract(3, false, Result::AliasArg(0), W0),
+        "fread" => contract(4, false, Result::Scalar, W0),
+        "fwrite" => contract(4, false, Result::Scalar, R0),
+        "fputs" => contract(2, false, Result::Scalar, R0),
+        "fputc" | "putc" => contract(2, false, Result::Scalar, NONE),
+
+        "gethostname" => contract(2, false, Result::Scalar, W0),
+        "getxattr" => contract(4, false, Result::Scalar, R01_W2),
+        "listxattr" => contract(3, false, Result::Scalar, R0_W1),
+        "readlink" => contract(3, false, Result::Scalar, R0_W1),
+        "realpath" => contract(2, false, Result::AliasArgOrFresh(1), R0_W1),
+        "stat" | "stat64" | "lstat" | "lstat64" => contract(2, false, Result::Scalar, R0_W1),
+        "__xstat" | "__xstat64" | "__lxstat" | "__lxstat64" => {
+            contract(3, false, Result::Scalar, R1_W2)
+        }
+        "__fxstat" | "__fxstat64" => contract(3, false, Result::Scalar, W2),
+        "strftime" => contract(4, false, Result::Scalar, W0_R123),
+        "time" => contract(1, false, Result::Scalar, W0),
+
+        "isatty" | "iswprint" | "tolower" => contract(1, false, Result::Scalar, NONE),
+        "exit" => contract(1, false, Result::Void, NONE),
+        "open" => contract(2, true, Result::Scalar, R0),
+        "fcntl" => ExternalCallContract {
+            policy: ExternalContractPolicy::NoVariadicActuals,
+            ..contract(2, true, Result::Scalar, NONE)
+        },
+
+        "printf" => ExternalCallContract {
+            policy: ExternalContractPolicy::Printf,
+            ..contract(1, true, Result::Scalar, R0)
+        },
+        "fprintf" | "dprintf" => ExternalCallContract {
+            policy: ExternalContractPolicy::Printf,
+            ..contract(2, true, Result::Scalar, R1)
+        },
+        "sprintf" => ExternalCallContract {
+            policy: ExternalContractPolicy::Printf,
+            ..contract(2, true, Result::Scalar, W0_R1)
+        },
+        "snprintf" => ExternalCallContract {
+            policy: ExternalContractPolicy::Printf,
+            ..contract(3, true, Result::Scalar, W0_R12)
+        },
+        name => {
+            let base = name
+                .strip_prefix("__isoc99_")
+                .or_else(|| name.strip_prefix("__isoc23_"))
+                .unwrap_or(name);
+            let (fixed, effects) = match base {
+                "scanf" | "wscanf" => (1, R0),
+                "fscanf" | "fwscanf" => (2, R1),
+                "sscanf" | "swscanf" => (2, R01),
+                _ => return None,
+            };
+            ExternalCallContract {
+                policy: ExternalContractPolicy::Scanf,
+                ..contract(fixed, true, Result::Scalar, effects)
+            }
+        }
+    };
+    Some(value)
+}
+
+/// Compatibility shim for front-end provenance validation.
 pub fn external_return_alias_arg(callee: &str) -> Option<usize> {
-    matches!(
-        callee.strip_prefix('@').unwrap_or(callee),
-        "strchr" | "strrchr" | "strstr" | "strpbrk" | "memchr"
-    )
-    .then_some(0)
+    match external_call_contract(callee)?.result {
+        ExternalResultContract::AliasArg(index)
+        | ExternalResultContract::AliasArgOrFresh(index) => Some(index),
+        _ => None,
+    }
 }
 
 /// Instrument every indirect call in an LLVM `.bc`/`.ll` module with a runtime trace hook

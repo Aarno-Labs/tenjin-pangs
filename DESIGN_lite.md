@@ -80,8 +80,8 @@ makes per-component soundness auditable); the TeaDSA call/return-site filter
 and its precision is frozen into the graph for every downstream phase).
 
 Variadic boundaries fail closed unless their consumption is explicit. In addition to
-positionally recognized `va_arg` operations and constant `%n`-free calls to the standard
-`printf` family, PAG construction recognizes internal `vfprintf` forwarding wrappers.
+positionally recognized `va_arg` operations, PAG construction recognizes internal `vfprintf`
+forwarding wrappers.
 The wrapper proof requires the fixed format parameter to reach `vfprintf` unchanged,
 every `va_list` to have matched `va_start`/`va_end` roots, exactly one list to be forwarded,
 and every list-derived pointer use to be part of that construction, destruction, or call.
@@ -89,19 +89,16 @@ Each wrapper call is then safe only when its actual format is a decodable consta
 supported, `%n`-free conversion sequence. Unknown formats, `va_copy`, other consumers,
 escaping list aliases, and unfamiliar dataflow retain the ordinary Ω boundary and audit.
 
-The exact-name external summary registry is deliberately small and shape checked. In
-addition to safe format consumers, it can classify an external as pure/constant-returning,
-read-only over client state, or returning an interior alias of a particular argument.
-Implemented examples include `__ctype_get_*` accessors, the glibc ctype tables, and standard
-byte/string search routines such as `strchr`. Standard `free` is also recognized when a direct
-external call has exactly one integer-ABI-class argument, a non-variadic void signature, and no
-result. Its argument is a non-capturing terminal: the call produces no pointer flow and has no
-client-state Mod/Ref effect. A module-defined `free`, an indirect or unresolved call, or a name
-match with the wrong call shape retains the normal Ω effects. This summary trusts the standard
-library contract and does not model either statically linked replacements from unanalyzed
-translation units or dynamic interposition. Other unlisted calls retain the normal Ω effects.
-Known positional variadic bindings are modeled only when the callee's consumption is visible;
-otherwise function-pointer actuals and other pointer-bearing tail arguments fail closed.
+One exact-name, ABI-shape-checked external-call contract table is shared by PAG construction and
+certificate assembly. A contract records every synchronous client-memory read/write, result
+provenance (scalar, fresh/external object, or argument alias), callback behavior, and any modeled
+retention. Standard `printf` calls are complete even for dynamic formats: pointer-valued variadic
+actuals are conservatively read/write unless `%n` is excluded, when they sharpen to read-only.
+`scanf` pointer tails are writes. Destination-returning routines such as `strncpy`, `memcpy`, and
+`realpath` preserve that alias explicitly; `strtok` retention uses a modeled library-owned slot.
+The table trusts standard-library semantics and does not cover dynamic interposition. A
+module-defined replacement, indirect or unresolved call, name/ABI mismatch, callback-capable API,
+or unlisted function retains the normal Ω boundary and audit.
 
 **Cut:**
 - **Typed heap clones** (cclyzer use-based back-propagation). v1 uses plain
@@ -511,7 +508,9 @@ With an exhaustive materialized solution, every client is a scan, not a query en
 - **Escape and immutability:** Ω bits from C'/D' are narrowed per allocation by an
   independent address-flow proof when Steensgaard has merged unrelated storage.
   Address isolation and write isolation are separate facts: a known runtime write does
-  not by itself make the allocation's address externally reachable. Both proofs, and the
+  not by itself make the allocation's address externally reachable. Pointer values stored in
+  module memory are followed to loads through conservative alias-equivalent address components;
+  an externally exposed container still exposes every captured value. Both proofs, and the
   never-written verdict, apply only to globals this module defines. An imported declaration is
   storage owned by another module: the absence of a local store does not make it never-written,
   and allocation isolation over this module cannot discharge its external address or write

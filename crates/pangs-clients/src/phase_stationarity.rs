@@ -8,6 +8,7 @@ use pangs_api::{
     AffectedGlobals, Analysis, BuildMode, Callee, Caller, CallsiteId, FuncId, GlobalId, Opts, Via,
 };
 use pangs_manifest::{Certificate, Extra, Site, Witness};
+use pangs_pag::proven_external_call_contract;
 use pangs_pir::{Access, Pir, StatementCfg, Stmt};
 use serde_json::{json, Value};
 
@@ -753,6 +754,21 @@ pub(crate) fn assemble_spine_inputs(
                 let Some(&callsite) = callsites_by_statement.get(&(function, statement)) else {
                     continue;
                 };
+                let (direct_callee, modeled_external_call) = match stmt {
+                    Stmt::CallDirect {
+                        callee,
+                        sig,
+                        args,
+                        dest,
+                        ..
+                    } => (
+                        Some(callee.as_str()),
+                        proven_external_call_contract(module, callee, sig, args, dest.is_some())
+                            .is_some(),
+                    ),
+                    Stmt::CallIndirect { .. } => (None, false),
+                    _ => unreachable!(),
+                };
                 // A resolved spawn/signal registry call has an explicit callback model below.
                 // Treating its external declaration as Ω as well would contradict that model and
                 // make every reader registration look like a writer of every global.
@@ -772,9 +788,9 @@ pub(crate) fn assemble_spine_inputs(
                                 // that can retain/call client pointers or whose effects are not
                                 // known.
                                 has_unknown |= !modeled_registry_call
-                                    && !external_has_no_client_global_effect(
-                                        &analysis.functions()[*callee].key,
-                                    );
+                                    && !(modeled_external_call
+                                        && direct_callee
+                                            == Some(analysis.functions()[*callee].key.as_str()));
                                 continue;
                             }
                             internal_callees.push(*callee);
@@ -907,7 +923,9 @@ pub(crate) fn assemble_spine_inputs(
                     .strip_prefix("external-call:")
                     .or_else(|| source.strip_prefix("vararg-call:"))
                     .and_then(|key| callsite_by_key.get(key))
-                    .filter(|callsite| !callsite_has_no_client_global_effect(analysis, **callsite))
+                    .filter(|callsite| {
+                        !callsite_has_complete_external_contract(analysis, module, **callsite)
+                    })
                     .and_then(|callsite| boundary_by_callsite.get(callsite))
                     .copied()
             })
@@ -941,103 +959,36 @@ pub(crate) fn assemble_spine_inputs(
     }
 }
 
-/// External APIs known not to read or write *client* globals merely by being called.
-///
-/// This is deliberately not a purity table: `fprintf`, `setlocale`, and allocation routines may
-/// mutate libc state, but that state is outside the module being dispositioned. Direct and
-/// pointer-derived accesses to client storage remain represented by the normal access ledger.
-/// APIs which can invoke/retain a client callback, create a thread, or have unknown client-memory
-/// effects are intentionally absent and therefore retain the conservative Ω treatment.
-fn external_has_no_client_global_effect(callee: &str) -> bool {
-    let callee = callee.strip_prefix('@').unwrap_or(callee);
-    callee.starts_with("__ctype_get_")
-        || callee.starts_with("llvm.memcpy.")
-        || callee.starts_with("llvm.memmove.")
-        || callee.starts_with("llvm.memset.")
-        || callee.starts_with("llvm.va_")
-        || matches!(
-            callee,
-            "__ctype_b_loc"
-                | "__errno_location"
-                | "__xstat"
-                | "__xstat64"
-                | "__fxstat"
-                | "__fxstat64"
-                | "__lxstat"
-                | "__lxstat64"
-                | "atoi"
-                | "atol"
-                | "atoll"
-                | "bsearch"
-                | "calloc"
-                | "closedir"
-                | "exit"
-                | "fclose"
-                | "fcntl"
-                | "fdopen"
-                | "fgets"
-                | "fopen"
-                | "fopen64"
-                | "fprintf"
-                | "fputc"
-                | "fputs"
-                | "fread"
-                | "free"
-                | "fwrite"
-                | "getenv"
-                | "getgrgid"
-                | "gethostname"
-                | "getpwuid"
-                | "getxattr"
-                | "isatty"
-                | "iswprint"
-                | "lstat"
-                | "lstat64"
-                | "localtime"
-                | "malloc"
-                | "mbstowcs"
-                | "memcmp"
-                | "memchr"
-                | "memmove"
-                | "memcpy"
-                | "memset"
-                | "nl_langinfo"
-                | "open"
-                | "opendir"
-                | "printf"
-                | "putc"
-                | "readdir"
-                | "readdir64"
-                | "readlink"
-                | "realloc"
-                | "realpath"
-                | "setlocale"
-                | "snprintf"
-                | "sprintf"
-                | "stat"
-                | "stat64"
-                | "strcasecmp"
-                | "strchr"
-                | "strcmp"
-                | "strcoll"
-                | "strcpy"
-                | "strftime"
-                | "strlen"
-                | "strncmp"
-                | "strncpy"
-                | "strrchr"
-                | "strstr"
-                | "strtok"
-                | "strtoul"
-                | "strverscmp"
-                | "time"
-                | "tolower"
-        )
-}
-
-/// Whether a solved callsite is wholly covered by the client-global effect summary. Unknown and
-/// internal targets deliberately make this false: they need ordinary interprocedural handling.
-fn callsite_has_no_client_global_effect(analysis: &Analysis, callsite: CallsiteId) -> bool {
+/// Whether this exact direct callsite has the shared complete external contract. Unknown and
+/// indirect targets, internal replacements, ABI mismatches, and callsite-dependent policy
+/// failures deliberately return false.
+fn callsite_has_complete_external_contract(
+    analysis: &Analysis,
+    module: &Pir,
+    callsite: CallsiteId,
+) -> bool {
+    let Some((&(function, statement), _)) = callsites_by_statement(module)
+        .iter()
+        .find(|(_, candidate)| **candidate == callsite)
+    else {
+        return false;
+    };
+    let Some(Stmt::CallDirect {
+        callee,
+        sig,
+        args,
+        dest,
+        ..
+    }) = module
+        .functions
+        .get(function.0 as usize)
+        .and_then(|function| function.body.get(statement as usize))
+    else {
+        return false;
+    };
+    if proven_external_call_contract(module, callee, sig, args, dest.is_some()).is_none() {
+        return false;
+    }
     let mut has_target = false;
     for target in analysis.callees(callsite) {
         has_target = true;
@@ -1045,7 +996,7 @@ fn callsite_has_no_client_global_effect(analysis: &Analysis, callsite: CallsiteI
             return false;
         };
         let info = &analysis.functions()[*function];
-        if !info.external || !external_has_no_client_global_effect(&info.key) {
+        if !info.external || info.key != *callee {
             return false;
         }
     }
@@ -2823,18 +2774,20 @@ mod tests {
 
     #[test]
     fn libc_client_state_calls_do_not_generate_module_wide_effects() {
-        let signature = || json!({"ret":{"class":"void"},"params":[],"cc":"ccc"});
+        let unary = || json!({"ret":{"class":"integer"},"params":[{"class":"integer"}],"cc":"ccc"});
+        let binary = || json!({"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}],"cc":"ccc"});
+        let nullary = || json!({"ret":{"class":"integer"},"params":[],"cc":"ccc"});
         let pir: pangs_pir::Pir = serde_json::from_value(json!({
             "module":"phase-libc-summary",
             "functions":[
-                {"key":"main", "sig":signature(), "body":[
-                    {"kind":"call_direct", "callee":"fprintf", "sig":signature(), "args":[]},
-                    {"kind":"call_direct", "callee":"setlocale", "sig":signature(), "args":[]},
-                    {"kind":"call_direct", "callee":"__ctype_get_mb_cur_max", "sig":signature(), "args":[]}
+                {"key":"main", "sig":{"ret":{"class":"void"},"params":[]}, "body":[
+                    {"kind":"call_direct", "callee":"isatty", "sig":unary(), "args":["fd"]},
+                    {"kind":"call_direct", "callee":"setlocale", "sig":binary(), "args":["category","locale"]},
+                    {"kind":"call_direct", "callee":"__ctype_get_mb_cur_max", "sig":nullary(), "args":[]}
                 ]},
-                {"key":"fprintf", "sig":signature(), "external":true},
-                {"key":"setlocale", "sig":signature(), "external":true},
-                {"key":"__ctype_get_mb_cur_max", "sig":signature(), "external":true}
+                {"key":"isatty", "sig":unary(), "external":true},
+                {"key":"setlocale", "sig":binary(), "external":true},
+                {"key":"__ctype_get_mb_cur_max", "sig":nullary(), "external":true}
             ],
             "globals":[{"key":"@a"},{"key":"@b"}]
         }))

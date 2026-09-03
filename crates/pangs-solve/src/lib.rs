@@ -540,13 +540,14 @@ struct AllocationIsolation {
 /// isolated addresses and, separately, whether they are never written after initialization.
 ///
 /// This deliberately tracks only the address of an allocation, not values stored in it.  The
-/// supported address-preserving operations are exhaustive for the PAG: address-of, assign,
-/// GEP (including unknown offsets), direct-call bindings already present as Assign edges, and
-/// solved internal indirect-call bindings added below.  Storing the address itself rejects the
-/// proof rather than attempting a memory-flow analysis.  Any unmodeled/external use also rejects
-/// it. A store *through* the derived address invalidates only write isolation; storing the address
-/// itself invalidates both results. Consequently each successful result can safely narrow its
-/// corresponding union-induced class-level fact without narrowing any actual pointer behavior.
+/// supported flow operations are exhaustive for the PAG: address-of, assign, GEP (including
+/// unknown offsets), pointer-bearing stores matched to loads through alias-equivalent addresses,
+/// direct-call bindings already present as Assign edges, and solved internal indirect-call
+/// bindings added below. If a containing address reaches an unknown boundary, so does every
+/// pointer stored in it. Any unmodeled/external use still rejects the proof. A store *through* the
+/// derived address invalidates write isolation but does not by itself make the address escape.
+/// Consequently each successful result can safely narrow its corresponding union-induced
+/// class-level fact without narrowing pointer behavior.
 fn allocation_isolation(
     pir: &Pir,
     pag: &Pag,
@@ -555,26 +556,93 @@ fn allocation_isolation(
 ) -> AllocationIsolation {
     let mut flow = vec![Vec::<NodeId>::new(); pag.nodes.len()];
     for edge in &pag.edges {
-        if matches!(
-            edge.kind,
-            pangs_pag::EdgeKind::AddrOf
-                | pangs_pag::EdgeKind::Assign
-                | pangs_pag::EdgeKind::Gep { .. }
-        ) && (edge.kind != pangs_pag::EdgeKind::Assign
-            || (pag.nodes[edge.src.0 as usize]
-                .value_kind
-                .may_carry_pointer()
-                && pag.nodes[edge.dst.0 as usize]
+        let pointer_flow = match edge.kind {
+            pangs_pag::EdgeKind::AddrOf | pangs_pag::EdgeKind::Gep { .. } => true,
+            pangs_pag::EdgeKind::Assign => {
+                pag.nodes[edge.src.0 as usize]
                     .value_kind
-                    .may_carry_pointer()))
-        {
+                    .may_carry_pointer()
+                    && pag.nodes[edge.dst.0 as usize]
+                        .value_kind
+                        .may_carry_pointer()
+            }
+            pangs_pag::EdgeKind::Load
+            | pangs_pag::EdgeKind::Store
+            | pangs_pag::EdgeKind::Memcpy { .. } => false,
+        };
+        if pointer_flow {
             flow[edge.src.0 as usize].push(edge.dst);
         }
+    }
+
+    // Follow pointer values through module memory without confusing a container's address with
+    // its contents. Assign/GEP-connected address carriers form conservative alias components;
+    // each pointer store flows to every pointer load from the same component. The additional
+    // source -> destination-address edge makes an escaped container reject every captured value.
+    let mut address_aliases = vec![Vec::<NodeId>::new(); pag.nodes.len()];
+    for edge in &pag.edges {
+        if matches!(
+            edge.kind,
+            pangs_pag::EdgeKind::Assign | pangs_pag::EdgeKind::Gep { .. }
+        ) && pag.nodes[edge.src.0 as usize]
+            .value_kind
+            .may_carry_pointer()
+            && pag.nodes[edge.dst.0 as usize]
+                .value_kind
+                .may_carry_pointer()
+        {
+            address_aliases[edge.src.0 as usize].push(edge.dst);
+            address_aliases[edge.dst.0 as usize].push(edge.src);
+        }
+    }
+    let mut address_component = vec![usize::MAX; pag.nodes.len()];
+    let mut next_component = 0_usize;
+    for start in 0..pag.nodes.len() {
+        if address_component[start] != usize::MAX {
+            continue;
+        }
+        address_component[start] = next_component;
+        let mut queue = VecDeque::from([NodeId(start as u32)]);
+        while let Some(node) = queue.pop_front() {
+            for &next in &address_aliases[node.0 as usize] {
+                if address_component[next.0 as usize] == usize::MAX {
+                    address_component[next.0 as usize] = next_component;
+                    queue.push_back(next);
+                }
+            }
+        }
+        next_component += 1;
+    }
+    let mut pointer_loads = vec![Vec::<NodeId>::new(); next_component];
+    for edge in &pag.edges {
+        if edge.kind == pangs_pag::EdgeKind::Load
+            && pag.nodes[edge.dst.0 as usize]
+                .value_kind
+                .may_carry_pointer()
+        {
+            pointer_loads[address_component[edge.src.0 as usize]].push(edge.dst);
+        }
+    }
+    for edge in &pag.edges {
+        if edge.kind != pangs_pag::EdgeKind::Store
+            || !pag.nodes[edge.src.0 as usize]
+                .value_kind
+                .may_carry_pointer()
+        {
+            continue;
+        }
+        flow[edge.src.0 as usize].push(edge.dst);
+        flow[edge.src.0 as usize].extend(
+            pointer_loads[address_component[edge.dst.0 as usize]]
+                .iter()
+                .copied(),
+        );
     }
 
     let mut params: HashMap<(String, u32), NodeId> = HashMap::new();
     let mut returns: HashMap<String, NodeId> = HashMap::new();
     let mut global_objects: HashMap<String, NodeId> = HashMap::new();
+    let mut unknown_parameter_seeds = Vec::new();
     for node in &pag.nodes {
         match &node.kind {
             NodeKind::Param { func, index } => {
@@ -712,9 +780,8 @@ fn allocation_isolation(
         match edge.kind {
             pangs_pag::EdgeKind::Store => {
                 // Writing through the derived address is a runtime mutation. Storing the
-                // derived address makes later memory flow relevant, which this proof
-                // intentionally rejects instead of approximating optimistically.
-                address_blockers[edge.src.0 as usize] = true;
+                // derived address as a value is followed by the conservative pointer-content
+                // flow above, so it is no longer an immediate address-isolation failure.
                 if matches!(edge.owner, pangs_pag::Owner::Function(_)) {
                     write_blockers[edge.dst.0 as usize] = true;
                 }
@@ -736,6 +803,7 @@ fn allocation_isolation(
                     OmegaSeedKind::ExportedSymbol
                         | OmegaSeedKind::PtrToInt
                         | OmegaSeedKind::UnknownOperandEscape
+                        | OmegaSeedKind::UnknownResultExternal
                 ) =>
             {
                 address_blockers[node.0 as usize] = true;
@@ -765,6 +833,30 @@ fn allocation_isolation(
     for node in &pag.nodes {
         if matches!(&node.kind, NodeKind::Return { func } if unknown_callers.contains(func)) {
             address_blockers[node.id.0 as usize] = true;
+        }
+        if matches!(&node.kind, NodeKind::Param { func, .. } if unknown_callers.contains(func)) {
+            address_blockers[node.id.0 as usize] = true;
+            unknown_parameter_seeds.push(node.id);
+        }
+    }
+
+    // The named SSA value for a parameter is an Assign successor of its Param node. Mark the
+    // conservative forward closure of externally supplied parameters so a store through `%p`
+    // is recognized as writing into externally controlled storage.
+    for (blocked, reached) in address_blockers
+        .iter_mut()
+        .zip(reachable(&flow, &unknown_parameter_seeds))
+    {
+        *blocked |= reached;
+    }
+
+    // Export seeds name object nodes while stores and calls use the corresponding address value.
+    // Mark that one AddrOf carrier without closing through Assign/phi: closing forward there
+    // would conflate an escaped alternative with every other phi input and defeat the allocation
+    // provenance proof this routine exists to preserve.
+    for edge in &pag.edges {
+        if edge.kind == pangs_pag::EdgeKind::AddrOf && address_blockers[edge.src.0 as usize] {
+            address_blockers[edge.dst.0 as usize] = true;
         }
     }
 

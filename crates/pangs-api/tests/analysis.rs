@@ -54,6 +54,46 @@ fn m1_7_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn disposition_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic/disposition")
+        .join(name)
+}
+
+#[test]
+fn strncpy_contract_connects_returned_destination_to_downstream_store() {
+    let pir = Pir::from_path(disposition_fixture("strncpy_return_alias.pir.json")).unwrap();
+    for stage in [Stage::Steens, Stage::Andersen] {
+        let analysis = Analysis::run_with_disposition(
+            &pir,
+            &Opts {
+                stage,
+                build_mode: BuildMode::Executable,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        let buffer = analysis.lookup_global("@buffer").unwrap();
+        assert!(
+            !analysis.globals()[buffer].address_escaped,
+            "the complete non-capturing contract must not escape the destination at {stage:?}"
+        );
+        let write_lines = analysis
+            .access_sites_for_global(buffer)
+            .filter(|site| site.access == Access::Mod)
+            .filter_map(|site| site.loc.as_ref().map(|loc| loc.line))
+            .collect::<BTreeSet<_>>();
+        assert!(
+            write_lines.contains(&6),
+            "the synchronous strncpy write was not represented at {stage:?}: {write_lines:?}"
+        );
+        assert!(
+            write_lines.contains(&7),
+            "strncpy's returned destination did not attribute the downstream store at {stage:?}: {write_lines:?}"
+        );
+    }
+}
+
 #[test]
 fn external_policy_census_is_observational_after_forged_rows_become_finite() {
     let pir = Pir::from_path(m1_6_fixture("aliased_unknown_modref.pir.json")).unwrap();
@@ -2934,7 +2974,7 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
 }
 
 #[test]
-fn printf_vararg_audits_require_a_constant_percent_n_free_format() {
+fn printf_vararg_contracts_replace_dynamic_format_audits_with_modeled_effects() {
     let fprintf_sig = Signature {
         ret: AbiClass::Integer,
         params: vec![Param::Integer, Param::Integer],
@@ -3024,10 +3064,7 @@ fn printf_vararg_audits_require_a_constant_percent_n_free_format() {
                 && finding.detail.as_deref() == Some("callee:fprintf")
         })
         .collect::<Vec<_>>();
-    assert_eq!(printf_findings.len(), 2);
-    assert!(printf_findings
-        .iter()
-        .all(|finding| finding.affected == ["function:cb"] || finding.affected == ["value:cb"]));
+    assert!(printf_findings.is_empty());
 }
 
 #[test]

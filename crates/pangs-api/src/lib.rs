@@ -7,8 +7,9 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use pangs_pag::{
-    positionally_modeled_vararg_functions, BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag,
-    PagOpts, StorageRoot, StorageRootState, StorageRoots, VarargCallProof,
+    positionally_modeled_vararg_functions, proven_external_call_contract,
+    BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts, StorageRoot, StorageRootState,
+    StorageRoots, VarargCallProof,
 };
 use pangs_pir::{
     fsa_compatible, Access, LoweringStats, Pir, ScalarOp, ScalarTypeClass, ScalarTypeEvidence,
@@ -1055,7 +1056,11 @@ impl Analysis {
                         aggregate_fnptrs.note(stmt);
                     }
                     Stmt::CallDirect {
-                        callee, args, loc, ..
+                        callee,
+                        sig,
+                        args,
+                        dest,
+                        loc,
                     } => {
                         let cs = push_callsite(
                             &mut callsites,
@@ -1070,6 +1075,7 @@ impl Analysis {
                             module,
                             callee,
                             Some(args),
+                            Some((sig, dest.is_some())),
                             &positional_vararg_functions,
                             &mut vararg_call_proof,
                         );
@@ -3693,9 +3699,15 @@ fn direct_vararg_audit_kind(
     module: &Pir,
     callee: &str,
     args: Option<&[String]>,
+    call_shape: Option<(&pangs_pir::Signature, bool)>,
     positional_vararg_functions: &BTreeSet<String>,
     vararg_call_proof: &mut VarargCallProof<'_>,
 ) -> Option<&'static str> {
+    if let (Some(args), Some((sig, has_result))) = (args, call_shape) {
+        if proven_external_call_contract(module, callee, sig, args, has_result).is_some() {
+            return None;
+        }
+    }
     if vararg_call_proof.is_benign(callee, args.unwrap_or_default()) {
         return None;
     }
@@ -3754,6 +3766,7 @@ fn indirect_vararg_site_is_safe(
                     && direct_vararg_audit_kind(
                         module,
                         target,
+                        None,
                         None,
                         positional_vararg_functions,
                         vararg_call_proof,
