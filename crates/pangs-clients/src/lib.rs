@@ -134,6 +134,33 @@ pub fn assemble_disposition_artifacts(
     }
     let fact_indexes_started = Instant::now();
     let fact_rows = DispositionFactRows::new(analysis);
+    let access_failures = analysis
+        .globals()
+        .iter()
+        .enumerate()
+        .map(|(index, info)| {
+            let key = info
+                .file
+                .as_deref()
+                .map_or_else(
+                    || Key::unqualified(info.key.strip_prefix('@').unwrap_or(&info.key)),
+                    |file| Key::new(file, info.key.strip_prefix('@').unwrap_or(&info.key)),
+                )
+                .or_else(|_| Key::unqualified(info.key.strip_prefix('@').unwrap_or(&info.key)))
+                .ok()?;
+            let omega_witness = info
+                .address_escaped
+                .then(|| omega_escape_witness(analysis, &key, info, fact_rows.escape[index]));
+            access_set_failure(
+                analysis,
+                &info.key,
+                omega_witness.as_ref(),
+                opts.build_mode,
+                info.exported,
+                fact_rows.access_failure[index],
+            )
+        })
+        .collect::<Vec<_>>();
     if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing fact-row-indexes={}ms",
@@ -149,6 +176,7 @@ pub fn assemble_disposition_artifacts(
         &registry_facts.escape_read_callsites,
         &registry_facts.thread_writers,
         &fact_rows.violation,
+        &access_failures,
     );
     if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
@@ -208,15 +236,11 @@ pub fn assemble_disposition_artifacts(
         });
         let violation_witness = fact_rows.violation[index].clone();
         let violation_taint = violation_witness.is_some();
-        let access_failure = access_set_failure(
-            analysis,
-            &info.key,
-            omega_witness.as_ref(),
-            opts.build_mode,
-            info.exported,
-            fact_rows.access_failure[index],
+        let access_failure = access_failures[index].clone();
+        let localization = gate_localization_on_complete_access_set(
+            fact_rows.localization[index].clone(),
+            access_failure.as_ref(),
         );
-        let localization = fact_rows.localization[index].clone();
         let record = DispositionGlobal {
             key,
             meta: Meta {
@@ -3572,6 +3596,27 @@ fn localization_index(analysis: &Analysis) -> Vec<Option<Localization>> {
     out
 }
 
+fn gate_localization_on_complete_access_set(
+    localization: Option<Localization>,
+    access_failure: Option<&Witness>,
+) -> Option<Localization> {
+    let mut localization = localization?;
+    let Some(witness) = access_failure else {
+        return Some(localization);
+    };
+    localization.verdict = LocalizationVerdict::Blocked;
+    merge_localization_blockers(
+        &mut localization,
+        1,
+        vec![LocalizationBlocker {
+            code: "access-set-complete".into(),
+            witness: witness.clone(),
+            extra: Extra::new(),
+        }],
+    );
+    Some(localization)
+}
+
 pub fn validate_export_dir(outdir: &Path) -> Result<()> {
     let json_files = [
         "manifest.json",
@@ -5858,43 +5903,54 @@ int call_reader(void) { return read_pointer(&target); }
     }
 
     #[test]
-    #[ignore = "known soundness gap: phase stationarity and localization ignore external address escape"]
     fn external_result_store_cannot_certify_an_escaped_global() {
-        let mut unexpected = Vec::new();
         for stage in [Stage::Steens, Stage::Andersen] {
             let (_, manifest) = external_result_after_escape_artifacts(stage);
             let global = manifest_global_by_llvm_name(&manifest, "g");
-            if matches!(
-                global.facts.phase_stationarity.as_ref(),
-                Some(Certificate::Certified { .. })
-            ) {
-                unexpected.push(format!("{stage:?}:phase_stationarity"));
-            }
-            if matches!(
-                global.facts.atomic_eligibility.as_ref(),
-                Some(Certificate::Certified { .. })
-            ) {
-                unexpected.push(format!("{stage:?}:atomic_eligibility"));
-            }
-            if matches!(
-                global.facts.mutex_eligibility.as_ref(),
-                Some(Certificate::Certified { .. })
-            ) {
-                unexpected.push(format!("{stage:?}:mutex_eligibility"));
-            }
-            if global
+            let Some(Certificate::Failed { codes, .. }) = global.facts.phase_stationarity.as_ref()
+            else {
+                panic!("phase stationarity certified escaped storage at {stage:?}")
+            };
+            assert!(
+                codes.iter().any(|code| code == "access-set-complete"),
+                "phase stationarity omitted the access-set gate at {stage:?}: {codes:?}"
+            );
+
+            assert!(
+                !global
+                    .facts
+                    .atomic_eligibility
+                    .as_ref()
+                    .is_some_and(Certificate::is_certified),
+                "atomic eligibility certified escaped storage at {stage:?}"
+            );
+            assert!(
+                !global
+                    .facts
+                    .mutex_eligibility
+                    .as_ref()
+                    .is_some_and(Certificate::is_certified),
+                "mutex eligibility certified escaped storage at {stage:?}"
+            );
+
+            let localization = global
                 .facts
                 .localization
                 .as_ref()
-                .is_some_and(|localization| localization.verdict == LocalizationVerdict::Ok)
-            {
-                unexpected.push(format!("{stage:?}:localization"));
-            }
+                .expect("fixture must remain a localization candidate");
+            assert_eq!(
+                localization.verdict,
+                LocalizationVerdict::Blocked,
+                "localization accepted escaped storage at {stage:?}"
+            );
+            assert!(
+                localization
+                    .blocker_samples
+                    .iter()
+                    .any(|blocker| blocker.code == "access-set-complete"),
+                "localization omitted the access-set gate at {stage:?}: {localization:?}"
+            );
         }
-        assert!(
-            unexpected.is_empty(),
-            "certified externally mutable g via {unexpected:?}"
-        );
     }
 
     #[test]

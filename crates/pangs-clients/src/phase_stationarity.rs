@@ -1121,6 +1121,7 @@ pub(crate) fn certificate_slots(
     escape_read_callsites: &BTreeMap<GlobalId, BTreeSet<CallsiteId>>,
     thread_writers: &BTreeMap<GlobalId, Witness>,
     violation_witnesses: &[Option<Witness>],
+    access_failures: &[Option<Witness>],
 ) -> (Option<Value>, BTreeMap<GlobalId, Certificate>, Value) {
     let certificate_started = Instant::now();
     let main = (opts.build_mode == BuildMode::Executable
@@ -1205,18 +1206,32 @@ pub(crate) fn certificate_slots(
         if evaluation.exhausted {
             descent_exhausted.insert(global);
         }
-        let mut codes = kills
-            .get(&global)
+        let mut codes = access_failures
+            .get(global.0 as usize)
             .into_iter()
             .flatten()
-            .map(|kill| kill.code.to_string())
+            .map(|_| "access-set-complete".to_string())
             .collect::<Vec<_>>();
-        let mut witnesses = kills
-            .get(&global)
+        codes.extend(
+            kills
+                .get(&global)
+                .into_iter()
+                .flatten()
+                .map(|kill| kill.code.to_string()),
+        );
+        let mut witnesses = access_failures
+            .get(global.0 as usize)
             .into_iter()
             .flatten()
-            .map(|kill| kill.witness.clone())
+            .cloned()
             .collect::<Vec<_>>();
+        witnesses.extend(
+            kills
+                .get(&global)
+                .into_iter()
+                .flatten()
+                .map(|kill| kill.witness.clone()),
+        );
         let payload = match &evaluation.selection {
             Ok(selection) => build_payload(
                 analysis,
@@ -2441,6 +2456,10 @@ mod tests {
         crate::DispositionFactRows::new(analysis).violation
     }
 
+    fn complete_access_sets(analysis: &Analysis) -> Vec<Option<pangs_manifest::Witness>> {
+        vec![None; analysis.globals().len()]
+    }
+
     fn boundary(id: u32, successors: &[u32], predecessors: &[u32]) -> StatementBoundary {
         StatementBoundary {
             id,
@@ -3151,6 +3170,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &violation_witnesses(&analysis),
+            &complete_access_sets(&analysis),
         );
         assert_eq!(entry.unwrap()["root"], "main");
         let Certificate::Certified { certificate, .. } = &slots[&global] else {
@@ -3231,6 +3251,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &violation_witnesses(&analysis),
+            &complete_access_sets(&analysis),
         );
         let Certificate::Failed { codes, .. } = &slots[&global] else {
             panic!("a post-publication memory writer must not yield phase/once-lock support")
@@ -3312,6 +3333,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &violation_witnesses(&analysis),
+            &complete_access_sets(&analysis),
         );
         let Certificate::Certified { certificate, .. } = &slots[&global] else {
             panic!(
@@ -3414,6 +3436,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &violation_witnesses(&analysis),
+            &complete_access_sets(&analysis),
         );
         let Certificate::Certified { certificate, .. } = &slots[&global] else {
             panic!("expected certified both-phase slot: {:#?}", slots[&global]);
@@ -3499,6 +3522,7 @@ mod tests {
             &facts.escape_read_callsites,
             &facts.thread_writers,
             &violation_witnesses(&analysis),
+            &complete_access_sets(&analysis),
         );
         let Certificate::Certified { certificate, .. } = &slots[&global] else {
             panic!(
