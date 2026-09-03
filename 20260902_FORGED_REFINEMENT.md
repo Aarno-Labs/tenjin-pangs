@@ -461,7 +461,10 @@ results; and the Vim and OpenSSL candidate-set sizes. Its summary goes into
    backwards from the reader's point of view. Either external rows adopt the same union, and the
    two row kinds collapse into one, or the row contract is written down as it is: named candidates plus an Ω whose members are found only
    through per-global escape bits, with a list of which certificates must consult them. Decide
-   after R1, with the corpus union sizes in hand.
+   after R1, with the corpus union sizes in hand. **Resolved 2026-09-03:** retain finite external
+   rows and gate every transformation-bearing certificate/verdict on `access_set_complete`.
+   The 59-module production sweep loses 2 phase certificates, 113 localization OK verdicts, and
+   42 actionable dispositions; see `ju_out/certificate_gate_20260903/REPORT.md`.
 2. **Andersen forged gates.** `ANDERSEN_PROVENANCE_PROMOTION_*` and the closed-producer promotion
    both refuse forged partitions. The ceiling shows they do not bind on SQLite. Whether they bind
    anywhere is a cheap corpus count from the admission profiles, and should be taken before

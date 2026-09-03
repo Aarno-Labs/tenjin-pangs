@@ -67,9 +67,11 @@ The policy stage assigns each client-relevant global the **first applicable** en
 
 Guard-shape rule: **a strategy backed by an eligibility pass has a certificate-only
 guard** — the cascade reads one slot, and the pass's certificate internally requires
-its precondition facts (D4's requires `access_set_complete`,
-`¬signal_context_access`, and the reentrancy check; D3's analogously) — while
-strategies without a pass (`immutable`, `localize`) compose raw facts directly.
+its precondition facts. Phase stationarity, D3, and D4 all require
+`access_set_complete`; D4 additionally requires `¬signal_context_access` and its
+reentrancy check. Strategies without a pass compose raw facts directly. In particular,
+localization verdict assembly incorporates `access_set_complete` as a blocker; the context
+rewrite graph itself remains independent of ModRef attribution.
 Duplicating a pass's preconditions in the cascade guard would create a second,
 divergeable definition; the slot's failure codes already say *which* precondition
 failed, and that is what `cascade_trace` reports (a mutex skip is
@@ -140,7 +142,7 @@ Per-global facts, with producers:
 | `violation_taint` | evidenced bool (witness when true: an address-relevant, access-shape-relevant, or unresolved violation finding) — gates `immutable`, `once-lock`, `atomic`, and `mutex`; `localize` filters the complete `violation_relevance` list by the single exempt kind in §1; value-only/unrelated findings remain diagnostics | A′ relevance routing | implemented |
 | `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) — **reporting fact, not a guard**: thread visibility alone defeats no strategy (thread readers are a primary OnceLock use case; the thread-*writer* kill rule lives inside the phase-stationarity certificate) | F scan over spawn sites | implemented |
 | `signal_context_access` | evidenced bool (true iff accessed under a registered signal handler; witness when true: registration site + accessing function) | F scan over Ω escape sites of handlers | implemented |
-| `access_set_complete` | evidenced bool (true iff analysis bounds every possible accessor; **witness when false**: module-wide Ω, address escape, or library name reachability) | F scan | implemented; bounded indirect/rewrite compatibility is diagnosed separately for D3/D4 |
+| `access_set_complete` | evidenced bool (true iff analysis bounds every possible accessor; **witness when false**: module-wide Ω, address escape, or library name reachability) | F scan | implemented; gates phase stationarity, D3, D4, and localization; bounded indirect/rewrite compatibility is diagnosed separately for D3/D4 |
 | `word_sized_scalar` | `{ value, type_spelling?, size_bits?, class?, signed? }` — true iff the type has a matching Rust atomic on the target (`DISPOSITION_PLAN.md` §1.9; the name is historical shorthand, not "pointer-width only") | lowering metadata (O1b) | implemented |
 | `phase_stationarity` | certificate slot (null \| certified \| failed+codes+witnesses) | ONCELOCK pass | implemented |
 | `atomic_eligibility` | certificate slot | D3 access-lowering pass (§9) | implemented |

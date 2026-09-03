@@ -739,3 +739,19 @@ compact two-stage data are in `ju_out/forged_refinement_20260902/REPORT.md`. All
 tests and both debug SQLite stages passed. The 59-module differential sweep passed 53 modules; its
 six jq/Lemon/Vim failures predate this change and are recorded with baseline evidence in the
 report.
+
+### Complete-access certificate gate (2026-09-03)
+
+The ordinary-external-row soundness fixture demonstrated a live client gap: after `&g` crossed an
+external call boundary, a store through a later external result still left phase stationarity and
+localization certified because its finite candidate set did not name `g`. The chosen fix keeps the
+finite row precise and makes `access_set_complete` a common prerequisite of phase stationarity,
+atomic, mutex, and localization. The existing escape witness feeds both new failures.
+
+A matched production-Andersen sweep completed all 59 corpus modules. Among 9,153 disposition
+subjects, phase certificates fell 94 to 92 and localization OK verdicts fell 873 to 760. Final
+dispositions lost 2 once-lock and 40 localize selections, all to unhandled; immutable, atomic, and
+mutex counts were unchanged. Every one of the 115 proof-status transitions was caused by the
+global's own external address escape, not an export-only or module-wide boundary. Solver and
+ModRef semantic metrics were unchanged. Full per-module and per-global results are in
+`ju_out/certificate_gate_20260903/REPORT.md`.

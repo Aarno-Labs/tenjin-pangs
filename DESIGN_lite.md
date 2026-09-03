@@ -532,13 +532,19 @@ With an exhaustive materialized solution, every client is a scan, not a query en
   intersect a required signature rewrite. A global whose address is captured in a
   static aggregate initializer also blocks until source-level aggregate-initializer
   rewriting exists, because localization would replace its link-time-stable address
-  with a runtime local address. Components remain diagnostics, not the eligibility gate.
+  with a runtime local address. Ordinary outbound external calls do not connect otherwise
+  independent rewrite slices, but a global whose address crosses such a boundary has an
+  incomplete access set and is not localizable. Components remain diagnostics, not the
+  eligibility gate.
 - **Disposition:** the fact vector is routed by the policy stage in `DISPOSITION.md`.
   The default cascade selects the first independently applicable strategy among
   `immutable`, `once-lock`, `atomic`, `mutex`, and application-only `localize`, falling
   back to `unhandled` with accumulated witnesses. Coupling-group support, overrides,
   accepted-risk records, source-materialization recipes, and the marker inventory are
-  emitted in the shared manifest. Violation taint gates the four access-property
+  emitted in the shared manifest. `access_set_complete` gates every certificate or verdict
+  that would rewrite accesses: phase stationarity, atomic, mutex, and localization all fail
+  closed when a module-wide row, address escape, or library name boundary leaves possible
+  accessors unenumerated. Violation taint gates the four access-property
   strategies. Localization may ignore hard `fnptr_varargs_internal_unmodeled`
   diagnostics when no other hard finding remains and its independent verdict is OK,
   under the supported-program contract in
