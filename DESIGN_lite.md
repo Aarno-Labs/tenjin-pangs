@@ -151,21 +151,21 @@ prepartition graph and uses Steensgaard at cut boundaries.
 
 Load and store use one-hop target equations rather than unifying a value carrier with a storage
 location: `P(V(load)) ≡ P(S(address))` and `P(S(address)) ≡ P(V(value))`. Unknown-root GEP and
-memcpy use the same target primitive. Directed content edges carry external, universal, and null
+memcpy use the same target primitive. Directed content edges carry external and null
 facts along those value transfers. Consequently every union-find class contains either value-like
 carriers or locations (object, pointee, and field classes), never both; debug builds assert this
 carrier/location invariant after every solve.
 
 Content facts also push down through pointer targets. When a class is external or escaped, its
-pointee class becomes external and escaped, and universal when the class is universal. Everything
-reachable from an external, escaped, or integer-forged pointer is therefore external, and every
-value loaded from such storage is external through its content edge. A value node reads its
-external and universal facts from its own carrier class only; escape, named-object, and callsite
+pointee class becomes external and escaped. Everything reachable from an external, escaped, or
+integer-forged pointer is therefore external, and every value loaded from such storage is external
+through its content edge. A value node reads its
+external facts from its own carrier class only; escape, named-object, and callsite
 facts stay on location classes. The push-down and the content edges compose into a closure that
 the one-hop rules do not narrow: in library mode the storage reachable from an exported function's
-pointer parameters, and every value loaded from it, is external. On SQLite that closure, seeded by
-thirteen `inttoptr` sites, is what remains behind nearly every module-wide unknown mod/ref row
-after the 2026-09-02 change (`EXPERIMENT_HISTORY.md`).
+pointer parameters, and every value loaded from it, is external. Integer-forged flow retains a
+cheap internal scope selector so ModRef can add the externally escaped globals without carrying
+per-seed provenance through the closure.
 
 Its partition boundary is allocation-field aware when the fixed PAG independently proves
 an address root. Constant GEP offsets get distinct synthetic storage classes. LLVM
@@ -207,14 +207,14 @@ configured budget. An oversize component remains at its Steensgaard answer, and 
 result records the number and largest size of such fallbacks. Provenance separation also
 permits a bounded promotion: a sparse, medium-sized component that exceeds the old cost
 proxy may still be admitted when its node and edge counts fit fixed caps and it contains
-no integer-forged/universal external source.
+no integer-forged external source.
 
 For an indirect call stranded in an oversize weak component, D' may instead admit a
 bounded, source-closed slice of the directed condensation graph. It starts at the call
 operand's SCC and closes over predecessor SCCs, because every excluded predecessor would
 be a missing producer. Outgoing dependencies may cross the cut: their consumers retain
 the complete Steensgaard summary when refined and base facts are merged. If the closed
-slice exceeds its budget or contains a disallowed universal source, the whole site keeps
+slice exceeds its budget or contains a disallowed forged source, the whole site keeps
 the ordinary fallback. Complete Andersen facts overwrite only admitted nodes, so omission
 by the refiner is conservative.
 
@@ -499,14 +499,15 @@ With an exhaustive materialized solution, every client is a scan, not a query en
   the storage root of that access: mixed-root joins, loads, calls, and unsupported or incomplete
   integer conversions remain solver queries, and field contents still participate in pointer,
   escape, and indirect-call analysis.
-  Rows distinguish direct, aliased, finite-unknown, and universal-unknown provenance.
+  Rows distinguish direct, aliased, and finite-unknown provenance.
   Transitive mod/ref closes over the final direct and indirect call graph. When a local
   or transitive expansion exceeds its configured high-fanout bound, the concrete rows
   collapse to an explicit conservative unknown row rather than being truncated.
   Aggregate-memory and other audit findings retain finite global-flow candidates when
   the solver proves them; violation relevance is then attributed to those candidates
-  instead of poisoning unrelated globals. Universal or assumption-tainted flow remains
-  module-wide.
+  instead of poisoning unrelated globals. Assumption-tainted flow remains module-wide.
+  Integer-forged flow is finite: its candidates are the address-exposed globals of the pointee
+  class plus every externally escaped global.
 - **Escape and immutability:** Ω bits from C'/D' are narrowed per allocation by an
   independent address-flow proof when Steensgaard has merged unrelated storage.
   Address isolation and write isolation are separate facts: a known runtime write does
@@ -644,8 +645,9 @@ Integer transforms between the two conversions have a deliberately weaker interp
 their complete producer graph is formed from compatible `ptrtoint` leaves, integer constants,
 assignments, and modeled scalar operations, the PAG records those leaves as allocation origins of
 the reconstructed value. This provenance-only relation feeds allocation-root analyses but is not a
-points-to assignment: both conversion Ω seeds and the integer-forged universal region remain. An
-unknown producer makes the origin row incomplete while retaining any compatible positive origins.
+points-to assignment: both conversion Ω seeds and the provenance-separated integer-forged region
+remain. An unknown producer makes the origin row incomplete while retaining any compatible
+positive origins.
 
 This contract has a narrow theoretical soundness hole: low-level code may deliberately compute a
 relative function-address integer and later reconstruct and call the function, either locally or
@@ -668,8 +670,8 @@ ordinary copy/store/load/GEP constraints may add named allocations or other regi
 contents. Merely passing unrelated pointer arguments to the same external call does not
 equate those pointer values. This preserves every external origin while preventing argv,
 external returns, and unrelated client addresses from aliasing solely because all crossed an
-Ω boundary. Integer-forged pointers retain a separate universal marker and therefore never
-narrow module-wide mod/ref.
+Ω boundary. Integer-forged pointers retain a distinct region identity but not an absorbing
+universal marker.
 
 Boundary seeding is build-mode aware. Executable mode treats `main` and its entry arguments
 as the program boundary while retaining callbacks whose addresses flow to external code.
@@ -687,8 +689,11 @@ and memset operands, mixed or cross-function joins, stores as a value, all other
 `ptrtoint`, initializer capture, export, unsupported producers, and unknown operations expose every
 root they can carry. Thus every admitted use of an unexposed global address is proven
 non-capturing and non-publishing; class-unification side effects alone do not justify including the
-global in a finite `pointee_globals` set. Universal external rows bypass the filter. Inline
-assembly with modeled operands seeds Ω only from its pointer-capable operands and results, so
+global in a finite `pointee_globals` set. Integer-forged rows go through this filter and are then
+unioned with every global whose address escapes externally. The union uses external escape rather
+than the narrower address-escape bit so an exported library global is included even when its only
+in-module uses are direct. Inline assembly with modeled operands seeds Ω only from its
+pointer-capable operands and results, so
 globals whose address-flow closure is disjoint remain filtered. Assembly that embeds symbol
 references or otherwise has no bounded modeled storage operand records module-wide violation
 exposure and bypasses the filter. When candidates are removed, `pointee_globals_unfiltered`
@@ -696,10 +701,10 @@ retains the original class envelope for differential checks.
 Post-filter node resolutions also carry non-authoritative `pointee_provenance` diagnostics. The
 solver accumulates whether the surviving class involved direct address flow, scalar/unknown
 payload flow, by-value aggregate binding, memory merging, or call/return merging, then adds the
-finite-external or universal-origin classification. High-fanout ModRef rows append these labels to
-their detail string; unknown external rows do the same. Universal rows additionally append the
-sorted exact IntToPtr seed support as `universal_sources`, preserving overlapping sources rather
-than selecting one explanation. This is diagnostic provenance only. When filtering changed the class envelope,
+finite-external classification. High-fanout ModRef rows append these labels to their detail string;
+unknown external rows do the same. Forged rows also report `escaped_union=N`, including zero, so
+the class-only and explicit-union portions remain measurable without propagating exact seed sets.
+This is diagnostic provenance only. When filtering changed the class envelope,
 the detail also reports `prefilter_pointee_count` and `address_filtered_count`. The labels diagnose
 where precision was lost; they are intentionally excluded from every soundness guard and
 eligibility predicate.

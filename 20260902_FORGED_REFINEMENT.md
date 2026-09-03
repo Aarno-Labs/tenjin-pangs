@@ -1,8 +1,14 @@
 # Forged-Pointer Refinement: Bounding Universal Mod/Ref by Address Exposure
 
 Date: 2026-09-02
-Status: proposal. Follows `20260902_STEENS_ONEHOP.md` and the two measurement reports under
+Status: implemented and evaluated. Production results are in
+`ju_out/forged_refinement_20260902/REPORT.md`. Follows `20260902_STEENS_ONEHOP.md` and the two measurement reports under
 `ju_out/steens_onehop_20260902/` and `ju_out/universal_closure_20260902/`.
+
+Implementation note: R1b retains one non-serialized `external_escaped_union` boolean. Removing
+every selector, as the original text proposed, cannot preserve the R1 distinction between forged
+external rows (which union escaped globals) and plain external rows (whose union is deferred).
+Exact source sets and all universal diagnostics were removed as planned.
 
 ## 0. Summary
 

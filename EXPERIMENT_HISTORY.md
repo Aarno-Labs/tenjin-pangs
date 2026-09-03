@@ -713,3 +713,29 @@ only three globals from unhandled to atomic, leaving 37 of 40 unhandled. Full re
 `ju_out/universal_closure_20260902/REPORT.md`. Andersen was coarser than final Steensgaard external
 facts at 198 nodes in 13 modules. Full results and the soundness audit are in
 `ju_out/steens_onehop_20260902/REPORT.md`.
+
+### Forged-pointer scope bounded by address exposure (2026-09-02)
+
+The universal ModRef contract was replaced by a finite forged-pointer scope: the address-exposed
+members of the pointee class, explicitly unioned with every externally escaped global. Exact
+`universal_sources` propagation and the universal marker were then removed; a cheap internal
+boolean remains solely to request that API-level union, distinguishing forged external flow from
+ordinary external flow. SQLite's shared set is 71 globals (53 filtered class members plus 18
+escaped outsiders), not the proposal's projected maximum of 69 because `escape_external` also
+includes the exported mutable `sqlite3_data_directory` and `sqlite3_temp_directory`.
+
+All 118 combinations in the 59-module Steensgaard/Andersen sweep completed. Every final module
+had zero module-wide rows, all Steensgaard unknown-row counts matched baseline, and the largest
+finite forged sets were 2,075 globals on Vim and 5,337 on OpenSSL. SQLite kept its 91,618-node
+Andersen fallback, gained 22 complete access sets and three atomic dispositions
+(`randomnessPid`, `sqlite3TreeTrace`, `sqlite3WhereTrace`), and retained 37/40 unhandled globals.
+Violation-tainted globals fell from 27 to 24 rather than 22: four old false positives disappeared,
+but explicitly unioning the exported `sqlite3_data_directory` added one conservative attribution.
+
+Removing exact source sets cut SQLite content pushes from 473,120 to 209,562, worklist pops from
+141,617 to 96,642, and Andersen steps from 125,593 to 108,304 without changing normalized R1
+artifacts. Corpus-wide Steensgaard content pushes fell 33.5%. Full results, transition audit, and
+compact two-stage data are in `ju_out/forged_refinement_20260902/REPORT.md`. All 460 workspace
+tests and both debug SQLite stages passed. The 59-module differential sweep passed 53 modules; its
+six jq/Lemon/Vim failures predate this change and are recorded with baseline evidence in the
+report.
