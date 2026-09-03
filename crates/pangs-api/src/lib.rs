@@ -4344,6 +4344,30 @@ impl ModRefBuilder {
         self.maybe_print_profile("progress");
     }
 
+    fn note_prefiltered_duplicates(
+        &mut self,
+        row: &ModRef,
+        phase: ModRefSourcePhase,
+        duplicate_count: u64,
+    ) {
+        if duplicate_count == 0 {
+            return;
+        }
+        if let Some(key) = compact_modref_key(row) {
+            self.note_compact_modref_fanout_count(key, Some(phase), duplicate_count);
+        } else {
+            let key = ModRefFanoutKey {
+                func: row.func,
+                global: row.global.clone(),
+                access_rank: access_rank(row.access),
+                via_rank: via_rank(row.via),
+            };
+            self.note_modref_fanout_count(key, Some(phase), duplicate_count);
+        }
+        self.metrics.phase_mut(phase).duplicate += duplicate_count;
+        self.maybe_print_profile("progress");
+    }
+
     fn note_high_fanout_fallback(&mut self, collapsed_rows: u64) {
         self.metrics.high_fanout_fallbacks += 1;
         self.metrics.high_fanout_fallback_rows = self
@@ -5219,6 +5243,126 @@ fn flush_local_pointer_access_rows(
     }
 }
 
+fn flush_memcpy_pointer_access_rows(
+    modrefs: &mut ModRefBuilder,
+    func: Option<FuncId>,
+    memcpy_accesses: &mut LocalPointerAccessRows,
+    node_summaries: &[Option<ModRefNodeSummary<'_>>],
+    access_profile: &mut PointerAccessEmitterProfile,
+    high_fanout_limit: usize,
+) {
+    // A module can contain many copies through the same solved address. Expanding each occurrence
+    // separately is quadratic in practice on large carrier classes (notably Vim), even though the
+    // exported ModRef fact is identical. Coalesce per function/address and charge the suppressed
+    // occurrences to the duplicate counters so profiling retains the original work estimate.
+    let Some(func) = func else {
+        return;
+    };
+    let phase = ModRefSourcePhase::MemsetMemcpy;
+    for (idx, row) in memcpy_accesses.drain_touched() {
+        let address_node = (idx / 4) as u32;
+        let key = LocalPointerAccessKey {
+            func: func.0,
+            address_node,
+            access_rank: ((idx % 4) / 2) as u8,
+            suppress_direct_symbol: idx % 2 == 1,
+        };
+        let Some(Some(summary)) = node_summaries.get(key.address_node as usize) else {
+            continue;
+        };
+        let access = match key.access_rank {
+            0 => Access::Ref,
+            _ => Access::Mod,
+        };
+        let source = match access {
+            Access::Ref => "edge:memcpy_src",
+            Access::Mod => "edge:memcpy_dst",
+        };
+        let unknown_reason = match access {
+            Access::Ref => "omega_load",
+            Access::Mod => "omega_store",
+        };
+        let fanout = summary
+            .class_pointee_global_ids
+            .iter()
+            .filter(|&&gid| {
+                !(key.suppress_direct_symbol && summary.direct_symbol_global == Some(gid))
+            })
+            .count();
+        access_profile.observe(key, summary, fanout, row.count);
+        if high_fanout_limit > 0 && fanout > high_fanout_limit {
+            push_high_fanout_pointer_modref_fallback(
+                modrefs,
+                func,
+                access,
+                row.witness,
+                summary,
+                modref_stationarity_pointees(summary, key.suppress_direct_symbol),
+                fanout,
+                row.count,
+                phase,
+                source,
+            );
+            continue;
+        }
+        for &gid in summary.class_pointee_global_ids.iter() {
+            if key.suppress_direct_symbol && summary.direct_symbol_global == Some(gid) {
+                continue;
+            }
+            modrefs.push_named_empty(
+                func,
+                gid,
+                access,
+                Via::Aliased,
+                row.witness.as_deref(),
+                Some(phase),
+            );
+            modrefs.note_named_empty_prefiltered_duplicates(
+                func,
+                gid,
+                access,
+                Via::Aliased,
+                phase,
+                row.count.saturating_sub(1),
+            );
+        }
+
+        if summary.external {
+            let mut detail = modref_detail_with_external_suffix_and_pointee_count(
+                source,
+                summary.external_source_suffix.as_deref(),
+                summary.pointee_global_count,
+            );
+            append_address_filter_counts(
+                &mut detail,
+                summary.class_pointee_global_count,
+                summary.unfiltered_pointee_global_count,
+            );
+            append_escaped_union_count(
+                &mut detail,
+                summary.external_escaped_union,
+                summary.escaped_union_count,
+            );
+            append_pointee_provenance(&mut detail, &summary.pointee_provenance);
+            let unknown = ModRef {
+                func,
+                global: GlobalTarget::Unknown(unknown_reason.to_string()),
+                access,
+                via: Via::Unknown,
+                witness: row.witness,
+                detail: Some(detail),
+                address_node: Some(summary.label.to_string()),
+                pointee_globals: summary.pointee_global_sample.to_vec(),
+                global_candidates: GlobalCandidateSet::Finite(Rc::clone(
+                    &summary.pointee_global_ids,
+                )),
+            };
+            modrefs.push_with_phase(unknown.clone(), Some(phase));
+            modrefs.note_prefiltered_duplicates(&unknown, phase, row.count.saturating_sub(1));
+        }
+    }
+}
+
 fn push_high_fanout_pointer_modref_fallback(
     modrefs: &mut ModRefBuilder,
     func: FuncId,
@@ -5640,6 +5784,7 @@ fn push_pointer_modrefs_from_pag(
     let mut pointee_global_cache = HashMap::new();
     let mut missing_nodes = vec![false; pag.nodes.len()];
     let mut local_accesses = LocalPointerAccessRows::new(pag.nodes.len());
+    let mut memcpy_accesses = LocalPointerAccessRows::new(pag.nodes.len());
     let mut local_rows = LocalPointerModRefRows::new(global_lookup.len());
     let mut access_profile = PointerAccessEmitterProfile::from_env(global_lookup);
     let high_fanout_limit = pointer_modref_high_fanout_limit();
@@ -5655,6 +5800,14 @@ fn push_pointer_modrefs_from_pag(
                 active_func,
                 &mut local_rows,
                 &mut local_accesses,
+                &node_summaries,
+                &mut access_profile,
+                high_fanout_limit,
+            );
+            flush_memcpy_pointer_access_rows(
+                modrefs,
+                active_func,
+                &mut memcpy_accesses,
                 &node_summaries,
                 &mut access_profile,
                 high_fanout_limit,
@@ -5741,19 +5894,6 @@ fn push_pointer_modrefs_from_pag(
                     continue;
                 }
             }
-            if phase != ModRefSourcePhase::PagPointer {
-                flush_local_pointer_access_rows(
-                    modrefs,
-                    active_func,
-                    &mut local_rows,
-                    &mut local_accesses,
-                    &node_summaries,
-                    &mut access_profile,
-                    high_fanout_limit,
-                );
-                flush_local_pointer_modref_rows(modrefs, active_func, &mut local_rows);
-            }
-
             let site_key = AccessSiteKey {
                 func,
                 access: pointer_access.access,
@@ -5784,50 +5924,15 @@ fn push_pointer_modrefs_from_pag(
                     witness.as_deref(),
                 );
             } else {
-                let fanout = summary
-                    .class_pointee_global_ids
-                    .iter()
-                    .filter(|&&gid| {
-                        !(pointer_access.suppress_direct_symbol
-                            && summary.direct_symbol_global == Some(gid))
-                    })
-                    .count();
-                if high_fanout_limit > 0 && fanout > high_fanout_limit {
-                    push_high_fanout_pointer_modref_fallback(
-                        modrefs,
-                        func,
-                        pointer_access.access,
-                        witness.clone(),
-                        summary,
-                        modref_stationarity_pointees(
-                            summary,
-                            pointer_access.suppress_direct_symbol,
-                        ),
-                        fanout,
-                        1,
-                        phase,
-                        pointer_access.detail,
-                    );
-                    continue;
-                }
-                for &gid in summary.class_pointee_global_ids.iter() {
-                    if pointer_access.suppress_direct_symbol
-                        && summary.direct_symbol_global == Some(gid)
-                    {
-                        continue;
-                    }
-                    modrefs.push_named_empty(
-                        func,
-                        gid,
-                        pointer_access.access,
-                        Via::Aliased,
-                        witness.as_deref(),
-                        Some(phase),
-                    );
-                }
+                memcpy_accesses.push(
+                    pointer_access.address_node,
+                    pointer_access.access,
+                    pointer_access.suppress_direct_symbol,
+                    witness.as_deref(),
+                );
             }
 
-            if summary.external {
+            if phase == ModRefSourcePhase::PagPointer && summary.external {
                 let mut detail = modref_detail_with_external_suffix_and_pointee_count(
                     pointer_access.detail,
                     summary.external_source_suffix.as_deref(),
@@ -5868,6 +5973,14 @@ fn push_pointer_modrefs_from_pag(
         active_func,
         &mut local_rows,
         &mut local_accesses,
+        &node_summaries,
+        &mut access_profile,
+        high_fanout_limit,
+    );
+    flush_memcpy_pointer_access_rows(
+        modrefs,
+        active_func,
+        &mut memcpy_accesses,
         &node_summaries,
         &mut access_profile,
         high_fanout_limit,
