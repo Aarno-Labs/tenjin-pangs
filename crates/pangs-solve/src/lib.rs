@@ -1891,12 +1891,15 @@ impl<'a> Solver<'a> {
                         // certified empty address has no allocation storage class to unify.
                         continue;
                     }
-                    let width =
-                        (!edge.access_extent_unknown).then_some(edge.access_bytes.unwrap_or(0));
-                    let storage = self.storage_class_for_address(edge.dst, width, true);
+                    // Scalar stores have no points-to payload. ModRef and runtime-written
+                    // accounting consume the PAG edge directly, so avoid materializing a storage
+                    // class which this solver arm would immediately discard.
                     if !self.node_may_carry_pointer(edge.src) {
                         continue;
                     }
+                    let width =
+                        (!edge.access_extent_unknown).then_some(edge.access_bytes.unwrap_or(0));
+                    let storage = self.storage_class_for_address(edge.dst, width, true);
                     if self.node_is_proven_empty(edge.src) {
                         self.set_empty_witness(storage);
                         continue;

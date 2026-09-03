@@ -1057,6 +1057,7 @@ enum NodeKey {
     SymbolValue(SymbolKind, usize),
     FunctionValue(usize, String),
     ExternalNonPointerWrite(usize, usize),
+    ExternalPointerWrite(usize, usize),
     ExternalStateAddress(String),
     GlobalInitValue(String),
 }
@@ -2008,7 +2009,7 @@ impl<'a> Builder<'a> {
                         | ExternalContractPolicy::NoVariadicActuals => {}
                     }
                     if !effects.is_empty() {
-                        let value = self.add_node(
+                        let read_sink = self.add_node(
                             NodeKey::ExternalNonPointerWrite(func_index, stmt_index),
                             format!(
                                 "val:{}:@external-contract-effect:{stmt_index}",
@@ -2018,6 +2019,29 @@ impl<'a> Builder<'a> {
                                 scope: owner_scope(&owner),
                             },
                         );
+                        // `%p` makes a scanf-family output pointer-bearing. Without parsing the
+                        // format, every variadic destination must admit that possibility.
+                        let pointer_write = (contract.policy == ExternalContractPolicy::Scanf)
+                            .then(|| {
+                                let value = self.add_node(
+                                    NodeKey::ExternalPointerWrite(func_index, stmt_index),
+                                    format!(
+                                        "val:{}:@external-contract-pointer-write:{stmt_index}",
+                                        owner_name(&owner)
+                                    ),
+                                    NodeKind::Value {
+                                        scope: owner_scope(&owner),
+                                    },
+                                );
+                                self.add_seed(
+                                    OmegaSeedKind::UnknownResultExternal,
+                                    SeedTarget::Node(value),
+                                    Some(owner.clone()),
+                                    loc.clone(),
+                                    Some(format!("external-contract:{callee}:pointer-write")),
+                                );
+                                value
+                            });
                         for effect in effects {
                             let (index, read, write) = match effect {
                                 ExternalArgEffect::Read(index) => (index, true, false),
@@ -2037,7 +2061,7 @@ impl<'a> Builder<'a> {
                                 self.add_memory_edge(
                                     EdgeKind::Load,
                                     argument,
-                                    value,
+                                    read_sink,
                                     owner.clone(),
                                     None,
                                     true,
@@ -2046,6 +2070,7 @@ impl<'a> Builder<'a> {
                                 );
                             }
                             if write {
+                                let value = pointer_write.unwrap_or(read_sink);
                                 let edge = self.add_memory_edge(
                                     EdgeKind::Store,
                                     value,
@@ -2270,6 +2295,7 @@ impl<'a> Builder<'a> {
                 .copied()
                 .unwrap_or(ValueKind::Unknown),
             NodeKey::ExternalNonPointerWrite(..) => ValueKind::NonPointer,
+            NodeKey::ExternalPointerWrite(..) => ValueKind::Pointer,
             NodeKey::ExternalStateAddress(_) => ValueKind::Pointer,
             NodeKey::Param(func_index, param_index) => self
                 .pir
@@ -4324,7 +4350,36 @@ mod tests {
     }
 
     #[test]
-    fn scanf_family_models_pointer_outputs_as_non_capturing_writes() {
+    fn realloc_contract_keeps_old_abstract_allocation_and_a_fresh_alternative() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"realloc-contract",
+                "functions":[
+                    {"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"call_direct","callee":"realloc","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["%old","64"],"dest":"%new"}
+                    ]},
+                    {"key":"realloc","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"body":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let callsite = &pag.callsites[0];
+        let result = callsite.result.unwrap();
+
+        assert!(!callsite.external_boundary);
+        assert!(pag.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Assign && edge.src == callsite.args[0] && edge.dst == result
+        }));
+        assert!(pag.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::AddrOf
+                && edge.dst == result
+                && matches!(pag.nodes[edge.src.0 as usize].kind, NodeKind::Object { .. })
+        }));
+    }
+
+    #[test]
+    fn scanf_family_models_pointer_outputs_as_non_capturing_external_values() {
         let pir: Pir = serde_json::from_str(
             r#"{
                 "module":"scanf-summary",
@@ -4355,11 +4410,20 @@ mod tests {
                 ) && seed.target == SeedTarget::Callsite(callsite.id)
             }));
             let destination = *callsite.args.last().unwrap();
-            assert!(pag.edges.iter().any(|edge| {
+            let write = pag.edges.iter().find(|edge| {
                 edge.kind == EdgeKind::Store
                     && edge.dst == destination
                     && edge.modeled_external_write
                     && edge.access_extent_unknown
+            });
+            let write = write.expect("scanf destination write");
+            assert_eq!(
+                pag.nodes[write.src.0 as usize].value_kind,
+                ValueKind::Pointer
+            );
+            assert!(pag.omega_seeds.iter().any(|seed| {
+                seed.kind == OmegaSeedKind::UnknownResultExternal
+                    && seed.target == SeedTarget::Node(write.src)
             }));
         }
     }

@@ -94,8 +94,10 @@ certificate assembly. A contract records every synchronous client-memory read/wr
 provenance (scalar, fresh/external object, or argument alias), callback behavior, and any modeled
 retention. Standard `printf` calls are complete even for dynamic formats: pointer-valued variadic
 actuals are conservatively read/write unless `%n` is excluded, when they sharpen to read-only.
-`scanf` pointer tails are writes. Destination-returning routines such as `strncpy`, `memcpy`, and
-`realpath` preserve that alias explicitly; `strtok` retention uses a modeled library-owned slot.
+`scanf` pointer tails are writes and conservatively carry external pointer provenance because a
+dynamic format may contain `%p`. Destination-returning routines such as `strncpy`, `memcpy`, and
+`realpath` preserve that alias explicitly; `realloc` preserves the old abstract allocation plus a
+fresh null-input alternative, and `strtok` retention uses a modeled library-owned slot.
 The table trusts standard-library semantics and does not cover dynamic interposition. A
 module-defined replacement, indirect or unresolved call, name/ABI mismatch, callback-capable API,
 or unlisted function retains the normal Ω boundary and audit.
