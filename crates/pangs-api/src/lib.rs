@@ -4874,6 +4874,18 @@ struct ModRefNodeSummaryData {
 }
 
 #[derive(Debug, Clone)]
+struct CachedPointeeGlobals {
+    class_ids: Rc<[GlobalId]>,
+    ids: Rc<[GlobalId]>,
+    bits: Rc<[u64]>,
+    sample: Rc<[String]>,
+    count: usize,
+    class_count: usize,
+    escaped_union_count: usize,
+    has_string: bool,
+}
+
+#[derive(Debug, Clone)]
 struct ModRefNodeSummary<'a> {
     label: &'a str,
     data: Rc<ModRefNodeSummaryData>,
@@ -5471,80 +5483,74 @@ fn build_modref_node_summary_data(
     resolution: &NodeResolution,
     global_lookup: &HashMap<String, GlobalId>,
     escaped_external_globals: &EscapedExternalGlobals,
-    pointee_global_cache: &mut HashMap<((usize, usize), bool), (Rc<[GlobalId]>, Rc<[u64]>)>,
+    pointee_global_cache: &mut HashMap<((usize, usize), bool), CachedPointeeGlobals>,
 ) -> ModRefNodeSummaryData {
-    let class_pointee_global_ids =
-        global_ids_for_keys(resolution.pointee_globals.iter(), global_lookup);
     let cache_key = (
         resolution.pointee_globals.cache_key(),
         resolution.external_escaped_union,
     );
-    let (pointee_global_ids, pointee_global_bits) =
-        if let Some((ids, bits)) = pointee_global_cache.get(&cache_key) {
-            (Rc::clone(ids), Rc::clone(bits))
-        } else {
-            let mut ids = class_pointee_global_ids.to_vec();
-            let mut bits = global_target_bits(global_lookup.len(), ids.iter().copied()).to_vec();
-            if resolution.external_escaped_union {
-                ids.extend(escaped_external_globals.ids.iter().copied());
-                ids.sort();
-                ids.dedup();
-                for (word, escaped) in bits.iter_mut().zip(escaped_external_globals.bits.iter()) {
-                    *word |= escaped;
-                }
+    let cached = if let Some(cached) = pointee_global_cache.get(&cache_key) {
+        cached.clone()
+    } else {
+        let class_ids = Rc::<[GlobalId]>::from(global_ids_for_keys(
+            resolution.pointee_globals.iter(),
+            global_lookup,
+        ));
+        let mut ids = class_ids.to_vec();
+        let mut bits = global_target_bits(global_lookup.len(), ids.iter().copied()).to_vec();
+        if resolution.external_escaped_union {
+            ids.extend(escaped_external_globals.ids.iter().copied());
+            ids.sort();
+            ids.dedup();
+            for (word, escaped) in bits.iter_mut().zip(escaped_external_globals.bits.iter()) {
+                *word |= escaped;
             }
-            let ids = Rc::<[GlobalId]>::from(ids);
-            let bits = Rc::<[u64]>::from(bits);
-            pointee_global_cache.insert(cache_key, (Rc::clone(&ids), Rc::clone(&bits)));
-            (ids, bits)
+        }
+        let escaped_union_count = ids.len().saturating_sub(class_ids.len());
+        let mut keys = resolution
+            .pointee_globals
+            .iter()
+            .filter(|key| global_lookup.contains_key(*key))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if resolution.external_escaped_union {
+            keys.extend(escaped_external_globals.keys.iter().cloned());
+        }
+        let sample = Rc::<[String]>::from(pointee_global_sample(keys.iter(), global_lookup));
+        let cached = CachedPointeeGlobals {
+            class_ids,
+            ids: Rc::from(ids),
+            bits: Rc::from(bits),
+            sample,
+            count: keys.len(),
+            class_count: resolution.pointee_globals.len(),
+            escaped_union_count,
+            has_string: keys.iter().any(|key| looks_like_string_global_key(key)),
         };
+        pointee_global_cache.insert(cache_key, cached.clone());
+        cached
+    };
     let direct_symbol_global = label
         .strip_prefix("sym:global:")
         .and_then(|global_key| global_lookup.get(global_key).copied());
-    let mut pointee_global_keys = resolution
-        .pointee_globals
-        .iter()
-        .filter(|key| global_lookup.contains_key(*key))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if resolution.external_escaped_union {
-        pointee_global_keys.extend(escaped_external_globals.keys.iter().cloned());
-    }
-    let pointee_global_sample = Rc::<[String]>::from(pointee_global_sample(
-        pointee_global_keys.iter(),
-        global_lookup,
-    ));
-    let pointee_has_string = pointee_global_keys
-        .iter()
-        .any(|global_key| looks_like_string_global_key(global_key));
-    let class_pointee_global_count = resolution.pointee_globals.len();
+    let class_pointee_global_count = cached.class_count;
     let unfiltered_pointee_global_count = if resolution.pointee_globals_unfiltered.is_empty() {
         class_pointee_global_count
     } else {
         resolution.pointee_globals_unfiltered.len()
     };
-    let escaped_union_count = if resolution.external_escaped_union {
-        escaped_external_globals
-            .ids
-            .iter()
-            .filter(|id| !class_pointee_global_ids.contains(id))
-            .count()
-    } else {
-        0
-    };
-    let pointee_global_count = pointee_global_ids.len();
     ModRefNodeSummaryData {
         external: resolution.external,
         external_escaped_union: resolution.external_escaped_union,
-        class_pointee_global_ids,
-        pointee_global_ids,
-        pointee_global_bits,
-        pointee_global_sample,
-        pointee_global_count,
+        class_pointee_global_ids: cached.class_ids,
+        pointee_global_ids: cached.ids,
+        pointee_global_bits: cached.bits,
+        pointee_global_sample: cached.sample,
+        pointee_global_count: cached.count,
         class_pointee_global_count,
         unfiltered_pointee_global_count,
-        escaped_union_count,
-        pointee_has_string,
+        escaped_union_count: cached.escaped_union_count,
+        pointee_has_string: cached.has_string,
         external_source_suffix: resolution
             .external
             .then(|| modref_external_source_suffix(&resolution.external_sources))
