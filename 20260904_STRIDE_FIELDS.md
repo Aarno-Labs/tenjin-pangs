@@ -181,8 +181,7 @@ memory (`p = *pp; ...; *pp = p + 4`) and A alone does not stop the chain.
 - `field_of` (~L5903): a newly created cell gets `add_copy` in both directions with every
   existing cell of the same root whose location `may_alias` it, and with the root object when
   the location is `Unknown` and the root was directly accessed.
-- `note_direct_access` (~L5968): bridges root object ↔ its `Unknown` summary bidirectionally
-  under `PANGS_ANDERSEN_WHOLE_OBJECT_FIELD_BRIDGE`.
+- `note_direct_access` (~L5968): bridges root object ↔ its `Unknown` summary bidirectionally.
 - Consequence: a store to `o.f8` flows through the summary into `o.f16` (the spurious target
   of the paper's Fig. 8).
 

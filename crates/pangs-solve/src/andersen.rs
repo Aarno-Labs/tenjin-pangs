@@ -4409,58 +4409,6 @@ fn memcpy_edge_summaries_enabled_for(value: Option<&str>) -> bool {
     !matches!(value, Some("0"))
 }
 
-/// Why an object cell was accessed as a whole rather than through one of its field cells.
-///
-/// Both kinds bypass the object's `Exact`/`Lane` field cells, so both need the
-/// unknown-offset summary bridge to exchange anything with them. They are distinguished so
-/// the bridge can be enabled per family and their contributions measured separately.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum WholeObjectAccess {
-    /// A load or store whose address operand denotes the object itself.
-    DirectAccess,
-    /// An endpoint of a bulk copy.
-    BulkCopy,
-}
-
-/// Which whole-object access families create the unknown-offset summary bridge.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-struct WholeObjectBridgePolicy {
-    direct_access: bool,
-    bulk_copy: bool,
-}
-
-impl WholeObjectBridgePolicy {
-    fn enabled_for(self, access: WholeObjectAccess) -> bool {
-        match access {
-            WholeObjectAccess::DirectAccess => self.direct_access,
-            WholeObjectAccess::BulkCopy => self.bulk_copy,
-        }
-    }
-}
-
-fn whole_object_field_bridge_policy_for(value: Option<&str>) -> WholeObjectBridgePolicy {
-    match value {
-        Some("0") | Some("off") => WholeObjectBridgePolicy::default(),
-        Some("copy") => WholeObjectBridgePolicy {
-            direct_access: false,
-            bulk_copy: true,
-        },
-        Some("access") => WholeObjectBridgePolicy {
-            direct_access: true,
-            bulk_copy: false,
-        },
-        _ => WholeObjectBridgePolicy {
-            direct_access: true,
-            bulk_copy: true,
-        },
-    }
-}
-
-fn whole_object_field_bridge_policy() -> WholeObjectBridgePolicy {
-    let value = std::env::var(knobs::ENV_ANDERSEN_WHOLE_OBJECT_FIELD_BRIDGE).ok();
-    whole_object_field_bridge_policy_for(value.as_deref())
-}
-
 fn memcpy_edge_summaries_enabled() -> bool {
     let value = std::env::var(knobs::ENV_ANDERSEN_MEMCPY_EDGE_SUMMARIES).ok();
     memcpy_edge_summaries_enabled_for(value.as_deref())
@@ -5322,14 +5270,6 @@ struct Solve {
     scc_copy_edges_removed: usize,
     hybrid_points_to: bool,
     memcpy_edge_summaries: bool,
-    /// Which whole-object access families create the accessed object's unknown-offset
-    /// summary instead of only bridging to an existing one. See
-    /// `knobs::ENV_ANDERSEN_WHOLE_OBJECT_FIELD_BRIDGE`.
-    whole_object_field_bridge: WholeObjectBridgePolicy,
-    /// Objects whose summary bridge has already been installed. Kept separate from
-    /// `direct_accessed` so that an access from a disabled family cannot consume the
-    /// enabled family's one-shot installation.
-    bridged_objects: HashSet<Cell>,
 }
 
 #[derive(Debug, Default)]
@@ -5429,8 +5369,6 @@ impl Solve {
             scc_copy_edges_removed: 0,
             hybrid_points_to: hybrid_points_to_enabled(),
             memcpy_edge_summaries: memcpy_edge_summaries_enabled(),
-            whole_object_field_bridge: whole_object_field_bridge_policy(),
-            bridged_objects: HashSet::new(),
         }
     }
 
@@ -5461,7 +5399,6 @@ impl Solve {
         self.memcpy_summary_cells = HashSet::new();
         self.worklist = Vec::new();
         self.queued = HashSet::new();
-        self.bridged_objects = HashSet::new();
     }
 
     fn allocate_cell(&mut self) -> Cell {
@@ -5839,7 +5776,7 @@ impl Solve {
         // The baseline marks every newly discovered destination before entering its
         // possibly-empty source loop. Preserve that asymmetric side effect exactly.
         for &destination in &delta.new_destinations {
-            self.note_direct_access(destination, WholeObjectAccess::BulkCopy);
+            self.note_direct_access(destination);
         }
 
         let (summary, active, all_destinations, all_sources) = {
@@ -5863,7 +5800,7 @@ impl Solve {
             self.memcpys[index].summary_active = true;
             self.memcpy_summary_sites = self.memcpy_summary_sites.saturating_add(1);
             for source in all_sources {
-                self.note_direct_access(source, WholeObjectAccess::BulkCopy);
+                self.note_direct_access(source);
                 self.add_memcpy_summary_edge(source, summary);
             }
             for destination in all_destinations {
@@ -5873,7 +5810,7 @@ impl Solve {
         }
 
         for source in delta.new_sources {
-            self.note_direct_access(source, WholeObjectAccess::BulkCopy);
+            self.note_direct_access(source);
             self.add_memcpy_summary_edge(source, summary);
         }
         for destination in delta.new_destinations {
@@ -5954,31 +5891,22 @@ impl Solve {
         self.field_of(base, FieldLocation::Unknown)
     }
 
-    fn note_direct_access(&mut self, base: Cell, access: WholeObjectAccess) {
+    fn note_direct_access(&mut self, base: Cell) {
         if self.is_external(base)
             || self.field_base.contains_key(&base)
             || self.unknown_field_base.contains_key(&base)
         {
             return;
         }
-        let first_access = self.direct_accessed.insert(base);
-        if self.whole_object_field_bridge.enabled_for(access) && self.bridged_objects.insert(base) {
-            // `unknown_field_of` materializes the summary when absent, and `field_of` aliases
-            // a newly created `Unknown` location with every field of `base` that already
-            // exists. The explicit bridge below still matters when the summary was already
-            // present, since `field_of` only installs it at creation time.
-            let summary = self.unknown_field_of(base);
-            self.add_copy(base, summary);
-            self.add_copy(summary, base);
+        if !self.direct_accessed.insert(base) {
             return;
         }
-        if !first_access {
-            return;
-        }
-        if let Some(&summary) = self.unknown_fields.get(&base) {
-            self.add_copy(base, summary);
-            self.add_copy(summary, base);
-        }
+        // Materialize the summary when absent. `field_of` aliases a newly created
+        // `Unknown` location with every field of `base` that already exists. Keep the
+        // explicit bridge for an already-present summary as well.
+        let summary = self.unknown_field_of(base);
+        self.add_copy(base, summary);
+        self.add_copy(summary, base);
     }
 
     fn copy_edge_pairs(&self) -> Vec<(Cell, Cell)> {
@@ -6654,7 +6582,7 @@ impl Solve {
                     .saturating_add(ps.len().saturating_mul(pts_delta.len()));
                 for p in ps {
                     for o in &pts_delta {
-                        self.note_direct_access(o, WholeObjectAccess::DirectAccess);
+                        self.note_direct_access(o);
                         self.add_copy(o, p);
                     }
                 }
@@ -6671,7 +6599,7 @@ impl Solve {
                     .saturating_add(ps.len().saturating_mul(all_pts.len()));
                 for &p in &ps {
                     for &o in &all_pts {
-                        self.note_direct_access(o, WholeObjectAccess::DirectAccess);
+                        self.note_direct_access(o);
                         self.add_copy(o, p);
                     }
                 }
@@ -6685,7 +6613,7 @@ impl Solve {
                     .saturating_add(qs.len().saturating_mul(pts_delta.len()));
                 for (q, omega_source) in qs {
                     for o in &pts_delta {
-                        self.note_direct_access(o, WholeObjectAccess::DirectAccess);
+                        self.note_direct_access(o);
                         if self.is_external(q) {
                             self.add_pts_with_source(o, q, omega_source.as_deref());
                         } else {
@@ -6706,7 +6634,7 @@ impl Solve {
                     .saturating_add(qs.len().saturating_mul(all_pts.len()));
                 for (q, omega_source) in &qs {
                     for &o in &all_pts {
-                        self.note_direct_access(o, WholeObjectAccess::DirectAccess);
+                        self.note_direct_access(o);
                         if self.is_external(*q) {
                             self.add_pts_with_source(o, *q, omega_source.as_deref());
                         } else {
@@ -6775,9 +6703,9 @@ impl Solve {
                                 .saturating_mul(delta.all_sources.len()),
                         );
                     for &od in &delta.new_destinations {
-                        self.note_direct_access(od, WholeObjectAccess::BulkCopy);
+                        self.note_direct_access(od);
                         for &os in &delta.all_sources {
-                            self.note_direct_access(os, WholeObjectAccess::BulkCopy);
+                            self.note_direct_access(os);
                             self.add_copy(os, od);
                         }
                     }
@@ -6801,9 +6729,9 @@ impl Solve {
                                 .saturating_mul(delta.new_sources.len()),
                         );
                     for &od in &delta.old_destinations {
-                        self.note_direct_access(od, WholeObjectAccess::BulkCopy);
+                        self.note_direct_access(od);
                         for &os in &delta.new_sources {
-                            self.note_direct_access(os, WholeObjectAccess::BulkCopy);
+                            self.note_direct_access(os);
                             self.add_copy(os, od);
                         }
                     }
@@ -6841,9 +6769,8 @@ mod tests {
     use super::{
         finish_andersen_controlled, hybrid_points_to_enabled_for,
         memcpy_edge_summaries_enabled_for, solve_andersen, solve_andersen_with_overrides,
-        whole_object_field_bridge_policy_for, AndersenControls, Cell, ExternalRegion,
-        HybridPointSet, PointSet, RefinedPointeeGlobalInterner, Refiner, Solve, WholeObjectAccess,
-        WholeObjectBridgePolicy,
+        AndersenControls, Cell, ExternalRegion, HybridPointSet, PointSet,
+        RefinedPointeeGlobalInterner, Refiner, Solve,
     };
     use crate::{solve_steensgaard, FieldLocation, PointsToMaterialization};
 
@@ -7618,27 +7545,6 @@ mod tests {
     }
 
     #[test]
-    fn whole_object_field_bridge_policy_selects_access_families() {
-        for value in [None, Some("1"), Some("access")] {
-            let policy = whole_object_field_bridge_policy_for(value);
-            assert!(
-                policy.enabled_for(WholeObjectAccess::DirectAccess),
-                "{value:?}"
-            );
-        }
-        for value in [Some("0"), Some("off")] {
-            assert_eq!(
-                whole_object_field_bridge_policy_for(value),
-                WholeObjectBridgePolicy::default(),
-                "{value:?}"
-            );
-        }
-        let copy = whole_object_field_bridge_policy_for(Some("copy"));
-        assert!(copy.enabled_for(WholeObjectAccess::BulkCopy));
-        assert!(!copy.enabled_for(WholeObjectAccess::DirectAccess));
-    }
-
-    #[test]
     fn whole_object_access_exchanges_facts_with_its_field_cells() {
         // A whole-object store writes the root cell; a constant-offset read uses a distinct
         // field cell. Without the bridge the two never exchange anything, so the field read
@@ -7646,7 +7552,7 @@ mod tests {
         let mut solve = Solve::new(6, false);
         let object = 2;
         let field = solve.field_of(object, FieldLocation::Exact(0));
-        solve.note_direct_access(object, WholeObjectAccess::DirectAccess);
+        solve.note_direct_access(object);
         solve.add_pts(object, 4);
         solve.run();
         assert!(
@@ -7672,30 +7578,6 @@ mod tests {
             !call.unknown_callee,
             "site retained its omega marker: {call:?}"
         );
-    }
-
-    #[test]
-    fn whole_object_bridge_is_not_suppressed_by_a_prior_other_family_access() {
-        // A disabled-family access records `direct_accessed` but must not consume the
-        // enabled family's one-shot bridge installation.
-        let mut solve = Solve::new(6, false);
-        solve.whole_object_field_bridge = WholeObjectBridgePolicy {
-            direct_access: false,
-            bulk_copy: true,
-        };
-        let object = 2;
-        let field = solve.field_of(object, FieldLocation::Exact(0));
-        solve.add_pts(field, 3);
-        solve.note_direct_access(object, WholeObjectAccess::DirectAccess);
-        assert!(solve.unknown_fields.get(&object).is_none());
-        solve.note_direct_access(object, WholeObjectAccess::BulkCopy);
-        solve.run();
-        let summary = *solve
-            .unknown_fields
-            .get(&object)
-            .expect("bulk-copy access materializes the unknown-offset summary");
-        assert!(solve.points_to(summary).unwrap().contains(&3));
-        assert!(solve.points_to(object).unwrap().contains(&3));
     }
 
     #[test]

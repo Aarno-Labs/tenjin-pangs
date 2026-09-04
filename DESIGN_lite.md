@@ -411,11 +411,10 @@ location for that root; a whole-object access is likewise bridged to that summar
 **materializes it when absent**. Both access families that bypass field cells — a direct
 load/store through the object, and a bulk-copy endpoint — install that bridge, so an
 aggregate copy delivers its contents to the destination's fields at whole-object
-granularity. `PANGS_ANDERSEN_WHOLE_OBJECT_FIELD_BRIDGE` disables it (`0`) or selects one
-family (`access`, `copy`) for ablation. Until 2026-08-24 the bridge fired only when a
-dynamic GEP had already created the summary, so an object whose GEPs all had constant
-offsets exchanged nothing between its root cell and its fields; the consequences are
-recorded in [EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md).
+granularity. Until 2026-08-24 the bridge fired only when a dynamic GEP had already
+created the summary, so an object whose GEPs all had constant offsets exchanged nothing
+between its root cell and its fields; the consequences are recorded in
+[EXPERIMENT_HISTORY.md](EXPERIMENT_HISTORY.md).
 Nested GEPs canonicalize to a root-relative exact offset or lane only when that location
 occurs in the fixed PAG's finite location vocabulary. Other nested or recursive locations
 route to the root's unknown summary rather than creating an unbounded field-of-field
