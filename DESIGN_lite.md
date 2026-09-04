@@ -667,14 +667,15 @@ not silently treated as an unconstrained pointer. The contract requires that suc
 recovered, dereferenced, invoked, or published as addresses, including after memory or external
 call flow. The selected policy is recorded in the exported analysis options.
 
-This contract has a narrow theoretical soundness hole: low-level code may deliberately compute a
-relative function-address integer and later reconstruct and call the function, either locally or
-after communicating the integer outside the analyzed module. Treating that subtraction as harmless
-can hide an indirect callee or unknown incoming caller and thereby invalidate context-threading or
-localization. Numeric layout leakage, address hashing, and other integer-only observations are
-outside the supported clients and are not reasons to retain provenance recovery. Supporting
-integer-encoded callbacks would require frontend/source semantics or reinstating a stricter
-provenance-sensitive mode; bare LLVM `ptrtoint`/`sub` shape cannot distinguish the two idioms.
+The paired-pointer-difference exception above has a narrow theoretical soundness hole: low-level
+code may deliberately compute a relative function-address integer and later reconstruct and call
+the function, either locally or after communicating the integer outside the analyzed module.
+Treating that subtraction as harmless can hide an indirect callee or unknown incoming caller and
+thereby invalidate context-threading or localization. Numeric layout leakage, address hashing, and
+other integer-only observations are outside the supported clients and are not reasons to retain
+provenance recovery. Supporting integer-encoded callbacks would require frontend/source semantics
+or reinstating a stricter provenance-sensitive mode; bare LLVM `ptrtoint`/`sub` shape cannot
+distinguish the two idioms.
 
 External calls remain Ω boundaries by default.  A small exact-name summary may replace
 that boundary only when it encodes a documented, auditable pointer transfer; unlisted
