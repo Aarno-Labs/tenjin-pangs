@@ -2351,7 +2351,7 @@ fn steens_ptrtoint_marks_only_the_pointee_global_as_external() {
 }
 
 #[test]
-fn assume_tags_keeps_unhandled_ptrtoint_source_module_local() {
+fn assume_tags_keeps_unhandled_ptrtoint_source_external() {
     let pir = Pir::from_path(m1_4_fixture("ptrtoint_escape.pir.json")).unwrap();
     let analysis = Analysis::run(
         &pir,
@@ -2365,8 +2365,63 @@ fn assume_tags_keeps_unhandled_ptrtoint_source_module_local() {
     .unwrap();
 
     let global = analysis.lookup_global("@G").unwrap();
-    assert_eq!(analysis.escape(global), EscapeStatus::Module);
-    assert!(analysis.globals()[global].never_written);
+    assert_eq!(analysis.escape(global), EscapeStatus::External);
+    assert!(!analysis.globals()[global].never_written);
+}
+
+#[test]
+fn assume_tags_exports_nonlocal_assumption_audit_counts() {
+    let pir = Pir {
+        module: "assume-tags-audit".into(),
+        source: None,
+        lowering: Default::default(),
+        target: Some(pangs_pir::TargetInfo {
+            triple: "x86_64".into(),
+            data_layout: "e-p:64:64".into(),
+            supported_atomic_widths: vec![8, 16, 32, 64],
+        }),
+        functions: vec![Func {
+            key: "main".into(),
+            sig: sig(AbiClass::Integer, vec![]),
+            param_names: vec![],
+            file: None,
+            line: None,
+            external: false,
+            exported: false,
+            address_taken: false,
+            body: vec![
+                Stmt::IntToPtr {
+                    dest: "tag".into(),
+                    source: "bits".into(),
+                    integer_bits: Some(64),
+                    pointer_bits: Some(64),
+                    pointer_address_space: Some(0),
+                    provenance_trace: None,
+                    loc: None,
+                },
+                Stmt::Return {
+                    value: Some("tag".into()),
+                    loc: None,
+                },
+            ],
+        }],
+        globals: vec![],
+        global_init: vec![],
+    };
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            integer_pointer_policy: IntegerPointerPolicy::AssumeTags,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(analysis.metrics().assumed_integer_pointer_tags, 1);
+    assert_eq!(analysis.metrics().assumed_tag_returned, 1);
+    assert_eq!(analysis.metrics().assumed_tag_crosses_memory, 0);
+    assert_eq!(analysis.metrics().assumed_tag_crosses_call, 0);
 }
 
 #[test]

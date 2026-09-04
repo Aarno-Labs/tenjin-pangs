@@ -23,12 +23,13 @@ pub struct PagOpts {
     pub safe_indirect_vararg_callsites: BTreeSet<String>,
 }
 
-/// Policy for otherwise fail-closed LLVM `ptrtoint` and `inttoptr` operations.
+/// Policy for otherwise fail-closed LLVM integer/pointer operations.
 ///
-/// `AssumeTags` is an explicit supported-program contract: conversions not covered by the
-/// existing comparison, lossless-round-trip, or reserved-sentinel proofs are treated as
-/// non-address tags. In particular, the reconstructed pointer has a positive empty witness;
-/// it is not merely left without an Ω seed.
+/// `AssumeTags` is an explicit supported-program contract. Otherwise-unhandled `ptrtoint`
+/// remains conservative. An `inttoptr` with a recovered pointer origin or a function-local
+/// address-sensitive use also remains conservative; other conversions are treated as non-address
+/// tags. In particular, the reconstructed pointer has a positive empty witness rather than merely
+/// being left without an Ω seed. Memory, call, and return crossings are counted audit boundaries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegerPointerPolicy {
@@ -502,6 +503,21 @@ pub struct PagMetrics {
     pub direct_calls: usize,
     pub indirect_calls: usize,
     pub omega_seeds: usize,
+    /// `inttoptr` values certified empty by the explicit `assume-tags` contract after all
+    /// conservative vetoes have run.
+    #[serde(default)]
+    pub assumed_integer_pointer_tags: usize,
+    /// Relaxed values stored into memory. These are audit-only because this first refinement
+    /// deliberately does not follow the value through memory.
+    #[serde(default)]
+    pub assumed_tag_crosses_memory: usize,
+    /// Relaxed values passed as call arguments. These are audit-only because this first
+    /// refinement deliberately does not follow the value through callees.
+    #[serde(default)]
+    pub assumed_tag_crosses_call: usize,
+    /// Relaxed values returned from their defining function.
+    #[serde(default)]
+    pub assumed_tag_returned: usize,
 }
 
 impl PagMetrics {
@@ -1195,6 +1211,111 @@ struct IntegerOriginProof {
     complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct IntToPtrUseSummary {
+    address_sensitive: bool,
+    crosses_memory: bool,
+    crosses_call: bool,
+    returned: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AssumedTagCounts {
+    values: usize,
+    crosses_memory: usize,
+    crosses_call: usize,
+    returned: usize,
+}
+
+/// Classify uses reachable from each `inttoptr` result through function-local SSA copies.
+///
+/// This intentionally stops at memory, call, and return boundaries. Those uses are recorded for
+/// auditing but do not veto `assume-tags`; following them precisely is the substantially more
+/// expensive refinement that this policy is intended to avoid. Direct address uses do veto the
+/// assumption: loads, stores, GEPs, memory intrinsics, indirect calls, and inline assembly can all
+/// interpret the reconstructed value as an address immediately.
+fn collect_inttoptr_local_uses(
+    scope: usize,
+    body: &[Stmt],
+    summaries: &mut BTreeMap<(usize, usize), IntToPtrUseSummary>,
+) {
+    let mut uses = BTreeMap::<&str, Vec<&Stmt>>::new();
+    for stmt in body {
+        for operand in stmt_input_operands(stmt) {
+            uses.entry(operand).or_default().push(stmt);
+        }
+    }
+
+    for (index, stmt) in body.iter().enumerate() {
+        let Stmt::IntToPtr { dest, .. } = stmt else {
+            continue;
+        };
+        let mut summary = IntToPtrUseSummary::default();
+        let mut pending = vec![dest.as_str()];
+        let mut visited = BTreeSet::new();
+        while let Some(value) = pending.pop() {
+            if !visited.insert(value) {
+                continue;
+            }
+            for user in uses.get(value).into_iter().flatten() {
+                match user {
+                    Stmt::Assign { dest, .. } => pending.push(dest),
+                    Stmt::Load { address, .. } if address == value => {
+                        summary.address_sensitive = true;
+                    }
+                    Stmt::Store {
+                        address,
+                        value: stored,
+                        ..
+                    } => {
+                        if address == value {
+                            summary.address_sensitive = true;
+                        }
+                        if stored == value {
+                            summary.crosses_memory = true;
+                        }
+                    }
+                    Stmt::Gep { base, .. } if base == value => {
+                        summary.address_sensitive = true;
+                    }
+                    Stmt::Memcpy { dst, src, .. } if dst == value || src == value => {
+                        summary.address_sensitive = true;
+                    }
+                    Stmt::Memset { dst, .. } if dst == value => {
+                        summary.address_sensitive = true;
+                    }
+                    Stmt::CallDirect { args, .. } if args.iter().any(|arg| arg == value) => {
+                        summary.crosses_call = true;
+                    }
+                    Stmt::CallIndirect { operand, args, .. } => {
+                        if operand == value {
+                            summary.address_sensitive = true;
+                        }
+                        if args.iter().any(|arg| arg == value) {
+                            summary.crosses_call = true;
+                        }
+                    }
+                    Stmt::Unknown {
+                        operands, reason, ..
+                    } if reason.starts_with("inline_asm")
+                        && operands.iter().any(|operand| operand == value) =>
+                    {
+                        summary.address_sensitive = true;
+                    }
+                    Stmt::Return {
+                        value: Some(returned),
+                        ..
+                    } if returned == value => {
+                        summary.returned = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        summaries.insert((scope, index), summary);
+    }
+}
+
 fn is_integer_literal(value: &str) -> bool {
     let token = value.split_whitespace().last().unwrap_or(value);
     if matches!(token, "true" | "false") {
@@ -1427,6 +1548,8 @@ struct Builder<'a> {
     lossless_ptrtoint: BTreeSet<(usize, usize)>,
     pointer_integer_origin_proofs: BTreeMap<(usize, usize), IntegerOriginProof>,
     pointer_integer_origins: Vec<PointerIntegerOrigin>,
+    inttoptr_use_summaries: BTreeMap<(usize, usize), IntToPtrUseSummary>,
+    assumed_tag_counts: AssumedTagCounts,
 }
 
 impl<'a> Builder<'a> {
@@ -1447,6 +1570,7 @@ impl<'a> Builder<'a> {
         let mut lossless_inttoptr = BTreeMap::new();
         let mut lossless_ptrtoint = BTreeSet::new();
         let mut pointer_integer_origin_proofs = BTreeMap::new();
+        let mut inttoptr_use_summaries = BTreeMap::new();
         for (func_index, func) in pir.functions.iter().enumerate() {
             collect_lossless_pointer_round_trips(
                 pir,
@@ -1461,6 +1585,7 @@ impl<'a> Builder<'a> {
                 &func.body,
                 &mut pointer_integer_origin_proofs,
             );
+            collect_inttoptr_local_uses(func_index, &func.body, &mut inttoptr_use_summaries);
         }
         collect_lossless_pointer_round_trips(
             pir,
@@ -1475,6 +1600,7 @@ impl<'a> Builder<'a> {
             &pir.global_init,
             &mut pointer_integer_origin_proofs,
         );
+        collect_inttoptr_local_uses(usize::MAX, &pir.global_init, &mut inttoptr_use_summaries);
         Self {
             pir,
             opts,
@@ -1493,6 +1619,8 @@ impl<'a> Builder<'a> {
             lossless_ptrtoint,
             pointer_integer_origin_proofs,
             pointer_integer_origins: Vec::new(),
+            inttoptr_use_summaries,
+            assumed_tag_counts: AssumedTagCounts::default(),
         }
     }
 
@@ -1590,8 +1718,12 @@ impl<'a> Builder<'a> {
             self.lower_stmt(Owner::GlobalInit, usize::MAX, stmt_index, stmt);
         }
 
-        let metrics =
+        let mut metrics =
             PagMetrics::compute(&self.nodes, &self.edges, &self.callsites, &self.omega_seeds);
+        metrics.assumed_integer_pointer_tags = self.assumed_tag_counts.values;
+        metrics.assumed_tag_crosses_memory = self.assumed_tag_counts.crosses_memory;
+        metrics.assumed_tag_crosses_call = self.assumed_tag_counts.crosses_call;
+        metrics.assumed_tag_returned = self.assumed_tag_counts.returned;
 
         Pag {
             module: self.pir.module.clone(),
@@ -1696,10 +1828,7 @@ impl<'a> Builder<'a> {
             } => {
                 let src = self.operand_node(func_index, owner_scope(&owner), source);
                 self.value_node(func_index, owner_scope(&owner), dest);
-                if !comparison_only
-                    && !self.lossless_ptrtoint.contains(&(func_index, stmt_index))
-                    && self.opts.integer_pointer_policy == IntegerPointerPolicy::Conservative
-                {
+                if !comparison_only && !self.lossless_ptrtoint.contains(&(func_index, stmt_index)) {
                     self.add_seed(
                         OmegaSeedKind::PtrToInt,
                         SeedTarget::Node(src),
@@ -1735,38 +1864,56 @@ impl<'a> Builder<'a> {
                     *pointer_address_space,
                 ) {
                     self.nodes[dst.0 as usize].has_empty_witness = true;
-                } else if self.opts.integer_pointer_policy == IntegerPointerPolicy::AssumeTags {
-                    // This is intentionally stronger than omitting the Ω seed. The explicit
-                    // tag contract proves that this value cannot name an allocation or function
-                    // object, so consumers can distinguish it from an unmodelled pointer.
-                    self.nodes[dst.0 as usize].has_empty_witness = true;
                 } else {
-                    if let Some(proof) = self
+                    let proof = self
                         .pointer_integer_origin_proofs
                         .get(&(func_index, stmt_index))
-                        .cloned()
-                    {
-                        let sources = proof
-                            .sources
-                            .iter()
-                            .map(|source| {
-                                self.operand_node(func_index, owner_scope(&owner), source)
-                            })
-                            .collect();
-                        self.pointer_integer_origins.push(PointerIntegerOrigin {
-                            destination: dst,
-                            sources,
-                            complete: proof.complete,
-                            owner: owner.clone(),
-                        });
+                        .cloned();
+                    let use_summary = self
+                        .inttoptr_use_summaries
+                        .get(&(func_index, stmt_index))
+                        .copied()
+                        .unwrap_or_default();
+                    let assume_tag = self.opts.integer_pointer_policy
+                        == IntegerPointerPolicy::AssumeTags
+                        && proof.is_none()
+                        && !use_summary.address_sensitive;
+                    if assume_tag {
+                        // This is intentionally stronger than omitting the Ω seed. The explicit
+                        // tag contract proves that this value cannot name an allocation or
+                        // function object, so consumers can distinguish it from an unmodelled
+                        // pointer. Nonlocal uses remain an explicit, counted assumption boundary.
+                        self.nodes[dst.0 as usize].has_empty_witness = true;
+                        self.assumed_tag_counts.values += 1;
+                        self.assumed_tag_counts.crosses_memory +=
+                            usize::from(use_summary.crosses_memory);
+                        self.assumed_tag_counts.crosses_call +=
+                            usize::from(use_summary.crosses_call);
+                        self.assumed_tag_counts.returned += usize::from(use_summary.returned);
+                    } else {
+                        if let Some(proof) = proof {
+                            let sources = proof
+                                .sources
+                                .iter()
+                                .map(|source| {
+                                    self.operand_node(func_index, owner_scope(&owner), source)
+                                })
+                                .collect();
+                            self.pointer_integer_origins.push(PointerIntegerOrigin {
+                                destination: dst,
+                                sources,
+                                complete: proof.complete,
+                                owner: owner.clone(),
+                            });
+                        }
+                        self.add_seed(
+                            OmegaSeedKind::IntToPtr,
+                            SeedTarget::Node(dst),
+                            Some(owner),
+                            loc.clone(),
+                            Some(dest.clone()),
+                        );
                     }
-                    self.add_seed(
-                        OmegaSeedKind::IntToPtr,
-                        SeedTarget::Node(dst),
-                        Some(owner),
-                        loc.clone(),
-                        Some(dest.clone()),
-                    );
                 }
             }
             Stmt::VarArg { dest, .. } => {
@@ -4568,7 +4715,7 @@ mod tests {
     }
 
     #[test]
-    fn assume_tags_suppresses_unhandled_integer_pointer_omega_and_certifies_empty() {
+    fn assume_tags_keeps_ptrtoint_and_pointer_origin_vetoes_but_relaxes_unknown_tags() {
         let pir: Pir = serde_json::from_str(
             r#"{
                 "module":"assume-tags",
@@ -4577,7 +4724,8 @@ mod tests {
                 "functions":[{"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
                     {"kind":"ptr_to_int","dest":"bits","source":"g","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
                     {"kind":"scalar_op","dest":"tagged","op":"xor","lhs":"bits","rhs":"1"},
-                    {"kind":"int_to_ptr","dest":"tag","source":"tagged","integer_bits":64,"pointer_bits":64,"pointer_address_space":0}
+                    {"kind":"int_to_ptr","dest":"reconstructed","source":"tagged","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"int_to_ptr","dest":"tag","source":"unknown_integer","integer_bits":64,"pointer_bits":64,"pointer_address_space":0}
                 ]}]
             }"#,
         )
@@ -4600,20 +4748,92 @@ mod tests {
                 ..PagOpts::default()
             },
         );
-        assert!(!assumed.omega_seeds.iter().any(|seed| {
-            matches!(seed.kind, OmegaSeedKind::PtrToInt | OmegaSeedKind::IntToPtr)
+        assert!(assumed
+            .omega_seeds
+            .iter()
+            .any(|seed| seed.kind == OmegaSeedKind::PtrToInt));
+        let reconstructed = assumed
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:main:reconstructed")
+            .expect("reconstructed destination node");
+        assert!(assumed.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::IntToPtr
+                && seed.target == SeedTarget::Node(reconstructed.id)
         }));
-        assert!(assumed.pointer_integer_origins.is_empty());
+        assert_eq!(assumed.pointer_integer_origins.len(), 1);
         let tag = assumed
             .nodes
             .iter()
             .find(|node| node.label == "val:main:tag")
             .expect("tag destination node");
         assert!(tag.has_empty_witness);
+        assert_eq!(assumed.metrics.assumed_integer_pointer_tags, 1);
         assert_eq!(
             allocation_storage_roots(&pir, &assumed).states[tag.id.0 as usize],
             StorageRootState::ProvenEmpty
         );
+    }
+
+    #[test]
+    fn assume_tags_vetoes_local_address_use_and_audits_nonlocal_boundaries() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"assume-tags-uses",
+                "target":{"triple":"x86_64","data_layout":"e-p:64:64","supported_atomic_widths":[8,16,32,64]},
+                "functions":[
+                    {"key":"main","sig":{"ret":{"class":"integer"},"params":[]},"body":[
+                        {"kind":"int_to_ptr","dest":"address","source":"address_bits","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                        {"kind":"assign","dest":"address_copy","sources":["address"]},
+                        {"kind":"load","dest":"loaded","address":"address_copy"},
+                        {"kind":"int_to_ptr","dest":"callee","source":"callee_bits","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                        {"kind":"call_indirect","operand":"callee","sig":{"ret":{"class":"void"},"params":[]},"args":[]},
+                        {"kind":"int_to_ptr","dest":"asm_address","source":"asm_bits","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                        {"kind":"unknown","op":"call","operands":["asm_address"],"reason":"inline_asm"},
+                        {"kind":"int_to_ptr","dest":"stored","source":"stored_tag","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                        {"kind":"store","address":"slot","value":"stored"},
+                        {"kind":"int_to_ptr","dest":"called","source":"called_tag","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                        {"kind":"call_direct","callee":"sink","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["called"]},
+                        {"kind":"int_to_ptr","dest":"returned","source":"returned_tag","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                        {"kind":"return","value":"returned"}
+                    ]},
+                    {"key":"sink","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"body":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(
+            &pir,
+            &PagOpts {
+                integer_pointer_policy: IntegerPointerPolicy::AssumeTags,
+                ..PagOpts::default()
+            },
+        );
+        let node = |dest: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == format!("val:main:{dest}"))
+                .unwrap_or_else(|| panic!("missing {dest}"))
+        };
+
+        for dest in ["address", "callee", "asm_address"] {
+            let address = node(dest);
+            assert!(!address.has_empty_witness, "{dest}");
+            assert!(
+                pag.omega_seeds.iter().any(|seed| {
+                    seed.kind == OmegaSeedKind::IntToPtr
+                        && seed.target == SeedTarget::Node(address.id)
+                }),
+                "{dest}"
+            );
+        }
+        for dest in ["stored", "called", "returned"] {
+            assert!(node(dest).has_empty_witness, "{dest}");
+        }
+        assert_eq!(pag.metrics.assumed_integer_pointer_tags, 3);
+        assert_eq!(pag.metrics.assumed_tag_crosses_memory, 1);
+        assert_eq!(pag.metrics.assumed_tag_crosses_call, 1);
+        assert_eq!(pag.metrics.assumed_tag_returned, 1);
     }
 
     #[test]

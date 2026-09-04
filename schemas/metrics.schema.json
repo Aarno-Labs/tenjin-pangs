@@ -177,6 +177,22 @@
       "type": "integer",
       "minimum": 0
     },
+    "assumed_integer_pointer_tags": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "assumed_tag_crosses_memory": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "assumed_tag_crosses_call": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "assumed_tag_returned": {
+      "type": "integer",
+      "minimum": 0
+    },
     "mutable_globals_total": {
       "type": "integer",
       "minimum": 0

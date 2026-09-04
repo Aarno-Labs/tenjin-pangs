@@ -568,6 +568,14 @@ pub struct Metrics {
     pub callsites: usize,
     pub call_edges: usize,
     pub audit_findings: usize,
+    #[serde(default)]
+    pub assumed_integer_pointer_tags: usize,
+    #[serde(default)]
+    pub assumed_tag_crosses_memory: usize,
+    #[serde(default)]
+    pub assumed_tag_crosses_call: usize,
+    #[serde(default)]
+    pub assumed_tag_returned: usize,
     pub mutable_globals_total: usize,
     pub in_rewritable_components: usize,
     pub partition_count: usize,
@@ -1058,6 +1066,10 @@ impl Analysis {
         let mut icall_fsa_census = BTreeMap::<CallsiteId, IcallFsaCensus>::new();
         let mut external_policy_inputs = None;
         let mut pag_build_us = 0;
+        let mut assumed_integer_pointer_tags = 0;
+        let mut assumed_tag_crosses_memory = 0;
+        let mut assumed_tag_crosses_call = 0;
+        let mut assumed_tag_returned = 0;
         let mut solve_us = 0;
         let address_taken: Vec<_> = module
             .functions
@@ -1578,6 +1590,10 @@ impl Analysis {
                         &registry_labels,
                     );
                 }
+                assumed_integer_pointer_tags = pag.metrics.assumed_integer_pointer_tags;
+                assumed_tag_crosses_memory = pag.metrics.assumed_tag_crosses_memory;
+                assumed_tag_crosses_call = pag.metrics.assumed_tag_crosses_call;
+                assumed_tag_returned = pag.metrics.assumed_tag_returned;
                 solver_metrics = Some(solved.metrics.clone());
                 let solver_postprocess_started = Instant::now();
                 let escaped_external_globals = build_escaped_external_globals(
@@ -1983,6 +1999,10 @@ impl Analysis {
             globals_with_complete_initval: initval_report.complete_globals.len(),
             initval_stable_globals: initval_report.initval_stable_globals.len(),
             audit_findings: findings.len(),
+            assumed_integer_pointer_tags,
+            assumed_tag_crosses_memory,
+            assumed_tag_crosses_call,
+            assumed_tag_returned,
             mutable_globals_total,
             in_rewritable_components,
             partition_count: 0,

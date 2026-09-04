@@ -659,13 +659,22 @@ positive origins.
 
 `--integer-pointer-policy=conservative` is the default and retains this fail-closed behavior.
 `--integer-pointer-policy=assume-tags` is an explicit, reproducible supported-program contract
-for controlled bitcode builds: every conversion not already handled by one of the preceding safe
-cases is assumed to carry a non-address tag. In that mode an otherwise-unhandled `ptrtoint` does
-not escape its source, and an otherwise-unhandled `inttoptr` receives `has_empty_witness` rather
-than an IntToPtr Ω seed or integer-origin record. Thus the reconstructed value is certified empty,
-not silently treated as an unconstrained pointer. The contract requires that such values are never
-recovered, dereferenced, invoked, or published as addresses, including after memory or external
-call flow. The selected policy is recorded in the exported analysis options.
+for controlled bitcode builds. Otherwise-unhandled `ptrtoint` remains fail-closed and escapes its
+source; the policy relaxes only `inttoptr`. Before relaxing one, PAG construction consults the
+integer-origin proof above. Any recovered pointer origin retains the IntToPtr Ω seed and origin
+record, including origins carried through supported scalar arithmetic. It then follows the
+reconstructed result through function-local SSA copies. A direct use as a load/store address, GEP
+base, memory-intrinsic address, indirect callee, or inline-assembly operand also retains the Ω
+seed. Only a value with neither veto receives `has_empty_witness`, certifying it empty rather than
+silently treating it as an unconstrained pointer.
+
+This deliberately bounded check does not follow the value through memory or callees. A relaxed
+value stored in memory, passed as an argument, or returned remains covered by the explicit
+supported-program assumption; per-module metrics count these boundaries as
+`assumed_tag_crosses_memory`, `assumed_tag_crosses_call`, and `assumed_tag_returned`. They are
+diagnostic, not blockers. The contract requires that such values are not later recovered as
+addresses beyond the checked local SSA closure. The selected policy and audit counts are recorded
+in exported analysis artifacts.
 
 The paired-pointer-difference exception above has a narrow theoretical soundness hole: low-level
 code may deliberately compute a relative function-address integer and later reconstruct and call

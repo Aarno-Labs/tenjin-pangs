@@ -41,8 +41,9 @@ enum Command {
         exports: Option<PathBuf>,
         #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
-        /// Model otherwise-unhandled ptrtoint/inttoptr conversions conservatively, or assume
-        /// they are non-address tags. `assume-tags` is an explicit supported-program contract.
+        /// Model integer/pointer conversions conservatively, or allow unrecognized inttoptr
+        /// values with no pointer origin or local address use to be assumed non-address tags.
+        /// `assume-tags` is an explicit supported-program contract.
         #[arg(long, default_value = "conservative")]
         integer_pointer_policy: IntegerPointerPolicyArg,
         #[arg(long)]
