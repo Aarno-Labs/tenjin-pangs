@@ -5,7 +5,10 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use pangs_api::{AffectedGlobals, Analysis, BuildMode, GlobalTarget, Opts, RegistryApi, Stage};
+use pangs_api::{
+    AffectedGlobals, Analysis, BuildMode, GlobalTarget, IntegerPointerPolicy, Opts, RegistryApi,
+    Stage,
+};
 use pangs_dispose::{apply_policy, config_with_overrides, parse_overrides, write_artifact_pair};
 use pangs_manifest::{write_canonical_json, DisposeMode};
 use pangs_pag::{BuildMode as PagBuildMode, Pag, PagOpts};
@@ -38,6 +41,10 @@ enum Command {
         exports: Option<PathBuf>,
         #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
+        /// Model otherwise-unhandled ptrtoint/inttoptr conversions conservatively, or assume
+        /// they are non-address tags. `assume-tags` is an explicit supported-program contract.
+        #[arg(long, default_value = "conservative")]
+        integer_pointer_policy: IntegerPointerPolicyArg,
         #[arg(long)]
         validate: bool,
         #[arg(long)]
@@ -264,6 +271,21 @@ enum BuildModeArg {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum IntegerPointerPolicyArg {
+    Conservative,
+    AssumeTags,
+}
+
+impl From<IntegerPointerPolicyArg> for IntegerPointerPolicy {
+    fn from(value: IntegerPointerPolicyArg) -> Self {
+        match value {
+            IntegerPointerPolicyArg::Conservative => Self::Conservative,
+            IntegerPointerPolicyArg::AssumeTags => Self::AssumeTags,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum DisposeModeArg {
     Application,
     Library,
@@ -304,6 +326,7 @@ fn run() -> Result<()> {
             build_mode,
             exports,
             partition_budget,
+            integer_pointer_policy,
             validate,
             dispose,
             manifest_only,
@@ -327,12 +350,13 @@ fn run() -> Result<()> {
                 build_mode: build_mode.into(),
                 exports: read_exports(exports)?,
                 partition_budget,
+                integer_pointer_policy: integer_pointer_policy.into(),
                 disposition_registries: read_registry_config(registry_config.as_deref())?,
                 ..Opts::default()
             };
             eprintln!(
-                "pangs analyze stage={:?} build_mode={:?}",
-                opts.stage, opts.build_mode
+                "pangs analyze stage={:?} build_mode={:?} integer_pointer_policy={:?}",
+                opts.stage, opts.build_mode, opts.integer_pointer_policy
             );
             let analysis = if dispose {
                 Analysis::run_with_disposition(&pir, &opts)?

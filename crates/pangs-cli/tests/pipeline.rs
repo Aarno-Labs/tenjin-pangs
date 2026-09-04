@@ -2004,6 +2004,37 @@ fn run_analyze_stage(fixture: &Path, out: &Path, stage: &str) {
     assert!(status.success());
 }
 
+#[test]
+fn integer_pointer_policy_is_parsed_and_recorded_in_export_manifest() {
+    let fixture = m1_4_fixture("ptrtoint_escape.pir.json");
+    let tmp = TempDir::new().unwrap();
+
+    for (policy, expected) in [(None, None), (Some("assume-tags"), Some("assume_tags"))] {
+        let out = tmp.path().join(expected.unwrap_or("conservative"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pangs"));
+        command
+            .arg("analyze")
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&out)
+            .arg("--stage")
+            .arg("steens")
+            .arg("--build-mode")
+            .arg("executable");
+        if let Some(policy) = policy {
+            command.arg("--integer-pointer-policy").arg(policy);
+        }
+        assert!(command.status().unwrap().success());
+
+        let manifest: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+        match expected {
+            Some(expected) => assert_eq!(manifest["opts"]["integer_pointer_policy"], expected),
+            None => assert!(manifest["opts"].get("integer_pointer_policy").is_none()),
+        }
+    }
+}
+
 /// M1.8 differential ledger: every synthetic PIR fixture must satisfy the cross-stage
 /// narrowing/monotonicity relations (`pangs differential` exits 0). A non-zero exit is a
 /// soundness regression, not a precision difference.

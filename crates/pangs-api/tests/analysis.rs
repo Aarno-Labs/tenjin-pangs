@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use pangs_api::{
-    run_m2_ablation, AffectedGlobals, Analysis, BuildMode, Caller, EscapeStatus, M2AblationMode,
-    Opts, Stage, StationarityReason,
+    run_m2_ablation, AffectedGlobals, Analysis, BuildMode, Caller, EscapeStatus,
+    IntegerPointerPolicy, M2AblationMode, Opts, Stage, StationarityReason,
 };
 use pangs_pir::{AbiClass, Access, Func, Global, Param, Pir, Signature, Stmt, VarArgPosition};
 
@@ -2348,6 +2348,25 @@ fn steens_ptrtoint_marks_only_the_pointee_global_as_external() {
     assert_eq!(analysis.escape(global), EscapeStatus::External);
     assert!(!analysis.globals()[global].never_written);
     assert!(analysis.call_edges().is_empty());
+}
+
+#[test]
+fn assume_tags_keeps_unhandled_ptrtoint_source_module_local() {
+    let pir = Pir::from_path(m1_4_fixture("ptrtoint_escape.pir.json")).unwrap();
+    let analysis = Analysis::run(
+        &pir,
+        &Opts {
+            stage: Stage::Steens,
+            build_mode: BuildMode::Library,
+            integer_pointer_policy: IntegerPointerPolicy::AssumeTags,
+            ..Opts::default()
+        },
+    )
+    .unwrap();
+
+    let global = analysis.lookup_global("@G").unwrap();
+    assert_eq!(analysis.escape(global), EscapeStatus::Module);
+    assert!(analysis.globals()[global].never_written);
 }
 
 #[test]

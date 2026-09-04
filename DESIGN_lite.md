@@ -657,6 +657,16 @@ points-to assignment: both conversion Ω seeds and the provenance-separated inte
 remain. An unknown producer makes the origin row incomplete while retaining any compatible
 positive origins.
 
+`--integer-pointer-policy=conservative` is the default and retains this fail-closed behavior.
+`--integer-pointer-policy=assume-tags` is an explicit, reproducible supported-program contract
+for controlled bitcode builds: every conversion not already handled by one of the preceding safe
+cases is assumed to carry a non-address tag. In that mode an otherwise-unhandled `ptrtoint` does
+not escape its source, and an otherwise-unhandled `inttoptr` receives `has_empty_witness` rather
+than an IntToPtr Ω seed or integer-origin record. Thus the reconstructed value is certified empty,
+not silently treated as an unconstrained pointer. The contract requires that such values are never
+recovered, dereferenced, invoked, or published as addresses, including after memory or external
+call flow. The selected policy is recorded in the exported analysis options.
+
 This contract has a narrow theoretical soundness hole: low-level code may deliberately compute a
 relative function-address integer and later reconstruct and call the function, either locally or
 after communicating the integer outside the analyzed module. Treating that subtraction as harmless

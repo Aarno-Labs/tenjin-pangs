@@ -13,10 +13,28 @@ pub mod knobs;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PagOpts {
     pub build_mode: BuildMode,
+    /// How to model integer/pointer conversions that do not already satisfy one of the
+    /// supported safe-use proofs below.
+    #[serde(default)]
+    pub integer_pointer_policy: IntegerPointerPolicy,
     #[serde(default)]
     pub exports: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub safe_indirect_vararg_callsites: BTreeSet<String>,
+}
+
+/// Policy for otherwise fail-closed LLVM `ptrtoint` and `inttoptr` operations.
+///
+/// `AssumeTags` is an explicit supported-program contract: conversions not covered by the
+/// existing comparison, lossless-round-trip, or reserved-sentinel proofs are treated as
+/// non-address tags. In particular, the reconstructed pointer has a positive empty witness;
+/// it is not merely left without an Ω seed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegerPointerPolicy {
+    #[default]
+    Conservative,
+    AssumeTags,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1678,7 +1696,10 @@ impl<'a> Builder<'a> {
             } => {
                 let src = self.operand_node(func_index, owner_scope(&owner), source);
                 self.value_node(func_index, owner_scope(&owner), dest);
-                if !comparison_only && !self.lossless_ptrtoint.contains(&(func_index, stmt_index)) {
+                if !comparison_only
+                    && !self.lossless_ptrtoint.contains(&(func_index, stmt_index))
+                    && self.opts.integer_pointer_policy == IntegerPointerPolicy::Conservative
+                {
                     self.add_seed(
                         OmegaSeedKind::PtrToInt,
                         SeedTarget::Node(src),
@@ -1713,6 +1734,11 @@ impl<'a> Builder<'a> {
                     *pointer_bits,
                     *pointer_address_space,
                 ) {
+                    self.nodes[dst.0 as usize].has_empty_witness = true;
+                } else if self.opts.integer_pointer_policy == IntegerPointerPolicy::AssumeTags {
+                    // This is intentionally stronger than omitting the Ω seed. The explicit
+                    // tag contract proves that this value cannot name an allocation or function
+                    // object, so consumers can distinguish it from an unmodelled pointer.
                     self.nodes[dst.0 as usize].has_empty_witness = true;
                 } else {
                     if let Some(proof) = self
@@ -3689,9 +3715,9 @@ fn is_exported_global(marked: bool, key: &str, opts: &PagOpts) -> bool {
 mod tests {
     use super::{
         allocation_storage_roots, direct_vararg_call_is_benign, proven_external_call_contract,
-        trusted_free_call, CallKind, Edge, EdgeId, EdgeKind, NodeKind, ObjectKind, OmegaSeedKind,
-        Owner, Pag, PagOpts, PointerIntegerOrigin, SeedTarget, StorageRoot, StorageRootState,
-        VarargCallProof,
+        trusted_free_call, CallKind, Edge, EdgeId, EdgeKind, IntegerPointerPolicy, NodeKind,
+        ObjectKind, OmegaSeedKind, Owner, Pag, PagOpts, PointerIntegerOrigin, SeedTarget,
+        StorageRoot, StorageRootState, VarargCallProof,
     };
     use pangs_pir::{ExternalArgEffect, Global, Pir, Stmt, ValueKind};
     use std::collections::BTreeSet;
@@ -4539,6 +4565,55 @@ mod tests {
             panic!("ptrtoint seed must target the source node")
         };
         assert_eq!(pag.nodes[node.0 as usize].label, "sym:global:g");
+    }
+
+    #[test]
+    fn assume_tags_suppresses_unhandled_integer_pointer_omega_and_certifies_empty() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"assume-tags",
+                "target":{"triple":"x86_64","data_layout":"e-p:64:64","supported_atomic_widths":[8,16,32,64]},
+                "globals":[{"key":"g","mutable":true}],
+                "functions":[{"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                    {"kind":"ptr_to_int","dest":"bits","source":"g","integer_bits":64,"pointer_bits":64,"pointer_address_space":0},
+                    {"kind":"scalar_op","dest":"tagged","op":"xor","lhs":"bits","rhs":"1"},
+                    {"kind":"int_to_ptr","dest":"tag","source":"tagged","integer_bits":64,"pointer_bits":64,"pointer_address_space":0}
+                ]}]
+            }"#,
+        )
+        .unwrap();
+
+        let conservative = Pag::from_pir(&pir, &PagOpts::default());
+        assert!(conservative
+            .omega_seeds
+            .iter()
+            .any(|seed| seed.kind == OmegaSeedKind::PtrToInt));
+        assert!(conservative
+            .omega_seeds
+            .iter()
+            .any(|seed| seed.kind == OmegaSeedKind::IntToPtr));
+
+        let assumed = Pag::from_pir(
+            &pir,
+            &PagOpts {
+                integer_pointer_policy: IntegerPointerPolicy::AssumeTags,
+                ..PagOpts::default()
+            },
+        );
+        assert!(!assumed.omega_seeds.iter().any(|seed| {
+            matches!(seed.kind, OmegaSeedKind::PtrToInt | OmegaSeedKind::IntToPtr)
+        }));
+        assert!(assumed.pointer_integer_origins.is_empty());
+        let tag = assumed
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:main:tag")
+            .expect("tag destination node");
+        assert!(tag.has_empty_witness);
+        assert_eq!(
+            allocation_storage_roots(&pir, &assumed).states[tag.id.0 as usize],
+            StorageRootState::ProvenEmpty
+        );
     }
 
     #[test]

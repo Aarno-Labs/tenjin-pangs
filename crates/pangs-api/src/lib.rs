@@ -36,6 +36,8 @@ use knobs::DEFAULT_B2_CONTEXT_DEPTH;
 pub use knobs::DEFAULT_PARTITION_BUDGET;
 use simple::{resolve_simple_icalls, SimpleIcallQuery, SimpleIcallResolution};
 
+pub use pangs_pag::IntegerPointerPolicy;
+
 #[derive(Debug, Error)]
 pub enum AnalysisError {
     #[error("duplicate function key {0}")]
@@ -62,12 +64,21 @@ pub struct Opts {
     pub build_mode: BuildMode,
     pub exports: BTreeSet<String>,
     pub partition_budget: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "integer_pointer_policy_is_conservative"
+    )]
+    pub integer_pointer_policy: IntegerPointerPolicy,
     pub enable_b1_initval: bool,
     pub enable_b2_simple: bool,
     pub enable_b3_confined: bool,
     pub b2_context_depth: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disposition_registries: Vec<RegistryApi>,
+}
+
+fn integer_pointer_policy_is_conservative(policy: &IntegerPointerPolicy) -> bool {
+    *policy == IntegerPointerPolicy::Conservative
 }
 
 impl Default for Opts {
@@ -77,6 +88,7 @@ impl Default for Opts {
             build_mode: knobs::DEFAULT_BUILD_MODE,
             exports: BTreeSet::new(),
             partition_budget: DEFAULT_PARTITION_BUDGET,
+            integer_pointer_policy: IntegerPointerPolicy::Conservative,
             enable_b1_initval: knobs::DEFAULT_ENABLE_B1_INITVAL,
             enable_b2_simple: knobs::DEFAULT_ENABLE_B2_SIMPLE,
             enable_b3_confined: knobs::DEFAULT_ENABLE_B3_CONFINED,
@@ -954,6 +966,7 @@ impl Analysis {
             &PagOpts {
                 build_mode: opts.build_mode.into(),
                 exports: opts.exports.clone(),
+                integer_pointer_policy: opts.integer_pointer_policy,
                 ..PagOpts::default()
             },
         );
@@ -1408,6 +1421,7 @@ impl Analysis {
                     &PagOpts {
                         build_mode: opts.build_mode.into(),
                         exports: opts.exports.clone(),
+                        integer_pointer_policy: opts.integer_pointer_policy,
                         ..PagOpts::default()
                     },
                 );
@@ -1465,6 +1479,7 @@ impl Analysis {
                         &PagOpts {
                             build_mode: opts.build_mode.into(),
                             exports: opts.exports.clone(),
+                            integer_pointer_policy: opts.integer_pointer_policy,
                             safe_indirect_vararg_callsites: safe_indirect_varargs.clone(),
                         },
                     );
