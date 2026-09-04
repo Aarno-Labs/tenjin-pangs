@@ -104,9 +104,12 @@ unsafe fn has_closed_comparison_uses(value: LLVMValueRef) -> bool {
 /// ```
 ///
 /// Each converted value must be used only by subtractions whose other operand is another
-/// same-width `ptrtoint`. A conversion may be shared by several differences (for example
-/// `end - line` and `loc - line`) as long as every use has that shape. Source provenance is
-/// deliberately not recovered here; see the supported-program contract in `DESIGN_lite.md`.
+/// same-width pointer representation. LLVM may place a phi or select between a `ptrtoint` and
+/// its subtraction when optimizing a loop; those joins are accepted only when every alternative
+/// is itself made entirely from same-width `ptrtoint` values and every use of the joined value
+/// remains in a paired subtraction. A conversion may be shared by several differences (for
+/// example `end - line` and `loc - line`) as long as every use has that shape. Source provenance
+/// is deliberately not recovered here; see the supported-program contract in `DESIGN_lite.md`.
 unsafe fn has_paired_pointer_difference_uses(value: LLVMValueRef) -> bool {
     unsafe fn is_ptrtoint(value: LLVMValueRef) -> bool {
         (!LLVMIsAInstruction(value).is_null()
@@ -115,28 +118,95 @@ unsafe fn has_paired_pointer_difference_uses(value: LLVMValueRef) -> bool {
                 && LLVMGetConstOpcode(value) == LLVMOpcode::LLVMPtrToInt)
     }
 
-    let mut usage = LLVMGetFirstUse(value);
-    let mut saw_difference = false;
-    while !usage.is_null() {
-        let difference = LLVMGetUser(usage);
-        if difference.is_null()
-            || LLVMIsAInstruction(difference).is_null()
-            || LLVMGetInstructionOpcode(difference) != LLVMOpcode::LLVMSub
-        {
+    unsafe fn is_pointer_representation(
+        value: LLVMValueRef,
+        ty: LLVMTypeRef,
+        visiting: &mut BTreeSet<usize>,
+    ) -> bool {
+        if LLVMTypeOf(value) != ty {
             return false;
         }
-        let lhs = LLVMGetOperand(difference, 0);
-        let rhs = LLVMGetOperand(difference, 1);
-        if (lhs != value && rhs != value)
-            || !is_ptrtoint(lhs)
-            || !is_ptrtoint(rhs)
-            || LLVMTypeOf(lhs) != LLVMTypeOf(rhs)
-        {
+        if is_ptrtoint(value) {
+            return true;
+        }
+        if LLVMIsAInstruction(value).is_null() {
             return false;
         }
 
-        saw_difference = true;
-        usage = LLVMGetNextUse(usage);
+        let key = value as usize;
+        if !visiting.insert(key) {
+            return true;
+        }
+        let represented = match LLVMGetInstructionOpcode(value) {
+            LLVMOpcode::LLVMPHI => (0..LLVMCountIncoming(value)).all(|index| {
+                is_pointer_representation(LLVMGetIncomingValue(value, index), ty, visiting)
+            }),
+            LLVMOpcode::LLVMSelect => [LLVMGetOperand(value, 1), LLVMGetOperand(value, 2)]
+                .into_iter()
+                .all(|alternative| is_pointer_representation(alternative, ty, visiting)),
+            _ => false,
+        };
+        visiting.remove(&key);
+        represented
     }
-    saw_difference
+
+    unsafe fn uses_only_paired_differences(
+        value: LLVMValueRef,
+        ty: LLVMTypeRef,
+        visiting: &mut BTreeSet<usize>,
+        saw_difference: &mut bool,
+    ) -> bool {
+        let key = value as usize;
+        if !visiting.insert(key) {
+            return true;
+        }
+
+        let mut usage = LLVMGetFirstUse(value);
+        let mut accepted = true;
+        while !usage.is_null() {
+            let user = LLVMGetUser(usage);
+            if user.is_null() || LLVMIsAInstruction(user).is_null() {
+                accepted = false;
+                break;
+            }
+            match LLVMGetInstructionOpcode(user) {
+                LLVMOpcode::LLVMSub => {
+                    let lhs = LLVMGetOperand(user, 0);
+                    let rhs = LLVMGetOperand(user, 1);
+                    if (lhs != value && rhs != value)
+                        || !is_pointer_representation(lhs, ty, &mut BTreeSet::new())
+                        || !is_pointer_representation(rhs, ty, &mut BTreeSet::new())
+                    {
+                        accepted = false;
+                        break;
+                    }
+                    *saw_difference = true;
+                }
+                LLVMOpcode::LLVMPHI | LLVMOpcode::LLVMSelect => {
+                    let is_value_input = LLVMGetInstructionOpcode(user) != LLVMOpcode::LLVMSelect
+                        || LLVMGetOperand(user, 1) == value
+                        || LLVMGetOperand(user, 2) == value;
+                    if !is_value_input
+                        || !is_pointer_representation(user, ty, &mut BTreeSet::new())
+                        || !uses_only_paired_differences(user, ty, visiting, saw_difference)
+                    {
+                        accepted = false;
+                        break;
+                    }
+                }
+                _ => {
+                    accepted = false;
+                    break;
+                }
+            }
+            usage = LLVMGetNextUse(usage);
+        }
+        visiting.remove(&key);
+        accepted
+    }
+
+    let ty = LLVMTypeOf(value);
+    let mut saw_difference = false;
+    uses_only_paired_differences(value, ty, &mut BTreeSet::new(), &mut saw_difference)
+        && saw_difference
 }

@@ -1470,6 +1470,56 @@ entry:
   ret void
 }
 
+define void @phi_selected_pointer_difference(i1 %choose, i8* %p, i8* %q, i8* %r) {
+entry:
+  %pi = ptrtoint i8* %p to i64
+  br i1 %choose, label %left, label %right
+
+left:
+  %qi = ptrtoint i8* %q to i64
+  br label %merge
+
+right:
+  %ri = ptrtoint i8* %r to i64
+  br label %merge
+
+merge:
+  %selected = phi i64 [ %qi, %left ], [ %ri, %right ]
+  %delta = sub i64 %pi, %selected
+  call void @sink(i64 %delta)
+  ret void
+}
+
+define void @select_pointer_difference(i1 %choose, i8* %p, i8* %q, i8* %r) {
+entry:
+  %pi = ptrtoint i8* %p to i64
+  %qi = ptrtoint i8* %q to i64
+  %ri = ptrtoint i8* %r to i64
+  %selected = select i1 %choose, i64 %qi, i64 %ri
+  %delta = sub i64 %pi, %selected
+  call void @sink(i64 %delta)
+  ret void
+}
+
+define void @mixed_phi_pointer_difference(i1 %choose, i8* %p, i8* %q) {
+entry:
+  %pi = ptrtoint i8* %p to i64
+  %qi = ptrtoint i8* %q to i64
+  br i1 %choose, label %left, label %right
+
+left:
+  br label %merge
+
+right:
+  br label %merge
+
+merge:
+  %selected = phi i64 [ %qi, %left ], [ 0, %right ]
+  %delta = sub i64 %pi, %selected
+  call void @sink(i64 %delta)
+  ret void
+}
+
 define void @paired_and_raw_pointer_use(i8* %p, i8* %q) {
 entry:
   %pi = ptrtoint i8* %p to i64
@@ -1557,6 +1607,9 @@ entry:
     assert!(!innocuous("mixed_use"));
     assert!(innocuous("closed_pointer_difference"));
     assert!(innocuous("shared_paired_pointer_differences"));
+    assert!(innocuous("phi_selected_pointer_difference"));
+    assert!(innocuous("select_pointer_difference"));
+    assert!(!innocuous("mixed_phi_pointer_difference"));
     assert!(!innocuous("paired_and_raw_pointer_use"));
     assert!(!innocuous("unpaired_pointer_integer_subtraction"));
     assert!(innocuous("escaping_pointer_difference"));
