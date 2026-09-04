@@ -25,7 +25,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 mod differential;
-pub mod external_policy_census;
 pub mod icall_census;
 mod initval;
 pub mod knobs;
@@ -902,10 +901,6 @@ pub struct Analysis {
     /// `Stage::Conservative`, which has no pointer solution to compare against.
     #[serde(skip)]
     icall_fsa_census: BTreeMap<CallsiteId, IcallFsaCensus>,
-    /// Diagnostic-only Phase-0 external-policy census. This is populated only by
-    /// `run_with_external_policy_census`; no semantic client reads it.
-    #[serde(skip)]
-    external_policy_census: Option<external_policy_census::ExternalPolicyCensus>,
 }
 
 /// How one indirect callsite's pointer answer relates to its FSA signature envelope.
@@ -936,31 +931,17 @@ impl Analysis {
     }
 
     pub fn run(module: &Pir, opts: &Opts) -> Result<Self, AnalysisError> {
-        Self::run_internal(module, opts, false, false, None)
+        Self::run_internal(module, opts, false)
     }
 
     pub fn run_with_disposition(module: &Pir, opts: &Opts) -> Result<Self, AnalysisError> {
-        Self::run_internal(module, opts, true, false, None)
-    }
-
-    /// Run the ordinary disposition-capable analysis and build the read-only external-policy
-    /// opportunity census. `callback_callsite_filter` opts the named opaque callsites into the
-    /// expensive targeted allocation rows needed to enrich otherwise incomplete callback
-    /// inventories.
-    pub fn run_with_external_policy_census(
-        module: &Pir,
-        opts: &Opts,
-        callback_callsite_filter: Option<&BTreeSet<String>>,
-    ) -> Result<Self, AnalysisError> {
-        Self::run_internal(module, opts, true, true, callback_callsite_filter)
+        Self::run_internal(module, opts, true)
     }
 
     fn run_internal(
         module: &Pir,
         opts: &Opts,
         disposition_facts: bool,
-        external_policy_census: bool,
-        callback_callsite_filter: Option<&BTreeSet<String>>,
     ) -> Result<Self, AnalysisError> {
         let analysis_started = Instant::now();
         let registry_apis = if disposition_facts {
@@ -1064,7 +1045,6 @@ impl Analysis {
         let mut solver_metrics = None;
         let mut registry_entries = BTreeMap::new();
         let mut icall_fsa_census = BTreeMap::<CallsiteId, IcallFsaCensus>::new();
-        let mut external_policy_inputs = None;
         let mut pag_build_us = 0;
         let mut assumed_integer_pointer_tags = 0;
         let mut assumed_tag_crosses_memory = 0;
@@ -1443,9 +1423,6 @@ impl Analysis {
                 } else {
                     BTreeSet::new()
                 };
-                if let Some(filter) = callback_callsite_filter {
-                    registry_labels.extend(external_policy_census::targeted_labels(&pag, filter));
-                }
                 let solve_started = Instant::now();
                 let mut solved = match opts.stage {
                     Stage::Andersen if !registry_labels.is_empty() => {
@@ -1501,10 +1478,6 @@ impl Analysis {
                     } else {
                         BTreeSet::new()
                     };
-                    if let Some(filter) = callback_callsite_filter {
-                        registry_labels
-                            .extend(external_policy_census::targeted_labels(&pag, filter));
-                    }
                     let solve_started = Instant::now();
                     solved = match opts.stage {
                         Stage::Andersen if !registry_labels.is_empty() => {
@@ -1543,12 +1516,8 @@ impl Analysis {
                     // indirect call can only be recognized as a registry call from the final
                     // call graph, so perform one bounded narrow re-solve when that discovers
                     // additional operand labels. No all-node points-to export is involved.
-                    let mut expanded_labels =
+                    let expanded_labels =
                         registry_target_labels(&pag, Some(&solved), &registry_apis);
-                    if let Some(filter) = callback_callsite_filter {
-                        expanded_labels
-                            .extend(external_policy_census::targeted_labels(&pag, filter));
-                    }
                     if expanded_labels != registry_labels {
                         registry_labels = expanded_labels;
                         let solve_started = Instant::now();
@@ -1822,14 +1791,6 @@ impl Analysis {
                 modrefs.print_profile("after-mem");
                 print_memory_profile("api-modref-after-mem");
                 pointer_modref_us = pointer_modref_started.elapsed().as_micros() as u64;
-                if external_policy_census {
-                    external_policy_inputs = Some(external_policy_census::collect_solver_inputs(
-                        module,
-                        &pag,
-                        &solved,
-                        &registry_labels,
-                    ));
-                }
             }
         }
         print_memory_profile("api-pointer-state-released");
@@ -2172,7 +2133,7 @@ impl Analysis {
             .filter_map(|(index, written)| written.then_some(GlobalId(index as u32)))
             .collect();
 
-        let mut analysis = Self {
+        let analysis = Self {
             functions: Table::new(functions),
             globals: Table::new(globals),
             callsites: Table::new(callsites),
@@ -2194,13 +2155,7 @@ impl Analysis {
             registry_entries,
             registry_apis,
             icall_fsa_census,
-            external_policy_census: None,
         };
-        if let Some(inputs) = external_policy_inputs {
-            analysis.external_policy_census = Some(external_policy_census::build(
-                module, opts, &analysis, inputs,
-            ));
-        }
         print_memory_profile("api-analysis-complete");
         Ok(analysis)
     }
@@ -2208,10 +2163,6 @@ impl Analysis {
     /// Diagnostic-only FSA census per indirect callsite; empty under `Stage::Conservative`.
     pub fn icall_fsa_census(&self) -> &BTreeMap<CallsiteId, IcallFsaCensus> {
         &self.icall_fsa_census
-    }
-
-    pub fn external_policy_census(&self) -> Option<&external_policy_census::ExternalPolicyCensus> {
-        self.external_policy_census.as_ref()
     }
 
     pub fn functions(&self) -> &Table<FuncId, FuncInfo> {

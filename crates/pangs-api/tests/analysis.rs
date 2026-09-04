@@ -94,38 +94,6 @@ fn strncpy_contract_connects_returned_destination_to_downstream_store() {
     }
 }
 
-#[test]
-fn external_policy_census_is_observational_after_forged_rows_become_finite() {
-    let pir = Pir::from_path(m1_6_fixture("aliased_unknown_modref.pir.json")).unwrap();
-    let opts = Opts {
-        stage: Stage::Andersen,
-        build_mode: BuildMode::Executable,
-        ..Opts::default()
-    };
-    let ordinary = Analysis::run_with_disposition(&pir, &opts).unwrap();
-    let instrumented = Analysis::run_with_external_policy_census(&pir, &opts, None).unwrap();
-
-    assert_eq!(
-        format!("{:?}", ordinary.call_edges()),
-        format!("{:?}", instrumented.call_edges())
-    );
-    assert_eq!(
-        format!("{:?}", ordinary.modrefs()),
-        format!("{:?}", instrumented.modrefs())
-    );
-    for (ordinary, instrumented) in ordinary.modrefs().iter().zip(instrumented.modrefs()) {
-        assert_eq!(
-            format!("{:?}", ordinary.global_candidates),
-            format!("{:?}", instrumented.global_candidates)
-        );
-    }
-
-    let census = instrumented.external_policy_census().unwrap();
-    assert_eq!(census.summary.module_wide_rows, 0);
-    assert_eq!(census.summary.distinct_module_wide_poisoned_globals, 0);
-    assert!(census.module_wide_rows.is_empty());
-}
-
 fn unknown_candidate_keys(analysis: &Analysis) -> Vec<Vec<String>> {
     analysis
         .modrefs()
