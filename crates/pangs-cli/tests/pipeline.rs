@@ -2020,7 +2020,8 @@ fn integer_pointer_policy_is_parsed_and_recorded_in_export_manifest() {
             .arg("--stage")
             .arg("steens")
             .arg("--build-mode")
-            .arg("executable");
+            .arg("executable")
+            .arg("--validate");
         if let Some(policy) = policy {
             command.arg("--integer-pointer-policy").arg(policy);
         }

@@ -67,6 +67,10 @@
           "type": "integer",
           "minimum": 0
         },
+        "integer_pointer_policy": {
+          "type": "string",
+          "enum": ["conservative", "assume_tags"]
+        },
         "enable_b1_initval": {
           "type": "boolean"
         },
