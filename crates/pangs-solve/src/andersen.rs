@@ -1429,15 +1429,13 @@ impl<'a> Refiner<'a> {
                     EdgeKind::Memcpy { .. } => {
                         self.prepartition_flow_edges.push((src, left));
                         self.prepartition_flow_edges.push((dst, left));
-                        if memcpy_prepartition_carriers_enabled() {
-                            // Both endpoints above are synthetic storage regions, so unlike
-                            // every other memory edge this one contributes no value node to
-                            // the component. Attach the carriers explicitly, or their
-                            // producers stay in an uninteresting partition and the copy is
-                            // solved with empty endpoint sets.
-                            self.ap_union(src, left);
-                            self.ap_union(dst, left);
-                        }
+                        // Both endpoints above are synthetic storage regions, so unlike
+                        // every other memory edge this one contributes no value node to
+                        // the component. Attach the carriers explicitly, or their
+                        // producers stay in an uninteresting partition and the copy is
+                        // solved with empty endpoint sets.
+                        self.ap_union(src, left);
+                        self.ap_union(dst, left);
                     }
                     _ => {}
                 }
@@ -4463,15 +4461,6 @@ fn whole_object_field_bridge_policy() -> WholeObjectBridgePolicy {
     whole_object_field_bridge_policy_for(value.as_deref())
 }
 
-fn memcpy_prepartition_carriers_enabled_for(value: Option<&str>) -> bool {
-    !matches!(value, Some("0"))
-}
-
-fn memcpy_prepartition_carriers_enabled() -> bool {
-    let value = std::env::var(knobs::ENV_ANDERSEN_MEMCPY_PREPARTITION_CARRIERS).ok();
-    memcpy_prepartition_carriers_enabled_for(value.as_deref())
-}
-
 fn memcpy_edge_summaries_enabled() -> bool {
     let value = std::env::var(knobs::ENV_ANDERSEN_MEMCPY_EDGE_SUMMARIES).ok();
     memcpy_edge_summaries_enabled_for(value.as_deref())
@@ -6851,10 +6840,10 @@ mod tests {
 
     use super::{
         finish_andersen_controlled, hybrid_points_to_enabled_for,
-        memcpy_edge_summaries_enabled_for, memcpy_prepartition_carriers_enabled_for,
-        solve_andersen, solve_andersen_with_overrides, whole_object_field_bridge_policy_for,
-        AndersenControls, Cell, ExternalRegion, HybridPointSet, PointSet,
-        RefinedPointeeGlobalInterner, Refiner, Solve, WholeObjectAccess, WholeObjectBridgePolicy,
+        memcpy_edge_summaries_enabled_for, solve_andersen, solve_andersen_with_overrides,
+        whole_object_field_bridge_policy_for, AndersenControls, Cell, ExternalRegion,
+        HybridPointSet, PointSet, RefinedPointeeGlobalInterner, Refiner, Solve, WholeObjectAccess,
+        WholeObjectBridgePolicy,
     };
     use crate::{solve_steensgaard, FieldLocation, PointsToMaterialization};
 
@@ -7707,13 +7696,6 @@ mod tests {
             .expect("bulk-copy access materializes the unknown-offset summary");
         assert!(solve.points_to(summary).unwrap().contains(&3));
         assert!(solve.points_to(object).unwrap().contains(&3));
-    }
-
-    #[test]
-    fn memcpy_prepartition_carriers_default_on_with_zero_opt_out() {
-        assert!(memcpy_prepartition_carriers_enabled_for(None));
-        assert!(memcpy_prepartition_carriers_enabled_for(Some("1")));
-        assert!(!memcpy_prepartition_carriers_enabled_for(Some("0")));
     }
 
     #[test]

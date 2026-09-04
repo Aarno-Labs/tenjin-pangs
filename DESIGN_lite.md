@@ -449,7 +449,6 @@ other memory edge, which contributes a value node — its two address carriers a
 into that component explicitly. Without it the carriers' producers sit in an uninteresting
 partition, are dropped from the admitted solve, and the copy is solved with an empty
 endpoint set, which no amount of field modelling can repair.
-`PANGS_ANDERSEN_MEMCPY_PREPARTITION_CARRIERS=0` restores the older behaviour for ablation.
 
 The Andersen solver summarizes memcpy edges by default. Set
 `PANGS_ANDERSEN_MEMCPY_EDGE_SUMMARIES=0` to restore the direct Cartesian join for
