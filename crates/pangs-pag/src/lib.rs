@@ -4391,6 +4391,48 @@ mod tests {
     }
 
     #[test]
+    fn strdup_contract_reads_source_and_returns_fresh_storage() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"strdup-contract",
+                "globals":[{"key":"@source","mutable":true}],
+                "functions":[
+                    {"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"call_direct","callee":"strdup","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"args":["@source"],"dest":"%copy"}
+                    ]},
+                    {"key":"strdup","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"body":[]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let callsite = &pag.callsites[0];
+        let result = callsite.result.unwrap();
+
+        assert!(!callsite.external_boundary);
+        assert!(pag
+            .edges
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Load && edge.src == callsite.args[0]));
+        assert!(pag.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::AddrOf
+                && edge.dst == result
+                && matches!(
+                    &pag.nodes[edge.src.0 as usize].kind,
+                    NodeKind::Object {
+                        object: ObjectKind::Alloca,
+                        key,
+                        ..
+                    } if key == "strdup@0"
+                )
+        }));
+        assert!(!pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::ExternalCallBoundary
+                && seed.target == SeedTarget::Callsite(callsite.id)
+        }));
+    }
+
+    #[test]
     fn external_copy_contract_preserves_constant_extent_and_zero_is_a_noop() {
         let pir: Pir = serde_json::from_str(
             r#"{

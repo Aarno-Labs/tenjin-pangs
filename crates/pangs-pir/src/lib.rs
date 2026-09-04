@@ -152,6 +152,7 @@ pub fn external_call_contract(callee: &str) -> Option<ExternalCallContract> {
         },
         "free" => contract(1, false, Result::Void, NONE),
 
+        "strdup" => contract(1, false, Result::Fresh, R0),
         "strchr" | "strrchr" | "memchr" => contract(2, false, Result::AliasArg(0), R0),
         "strstr" | "strpbrk" => contract(2, false, Result::AliasArg(0), R01),
         "strlen" | "atoi" | "atol" | "atoll" => contract(1, false, Result::Scalar, R0),
