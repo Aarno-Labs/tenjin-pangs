@@ -42,6 +42,20 @@ disposition run, producing 15 unhandled globals instead of the expected 2
 in allocation isolation and, if still required, a narrow invariant-discriminator
 proof for guarded stores.
 
+## curl `no_protos`
+
+curl initializes the pointer holder `built_in_protos` with `&no_protos`, then
+later overwrites the holder in `get_libcurl_info`; `no_protos` itself is never
+written. Allocation isolation represents the initializer capture with a flow
+edge from `&no_protos` to the address of `built_in_protos`. Reverse write-blocker
+propagation then follows that edge and incorrectly attributes the later holder
+overwrite to `no_protos`.
+
+The proof must distinguish a container's address from its contents: overwriting
+`built_in_protos` mutates the holder, while only a store through a value loaded
+from it could mutate `no_protos`. This false `written` fact prevents the correct
+`immutable` disposition.
+
 ## fribidi `caprtl_to_unicode`
 
   This is the lazy CapRTL lookup-table pointer:
@@ -92,6 +106,5 @@ In the actual source, the sentinel’s type is
   `FRIBIDI_TYPE_SENTINEL`, so the `next_type == FRIBIDI_TYPE_NSM` guard prevents that write.
 Proving this requires a relational/path-sensitive
   value argument that ModRef currently lacks.
-
 
 

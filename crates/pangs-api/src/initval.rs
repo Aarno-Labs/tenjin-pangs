@@ -414,6 +414,7 @@ fn stmt_operands(stmt: &Stmt) -> Vec<&str> {
         Stmt::Gep { base, .. } => vec![base.as_str()],
         Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => vec![source.as_str()],
         Stmt::VarArg { .. } => Vec::new(),
+        Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => vec![list.as_str()],
         Stmt::Memcpy { dst, src, .. } => vec![dst.as_str(), src.as_str()],
         Stmt::Memset { dst, value, .. } => vec![dst.as_str(), value.as_str()],
         Stmt::Unknown {

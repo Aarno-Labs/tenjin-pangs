@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use pangs_pag::{BuildMode, OmegaSeedKind, Pag, PagOpts, SeedTarget, ValidationIssue};
+use pangs_pag::{BuildMode, EdgeKind, OmegaSeedKind, Pag, PagOpts, SeedTarget, ValidationIssue};
 use pangs_pir::{AbiClass, Func, Param, Pir, Signature, Stmt, VarArgPosition};
 
 fn fixture(name: &str) -> std::path::PathBuf {
@@ -294,22 +294,54 @@ fn direct_internal_vararg_boundary_requires_visible_vararg_consumption() {
                     loc: None,
                 }],
             },
+            // Proved read-only from its own body: reading through a tail pointer is the whole
+            // effect, so its callers' pointer actuals need no boundary. This replaces the
+            // hard-coded benign-name list that used to make this case pass.
             Func {
-                key: "log_debug".to_string(),
+                key: "read_only_sink".to_string(),
                 sig: vararg_sig.clone(),
-                param_names: vec![],
+                param_names: vec!["%read_only_sink::tag".to_string()],
                 file: None,
                 line: None,
                 external: false,
                 exported: false,
                 address_taken: false,
-                body: vec![Stmt::Unknown {
-                    op: "va_arg".to_string(),
-                    operands: vec!["%ap".to_string()],
-                    results: vec!["%next".to_string()],
-                    reason: "va_arg".to_string(),
-                    loc: None,
-                }],
+                body: vec![
+                    Stmt::Alloca {
+                        dest: "%read_only_sink::ap".to_string(),
+                        ty: "[1 x %struct.__va_list_tag]".to_string(),
+                        loc: None,
+                    },
+                    Stmt::Gep {
+                        dest: "%read_only_sink::decay".to_string(),
+                        base: "%read_only_sink::ap".to_string(),
+                        byte_off: Some(0),
+                        lane: None,
+                        loc: None,
+                    },
+                    Stmt::VaStart {
+                        list: "%read_only_sink::decay".to_string(),
+                        loc: None,
+                    },
+                    Stmt::Load {
+                        dest: "%read_only_sink::tail".to_string(),
+                        address: "%read_only_sink::decay".to_string(),
+                        volatile: false,
+                        access_bytes: Some(8),
+                        loc: None,
+                    },
+                    Stmt::Load {
+                        dest: "%read_only_sink::byte".to_string(),
+                        address: "%read_only_sink::tail".to_string(),
+                        volatile: false,
+                        access_bytes: Some(1),
+                        loc: None,
+                    },
+                    Stmt::VaEnd {
+                        list: "%read_only_sink::decay".to_string(),
+                        loc: None,
+                    },
+                ],
             },
             Func {
                 key: "cb".to_string(),
@@ -347,7 +379,7 @@ fn direct_internal_vararg_boundary_requires_visible_vararg_consumption() {
                         loc: None,
                     },
                     Stmt::CallDirect {
-                        callee: "log_debug".to_string(),
+                        callee: "read_only_sink".to_string(),
                         sig: vararg_sig.clone(),
                         args: vec!["%tag".to_string(), "cb".to_string()],
                         dest: None,
@@ -374,7 +406,7 @@ fn direct_internal_vararg_boundary_requires_visible_vararg_consumption() {
     let summarized = pag
         .callsites
         .iter()
-        .find(|callsite| callsite.callee.as_deref() == Some("log_debug"))
+        .find(|callsite| callsite.callee.as_deref() == Some("read_only_sink"))
         .unwrap();
 
     assert!(!pag.omega_seeds.iter().any(|seed| {
@@ -388,6 +420,12 @@ fn direct_internal_vararg_boundary_requires_visible_vararg_consumption() {
     assert!(!pag.omega_seeds.iter().any(|seed| {
         seed.kind == OmegaSeedKind::VarargCallBoundary
             && seed.target == SeedTarget::Callsite(summarized.id)
+    }));
+    // A proof replaces the boundary with what it proved, so the read the callee performs
+    // through the tail actual is still recorded. Dropping the seed without this would report
+    // less than the boundary it replaced.
+    assert!(pag.edges.iter().any(|edge| {
+        edge.kind == EdgeKind::Load && Some(&edge.src) == summarized.args.get(1)
     }));
 }
 

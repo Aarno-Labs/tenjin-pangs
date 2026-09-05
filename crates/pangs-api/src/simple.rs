@@ -618,6 +618,8 @@ impl<'a> SimpleResolver<'a> {
             | Stmt::Memcpy { .. }
             | Stmt::Memset { .. }
             | Stmt::Unknown { .. }
+            | Stmt::VaStart { .. }
+            | Stmt::VaEnd { .. }
             | Stmt::CallIndirect { .. } => WalkResult::Complex,
             Stmt::Store { .. } | Stmt::Return { .. } | Stmt::GlobalRef { .. } => {
                 WalkResult::Complex
@@ -953,6 +955,7 @@ impl<'a> SimpleResolver<'a> {
                 operands.iter().any(|operand| same_symbol(operand, target))
                     || results.iter().any(|result| same_symbol(result, target))
             }
+            Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => same_symbol(list, target),
             Stmt::Alloca { .. }
             | Stmt::Assign { .. }
             | Stmt::ScalarOp { .. }
@@ -1047,6 +1050,7 @@ impl<'a> SimpleResolver<'a> {
                 operands.iter().any(|operand| operand == value)
                     || results.iter().any(|result| result == value)
             }
+            Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => list == value,
             Stmt::Alloca { .. }
             | Stmt::Assign { .. }
             | Stmt::ScalarOp { .. }
@@ -1201,6 +1205,8 @@ fn stmt_dest(stmt: &Stmt) -> Option<&str> {
         | Stmt::Memcpy { .. }
         | Stmt::Memset { .. }
         | Stmt::Return { .. }
+        | Stmt::VaStart { .. }
+        | Stmt::VaEnd { .. }
         | Stmt::GlobalRef { .. } => None,
     }
 }
@@ -1208,6 +1214,7 @@ fn stmt_dest(stmt: &Stmt) -> Option<&str> {
 fn stmt_operands(stmt: &Stmt) -> Vec<&str> {
     match stmt {
         Stmt::Alloca { .. } | Stmt::VarArg { .. } | Stmt::GlobalRef { .. } => Vec::new(),
+        Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => vec![list.as_str()],
         Stmt::Assign { sources, .. } => sources.iter().map(String::as_str).collect(),
         Stmt::ScalarOp { lhs, rhs, .. } => vec![lhs.as_str(), rhs.as_str()],
         Stmt::Load { address, .. } => vec![address.as_str()],
@@ -1238,6 +1245,7 @@ fn stmt_operands(stmt: &Stmt) -> Vec<&str> {
 fn function_symbol_value_operands(stmt: &Stmt) -> Vec<&str> {
     match stmt {
         Stmt::Alloca { .. } | Stmt::VarArg { .. } | Stmt::GlobalRef { .. } => Vec::new(),
+        Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => vec![list.as_str()],
         Stmt::Assign { sources, .. } => sources.iter().map(String::as_str).collect(),
         Stmt::ScalarOp { lhs, rhs, .. } => vec![lhs.as_str(), rhs.as_str()],
         Stmt::Load { address, .. } => vec![address.as_str()],
@@ -1270,6 +1278,7 @@ fn global_init_function_escape_operands(stmt: &Stmt) -> Vec<&str> {
             vec![dest.as_str(), lhs.as_str(), rhs.as_str()]
         }
         Stmt::Store { value, .. } => vec![value.as_str()],
+        Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => vec![list.as_str()],
         Stmt::CallIndirect {
             operand,
             args,
@@ -1380,6 +1389,8 @@ where
             !global_is_safe_slot(address.as_str())
         }
         Stmt::Store { .. } => false,
+        // A function address cannot legitimately be a `va_list`; if one appears there, say so.
+        Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => same_symbol(list, target),
         Stmt::CallIndirect {
             operand,
             args,

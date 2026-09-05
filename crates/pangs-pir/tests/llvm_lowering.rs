@@ -627,6 +627,16 @@ fn recognizes_closed_sysv_pointer_varargs_and_rejects_va_copy() {
         stmt,
         Stmt::Unknown { reason, .. } if reason == "varargs_intrinsic"
     )));
+    // The list operations are explicit in both paths, so the write to the list is never lost,
+    // and neither intrinsic is an opaque operand escape.
+    assert!(first
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::VaStart { .. })));
+    assert!(first
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::VaEnd { .. })));
 
     let tail = pir
         .functions
@@ -650,9 +660,10 @@ fn recognizes_closed_sysv_pointer_varargs_and_rejects_va_copy() {
         .body
         .iter()
         .any(|stmt| matches!(stmt, Stmt::VarArg { .. })));
+    // `va_copy` has no modeled contract and keeps the opaque boundary.
     assert!(copied.body.iter().any(|stmt| matches!(
         stmt,
-        Stmt::Unknown { op, .. } if op.starts_with("llvm.va_")
+        Stmt::Unknown { op, .. } if op == "llvm.va_copy"
     )));
 }
 

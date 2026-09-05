@@ -219,6 +219,10 @@ pub fn external_call_contract(callee: &str) -> Option<ExternalCallContract> {
         "strftime" => contract(4, false, Result::Scalar, W0_R123),
         "time" => contract(1, false, Result::Scalar, W0),
 
+        // The ordinary synchronous POSIX contract: the pathname is read during the call and is
+        // not retained. Interposition and module-defined replacements fail closed through the
+        // shared external-declaration and ABI-shape checks.
+        "access" => contract(2, false, Result::Scalar, R0),
         "isatty" | "iswprint" | "tolower" => contract(1, false, Result::Scalar, NONE),
         "exit" => contract(1, false, Result::Void, NONE),
         "open" => contract(2, true, Result::Scalar, R0),
@@ -665,6 +669,22 @@ pub enum Stmt {
     VarArg {
         dest: String,
         position: VarArgPosition,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    /// `llvm.va_start` on caller-provided `va_list` storage. The intrinsic writes that storage
+    /// and does not publish its address to an unknown external agent, so it is represented
+    /// explicitly rather than as an opaque operand escape. Whether the *contents* of the list
+    /// are opaque is a separate question, decided by whether the consumer is proved.
+    VaStart {
+        list: String,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
+    /// `llvm.va_end` on the same local storage. Modeled conservatively as a read and a write of
+    /// the list itself.
+    VaEnd {
+        list: String,
         #[serde(default)]
         loc: Option<Loc>,
     },

@@ -650,6 +650,7 @@ enum ExternalRegion {
     EscapedFunctionParam(u32),
     ForgedPointer(u32),
     ReceiverPayload(u32),
+    VarargPayload(u32),
 }
 
 impl ExternalRegion {
@@ -667,6 +668,7 @@ impl ExternalRegion {
             Self::EscapedFunctionParam(id) => format!("escaped_function_param:{id}"),
             Self::ForgedPointer(id) => format!("forged_pointer:{id}"),
             Self::ReceiverPayload(id) => format!("receiver_payload:{id}"),
+            Self::VarargPayload(id) => format!("vararg_payload:{id}"),
         }
     }
 }
@@ -3327,6 +3329,17 @@ impl<'a> Refiner<'a> {
                         self.apply_vararg_call_effects(solve, callsite);
                     }
                 }
+                // The list contents are opaque, but the list address itself is not published:
+                // this stores one external region *through* the address without making the
+                // address a boundary root. Every external region already contains itself, so a
+                // multi-level `va_arg` extraction keeps yielding the region.
+                (OmegaSeedKind::VarargListPayload, SeedTarget::Node(id)) => self
+                    .seed_unknown_store_through(
+                        solve,
+                        id,
+                        ExternalRegion::VarargPayload(id.0),
+                        omega_seed_source(seed.kind),
+                    ),
                 _ => {}
             }
         }
@@ -4351,6 +4364,7 @@ fn omega_seed_source(kind: OmegaSeedKind) -> &'static str {
         OmegaSeedKind::UnknownResultExternal => "omega:unknown_result",
         OmegaSeedKind::ExternalCallBoundary => "omega:external_call",
         OmegaSeedKind::VarargCallBoundary => "omega:vararg_call",
+        OmegaSeedKind::VarargListPayload => "omega:vararg_list_payload",
     }
 }
 
@@ -4677,6 +4691,7 @@ fn omega_seed_kind_label(kind: OmegaSeedKind) -> &'static str {
         OmegaSeedKind::ImportedSymbol => "imported_symbol",
         OmegaSeedKind::ExternalCallBoundary => "external_call_boundary",
         OmegaSeedKind::VarargCallBoundary => "vararg_call_boundary",
+        OmegaSeedKind::VarargListPayload => "vararg_list_payload",
         OmegaSeedKind::PtrToInt => "ptr_to_int",
         OmegaSeedKind::IntToPtr => "int_to_ptr",
         OmegaSeedKind::UnknownOperandEscape => "unknown_operand_escape",
@@ -7405,6 +7420,58 @@ mod tests {
         let unknown_ptr = &andersen.nodes["val:driver:%unknown_ptr"];
         assert!(unknown_ptr.external);
         assert_eq!(unknown_ptr.external_sources, vec!["omega:inttoptr"]);
+    }
+
+    /// A pointer `va_arg` on the SysV ABI is a two-level extraction: load an area pointer out of
+    /// the list, then load the value out of that. The payload region must therefore stay opaque
+    /// through any number of loads, or the extracted pointer would come back empty — a missed
+    /// store destination rather than a conservative one.
+    #[test]
+    fn unproved_va_list_contents_stay_external_through_repeated_loads() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"va-list-payload",
+                "globals":[{"key":"@g","mutable":true}],
+                "functions":[
+                    {"key":"wrapper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}],"vararg":true},
+                     "param_names":["%wrapper::fmt"],
+                     "body":[
+                        {"kind":"alloca","dest":"%wrapper::ap","ty":"[1 x %struct.__va_list_tag]"},
+                        {"kind":"gep","dest":"%wrapper::decay","base":"%wrapper::ap","byte_off":0},
+                        {"kind":"va_start","list":"%wrapper::decay"},
+                        {"kind":"load","dest":"%wrapper::area","address":"%wrapper::decay","access_bytes":8},
+                        {"kind":"load","dest":"%wrapper::deep","address":"%wrapper::area","access_bytes":8},
+                        {"kind":"load","dest":"%wrapper::deeper","address":"%wrapper::deep","access_bytes":8},
+                        {"kind":"va_end","list":"%wrapper::decay"},
+                        {"kind":"return","value":null}
+                     ]},
+                    {"key":"driver","exported":true,"sig":{"ret":{"class":"void"},"params":[]},
+                     "body":[
+                        {"kind":"alloca","dest":"%driver::local","ty":"i8"},
+                        {"kind":"gep","dest":"%driver::addr","base":"@g","byte_off":0},
+                        {"kind":"call_direct","callee":"wrapper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}],"vararg":true},"args":["%driver::fmt","%driver::addr"]},
+                        {"kind":"return","value":null}
+                     ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Executable, 1_000_000);
+        for label in [
+            "val:wrapper:%wrapper::area",
+            "val:wrapper:%wrapper::deep",
+            "val:wrapper:%wrapper::deeper",
+        ] {
+            let node = &andersen.nodes[label];
+            assert!(node.external, "{label} must stay opaque");
+            assert!(!node.proven_empty, "{label} must not be certified empty");
+        }
+        // The list's own address is still an ordinary local: `va_start` does not publish it.
+        let steens = solve_steensgaard(&pir, &pag, BuildMode::Executable);
+        for label in ["val:wrapper:%wrapper::deep", "val:wrapper:%wrapper::deeper"] {
+            assert!(steens.nodes[label].external, "{label} in steensgaard");
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use pangs_pag::{
-    positionally_modeled_vararg_functions, proven_external_call_contract,
+    positionally_modeled_vararg_functions, proven_external_call_contract, stmt_consumes_varargs,
     BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts, StorageRoot, StorageRootState,
     StorageRoots, VarargCallProof,
 };
@@ -3771,16 +3771,6 @@ fn indirect_vararg_site_is_safe(
     })
 }
 
-fn stmt_consumes_varargs(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::VarArg { .. } => true,
-        Stmt::Unknown { op, reason, .. } => {
-            reason == "va_arg" || reason == "varargs_intrinsic" || op.starts_with("llvm.va_")
-        }
-        _ => false,
-    }
-}
-
 fn direct_boundary_kind(callee: &str) -> Option<&'static str> {
     match callee {
         "dlopen" | "dlsym" => Some("dlopen_dlsym"),
@@ -6599,6 +6589,7 @@ fn runtime_global_rewrite_roots(
 fn visit_runtime_operands(stmt: &Stmt, mut visit: impl FnMut(&str)) {
     match stmt {
         Stmt::Alloca { .. } | Stmt::VarArg { .. } | Stmt::GlobalRef { .. } => {}
+        Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => visit(list),
         Stmt::Assign { sources, .. } => sources.iter().for_each(|value| visit(value)),
         Stmt::ScalarOp { lhs, rhs, .. } => {
             visit(lhs);

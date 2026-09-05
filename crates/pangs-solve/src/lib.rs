@@ -2049,6 +2049,18 @@ impl<'a> Solver<'a> {
                 (OmegaSeedKind::VarargCallBoundary, SeedTarget::Callsite(id)) => {
                     self.apply_vararg_call(id.0 as usize);
                 }
+                (OmegaSeedKind::VarargListPayload, SeedTarget::Node(id)) => {
+                    // `va_start` does not publish the list's address, so nothing escapes here.
+                    // What it writes into the list is the caller's variadic tail, so the list's
+                    // contents are external: a pointer read out of it designates unknown memory
+                    // rather than nothing. The content push-down carries that through the
+                    // multi-level extraction the ABI actually uses.
+                    let class = self.class_of(id);
+                    self.add_class_provenance(class, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
+                    let pointee = self.pointee_of(class);
+                    self.add_class_provenance(pointee, PROV_SCALAR_OR_UNKNOWN_PAYLOAD);
+                    self.set_ext(pointee);
+                }
                 _ => {}
             }
         }

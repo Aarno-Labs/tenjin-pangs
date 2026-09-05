@@ -1009,6 +1009,9 @@ pub enum OmegaSeedKind {
     ImportedSymbol,
     ExternalCallBoundary,
     VarargCallBoundary,
+    /// The contents of a `va_list` whose consumer was not proved. The list's own address is not
+    /// published; only what `va_start` filled it with is opaque.
+    VarargListPayload,
     PtrToInt,
     IntToPtr,
     UnknownOperandEscape,
@@ -1022,6 +1025,7 @@ impl OmegaSeedKind {
             OmegaSeedKind::ImportedSymbol => "imported_symbol",
             OmegaSeedKind::ExternalCallBoundary => "external_call_boundary",
             OmegaSeedKind::VarargCallBoundary => "vararg_call_boundary",
+            OmegaSeedKind::VarargListPayload => "vararg_list_payload",
             OmegaSeedKind::PtrToInt => "ptr_to_int",
             OmegaSeedKind::IntToPtr => "int_to_ptr",
             OmegaSeedKind::UnknownOperandEscape => "unknown_operand_escape",
@@ -1921,6 +1925,59 @@ impl<'a> Builder<'a> {
                 // here also makes a malformed/unbound model fail closed as an empty value.
                 self.value_node(func_index, owner_scope(&owner), dest);
             }
+            Stmt::VaStart { list, loc } | Stmt::VaEnd { list, loc } => {
+                let address = self.operand_node(func_index, owner_scope(&owner), list);
+                // The intrinsic writes (and `va_end` also reads) the list storage. Record that
+                // effect so mutation clients do not lose it, using the same modeled-effect shape
+                // as an external contract: there is no client value to store.
+                let sink = self.add_node(
+                    NodeKey::ExternalNonPointerWrite(func_index, stmt_index),
+                    format!("val:{}:@va-list-effect:{stmt_index}", owner_name(&owner)),
+                    NodeKind::Value {
+                        scope: owner_scope(&owner),
+                    },
+                );
+                let edge = self.add_memory_edge(
+                    EdgeKind::Store,
+                    sink,
+                    address,
+                    owner.clone(),
+                    None,
+                    true,
+                    false,
+                    loc.clone(),
+                );
+                self.edges[edge.0 as usize].modeled_external_write = true;
+                if matches!(stmt, Stmt::VaEnd { .. }) {
+                    self.add_memory_edge(
+                        EdgeKind::Load,
+                        address,
+                        sink,
+                        owner.clone(),
+                        None,
+                        true,
+                        false,
+                        loc.clone(),
+                    );
+                }
+                // The list *address* is not published, but its contents are the caller's
+                // variadic actuals. Unless positional recognition proved every extraction, give
+                // those contents one opaque region, so a pointer read out of the list still
+                // designates unknown memory instead of nothing.
+                if matches!(stmt, Stmt::VaStart { .. })
+                    && !self
+                        .positional_vararg_functions
+                        .contains(owner_name(&owner))
+                {
+                    self.add_seed(
+                        OmegaSeedKind::VarargListPayload,
+                        SeedTarget::Node(address),
+                        Some(owner),
+                        loc.clone(),
+                        Some(list.clone()),
+                    );
+                }
+            }
             Stmt::Memcpy {
                 dst,
                 src,
@@ -2396,14 +2453,54 @@ impl<'a> Builder<'a> {
                         Some(callee.clone()),
                     );
                 }
-                if sig.vararg && self.direct_vararg_call_requires_boundary(callee, sig, args) {
-                    self.add_seed(
-                        OmegaSeedKind::VarargCallBoundary,
-                        SeedTarget::Callsite(callsite),
-                        Some(owner),
-                        loc.clone(),
-                        Some(callee.clone()),
-                    );
+                if sig.vararg {
+                    match self.direct_vararg_call_treatment(callee, sig, args) {
+                        VarargCallTreatment::Boundary => self.add_seed(
+                            OmegaSeedKind::VarargCallBoundary,
+                            SeedTarget::Callsite(callsite),
+                            Some(owner),
+                            loc.clone(),
+                            Some(callee.clone()),
+                        ),
+                        // The proof replaced the boundary with a claim about what the callee
+                        // does, so record that claim: it reads through every pointer actual and
+                        // does nothing else. Without this the read would simply disappear from
+                        // mod/ref, which is less complete than the boundary it replaced.
+                        VarargCallTreatment::ProvedReadOnlyTail => {
+                            let sink = self.add_node(
+                                NodeKey::ExternalNonPointerWrite(func_index, stmt_index),
+                                format!(
+                                    "val:{}:@vararg-tail-read:{stmt_index}",
+                                    owner_name(&owner)
+                                ),
+                                NodeKind::Value {
+                                    scope: owner_scope(&owner),
+                                },
+                            );
+                            for &actual in arg_nodes.iter().skip(sig.params.len()) {
+                                if !self.nodes[actual.0 as usize].value_kind.may_carry_pointer() {
+                                    continue;
+                                }
+                                self.add_memory_edge(
+                                    EdgeKind::Load,
+                                    actual,
+                                    sink,
+                                    owner.clone(),
+                                    None,
+                                    true,
+                                    false,
+                                    loc.clone(),
+                                );
+                            }
+                        }
+                        // Positional recognition binds the actuals to the callee's own
+                        // `va_arg` values, whose real load/store edges carry the effects; a
+                        // callee that never consumes its tail has no effect to record; and an
+                        // external contract already modeled its own.
+                        VarargCallTreatment::PositionalBinding
+                        | VarargCallTreatment::NoConsumption
+                        | VarargCallTreatment::ExternalContract => {}
+                    }
                 }
             }
             Stmt::CallIndirect {
@@ -2500,12 +2597,12 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn direct_vararg_call_requires_boundary(
+    fn direct_vararg_call_treatment(
         &mut self,
         callee: &str,
         sig: &Signature,
         args: &[String],
-    ) -> bool {
+    ) -> VarargCallTreatment {
         let external = self
             .functions
             .get(callee)
@@ -2513,21 +2610,29 @@ impl<'a> Builder<'a> {
             .map(|func| func.external)
             .unwrap_or(true);
         if external && proven_external_call_contract(self.pir, callee, sig, args, false).is_some() {
-            return false;
+            return VarargCallTreatment::ExternalContract;
         }
         if self.vararg_call_proof.is_benign(callee, args) {
-            return false;
+            return VarargCallTreatment::ProvedReadOnlyTail;
         }
         let Some(func) = self
             .functions
             .get(callee)
             .and_then(|index| self.pir.functions.get(*index))
         else {
-            return true;
+            return VarargCallTreatment::Boundary;
         };
-        func.external
-            || (!self.positional_vararg_functions.contains(callee)
-                && func.body.iter().any(stmt_consumes_varargs))
+        if func.external {
+            return VarargCallTreatment::Boundary;
+        }
+        if self.positional_vararg_functions.contains(callee) {
+            return VarargCallTreatment::PositionalBinding;
+        }
+        if func.body.iter().any(stmt_consumes_varargs) {
+            VarargCallTreatment::Boundary
+        } else {
+            VarargCallTreatment::NoConsumption
+        }
     }
 
     fn indirect_vararg_call_requires_boundary(&self, callsite: CallsiteId) -> bool {
@@ -2823,6 +2928,45 @@ pub fn proven_external_call_contract(
     Some(contract)
 }
 
+/// Why a direct variadic callsite does or does not need the conservative tail boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VarargCallTreatment {
+    /// Nothing is proved: every pointer-valued tail actual crosses an Ω boundary.
+    Boundary,
+    /// The callee's own contract in the shared external table already models the effects.
+    ExternalContract,
+    /// Positional `va_arg` recognition binds the actuals to the callee's own values.
+    PositionalBinding,
+    /// The callee never reads its variadic tail.
+    NoConsumption,
+    /// Every pointer the callee extracts from its tail is only read.
+    ProvedReadOnlyTail,
+}
+
+/// A standard `v*printf` entry point: the byte format and the `va_list` are at fixed positions,
+/// and the tail is consumed only through that format. The wide-character variants are absent on
+/// purpose — the format decoder reads bytes — as are non-standard `verr`-style entry points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StandardVaListSink {
+    fixed_params: usize,
+    format_param: usize,
+    va_list_param: usize,
+}
+
+fn standard_va_list_sink(callee: &str) -> Option<StandardVaListSink> {
+    let sink = |fixed_params, format_param, va_list_param| StandardVaListSink {
+        fixed_params,
+        format_param,
+        va_list_param,
+    };
+    Some(match callee.strip_prefix('@').unwrap_or(callee) {
+        "vprintf" => sink(2, 0, 1),
+        "vfprintf" | "vdprintf" | "vsprintf" | "vasprintf" => sink(3, 1, 2),
+        "vsnprintf" => sink(4, 2, 3),
+        _ => return None,
+    })
+}
+
 fn printf_format_arg(callee: &str) -> Option<usize> {
     match callee.strip_prefix('@').unwrap_or(callee) {
         "printf" => Some(0),
@@ -2869,9 +3013,12 @@ fn loc_key(loc: Option<&Loc>) -> String {
     }
 }
 
-fn stmt_consumes_varargs(stmt: &Stmt) -> bool {
+/// Whether this statement is evidence that its function consumes a variadic tail. It is what
+/// decides that an un-proved callee still needs a `VarargCallBoundary` at every callsite, so the
+/// explicit `va_start`/`va_end` statements must count exactly as their opaque predecessors did.
+pub fn stmt_consumes_varargs(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::VarArg { .. } => true,
+        Stmt::VarArg { .. } | Stmt::VaStart { .. } | Stmt::VaEnd { .. } => true,
         Stmt::Unknown { op, reason, .. } => {
             reason == "va_arg" || reason == "varargs_intrinsic" || op.starts_with("llvm.va_")
         }
@@ -2940,31 +3087,6 @@ pub fn positionally_modeled_vararg_functions(pir: &Pir, opts: &PagOpts) -> BTree
         .collect()
 }
 
-fn is_known_benign_vararg_callee(callee: &str) -> bool {
-    matches!(
-        callee,
-        // tmux formatting/logging wrappers inspected for M4.3.
-        "log_debug"
-            | "cmdq_error"
-            | "cmdq_print"
-            | "fatalx"
-            | "xasprintf"
-            | "xsnprintf"
-            | "format_add"
-            | "cfg_add_cause"
-            // curl formatting/message wrappers inspected for M4.3.
-            | "warnf"
-            | "errorf"
-            | "notef"
-            | "helpf"
-            | "easysrc_addf"
-            | "curl_mprintf"
-            | "curl_mfprintf"
-            | "curl_msnprintf"
-            | "curl_maprintf"
-            | "curlx_dyn_addf"
-    )
-}
 
 /// Whether this direct variadic call has a proved pointer-safe ABI boundary. Project-specific
 /// wrappers retain their inspected whole-function contracts. Standard printf-family calls are
@@ -2983,9 +3105,31 @@ pub struct VarargCallProof<'a> {
     functions: BTreeMap<&'a str, &'a pangs_pir::Func>,
     fixed_forwarders: BTreeMap<String, FixedForwarderState>,
     variadic_forwarders: BTreeMap<String, Option<usize>>,
+    tail_audits: BTreeMap<TailEntry, TailAuditState>,
+    tail_audit_budget: usize,
     #[cfg(test)]
     fixed_summary_computations: usize,
 }
+
+/// One state of the read-only tail audit: a function together with the parameters that carry a
+/// `va_list` address, the parameters that carry a pointer already extracted from some tail, and
+/// whether the function's own `va_start` list is under audit.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TailEntry {
+    func: String,
+    own_va_start: bool,
+    list_params: Vec<usize>,
+    tail_params: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TailAuditState {
+    InProgress,
+    Done(bool),
+}
+
+/// How many audit states one module may explore. Reaching it rejects, like every other budget.
+const MAX_TAIL_AUDIT_STATES: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FixedVfprintfForwarder {
@@ -3029,20 +3173,346 @@ impl<'a> VarargCallProof<'a> {
                 .collect(),
             fixed_forwarders: BTreeMap::new(),
             variadic_forwarders: BTreeMap::new(),
+            tail_audits: BTreeMap::new(),
+            tail_audit_budget: MAX_TAIL_AUDIT_STATES,
             #[cfg(test)]
             fixed_summary_computations: 0,
         }
     }
 
     pub fn is_benign(&mut self, callee: &str, args: &[String]) -> bool {
-        if is_known_benign_vararg_callee(callee) {
-            return true;
-        }
         proven_printf_effect(self.pir, callee, args).is_some()
             || self
                 .internal_vfprintf_forwarder_format_index(callee)
                 .and_then(|index| args.get(index))
                 .is_some_and(|operand| constant_formats_are_percent_n_free(self.pir, operand))
+            || self.variadic_tail_is_read_only(callee)
+    }
+
+    /// Whether every pointer this internal variadic callee extracts from its own tail is only
+    /// read. Unlike the `vfprintf`-forwarder route, the proof is a property of the callee's body,
+    /// so it holds at every callsite and needs no constant format there.
+    pub fn variadic_tail_is_read_only(&mut self, callee: &str) -> bool {
+        let Some(func) = self.functions.get(callee).copied() else {
+            return false;
+        };
+        if func.external || !func.sig.vararg {
+            return false;
+        }
+        self.tail_entry_is_read_only(TailEntry {
+            func: callee.to_string(),
+            own_va_start: true,
+            list_params: Vec::new(),
+            tail_params: Vec::new(),
+        })
+    }
+
+    fn tail_entry_is_read_only(&mut self, entry: TailEntry) -> bool {
+        match self.tail_audits.get(&entry) {
+            // A cycle would need its own fixed-point argument; reject the whole entry instead.
+            Some(TailAuditState::InProgress) => return false,
+            Some(TailAuditState::Done(result)) => return *result,
+            None => {}
+        }
+        if self.tail_audit_budget == 0 {
+            return false;
+        }
+        self.tail_audit_budget -= 1;
+        self.tail_audits.insert(entry.clone(), TailAuditState::InProgress);
+        let result = self.audit_tail_entry(&entry);
+        self.tail_audits
+            .insert(entry, TailAuditState::Done(result));
+        result
+    }
+
+    fn value_may_carry_pointer(&self, value: &str) -> bool {
+        self.pir
+            .lowering
+            .semantic_value_kinds
+            .get(value)
+            .copied()
+            .unwrap_or_default()
+            .may_carry_pointer()
+    }
+
+    fn audit_tail_entry(&mut self, entry: &TailEntry) -> bool {
+        let Some(func) = self.functions.get(entry.func.as_str()).copied() else {
+            return false;
+        };
+        if func.external || func.param_names.len() != func.sig.params.len() {
+            return false;
+        }
+
+        let starts = func
+            .body
+            .iter()
+            .filter_map(|stmt| vararg_intrinsic_operand(stmt, "llvm.va_start"))
+            .collect::<Vec<_>>();
+        let ends = func
+            .body
+            .iter()
+            .filter_map(|stmt| vararg_intrinsic_operand(stmt, "llvm.va_end"))
+            .collect::<Vec<_>>();
+        let mut roots = BTreeSet::new();
+        if entry.own_va_start {
+            if starts.is_empty() {
+                return false;
+            }
+            let start_roots = match starts
+                .iter()
+                .map(|value| unique_local_alloca_root(func, value))
+                .collect::<Option<BTreeSet<_>>>()
+            {
+                Some(roots) => roots,
+                None => return false,
+            };
+            let end_roots = match ends
+                .iter()
+                .map(|value| unique_local_alloca_root(func, value))
+                .collect::<Option<BTreeSet<_>>>()
+            {
+                Some(roots) => roots,
+                None => return false,
+            };
+            if !end_roots.is_subset(&start_roots) {
+                return false;
+            }
+            roots.extend(start_roots);
+        } else if !starts.is_empty() || !ends.is_empty() {
+            // A consumer reached through a `va_list` parameter must not also open its own list:
+            // that second list is unaudited from here.
+            return false;
+        }
+        for &param in &entry.list_params {
+            match func.param_names.get(param) {
+                Some(name) => {
+                    roots.insert(name.as_str());
+                }
+                None => return false,
+            }
+        }
+        let list_values = local_pointer_derivatives(func, &roots);
+
+        let mut tail = BTreeSet::new();
+        for &param in &entry.tail_params {
+            match func.param_names.get(param) {
+                Some(name) => {
+                    tail.insert(name.as_str());
+                }
+                None => return false,
+            }
+        }
+        // A positionally recognized `va_arg` delivers a tail pointer without a load, so its
+        // result is a tail seed too. Without this the audit would not see what that value does.
+        for stmt in &func.body {
+            if let Stmt::VarArg { dest, .. } = stmt {
+                if self.value_may_carry_pointer(dest) {
+                    tail.insert(dest.as_str());
+                }
+            }
+        }
+        // A value proven non-pointer cannot carry an address out of the tail, which is what lets
+        // an ordinary `%d`/`%.*s` conversion read integers from the list without rejecting it.
+        loop {
+            let before = tail.len();
+            for stmt in &func.body {
+                let (dest, sourced) = match stmt {
+                    Stmt::Load { dest, address, .. } => (
+                        dest,
+                        list_values.contains(address.as_str()) || tail.contains(address.as_str()),
+                    ),
+                    Stmt::Assign { dest, sources, .. } => (
+                        dest,
+                        sources.iter().any(|source| tail.contains(source.as_str())),
+                    ),
+                    Stmt::Gep { dest, base, .. } => (dest, tail.contains(base.as_str())),
+                    _ => continue,
+                };
+                if !sourced || !self.value_may_carry_pointer(dest) {
+                    continue;
+                }
+                // A phi joining the list address with a pointer read out of it would be in both
+                // sets at once, and the list rules are the weaker of the two. Fail closed rather
+                // than pick one.
+                if list_values.contains(dest.as_str()) {
+                    return false;
+                }
+                tail.insert(dest.as_str());
+            }
+            if tail.len() == before {
+                break;
+            }
+        }
+
+        func.body
+            .iter()
+            .all(|stmt| self.tail_use_is_read_only(func, stmt, &list_values, &tail))
+    }
+
+    fn tail_use_is_read_only(
+        &mut self,
+        func: &pangs_pir::Func,
+        stmt: &Stmt,
+        list_values: &BTreeSet<&str>,
+        tail: &BTreeSet<&str>,
+    ) -> bool {
+        let is_list = |value: &str| list_values.contains(value);
+        let is_tail = |value: &str| tail.contains(value);
+        let touched = stmt_input_operands(stmt)
+            .into_iter()
+            .filter(|operand| is_list(operand) || is_tail(operand))
+            .collect::<Vec<_>>();
+        if touched.is_empty() {
+            return true;
+        }
+        match stmt {
+            // Copies and address arithmetic stay inside the tracked sets, or land in a value
+            // proven not to carry a pointer.
+            Stmt::Assign { dest, .. } | Stmt::Gep { dest, .. } => {
+                is_list(dest) || is_tail(dest) || !self.value_may_carry_pointer(dest)
+            }
+            // Reading through the list or through a tail pointer is the effect we are proving.
+            Stmt::Load { .. } => true,
+            Stmt::Store { address, value, .. } => {
+                // Writing into the list itself is ordinary ABI bookkeeping. Writing *through* a
+                // tail pointer is the effect that would make the summary a lie, and storing
+                // either the list address or a tail pointer into other memory is a capture.
+                if is_tail(address) || is_list(value) || is_tail(value) {
+                    return is_list(address) && !is_list(value);
+                }
+                is_list(address)
+            }
+            Stmt::Memcpy { dst, src, .. } => {
+                !is_list(dst) && !is_tail(dst) && !is_list(src) && is_tail(src)
+            }
+            Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => is_list(list),
+            Stmt::CallDirect {
+                callee,
+                sig,
+                args,
+                dest,
+                ..
+            } => self.tail_call_is_read_only(func, callee, sig, args, dest.as_deref(), tail, list_values),
+            // Everything else — returning the pointer, integer conversion, arithmetic on it,
+            // memset, inline assembly, an indirect call, a `va_copy` spelled as an unknown
+            // intrinsic — is either a capture or an unmodeled effect.
+            _ => false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tail_call_is_read_only(
+        &mut self,
+        func: &pangs_pir::Func,
+        callee: &str,
+        sig: &Signature,
+        args: &[String],
+        dest: Option<&str>,
+        tail: &BTreeSet<&str>,
+        list_values: &BTreeSet<&str>,
+    ) -> bool {
+        let positions = |set: &BTreeSet<&str>| {
+            args.iter()
+                .enumerate()
+                .filter(|(_, arg)| set.contains(arg.as_str()))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
+        let list_positions = positions(list_values);
+        let tail_positions = positions(tail)
+            .into_iter()
+            .filter(|index| !list_positions.contains(index))
+            .collect::<Vec<_>>();
+
+        let internal = self
+            .functions
+            .get(callee)
+            .is_some_and(|callee| !callee.external);
+        if internal {
+            // Continue the same audit in the callee. A list or tail pointer handed to a
+            // *variadic* position of another variadic callee is not a fixed parameter there and
+            // has no state to audit, so it fails closed.
+            if list_positions
+                .iter()
+                .chain(tail_positions.iter())
+                .any(|index| *index >= sig.params.len())
+            {
+                return false;
+            }
+            return self.tail_entry_is_read_only(TailEntry {
+                func: callee.to_string(),
+                own_va_start: false,
+                list_params: list_positions,
+                tail_params: tail_positions,
+            });
+        }
+
+        // Forwarding the whole list to a standard `v*printf` entry point consumes the tail
+        // through the format, so `%n` is the only way it could write. A format that is constant
+        // here discharges that locally; a format that arrives as a parameter is left to the
+        // callsite-sensitive forwarder proof.
+        if let Some(sink) = standard_va_list_sink(callee) {
+            return args.len() == sink.fixed_params
+                && list_positions == [sink.va_list_param]
+                && tail_positions.is_empty()
+                && args
+                    .get(sink.format_param)
+                    .is_some_and(|format| constant_formats_are_percent_n_free(self.pir, format));
+        }
+
+        // Any other external call needs a contract, and the list address may never cross it.
+        if !list_positions.is_empty() {
+            return false;
+        }
+        let Some(contract) =
+            proven_external_call_contract(self.pir, callee, sig, args, dest.is_some())
+        else {
+            return false;
+        };
+        if matches!(
+            contract.capture,
+            pangs_pir::ExternalCaptureContract::RetainedArgument(index)
+                if tail_positions.contains(&index)
+        ) {
+            return false;
+        }
+        if matches!(
+            contract.result,
+            ExternalResultContract::AliasArg(index)
+                | ExternalResultContract::AliasArgOrFresh(index)
+                if tail_positions.contains(&index)
+        ) {
+            return false;
+        }
+        if contract
+            .copy
+            .is_some_and(|copy| tail_positions.contains(&copy.destination))
+        {
+            return false;
+        }
+        let _ = func;
+        tail_positions.iter().all(|&index| {
+            if index >= contract.fixed_params {
+                // A variadic destination of this call: only a proven `%n`-free printf format
+                // keeps it read-only, and only when it is not the written buffer.
+                matches!(
+                    proven_printf_effect(self.pir, callee, args),
+                    Some(ProvenPrintfEffect::NoClientWrite)
+                ) || matches!(
+                    proven_printf_effect(self.pir, callee, args),
+                    Some(ProvenPrintfEffect::WritesArg { index: written }) if written != index
+                )
+            } else {
+                contract
+                    .effects
+                    .iter()
+                    .all(|effect| !matches!(effect, ExternalArgEffect::Write(written) | ExternalArgEffect::ReadWrite(written) if *written == index))
+                    && contract
+                        .effects
+                        .iter()
+                        .any(|effect| matches!(effect, ExternalArgEffect::Read(read) if *read == index))
+            }
+        })
     }
 
     fn internal_vfprintf_forwarder_format_index(&mut self, callee: &str) -> Option<usize> {
@@ -3149,11 +3619,11 @@ impl<'a> VarargCallProof<'a> {
         let Stmt::CallDirect { callee, args, .. } = stmt else {
             return FixedForwarderLookup::NoContract;
         };
-        if callee.strip_prefix('@').unwrap_or(callee) == "vfprintf" {
-            return if args.len() == 3 {
+        if let Some(sink) = standard_va_list_sink(callee) {
+            return if args.len() == sink.fixed_params {
                 FixedForwarderLookup::Contract(FixedVfprintfForwarder {
-                    format_param: 1,
-                    va_list_param: 2,
+                    format_param: sink.format_param,
+                    va_list_param: sink.va_list_param,
                 })
             } else {
                 FixedForwarderLookup::NoContract
@@ -3308,6 +3778,9 @@ fn call_could_forward_distinct_params(
 
 fn vararg_intrinsic_operand<'a>(stmt: &'a Stmt, expected: &str) -> Option<&'a str> {
     match stmt {
+        Stmt::VaStart { list, .. } if expected == "llvm.va_start" => Some(list.as_str()),
+        Stmt::VaEnd { list, .. } if expected == "llvm.va_end" => Some(list.as_str()),
+        // Hand-written PIR and pre-`VaStart` exports keep the opaque spelling.
         Stmt::Unknown {
             op,
             operands,
@@ -3558,6 +4031,7 @@ fn stmt_input_operands(stmt: &Stmt) -> Vec<&str> {
         Stmt::Gep { base, .. } => vec![base],
         Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => vec![source],
         Stmt::VarArg { .. } => Vec::new(),
+        Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => vec![list],
         Stmt::Memcpy { dst, src, .. } => vec![dst, src],
         Stmt::Memset { dst, value, .. } => vec![dst, value],
         Stmt::Unknown { operands, .. } => operands.iter().map(String::as_str).collect(),
@@ -3595,6 +4069,9 @@ fn va_list_uses_are_confined(
             Stmt::Gep { dest, base, .. } => {
                 used.len() == 1 && used[0] == base && derived.contains(dest.as_str())
             }
+            Stmt::VaStart { .. } => used.len() == 1 && starts.contains(used[0]),
+            Stmt::VaEnd { .. } => used.len() == 1 && ends.contains(used[0]),
+            // Hand-written PIR and pre-`VaStart` exports keep the opaque spelling.
             Stmt::Unknown { op, operands, .. }
                 if matches!(op.as_str(), "llvm.va_start" | "llvm.va_end") =>
             {
@@ -3645,9 +4122,9 @@ fn constant_formats_are_percent_n_free(pir: &Pir, operand: &str) -> bool {
 }
 
 /// Resolve a pointer-valued format operand through the PIR's representation of pointer SSA
-/// copies, `select`, and `phi`. LLVM lowering deliberately represents all three as `Assign`;
-/// requiring every source to resolve keeps the proof independent of pointee types and rejects
-/// cycles, memory loads, and genuinely dynamic alternatives.
+/// copies, `select`, `phi`, and constant-offset address arithmetic. LLVM lowering represents the
+/// first three as `Assign`; requiring every source to resolve keeps the proof independent of
+/// pointee types and rejects cycles, memory loads, and genuinely dynamic alternatives.
 fn constant_format_bytes(pir: &Pir, operand: &str) -> Option<BTreeSet<Vec<u8>>> {
     fn visit(
         pir: &Pir,
@@ -3671,14 +4148,34 @@ fn constant_format_bytes(pir: &Pir, operand: &str) -> Option<BTreeSet<Vec<u8>>> 
         if definitions.next().is_some() {
             return None;
         }
-        let Stmt::Assign { sources, .. } = definition else {
-            return None;
-        };
-        if sources.is_empty() {
-            return None;
-        }
-        for source in sources {
-            visit(pir, source, visiting, formats)?;
+        match definition {
+            Stmt::Assign { sources, .. } if !sources.is_empty() => {
+                for source in sources {
+                    visit(pir, source, visiting, formats)?;
+                }
+            }
+            // Clang spells a string-constant operand as a zero-offset GEP on the private
+            // constant, so a resolver that walked only assignments never reached a real format
+            // string on `-O0` bitcode. A constant offset selects the tail of that same constant;
+            // a dynamic lane, an unknown offset, and an offset past the decoded string all fail
+            // closed.
+            Stmt::Gep {
+                base,
+                byte_off,
+                lane,
+                ..
+            } if lane.is_none() => {
+                let offset = usize::try_from((*byte_off)?).ok()?;
+                let mut base_formats = BTreeSet::new();
+                visit(pir, base, visiting, &mut base_formats)?;
+                for format in base_formats {
+                    formats.insert(format.get(offset..)?.to_vec());
+                }
+                if formats.len() > MAX_CONSTANT_FORMAT_ALTERNATIVES {
+                    return None;
+                }
+            }
+            _ => return None,
         }
         visiting.remove(operand);
         Some(())
@@ -3984,6 +4481,203 @@ mod tests {
         ));
     }
 
+    /// Clang spells every `-O0` string-constant operand as a zero-offset GEP, so the format proof
+    /// is worthless unless it walks that shape. A constant offset selects the tail of the same
+    /// constant; every dynamic or out-of-range shape keeps the conservative boundary.
+    #[test]
+    fn printf_format_proof_follows_constant_offset_geps() {
+        let format = |key: &str, initializer: &str, is_const: bool| Global {
+            key: key.to_string(),
+            is_const,
+            mutable: !is_const,
+            initializer_ir: Some(initializer.to_string()),
+            ..Global::default()
+        };
+        let mut pir = Pir {
+            module: "gep-formats".to_string(),
+            source: None,
+            lowering: Default::default(),
+            target: None,
+            functions: vec![],
+            globals: vec![
+                format("str.safe", "[3 x i8] c\"%s\\00\"", true),
+                format("str.tail", "[6 x i8] c\"%n ok\\00\"", true),
+                format("str.mutable", "[3 x i8] c\"%s\\00\"", false),
+            ],
+            global_init: vec![],
+        };
+        pir.functions = serde_json::from_str(
+            r#"[{
+                "key":"caller",
+                "sig":{"ret":{"class":"void"},"params":[]},
+                "body":[
+                    {"kind":"gep","dest":"%caller::decay","base":"@str.safe","byte_off":0},
+                    {"kind":"assign","dest":"%caller::decay1","sources":["%caller::decay"]},
+                    {"kind":"gep","dest":"%caller::nested","base":"%caller::decay","byte_off":0},
+                    {"kind":"gep","dest":"%caller::tail_head","base":"@str.tail","byte_off":0},
+                    {"kind":"gep","dest":"%caller::tail_ok","base":"@str.tail","byte_off":3},
+                    {"kind":"gep","dest":"%caller::tail_end","base":"@str.tail","byte_off":5},
+                    {"kind":"gep","dest":"%caller::past_end","base":"@str.tail","byte_off":6},
+                    {"kind":"gep","dest":"%caller::negative","base":"@str.safe","byte_off":-1},
+                    {"kind":"gep","dest":"%caller::unknown_off","base":"@str.safe"},
+                    {"kind":"gep","dest":"%caller::lane","base":"@str.safe","lane":{"modulus":4,"residue":0}},
+                    {"kind":"gep","dest":"%caller::mutable_base","base":"@str.mutable","byte_off":0},
+                    {"kind":"assign","dest":"%caller::join","sources":["%caller::decay","%caller::tail_ok"]},
+                    {"kind":"assign","dest":"%caller::mixed","sources":["%caller::decay","%caller::tail_head"]}
+                ]
+            }]"#,
+        )
+        .unwrap();
+        let fprintf_args = |format: &str| {
+            vec![
+                "stream".to_string(),
+                format.to_string(),
+                "value".to_string(),
+            ]
+        };
+        let benign = |format: &str| direct_vararg_call_is_benign(&pir, "fprintf", &fprintf_args(format));
+
+        // The shape Clang actually emits, directly and through the `arraydecay` copy.
+        assert!(benign("%caller::decay"));
+        assert!(benign("%caller::decay1"));
+        assert!(benign("%caller::nested"));
+        // A constant offset selects the tail, so it can drop a leading `%n` but never invent one.
+        assert!(!benign("%caller::tail_head"));
+        assert!(benign("%caller::tail_ok"));
+        assert!(benign("%caller::tail_end"));
+        // Everything unproved keeps the conservative answer.
+        assert!(!benign("%caller::past_end"));
+        assert!(!benign("%caller::negative"));
+        assert!(!benign("%caller::unknown_off"));
+        assert!(!benign("%caller::lane"));
+        assert!(!benign("%caller::mutable_base"));
+        // A select/phi over GEP alternatives still requires every alternative to be safe.
+        assert!(benign("%caller::join"));
+        assert!(!benign("%caller::mixed"));
+    }
+
+    /// The body proof for an internal variadic consumer: a tail pointer may be read, and
+    /// nothing else. It holds at every callsite, so unlike the `vfprintf`-forwarder route it
+    /// needs no constant format there.
+    #[test]
+    fn read_only_tail_consumers_are_proved_from_their_bodies() {
+        // Each callee opens its own list and then does exactly one interesting thing with the
+        // pointer it extracts.
+        let callee = |key: &str, body: &str| {
+            format!(
+                r#"{{"key":"{key}","sig":{{"ret":{{"class":"void"}},"params":[{{"class":"integer"}}],"vararg":true}},
+                    "param_names":["%{key}::fmt"],
+                    "body":[
+                      {{"kind":"alloca","dest":"%{key}::ap","ty":"[1 x %struct.__va_list_tag]"}},
+                      {{"kind":"gep","dest":"%{key}::decay","base":"%{key}::ap","byte_off":0}},
+                      {{"kind":"va_start","list":"%{key}::decay"}},
+                      {{"kind":"load","dest":"%{key}::tail","address":"%{key}::decay","access_bytes":8}},
+                      {body},
+                      {{"kind":"va_end","list":"%{key}::decay"}},
+                      {{"kind":"return","value":null}}
+                    ]}}"#
+            )
+        };
+        let callees = [
+            // Reading through the tail pointer, directly and through a contracted external.
+            callee("reads_tail", r#"{"kind":"load","dest":"%reads_tail::byte","address":"%reads_tail::tail","access_bytes":1}"#),
+            callee("external_read", r#"{"kind":"call_direct","callee":"strlen","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"args":["%external_read::tail"],"dest":"%external_read::len"}"#),
+            callee("copies_out", r#"{"kind":"memcpy","dst":"%copies_out::fmt","src":"%copies_out::tail","bytes":8}"#),
+            // Writes, captures, invocations and unmodeled uses of the tail pointer.
+            callee("writes_tail", r#"{"kind":"store","address":"%writes_tail::tail","value":"0","access_bytes":8}"#),
+            callee("captures_tail", r#"{"kind":"store","address":"@g","value":"%captures_tail::tail","access_bytes":8}"#),
+            // Transitivity: a pointer *loaded through* the tail pointer is tail-derived too, so
+            // capturing it is a capture. Without this rule the summary would be a lie.
+            callee("captures_deep", r#"{"kind":"load","dest":"%captures_deep::inner","address":"%captures_deep::tail","access_bytes":8},
+                      {"kind":"store","address":"@g","value":"%captures_deep::inner","access_bytes":8}"#),
+            callee("copies_into", r#"{"kind":"memcpy","dst":"%copies_into::tail","src":"%copies_into::fmt","bytes":8}"#),
+            callee("external_write", r#"{"kind":"call_direct","callee":"memset","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"},{"class":"integer"}]},"args":["%external_write::tail","0","8"],"dest":"%external_write::res"}"#),
+            callee("uncontracted", r#"{"kind":"call_direct","callee":"opaque","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["%uncontracted::tail"]}"#),
+            callee("invokes_tail", r#"{"kind":"call_indirect","operand":"%invokes_tail::tail","sig":{"ret":{"class":"void"},"params":[]},"args":[]}"#),
+            callee("forges_tail", r#"{"kind":"ptr_to_int","dest":"%forges_tail::n","source":"%forges_tail::tail","integer_bits":64,"pointer_bits":64}"#),
+            // A positionally recognized `va_arg` result is a tail seed even though no load
+            // produced it.
+            callee("positional_capture", r#"{"kind":"var_arg","dest":"%positional_capture::va","position":{"kind":"exact","index":0}},
+                      {"kind":"store","address":"@g","value":"%positional_capture::va","access_bytes":8}"#),
+            // A phi joining the list address with a pointer read out of it is ambiguous.
+            callee("ambiguous_phi", r#"{"kind":"assign","dest":"%ambiguous_phi::decay","sources":["%ambiguous_phi::tail"]}"#),
+            // Interprocedural: the helper decides the wrapper's verdict.
+            callee("through_helper", r#"{"kind":"call_direct","callee":"helper_reads","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["%through_helper::tail"]}"#),
+            callee("through_bad_helper", r#"{"kind":"call_direct","callee":"helper_writes","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["%through_bad_helper::tail"]}"#),
+            // Handing the list itself to another internal consumer, and to itself.
+            callee("forwards_list", r#"{"kind":"call_direct","callee":"consumer_reads","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["%forwards_list::decay"]}"#),
+            callee("forwards_list_badly", r#"{"kind":"call_direct","callee":"consumer_writes","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["%forwards_list_badly::decay"]}"#),
+            callee("recursive", r#"{"kind":"call_direct","callee":"recursive_helper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["%recursive::decay"]}"#),
+            callee("returns_tail", r#"{"kind":"assign","dest":"%returns_tail::escaped","sources":["%returns_tail::tail"]}"#),
+        ]
+        .join(",");
+        let helpers = r#"
+            {"key":"helper_reads","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"param_names":["%helper_reads::p"],
+             "body":[{"kind":"load","dest":"%helper_reads::v","address":"%helper_reads::p","access_bytes":1},{"kind":"return","value":null}]},
+            {"key":"helper_writes","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"param_names":["%helper_writes::p"],
+             "body":[{"kind":"store","address":"%helper_writes::p","value":"0","access_bytes":1},{"kind":"return","value":null}]},
+            {"key":"consumer_reads","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"param_names":["%consumer_reads::ap"],
+             "body":[{"kind":"load","dest":"%consumer_reads::tail","address":"%consumer_reads::ap","access_bytes":8},
+                     {"kind":"load","dest":"%consumer_reads::v","address":"%consumer_reads::tail","access_bytes":1},
+                     {"kind":"return","value":null}]},
+            {"key":"consumer_writes","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"param_names":["%consumer_writes::ap"],
+             "body":[{"kind":"load","dest":"%consumer_writes::tail","address":"%consumer_writes::ap","access_bytes":8},
+                     {"kind":"store","address":"%consumer_writes::tail","value":"0","access_bytes":1},
+                     {"kind":"return","value":null}]},
+            {"key":"recursive_helper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"param_names":["%recursive_helper::ap"],
+             "body":[{"kind":"call_direct","callee":"recursive_helper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["%recursive_helper::ap"]},
+                     {"kind":"return","value":null}]},
+            {"key":"strlen","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"body":[]},
+            {"key":"memset","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"},{"class":"integer"}]},"body":[]},
+            {"key":"opaque","external":true,"sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"body":[]}"#;
+        let pir: Pir = serde_json::from_str(&format!(
+            r#"{{"module":"read-only-tails","globals":[{{"key":"@g","mutable":true}}],
+                "functions":[{callees},{helpers}]}}"#
+        ))
+        .unwrap();
+
+        // `returns_tail` only copies the pointer into another local; make the copy escape.
+        let mut pir = pir;
+        let returns_tail = pir
+            .functions
+            .iter_mut()
+            .find(|func| func.key == "returns_tail")
+            .unwrap();
+        returns_tail.body.push(Stmt::Return {
+            value: Some("%returns_tail::escaped".to_string()),
+            loc: None,
+        });
+
+        let benign = |callee: &str| direct_vararg_call_is_benign(&pir, callee, &["fmt".to_string(), "arg".to_string()]);
+        for proved in [
+            "reads_tail",
+            "external_read",
+            "copies_out",
+            "through_helper",
+            "forwards_list",
+        ] {
+            assert!(benign(proved), "{proved} reads its tail and nothing else");
+        }
+        for rejected in [
+            "writes_tail",
+            "captures_tail",
+            "copies_into",
+            "external_write",
+            "uncontracted",
+            "invokes_tail",
+            "forges_tail",
+            "through_bad_helper",
+            "forwards_list_badly",
+            "positional_capture",
+            "ambiguous_phi",
+            "captures_deep",
+            "recursive",
+            "returns_tail",
+        ] {
+            assert!(!benign(rejected), "{rejected} must keep the boundary");
+        }
+    }
+
     #[test]
     fn internal_vfprintf_forwarder_requires_constant_safe_format_and_closed_va_list() {
         let pir: Pir = serde_json::from_str(
@@ -4225,6 +4919,150 @@ mod tests {
         assert!(
             VarargCallProof::new(&irrelevant_recursion).is_benign("report", &["@safe".to_string()])
         );
+    }
+
+    /// `access` reads its pathname synchronously and retains nothing, so the exact POSIX
+    /// declaration is a modeled read rather than an Ω boundary. Every other shape of the same
+    /// name — a module-defined replacement, a wrong arity, a wrong result class — keeps the
+    /// boundary, because the contract is a fact about the standard function, not about the name.
+    #[test]
+    fn access_contract_reads_its_pathname_and_fails_closed_off_shape() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"access-contract",
+                "globals":[{"key":"@path","is_const":false,"mutable":true}],
+                "functions":[
+                    {"key":"main","exported":true,"sig":{"ret":{"class":"void"},"params":[]},"body":[
+                        {"kind":"gep","dest":"%main::decay","base":"@path","byte_off":0},
+                        {"kind":"call_direct","callee":"access","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["%main::decay","4"],"dest":"%main::ok"},
+                        {"kind":"call_direct","callee":"access_arity","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"args":["%main::decay"],"dest":"%main::arity"},
+                        {"kind":"call_direct","callee":"access_void","sig":{"ret":{"class":"void"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["%main::decay","4"]},
+                        {"kind":"call_direct","callee":"access_local","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"args":["%main::decay","4"],"dest":"%main::local"}
+                    ]},
+                    {"key":"access","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"body":[]},
+                    {"key":"access_arity","external":true,"sig":{"ret":{"class":"integer"},"params":[{"class":"integer"}]},"body":[]},
+                    {"key":"access_void","external":true,"sig":{"ret":{"class":"void"},"params":[{"class":"integer"},{"class":"integer"}]},"body":[]},
+                    {"key":"access_local","sig":{"ret":{"class":"integer"},"params":[{"class":"integer"},{"class":"integer"}]},"body":[
+                        {"kind":"return","value":null}
+                    ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let boundary = |callee: &str| {
+            let callsite = pag
+                .callsites
+                .iter()
+                .find(|callsite| callsite.callee.as_deref() == Some(callee))
+                .unwrap();
+            callsite.external_boundary
+                || pag.omega_seeds.iter().any(|seed| {
+                    seed.kind == OmegaSeedKind::ExternalCallBoundary
+                        && seed.target == SeedTarget::Callsite(callsite.id)
+                })
+        };
+        assert!(!boundary("access"));
+        // The contract is resolved by exact name, so these three are renamed stand-ins for the
+        // shapes that must not resolve: wrong arity, wrong result class, and a local definition.
+        assert!(boundary("access_arity"));
+        assert!(boundary("access_void"));
+        assert!(!boundary("access_local"));
+
+        let contract = proven_external_call_contract(
+            &pir,
+            "access",
+            &pangs_pir::Signature {
+                ret: pangs_pir::AbiClass::Integer,
+                params: vec![pangs_pir::Param::Integer, pangs_pir::Param::Integer],
+                vararg: false,
+                cc: "ccc".to_string(),
+            },
+            &["%main::decay".to_string(), "4".to_string()],
+            true,
+        )
+        .expect("exact POSIX access shape has a contract");
+        assert_eq!(contract.effects, &[ExternalArgEffect::Read(0)]);
+        assert!(matches!(
+            contract.capture,
+            pangs_pir::ExternalCaptureContract::None
+        ));
+    }
+
+    /// `va_start` writes caller-provided list storage; it does not publish that storage to an
+    /// unknown external agent. What it fills the list with *is* opaque, and an un-proved consumer
+    /// must still make its callers' pointer actuals cross a boundary.
+    #[test]
+    fn va_start_records_a_local_write_without_publishing_the_list_address() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"va-list-payload",
+                "globals":[{"key":"@g","mutable":true}],
+                "functions":[
+                    {"key":"wrapper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}],"vararg":true},
+                     "param_names":["%wrapper::fmt"],
+                     "body":[
+                        {"kind":"alloca","dest":"%wrapper::ap","ty":"[1 x %struct.__va_list_tag]"},
+                        {"kind":"gep","dest":"%wrapper::decay","base":"%wrapper::ap","byte_off":0},
+                        {"kind":"va_start","list":"%wrapper::decay"},
+                        {"kind":"load","dest":"%wrapper::area","address":"%wrapper::decay","access_bytes":8},
+                        {"kind":"load","dest":"%wrapper::deep","address":"%wrapper::area","access_bytes":8},
+                        {"kind":"store","address":"%wrapper::deep","value":"%wrapper::fmt","access_bytes":8},
+                        {"kind":"va_end","list":"%wrapper::decay"},
+                        {"kind":"return","value":null}
+                     ]},
+                    {"key":"driver","exported":true,"sig":{"ret":{"class":"void"},"params":[]},
+                     "body":[
+                        {"kind":"gep","dest":"%driver::addr","base":"@g","byte_off":0},
+                        {"kind":"call_direct","callee":"wrapper","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}],"vararg":true},"args":["%driver::fmt","%driver::addr"]},
+                        {"kind":"return","value":null}
+                     ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let list = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:wrapper:%wrapper::decay")
+            .expect("the list address has a value node");
+
+        assert!(!pag
+            .omega_seeds
+            .iter()
+            .any(|seed| seed.kind == OmegaSeedKind::UnknownOperandEscape));
+        assert!(pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::VarargListPayload
+                && seed.target == SeedTarget::Node(list.id)
+        }));
+        // The regression guarded here: the boundary predicate used to key on exactly the opaque
+        // statements this representation replaces, so an un-proved consumer would silently stop
+        // making its callers' tail actuals conservative. This wrapper writes through a pointer it
+        // extracted from the tail, so no summary can prove it away.
+        let callsite = pag
+            .callsites
+            .iter()
+            .find(|callsite| callsite.callee.as_deref() == Some("wrapper"))
+            .unwrap();
+        assert!(pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::VarargCallBoundary
+                && seed.target == SeedTarget::Callsite(callsite.id)
+        }));
+        // Both intrinsics record the memory effect on the list itself.
+        assert_eq!(
+            pag.edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::Store
+                    && edge.dst == list.id
+                    && edge.modeled_external_write)
+                .count(),
+            2
+        );
+        assert!(pag
+            .edges
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Load && edge.src == list.id));
     }
 
     #[test]

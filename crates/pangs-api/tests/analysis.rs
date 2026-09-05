@@ -2873,22 +2873,53 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                     loc: None,
                 }],
             },
+            // A callee whose tail is proved read-only from its own body produces no finding.
+            // This used to be a hard-coded benign name; the proof replaces the allowlist.
             Func {
-                key: "log_debug".to_string(),
+                key: "read_only_sink".to_string(),
                 sig: vararg_sig.clone(),
-                param_names: vec![],
+                param_names: vec!["%read_only_sink::tag".to_string()],
                 file: None,
                 line: None,
                 external: false,
                 exported: false,
                 address_taken: false,
-                body: vec![Stmt::Unknown {
-                    op: "va_arg".to_string(),
-                    operands: vec!["%ap".to_string()],
-                    results: vec!["%next".to_string()],
-                    reason: "va_arg".to_string(),
-                    loc: None,
-                }],
+                body: vec![
+                    Stmt::Alloca {
+                        dest: "%read_only_sink::ap".to_string(),
+                        ty: "[1 x %struct.__va_list_tag]".to_string(),
+                        loc: None,
+                    },
+                    Stmt::Gep {
+                        dest: "%read_only_sink::decay".to_string(),
+                        base: "%read_only_sink::ap".to_string(),
+                        byte_off: Some(0),
+                        lane: None,
+                        loc: None,
+                    },
+                    Stmt::VaStart {
+                        list: "%read_only_sink::decay".to_string(),
+                        loc: None,
+                    },
+                    Stmt::Load {
+                        dest: "%read_only_sink::tail".to_string(),
+                        address: "%read_only_sink::decay".to_string(),
+                        volatile: false,
+                        access_bytes: Some(8),
+                        loc: None,
+                    },
+                    Stmt::Load {
+                        dest: "%read_only_sink::byte".to_string(),
+                        address: "%read_only_sink::tail".to_string(),
+                        volatile: false,
+                        access_bytes: Some(1),
+                        loc: None,
+                    },
+                    Stmt::VaEnd {
+                        list: "%read_only_sink::decay".to_string(),
+                        loc: None,
+                    },
+                ],
             },
             Func {
                 key: "fprintf".to_string(),
@@ -2944,7 +2975,7 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                         loc: None,
                     },
                     Stmt::CallDirect {
-                        callee: "log_debug".to_string(),
+                        callee: "read_only_sink".to_string(),
                         sig: vararg_sig.clone(),
                         args: vec!["%tag".to_string(), "cb".to_string()],
                         dest: None,

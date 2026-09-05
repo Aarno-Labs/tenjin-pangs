@@ -2943,9 +2943,24 @@ unsafe fn lower_intrinsic_call(
     }
 
     if callee.starts_with("llvm.va_") {
-        if !fctx.positional_varargs.is_empty() && matches!(callee, "llvm.va_start" | "llvm.va_end")
+        // `va_start`/`va_end` operate on caller-provided list storage. Their canonical shape is
+        // one pointer operand and no result; anything else (including every `va_copy`) keeps the
+        // opaque boundary. The two are modeled identically whether or not positional `va_arg`
+        // recognition succeeded, so the list's write effect is recorded in both paths; the
+        // opacity of the list *contents* is decided later, by the PAG.
+        if matches!(callee, "llvm.va_start" | "llvm.va_end")
+            && LLVMGetNumArgOperands(inst) == 1
+            && is_pointer_like_type(LLVMTypeOf(LLVMGetOperand(inst, 0)))
+            && LLVMGetTypeKind(LLVMTypeOf(inst)) == LLVMTypeKind::LLVMVoidTypeKind
         {
-            lowering.bump_modeled(format!("positional_{callee}"));
+            let list = fctx.operand_key(LLVMGetOperand(inst, 0));
+            let loc = loc(inst);
+            body.push(if callee == "llvm.va_start" {
+                Stmt::VaStart { list, loc }
+            } else {
+                Stmt::VaEnd { list, loc }
+            });
+            lowering.bump_modeled(callee);
             return true;
         }
         lowering.bump_tainted(format!("intrinsic:{callee}"));

@@ -225,6 +225,9 @@ impl<'a> FuncIndex<'a> {
 fn for_each_capturing_operand<'a>(stmt: &'a Stmt, visit: &mut impl FnMut(&'a str)) {
     match stmt {
         Stmt::Alloca { .. } | Stmt::VarArg { .. } | Stmt::GlobalRef { .. } => {}
+        // The intrinsic does not capture the list, but a local whose address reaches it is not a
+        // promotable scalar slot either, so keep it out of that class.
+        Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => visit(list),
         Stmt::Assign { sources, .. } => sources.iter().for_each(|s| visit(s)),
         Stmt::ScalarOp { lhs, rhs, .. } => {
             visit(lhs);
@@ -272,6 +275,8 @@ fn stmt_dest(stmt: &Stmt) -> Option<&str> {
         | Stmt::Memset { .. }
         | Stmt::Unknown { .. }
         | Stmt::Return { .. }
+        | Stmt::VaStart { .. }
+        | Stmt::VaEnd { .. }
         | Stmt::GlobalRef { .. } => None,
     }
 }
@@ -428,6 +433,8 @@ impl<'a> Walker<'a> {
             | Stmt::Memcpy { .. }
             | Stmt::Memset { .. }
             | Stmt::Return { .. }
+            | Stmt::VaStart { .. }
+            | Stmt::VaEnd { .. }
             | Stmt::GlobalRef { .. } => {
                 labels.insert(Label::OtherLoad);
             }

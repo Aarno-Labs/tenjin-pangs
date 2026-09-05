@@ -79,15 +79,30 @@ makes per-component soundness auditable); the TeaDSA call/return-site filter
 (instruction-local SSA validity filtering on call-argument/return-value edges — cheap,
 and its precision is frozen into the graph for every downstream phase).
 
-Variadic boundaries fail closed unless their consumption is explicit. In addition to
-positionally recognized `va_arg` operations, PAG construction recognizes internal `vfprintf`
-forwarding wrappers.
-The wrapper proof requires the fixed format parameter to reach `vfprintf` unchanged,
-every `va_list` to have matched `va_start`/`va_end` roots, exactly one list to be forwarded,
-and every list-derived pointer use to be part of that construction, destruction, or call.
-Each wrapper call is then safe only when its actual format is a decodable constant with a
-supported, `%n`-free conversion sequence. Unknown formats, `va_copy`, other consumers,
-escaping list aliases, and unfamiliar dataflow retain the ordinary Ω boundary and audit.
+Variadic boundaries fail closed unless their consumption is explicit. `va_start` and `va_end`
+are explicit local operations rather than opaque operand escapes: they write the `va_list`
+storage and do not publish its address. What the list *contains* is a separate question. Unless
+positional recognition proved every extraction, the list's contents get one opaque external
+region, which is closed under load because every external region contains itself — a pointer
+`va_arg` on the SysV ABI is a two-level extraction, so an opaque region that stopped at the
+list's own fields would hand back an empty set and lose a store destination.
+
+A direct variadic callsite avoids the tail boundary in one of three ways. Positional `va_arg`
+recognition binds the callee's accesses to the callsite's actuals. A callsite-sensitive
+forwarder proof recognizes a wrapper whose list is forwarded once to a standard `v*printf`
+entry point: it requires matched `va_start`/`va_end` roots, exactly one forwarded list, every
+list-derived use confined to that construction, destruction or call, and — because the tail is
+consumed through a format, where `%n` is the only write — a decodable constant, `%n`-free
+format at that callsite. Third, a body proof establishes that every pointer the callee extracts
+from its tail is only read; being a property of the body, it holds at every callsite and needs
+no format. That proof tracks the values naming the list separately from the pointers extracted
+from it, requires each extracted pointer to be read and never written through, stored, returned,
+converted, or invoked, follows internal direct calls by re-entering the callee at the argument
+positions carrying a list or tail pointer, rejects recursion, and stops at a fixed state budget.
+A value LLVM proved non-pointer never enters the tail set, so ordinary integer conversions read
+from the list freely. `va_copy`, an ambiguous join of a list address with a pointer read out of
+it, an escaping list alias, an uncontracted callee, and every unfamiliar dataflow retain the
+ordinary Ω boundary and audit. No callee is exempt by name.
 
 One exact-name, ABI-shape-checked external-call contract table is shared by PAG construction and
 certificate assembly. A contract records every synchronous client-memory read/write, result

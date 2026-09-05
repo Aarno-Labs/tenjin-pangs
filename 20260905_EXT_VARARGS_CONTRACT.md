@@ -2,7 +2,12 @@
 
 ## 0. Status and goal
 
-Proposal, not implemented.  The immediate target is
+**Implemented on 2026-09-05.**  Parts 0, A, B and C1 are in the working tree with fixtures;
+the whole-corpus gates and the remaining work are recorded in §9.  The plan text below is
+kept as the design record; where a measurement contradicted it, the correction is marked
+inline and explained in §9.
+
+The immediate target is
 `tplt_open.templatename_xjtr_0` in `exe-lemon-O0`.  On the 2026-09-05 working tree, a
 validated executable-mode Andersen run chooses `unhandled` for this global even though the
 source object is the fixed string `"lempar.c"` and all source uses are reads.
@@ -22,6 +27,10 @@ precondition for the acceptance gate in §8.2.
    certificate/audit assembly.  This part is staged: C1 extends the existing forwarder
    proof and is enough for Lemon; C2 is the general effect engine and is built only if the
    census justifies it.
+
+C1 grew one step beyond its plan during implementation: the same body proof also settles a
+variadic function that consumes its own list with no forwarding call at all, which is the
+larger population (§5.1) and what allowed the name allowlist of §6.2 to be deleted.
 
 Every failed proof keeps today's boundary.  There is no name-based exemption for
 `lemon_sprintf`, no global-specific exception for `templatename`, and no weakening of
@@ -79,6 +88,9 @@ The PAG currently emits 59 `vararg_call_boundary` seeds and four
 `unknown_operand_escape` seeds for their two `va_start`/`va_end` pairs.
 
 ### 1.1 Why `ErrorMsg` is rejected today
+
+*Confirmed by the implementation: Part 0 alone took Lemon's `vararg_call_boundary` seeds
+from 59 to 10, exactly the 49 `ErrorMsg` callsites.*
 
 The `VarargCallProof` was intended to recognize the `ErrorMsg`/`vfprintf` shape.  It does.
 Hand-tracing `internal_vfprintf_forwarder_format_index("ErrorMsg")` on the dumped PIR gives
@@ -234,6 +246,12 @@ unknown(va_start), unknown(va_end), call_direct, return`: the two intrinsic stat
 
 If Part A replaces them without updating this predicate, every un-proved internal consumer
 silently stops getting a `VarargCallBoundary`.  That fails open.
+
+*This happened.*  The `pangs-pag` copy was updated with the representation, but the second
+copy in `pangs-api` was not, and Lemon's audit findings silently fell from 39 to 0 — the
+seeds were still emitted, but every `fnptr_varargs_internal_unmodeled` finding disappeared,
+and with it one global's `violation_taint`.  The two copies are now one shared
+`pangs_pag::stmt_consumes_varargs`.
 
 Required in the same change:
 
@@ -555,12 +573,17 @@ templatename:
 
 Expected result per part:
 
-| part | expected change |
-|---|---|
-| 0 | `VarargCallBoundary` 59 → 10 (the 49 `ErrorMsg` sites); Mod row gone; `written=false`; escape and `access_set_complete` unchanged |
-| A | `UnknownOperandEscape` 4 → 0; seed and fact vector otherwise unchanged; witness text changes only |
-| B | the `access` call becomes a modeled Ref; escape still held by the `lemon_sprintf` sites |
-| C | `omega_escaped_address=false`, `access_set_complete=true`, no new module-wide ModRef row, `chosen = immutable` |
+| part | expected change | measured |
+|---|---|---|
+| 0 | `VarargCallBoundary` 59 → 10 (the 49 `ErrorMsg` sites); Mod row gone; escape and `access_set_complete` unchanged | as expected |
+| A | `UnknownOperandEscape` 4 → 0; seed and fact vector otherwise unchanged; witness text changes only | as expected (`vararg_list_payload` 2 seeds added) |
+| B | the `access` call becomes a modeled Ref; escape still held by the `lemon_sprintf` sites | as expected (`external_call_boundary` 41 → 37) |
+| C | `omega_escaped_address=false`, `access_set_complete=true`, no new module-wide ModRef row, `chosen = immutable` | as expected |
+
+One correction to an earlier draft of this table: Part 0 removes the false Mod row, but
+`written` stays true until the escape clears.  `written` is `runtime_written ∨ escape ==
+External`, because external storage is may-written whether or not a store is visible.  So
+`written = false` arrives with Part C, not with Part 0.
 
 `localize` is still a precision gain if a real write remains, but the source review predicts
 immutable.  Note that `immutable` depends on Part 0 as well as Part C: without Part 0 the
@@ -586,3 +609,176 @@ Also check `translate_code.newlinestr_xjtr_0` after each part; it shares the sel
 
 Promote only the prove-then-replace path.  Rejection and resource exhaustion must be identical
 to today's conservative boundary.
+
+## 9. Implementation results (2026-09-05)
+
+### 9.1 What shipped
+
+| Part | Change | Files |
+|---|---|---|
+| 0 | `constant_format_bytes` follows a constant-offset GEP to the string it names. A dynamic lane, an unknown offset, a mutable base and an offset past the decoded string all fail closed. | `pangs-pag/src/lib.rs` |
+| A | `Stmt::VaStart` / `Stmt::VaEnd` replace the opaque `Unknown` spelling. The PAG records the write (and `va_end`'s read) of the list, and seeds a new `VarargListPayload` Ω kind on the list address when the consumer is not positionally proved. Andersen turns that into a `VarargPayload` external region, Steensgaard marks the pointee class external. Neither marks the list address escaped. | `pangs-pir`, `pangs-pag`, `pangs-solve`, `pangs-api` |
+| B | `access` added to the shared external-call contract table as `Read(0)`. | `pangs-pir/src/lib.rs` |
+| C1 | A read-only tail audit proved from the callee's body, plus a table of standard `v*printf` sinks in place of the hard-coded `vfprintf` test. | `pangs-pag/src/lib.rs` |
+| C1 | §4.3's other half: where a proof replaces the boundary, the callsite now carries an explicit modeled read edge for every pointer-capable tail actual, instead of the effect simply disappearing from mod/ref. | `pangs-pag/src/lib.rs` |
+| §6.2 | `is_known_benign_vararg_callee` — the 21-name allowlist — is deleted. | `pangs-pag/src/lib.rs` |
+| §3.4/§6.1 | The duplicated `stmt_consumes_varargs` is now one shared `pangs_pag::stmt_consumes_varargs`. | `pangs-pag`, `pangs-api` |
+
+The C1 audit is one function-level analysis with two entry shapes: a variadic function's own
+`va_start` list, or a fixed-argument function's `va_list` parameter. It tracks two sets — values
+that name the list, and pointers extracted from it — and requires every extracted pointer to be
+read and nothing else. It follows internal direct calls by re-entering the callee with the
+argument positions that carry a list or a tail pointer, caches each state, rejects recursion,
+and stops at a fixed budget of states. A value LLVM proved non-pointer never enters the tail
+set, which is what lets an ordinary `%d` or `%.*s` conversion read integers out of the list
+without rejecting the function.
+
+### 9.2 Lemon gate
+
+Every expected transition in §8.2 was measured. Final state:
+
+```text
+tplt_open.templatename_xjtr_0   immutable   written=false esc=false access_set_complete=true
+translate_code.newlinestr_xjtr_0 localize   written=true  esc=false access_set_complete=true
+```
+
+Ω seeds, baseline → final: `vararg_call_boundary` 59 → 0, `unknown_operand_escape` 4 → 0,
+`external_call_boundary` 41 → 37, `vararg_list_payload` 0 → 2. Audit findings 39 → 0.
+
+The `immutable` verdict was checked against the source, as §8.3 requires. The audit accepts
+`lemon_sprintf` because it forwards its list to `lemon_vsprintf`, whose extracted `%s` pointers
+(`tmp21`, `tmp34`) reach only `lemon_addtext`, where the parameter is GEP'd, loaded one byte at
+a time, and used as a `memcpy` **source**. Nothing writes through it or retains it. The
+integer conversions (`tmp13`, `tmp28`, 4-byte loads) never enter the tail set because LLVM
+proved them non-pointer. `static char templatename[] = "lempar.c"` is read-only in the source.
+
+### 9.3 Three holes found while implementing C1
+
+All three were found by self-review, not by a failing test, and all now have fixtures:
+
+- **A positionally recognized `va_arg` result is a tail pointer with no load to see.** The
+  audit seeded the tail set only from loads through the list, so a `Stmt::VarArg` result could
+  be stored into a global unaudited. Every `Stmt::VarArg` destination is now a tail seed.
+- **A phi joining the list address with a pointer read out of it lands in both sets**, and the
+  list rules are the weaker of the two (a store through the list address is legitimate ABI
+  bookkeeping; a store through a tail pointer is not). Such a value now fails the audit closed.
+- **Dropping the boundary dropped the read with it.** §4.3 says a proof replaces the boundary
+  with the summary's explicit memory edges; the first implementation dropped the seed and added
+  nothing, so a callee that reads a global through its variadic tail produced no mod/ref row at
+  all — less complete than the boundary it replaced. A proved callsite now emits a modeled read
+  edge per pointer-capable tail actual, the same shape an external `Read(i)` contract uses.
+  This is a *reason for `ref` rows to increase* in the corpus gate below; `mod` rows may still
+  only decrease.
+
+### 9.4 Deleting the name allowlist
+
+The allowlist was asserting an unproved fact, and deleting it moves in the fail-closed
+direction. Measured on the two modules it covered:
+
+| module | `fnptr_varargs_internal_unmodeled` with allowlist | without | disposition change |
+|---|---:|---:|---|
+| `exe-tmux-O0` | 16 | 64 | one global `immutable` → `localize` |
+| `exe-curl-O0` | 474 | 767 | none |
+
+The single tmux global loses an `immutable` claim it never had evidence for: the allowlist had
+hidden a possible write through a variadic tail. `localize` is still a rewriting disposition,
+so the cost is one strategy step, not a lost global. Modules that use none of those names are
+unchanged.
+
+### 9.5 What remains
+
+- **C2, the general summary** (`InternalVarargSummary` with `fixed_effects`, `result`,
+  `captures_*`): not built. C1 covers the read-only-tail question, which is all the callsite
+  boundary needs. C2 becomes worthwhile if the census shows a large residue of callees that
+  write through a tail pointer in a bounded, describable way.
+- **The `vararg-contract-census` of §7**: not built. The corpus gate in §9.6 answers the
+  aggregate questions, but not per-callee rejection reasons. The audit already computes a
+  decisive rejecting statement internally; exposing it as a stable enum is the next step and is
+  what the census rows need.
+- **External contracts for the `v*printf` family**: `vfprintf`, `vsnprintf` and friends are
+  recognized as forwarding sinks but still have no entry in the external-call contract table,
+  so a call to one remains an ordinary Ω boundary that escapes its own arguments. Adding those
+  contracts is independent of this plan and would sharpen wrappers that write into a caller
+  buffer.
+- **`Stmt::VarArg` in a function that positional recognition lowered but PAG-level admission
+  rejected** still produces a value with no incoming edges. That predates this work and is
+  unrelated to the `va_list` payload, but it is the same class of question and deserves its own
+  check.
+
+### 9.6 Whole-corpus gate
+
+59 `-O0`/`-O1` modules, executable or library mode by name, `--stage andersen --dispose
+--no-overrides`. `lib-openssl-4.1.0-O1` timed out in the Part 0 sweep under CPU contention
+(it completes when run alone), so the Part 0 comparison is over the 58 modules that completed
+in both runs.
+
+**Part 0 measured on its own**, as §2.3 requires:
+
+| metric | base → Part 0 |
+|---|---|
+| `immutable` | +101 |
+| `unhandled` | −98 |
+| `once-lock` / `mutex` | +2 / −2 |
+| `localize` | −3 (each to `immutable`) |
+| `access_set_complete` true | +98 |
+| `omega_escaped_address` true | −98 |
+| `written` true | −100 |
+| `violation_taint` true | −125 |
+| `fnptr_varargs_internal_unmodeled` findings | −405 |
+| `mod` rows (aliased / unknown) | −633 / −1131 |
+| `ref` rows | unchanged |
+
+The gate it had to pass — **no `mod` row increased in any module, and `unhandled` grew in no
+module** — holds on all 58. The largest single effect is `exe-chibicc-O0`/`-O1`, where 49
+globals per module move `unhandled` → `immutable`: their only apparent write was a `%s` actual
+at a `fprintf` whose constant format the resolver could not read.
+
+Two modules move `mutex` → `once-lock` (`exe-OMP__tree-O0`, `exe-tree-O0`): removing a
+spurious write let phase stationarity certify, and the cascade prefers the stronger property.
+
+**All parts together**, same 58 modules:
+
+| metric | base → final | note |
+|---|---|---|
+| `immutable` | +101 | |
+| `unhandled` | −101 | |
+| `once-lock` / `mutex` | +2 / −2 | |
+| `localize` | ±0 | one gained (tmux), one lost to `immutable` (apg_bore) |
+| `access_set_complete` true | +102 | |
+| `omega_escaped_address` true | −102 | |
+| `written` true | −102 | |
+| `violation_taint` true | −120 | |
+| `mod` rows (aliased / unknown) | −633 / −1187 | no module increased any `mod` row |
+| `ref` rows (aliased / unknown) | +310 / +1609 | the modeled reads of §9.3 |
+| `fnptr_varargs_internal_unmodeled` | +251 | curl and tmux only; every other module fell |
+| `fnptr_varargs_external` | +127 | curl only |
+
+`ref` rows rise for the reason §9.3 gives: a proof now records the read it proved instead of
+letting it vanish with the boundary. `mod` rows fall and never rise, which is the gate that
+matters. The audit-finding rise is entirely the allowlist deletion — outside curl and tmux
+every module's finding count went down, led by `exe-vim-9.2-O1` (−76) and `exe-chibicc-O1`
+(−64).
+
+**Two dispositions regressed, both from deleting the allowlist, both fail-closed:**
+
+- `exe-curl-O1`, `curl/src/tool_getparam.c::opt_filestring.redir_protos`: `immutable` →
+  `unhandled`. A `curl_mprintf` callsite in `tool_version_info` is a variadic boundary again,
+  and its access-shape-relevant taint gates the four access-property strategies. The
+  `immutable` claim rested on a hard-coded name, not on evidence.
+- `exe-tmux-O0`, one global: `immutable` → `localize`, for the same reason. `localize` is
+  still a rewriting disposition, so that one costs a strategy step rather than the global.
+
+Net across the corpus this is +101 `immutable` against those two, and every fact that moved in
+the conservative direction moved because a name-based assumption was withdrawn.
+
+### 9.7 Differential ledger
+
+`pangs differential` (conservative → Steensgaard → Andersen) over all 59 modules, baseline
+binary against final binary: **identical on every module.** Four modules report a nonzero
+count in *both* runs — `exe-jq-O0`/`-O1` (1) and `exe-lemon-O0`/`-nostatic-O0` (5) — and those
+are pre-existing coverage differences (`unknown_callers: match_at`; Steensgaard listing
+rewritable globals Andersen does not). No monotonicity break was introduced.
+
+`check-pag` reports the same 27 pre-existing `addr_of` complaints on Lemon before and after
+(the glibc ctype-table model, unrelated to this work), and `--validate` export validation
+passes.
