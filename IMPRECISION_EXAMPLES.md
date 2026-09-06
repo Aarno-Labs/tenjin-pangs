@@ -108,3 +108,64 @@ Proving this requires a relational/path-sensitive
   value argument that ModRef currently lacks.
 
 
+
+## gifsicle `Clp_ValType::func`
+
+CLP dispatches an option-value parser through a function pointer held in a
+heap array of structs, written by `Clp_AddType` and read back at a dynamic
+index:
+
+```c
+  cli->valtype[vtpos].func = parser;          /* clp.c, Clp_AddType */
+
+  Clp_ValType *atr = &cli->valtype[vtpos];    /* clp.c, Clp_Next */
+  if (atr->func(clp, clp->vstr, complain, atr->user_data) <= 0)
+```
+
+The true target set is five functions: `parse_string`, `parse_int`,
+`parse_bool`, `parse_double` and `parse_string_list`. PANGS reports 25 and marks
+the callee unknown. It does so at 203 of gifsicle's 207 indirect callsites.
+
+The merge starts in a header. `gif.h` has `#define Gif_Free free`, so
+`gfi->free_image_data = Gif_Free` takes the address of `free` and stores it in a
+struct field. Steensgaard then holds `free` in the same class as every other
+address-taken function, including the five parsers. The signature envelope does
+not separate them either: `fsa_compatible` deliberately admits a callee with
+fewer parameters and a void return, so `free`, declared `void(void *)`, is a
+legal candidate at this four-argument site.
+
+Two mechanisms then keep the site unknown, and neither is about Andersen's
+precision.
+
+First, a base-tier verdict decides the reported answer. When Steensgaard reports
+`unknown_callee`, Andersen puts the site in `eager_sites`, activates the whole
+Steensgaard envelope, and marks the answer a fallback. The reported target set is
+that activated envelope, and Andersen's own points-to can only add to it. So the
+answer stays the envelope however precise the refinement becomes.
+
+Second, until the external target's own contract was consulted, activating the
+external `free` applied the generic client boundary to every argument of the
+site. One of those arguments is `clp`, so the parser object escaped, everything
+reachable from it read back as external memory, `atr->func` read back external,
+and the callee stayed unknown — a self-sustaining loop whose only Ω source was
+the callsite itself. A direct `free(p)` never did this: the PAG consults the
+contract table and raises no boundary at all.
+
+Admission is not the remaining lever, and this was measured rather than assumed.
+gifsicle's indirect-call operands sit in one partition of 9,353 nodes, which
+exceeds the budget, so only a 3,488-node directional slice of it is refined.
+Admitting the whole partition costs 4m50s against 0.8s and leaves the reported
+target set at 26, unchanged. At full admission the operand is external again,
+now through the boundaries of *other* indirect callsites: the contamination is a
+whole-program fixed point over indirect calls, not a property of one site.
+
+The cost is concentrated. All 73 of gifsicle's written-but-unescaped globals sit
+in one localization component with about 133 blockers, every sampled one
+`unknown-callee-taint` at `Clp_Next`. Localization is the only disposition left
+open to them — the write rules out `immutable`, their aggregate shape rules out
+`atomic`, and an accessor that can re-enter an accessor rules out `mutex` — so
+the unresolved callee is what holds all 73 at `unhandled`.
+
+Separating them needs base-tier class precision: a field-sensitive account of
+which functions reach `Clp_ValType::func`, distinct from the class that holds
+`free`. Nothing downstream of that verdict can recover it.
