@@ -1,9 +1,11 @@
 # Fixing Lemon `newlinestr`: recover localization before chasing immutability
 
-## 0. Status and recommendation
+## 0. Status and outcome
 
-Proposal, not implemented.  The target is
-`translate_code.newlinestr_xjtr_0` in `exe-lemon-O0`:
+**Resolved by Work item A on 2026-09-06.**  The shared varargs work was enough on its own.
+No new object-sensitive solver, no field-aware content flow, and no content proof were needed.
+
+The target is `translate_code.newlinestr_xjtr_0` in `exe-lemon-O0`:
 
 ```c
 if( rp->code==0 ){
@@ -13,20 +15,28 @@ if( rp->code==0 ){
 }
 ```
 
-The best first step is **not** a new object-sensitive solver.  Implement and measure
-`20260905_EXT_VARARGS_CONTRACT.md` first.  `newlinestr` has the same selected
-`lemon_sprintf`/`llvm.va_start` escape witness as `templatename`, and localization is currently
-blocked only by `access_set_complete`.  If the shared varargs fix makes the access set complete,
-the existing localization plan already succeeds (`ctx0001`, no non-completeness blockers) and
-the disposition problem is solved.
+The prediction in this plan was correct.  `newlinestr` was blocked only by
+`access_set_complete`, and that block came from a single Ω source: the `va_list` argument of
+`lemon_sprintf`.  Once `va_start`, `va_end` and `va_copy` became explicit local operations
+instead of opaque intrinsics, the source disappeared, the access set closed, and the existing
+localization plan succeeded unchanged.
 
-If it remains incomplete, add a targeted explanation census and refine allocation-address flow
-with field-aware store/load matching.  Do not attempt path-sensitive string reasoning unless the
-goal changes from “handle this global soundly” to “prove it immutable”.
+`newlinestr` is now `localize`, with localization verdict `ok` and zero blockers.  That meets
+the acceptance stated in §3.  The other Lemon array, `tplt_open.templatename_xjtr_0`, did
+better: it is now `immutable`.  Measurements are in §3.1.
+
+The varargs work landed in revisions `vulo` ("Improve handling of varargs") and `kovx`
+("Model `llvm.va_copy` instead of leaving it an opaque intrinsic").  Its plan document,
+`20260905_EXT_VARARGS_CONTRACT.md`, was deleted once the work was done; references to it below
+mean those two revisions.
+
+Per the stopping rule in §7, work stops here.  Work items B, C and D are **not** to be
+implemented for this target.  They stay in this document as a record of what was considered
+and why it turned out to be unnecessary.
 
 The filename intentionally follows the requested `20960905_...` spelling.
 
-## 1. Measured baseline
+## 1. Measured baseline (superseded, see §3.1)
 
 The validated 2026-09-05 Andersen run used:
 
@@ -36,7 +46,7 @@ The validated 2026-09-05 Andersen run used:
 default conservative integer-pointer policy
 ```
 
-Current facts:
+Facts as of 2026-09-05.  §3.1 has the current ones:
 
 ```text
 chosen                     unhandled
@@ -103,7 +113,9 @@ where the address/value may be used so those uses can be rewritten.  The current
 graph already reports no blocker other than completeness.  Therefore the desired near-term
 outcome is `localize`, not necessarily `immutable`.
 
-## 3. Work item A: take the shared varargs fix first
+## 3. Work item A: take the shared varargs fix first (done)
+
+*Done.  The plan below is kept as written; the result is in §3.1.*
 
 Implement `20260905_EXT_VARARGS_CONTRACT.md` and rerun Lemon before changing field logic.  Record:
 
@@ -118,7 +130,7 @@ already an allowed localization-only violation kind.  Once the same callsites ar
 shared vararg summary, the finding should disappear anyway.  If `access_set_complete` becomes
 true, expect `localize`; stop there unless immutable precision is independently valuable.
 
-Acceptance for this work item:
+Acceptance for this work item, **met**:
 
 ```text
 newlinestr localization verdict = ok
@@ -129,7 +141,60 @@ Do not require its aliased ModRef set to become tiny.  A large but finite, compl
 is acceptable for localization, and the manifest already says the resulting context component
 has no other blocker.
 
-## 4. Work item B: explain the first remaining open terminal
+### 3.1 Measured outcome (2026-09-06)
+
+The §1 command was run twice: once with the sources of `ptrw`, the revision just before the
+varargs work, and once with the current sources.  For `newlinestr`:
+
+| | before | after |
+|---|---|---|
+| chosen disposition | `unhandled` | **`localize`** |
+| `written` | true | true |
+| `omega_escaped_address` | true | **false** |
+| selected Ω source | `UnknownOperandEscape` at `lemon_sprintf`'s `%arraydecay1` | none |
+| `access_set_complete` | false | **true** |
+| `violation_taint` | true (`fnptr_varargs_internal_unmodeled`) | **false** |
+| localization | `ctx0001`, blocked, 1 blocker | **`ctx0001`, ok, 0 blockers** |
+| named ModRef rows | 121 (47 Mod / 74 Ref) over 75 functions | 108 (34 Mod / 74 Ref) over 75 functions |
+| atomic access sites | 1,147 | 1,112 |
+
+`tplt_open.templatename_xjtr_0` carried the same selected witness and moved further.  Its named
+surface fell to 2 Ref rows over 2 functions with no Mod row at all, so `written` became false
+and the cascade selected `immutable` at the first strategy.
+
+Across the whole module, three of 29 keyed globals changed disposition and all three improved:
+
+- `translate_code.newlinestr_xjtr_0`: `unhandled` → `localize`
+- `tplt_open.templatename_xjtr_0`: `unhandled` → `immutable`
+- `emsg_xjtr_0`: `localize` → `immutable`
+
+Nothing regressed.  Module counters:
+
+| | before | after |
+|---|---|---|
+| `unhandled` globals | 2 | **0** |
+| audit findings | 39 | **0** |
+| modeled `llvm.va_start` / `llvm.va_end` | 0 / 0 | 2 / 2 |
+| `unknown` statements | 4 | **0** |
+| unique pointer ModRef rows | 5,284 | 5,049 |
+| analysis wall time | 0.78 s | 0.56 s |
+| partitions / max size / oversize / rounds | 6,966 / 140 / 0 / 1 | 7,033 / 140 / 0 / 1 |
+
+The solve was already complete before the change and is still complete after it, which confirms
+§1: the partition budget was never the problem.  The gain came entirely from removing four
+`unknown` statements — the two `va_start` and two `va_end` calls — that had been escaping their
+operands.
+
+The 34 surviving Mod rows are still the false `Action_add` alias family described in §2, and
+`written` is still true.  That no longer matters.  Localization does not need a never-written
+proof.  It needs a complete inventory of the accesses, and the inventory is now complete.  This
+is the outcome §2 argued for.
+
+`cargo test --workspace --all-targets` is green.
+
+## 4. Work item B: explain the first remaining open terminal (not needed)
+
+*Work item A made the access set complete, so this was never started.  Kept as a design record.*
 
 If Work item A does not make the access set complete, add a narrow diagnostic to the existing
 allocation-isolation/address-flow proof rather than inferring the cause from row counts.
@@ -178,7 +243,10 @@ This census answers whether the refinement is a reusable corpus feature or a Lem
 It should be a small standalone/reporting path, not a revival of the removed general
 `external-policy-census` or a permanent parallel analysis API.
 
-## 5. Work item C: field-aware content flow in allocation isolation
+## 5. Work item C: field-aware content flow in allocation isolation (not needed)
+
+*Not started: §7 requires an explanation diagnostic and a corpus census before this is justified,
+and Work item A removed the reason to run either.  Kept as a design record.*
 
 The current independent `allocation_isolation` proof follows pointer values stored in module
 memory to loads through conservative alias-equivalent address components.  That is sound but can
@@ -239,7 +307,10 @@ therefore needs a `DESIGN_lite.md` update and an explicit refinement-order asser
 Run these tests at Steensgaard and Andersen stages and assert that every failure mode returns to
 the current conservative answer.
 
-## 6. Optional work item D: immutable-content proof (defer)
+## 6. Optional work item D: immutable-content proof (dropped)
+
+*Dropped.  §7 says not to implement this merely to turn a sound `localize` into `immutable` for
+one two-byte array, and that is now exactly what it would be.*
 
 Only pursue this if there is measured value in selecting `immutable` instead of `localize`.
 Field-aware points-to alone cannot prove Lemon's guarded temporary stores unreachable.
@@ -262,31 +333,183 @@ should not be used to validate this proposal.
 
 ## 7. Evaluation and stopping rules
 
-Evaluate cumulatively:
+The stopping rule was: *stop after Work item A if `newlinestr` becomes localizable.*  It did,
+so only the first two variants were ever evaluated.
 
-| Variant | Purpose |
+| Variant | Purpose | Status |
+|---|---|---|
+| baseline | current default | measured, §3.1 |
+| varargs | revisions `vulo` and `kovx` | measured, §3.1 — **rule fired here** |
+| varargs + field-flow | Work item C, only if still needed | not needed, not run |
+| optional immutable proof | only after a separate payoff decision | dropped |
+
+### 7.1 Required record
+
+Both target globals, all retained items from the original list, are in §3.1.  The remaining
+required checks were run on 2026-09-06:
+
+- **Corpus transitions.**  The varargs work was swept over 55 corpus modules while it was being
+  built.  Corpus-wide `unhandled` fell from 7,121 to 6,985, so Lemon's two globals are part of a
+  136-global improvement rather than a one-module special case.  Lemon itself is not a heavy
+  module: 0.56 s wall, negligible RSS.
+- **Schema validation.**  `--validate` passes at all three stages.
+- **Differential ledger.**  `pangs differential` was run on Lemon before and after the varargs
+  work.  Both runs print byte-identical output, so the change introduced no new ledger
+  complaint.  The complaints that are present are pre-existing and are described in §7.2.
+- **Tests.**  `cargo test --workspace --all-targets` is green.
+- **Source check.**  `newlinestr` is now handled through a closed access set built from named
+  accesses only; the Ω source that used to open it, `lemon_sprintf`'s `va_list`, is gone because
+  `va_start` and `va_end` are now modeled locally instead of being `unknown` statements.
+
+### 7.2 Two pre-existing findings, unchanged by this work
+
+Both were investigated on 2026-09-06.  Neither is caused by the varargs work: `pangs
+differential` prints byte-identical output before and after it.  Neither changes the §3.1
+result.
+
+#### 7.2.1 The `in_rewritable_components` drop is a defect in the metric, not in Andersen
+
+`differential` reports `in_rewritable_components` falling from 6 at Steensgaard to 1 at
+Andersen and calls it a monotonicity break.  Andersen is right and the check is wrong.
+
+The component structure is **identical** at both tiers: 42 components, same members, same
+frozen flags.  Nothing merges.  The whole difference is one function.  `Symbol_Nth` is a
+one-function component with no taint, and its body is:
+
+```c
+struct symbol *Symbol_Nth(int n){
+  if( x2a_xjtr_0 && n>0 && n<=x2a_xjtr_0->count ){
+    data = x2a_xjtr_0->tbl[n-1].data;
+  }
+  ...
+}
+```
+
+At Steensgaard the load `x2a_xjtr_0->tbl[n-1].data` carries five extra `aliased ref` rows, for
+`append_str.empty`, `basis`, `current`, `templatename` and `newlinestr`.  They are false:
+`Symbol_Nth` reads one hash table and nothing else.  Andersen separates the classes and leaves
+the single true row, a direct ref of `x2a_xjtr_0`.  That is a precision win.
+
+It reads as a loss because of how the metric is defined.  `in_rewritable_components` counts a
+global as rewritable if **any** non-frozen component names it, and never checks whether a frozen
+component also names it.  All six of these globals are also in `c0001`, the frozen 120-function
+component.  Under the strict reading — named by a clean component and by no frozen one — the
+count is **0 at both tiers**, so there is no drop at all.
+
+Measured over 53 corpus modules:
+
+| | Steensgaard | Andersen |
+|---|---|---|
+| loose count (current metric) | 102 | 92 |
+| strict count (clean and never frozen) | **55** | **55** |
+
+The current metric is inflated by roughly a factor of two, and the strict count is identical at
+both tiers.  Only four modules move at all under the loose metric, and one of them moves *up*:
+`exe-yapteaparprfotci-O1-g` goes 5 → 6 loose and 0 → 1 strict.  So the quantity is not monotone
+in either direction, and the assertion cannot be repaired by flipping its sense.
+
+The reasoning error is stated in the check's own comment in `crates/pangs-api/src/differential.rs`:
+
+> steens → andersen share the pointer-aware mod/ref machinery; Andersen only refines pts, so it
+> can never *reveal* new aliased taint — coverage must be monotone here.
+
+The premise is true and the conclusion does not follow.  `rewritable_globals` is not a taint
+set.  It is the set of globals **named by** a clean component, and it is built from ModRef rows.
+Andersen refining points-to *removes* rows, and removing a false row removes a global from a
+clean component.  The check confuses "taint never grows" with "coverage never shrinks".
+
+Suggested fix, in two parts:
+
+1. Define the metric as *named by a non-frozen component and by no frozen component*.  A global
+   that a frozen component also names is not rewritable, and counting it hides that.
+2. Drop the `rewritable_globals` subset assertion and the `in_rewritable_components` comparison.
+   Neither direction is a theorem.  If a cross-tier invariant is wanted here, the candidate to
+   test is the taint side — no global should become *newly* frozen at Andersen — which is what
+   the comment actually argues for.
+
+#### 7.2.2 A real write is missed, and the global is dispositioned `immutable`
+
+This one is a soundness bug, found while checking the component sets above.  It is not specific
+to Lemon's varargs and it is not new.
+
+Lemon registers its `-p` flag in `main`'s local option table:
+
+```c
+{OPT_FLAG, "p", (char*)&showPrecedenceConflict_xjtr_0,
+                "Show conflicts resolved by precedence rules"},
+```
+
+`OptInit(argv, options, stderr)` publishes that table as `op_xjtr_0 = o`, and `handleflags`
+writes through it:
+
+```c
+}else if( op_xjtr_0[j].type==OPT_FLAG ){
+  *((int*)op_xjtr_0[j].arg) = v;
+```
+
+So `lemon -p` writes `showPrecedenceConflict_xjtr_0`, and line 3982 reads it back.  The write is
+real and reachable.
+
+Andersen sees it.  `modref.jsonl` carries the row:
+
+```text
+handleflags_xjtr_0  showPrecedenceConflict_xjtr_0  mod  aliased  ...:2726:31#0
+```
+
+The disposition does not.  All three stages report `written = false` and choose `immutable`.
+Converting this global to a Rust immutable static would be wrong.
+
+The cause is that the two facts come from different machinery and only one of them is consulted.
+In `crates/pangs-clients/src/lib.rs`:
+
+```rust
+let written = info.runtime_written || info.escape == pangs_api::EscapeStatus::External;
+```
+
+ModRef rows are never read.  They are used only to *label* a write once `written` is already
+true.  `runtime_written` comes from the solver's class-level `runtime_stored_classes` evidence,
+which misses this store, while `push_pointer_modrefs_from_pag` — a later, separate pass over the
+PAG — catches it.  Nothing reconciles the two.
+
+The allocation-isolation override a few lines above is **not** the cause.  Instrumenting
+
+```rust
+if locally_defined && isolation.write.contains(&global.key) { runtime_written = false; }
+```
+
+shows it firing for `tplt_open.templatename_xjtr_0`, `append_str.empty_xjtr_0` and
+`emsg_xjtr_0`, but never for `showPrecedenceConflict_xjtr_0`.  The class evidence was already
+false.  (The same instrumentation shows that `templatename`'s new `immutable` result in §3.1
+rests on that isolation proof, not on an absence of evidence — the class evidence for it says
+written.)
+
+A minimal fixture of the same shape — a global's address into a stack aggregate, the aggregate
+passed to a function that publishes it in a global pointer, a third function storing through a
+pointer loaded back out — is handled **correctly**, reaching `written = true` and `localize`.
+So the trigger is narrower than the general pattern.  Lemon's version adds a struct field, a
+round trip through `char*`, a dynamic index, and sibling entries holding function addresses and
+null.  Isolating which of those loses the write is the first step of any fix.
+
+Population at risk, over the same 53 modules and 1,917 keyed globals: **34 globals in 6 modules
+have a `mod` ModRef row while `written` is false, and all 34 are dispositioned `immutable`.**
+
+| module | globals affected |
 |---|---|
-| baseline | current default |
-| varargs | all work from `20260905_EXT_VARARGS_CONTRACT.md` |
-| varargs + field-flow | Work item C, only if still needed |
-| optional immutable proof | only after a separate payoff decision |
+| `exe-tree-O0` | 15 |
+| `exe-OMP__tree-O0` | 15 |
+| `exe-curl-O0` | 1 |
+| `exe-apg_bore-O0` | 1 |
+| `exe-lemon-O0` | 1 |
+| `exe-lemon-nostatic-O0` | 1 |
 
-For Lemon, report both target globals so shared effects are visible.  For `newlinestr`, retain:
+Only the Lemon global is confirmed against source.  The 30 in the two `tree` builds are witnessed
+from `html_outtro` and `print_version`, which look like printf-family over-approximation, so they
+may well be false rows with a correct `written = false`; their source tree is a deleted pytest
+temporary directory, so this could not be checked.  Treat 34 as the population to triage, not as
+34 proven bugs — but note that the disagreement is currently invisible, because no check
+compares a `mod` row against the `written` fact.
 
-- Ω/external source set;
-- escape and completeness facts;
-- named and unknown Mod/Ref rows, functions, and Mod/Ref split;
-- first false/remaining write witnesses;
-- violation relevance;
-- localization component/blockers; and
-- final disposition.
-
-For the whole corpus, report precision and disposition transitions plus runtime/RSS and the
-standard solver counters.  Source-check every newly handled global reachable from an accepted
-internal-vararg summary or a newly closed allocation path.  Run `cargo test --workspace
---all-targets`, validation, and the conservative → Steensgaard → Andersen differential ledger.
-
-Stop after Work item A if `newlinestr` becomes localizable.  Proceed to Work item C only when the
-explanation diagnostic identifies a field/content-flow false edge and the corpus census shows a
-reusable population.  Do not implement Work item D merely to turn a sound `localize` result into
-`immutable` for one two-byte array.
+Suggested first step: add exactly that check, as a debug assertion or a differential rule — a
+named `mod` ModRef row for a locally defined global must imply `written`.  It costs nothing, it
+would have caught this, and it decides the `tree` cases immediately by pointing at whichever side
+is wrong.
