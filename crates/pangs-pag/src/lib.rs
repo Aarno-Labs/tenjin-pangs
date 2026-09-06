@@ -1978,6 +1978,53 @@ impl<'a> Builder<'a> {
                     );
                 }
             }
+            // A second cursor over the same tail: it reads the source list's storage and
+            // writes the destination's, publishing neither address. The destination is a list
+            // in its own right, so its contents get the same opaque payload the source has.
+            Stmt::VaCopy { dst, src, loc } => {
+                let source = self.operand_node(func_index, owner_scope(&owner), src);
+                let destination = self.operand_node(func_index, owner_scope(&owner), dst);
+                let sink = self.add_node(
+                    NodeKey::ExternalNonPointerWrite(func_index, stmt_index),
+                    format!("val:{}:@va-list-effect:{stmt_index}", owner_name(&owner)),
+                    NodeKind::Value {
+                        scope: owner_scope(&owner),
+                    },
+                );
+                self.add_memory_edge(
+                    EdgeKind::Load,
+                    source,
+                    sink,
+                    owner.clone(),
+                    None,
+                    true,
+                    false,
+                    loc.clone(),
+                );
+                let edge = self.add_memory_edge(
+                    EdgeKind::Store,
+                    sink,
+                    destination,
+                    owner.clone(),
+                    None,
+                    true,
+                    false,
+                    loc.clone(),
+                );
+                self.edges[edge.0 as usize].modeled_external_write = true;
+                if !self
+                    .positional_vararg_functions
+                    .contains(owner_name(&owner))
+                {
+                    self.add_seed(
+                        OmegaSeedKind::VarargListPayload,
+                        SeedTarget::Node(destination),
+                        Some(owner),
+                        loc.clone(),
+                        Some(dst.clone()),
+                    );
+                }
+            }
             Stmt::Memcpy {
                 dst,
                 src,
@@ -3018,7 +3065,9 @@ fn loc_key(loc: Option<&Loc>) -> String {
 /// explicit `va_start`/`va_end` statements must count exactly as their opaque predecessors did.
 pub fn stmt_consumes_varargs(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::VarArg { .. } | Stmt::VaStart { .. } | Stmt::VaEnd { .. } => true,
+        Stmt::VarArg { .. } | Stmt::VaStart { .. } | Stmt::VaEnd { .. } | Stmt::VaCopy { .. } => {
+            true
+        }
         Stmt::Unknown { op, reason, .. } => {
             reason == "va_arg" || reason == "varargs_intrinsic" || op.starts_with("llvm.va_")
         }
@@ -3394,8 +3443,10 @@ impl<'a> VarargCallProof<'a> {
                 ..
             } => self.tail_call_is_read_only(func, callee, sig, args, dest.as_deref(), tail, list_values),
             // Everything else — returning the pointer, integer conversion, arithmetic on it,
-            // memset, inline assembly, an indirect call, a `va_copy` spelled as an unknown
-            // intrinsic — is either a capture or an unmodeled effect.
+            // memset, inline assembly, an indirect call, a `va_copy` — is either a capture or
+            // an effect this proof does not model. `va_copy` is modeled in the PAG but not
+            // here: proving a second cursor read-only means auditing both, which this proof
+            // does not do, so a callee that copies its list is rejected.
             _ => false,
         }
     }
@@ -4032,6 +4083,7 @@ fn stmt_input_operands(stmt: &Stmt) -> Vec<&str> {
         Stmt::PtrToInt { source, .. } | Stmt::IntToPtr { source, .. } => vec![source],
         Stmt::VarArg { .. } => Vec::new(),
         Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => vec![list],
+        Stmt::VaCopy { dst, src, .. } => vec![dst, src],
         Stmt::Memcpy { dst, src, .. } => vec![dst, src],
         Stmt::Memset { dst, value, .. } => vec![dst, value],
         Stmt::Unknown { operands, .. } => operands.iter().map(String::as_str).collect(),
@@ -5063,6 +5115,63 @@ mod tests {
             .edges
             .iter()
             .any(|edge| edge.kind == EdgeKind::Load && edge.src == list.id));
+    }
+
+    /// A `va_copy` destination is a `va_list` in its own right: the copy reads the source's
+    /// storage and writes the destination's, publishes neither address, and gives the
+    /// destination the same opaque payload — so a pointer read out of the copy still
+    /// designates unknown memory rather than nothing. Before `va_copy` had its own statement
+    /// it fell through to the opaque intrinsic path, which published *both* list addresses.
+    #[test]
+    fn va_copy_gives_the_second_cursor_the_same_opaque_payload() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"va-copy-payload",
+                "functions":[
+                    {"key":"walker","sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},
+                     "param_names":["%walker::ap"],
+                     "body":[
+                        {"kind":"alloca","dest":"%walker::cp","ty":"[1 x %struct.__va_list_tag]"},
+                        {"kind":"gep","dest":"%walker::decay","base":"%walker::cp","byte_off":0},
+                        {"kind":"va_copy","dst":"%walker::decay","src":"%walker::ap"},
+                        {"kind":"load","dest":"%walker::tail","address":"%walker::decay","access_bytes":8},
+                        {"kind":"va_end","list":"%walker::decay"},
+                        {"kind":"return","value":null}
+                     ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let copy = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:walker:%walker::decay")
+            .expect("the copy's address has a value node");
+        let source = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:walker:%walker::ap")
+            .expect("the source list has a value node");
+
+        // Neither address is published. This is the regression the statement kind fixes.
+        assert!(!pag
+            .omega_seeds
+            .iter()
+            .any(|seed| seed.kind == OmegaSeedKind::UnknownOperandEscape));
+        assert!(pag.omega_seeds.iter().any(|seed| {
+            seed.kind == OmegaSeedKind::VarargListPayload
+                && seed.target == SeedTarget::Node(copy.id)
+        }));
+        // The copy reads the source's storage and writes the destination's.
+        assert!(pag
+            .edges
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Load && edge.src == source.id));
+        assert!(pag
+            .edges
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Store && edge.dst == copy.id));
     }
 
     #[test]

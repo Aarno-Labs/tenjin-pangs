@@ -688,6 +688,16 @@ pub enum Stmt {
         #[serde(default)]
         loc: Option<Loc>,
     },
+    /// `llvm.va_copy`: a second cursor over the same variadic tail. It reads the source list's
+    /// storage and writes the destination's; neither address is published. The destination is
+    /// then a list in its own right, and everything the copy yields is tail-derived — which is
+    /// what lets a `v*printf` implementation walk its argument list twice.
+    VaCopy {
+        dst: String,
+        src: String,
+        #[serde(default)]
+        loc: Option<Loc>,
+    },
     Memcpy {
         dst: String,
         src: String,

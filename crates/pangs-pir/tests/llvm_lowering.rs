@@ -660,10 +660,16 @@ fn recognizes_closed_sysv_pointer_varargs_and_rejects_va_copy() {
         .body
         .iter()
         .any(|stmt| matches!(stmt, Stmt::VarArg { .. })));
-    // `va_copy` has no modeled contract and keeps the opaque boundary.
-    assert!(copied.body.iter().any(|stmt| matches!(
+    // `va_copy` is explicit — it reads one list's storage and writes another's, publishing
+    // neither address — but it still defeats positional recognition, which can only bind
+    // actuals it can name.
+    assert!(copied
+        .body
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::VaCopy { .. })));
+    assert!(!copied.body.iter().any(|stmt| matches!(
         stmt,
-        Stmt::Unknown { op, .. } if op == "llvm.va_copy"
+        Stmt::Unknown { reason, .. } if reason == "varargs_intrinsic"
     )));
 }
 

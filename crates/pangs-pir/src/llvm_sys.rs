@@ -2944,8 +2944,8 @@ unsafe fn lower_intrinsic_call(
 
     if callee.starts_with("llvm.va_") {
         // `va_start`/`va_end` operate on caller-provided list storage. Their canonical shape is
-        // one pointer operand and no result; anything else (including every `va_copy`) keeps the
-        // opaque boundary. The two are modeled identically whether or not positional `va_arg`
+        // one pointer operand and no result; `va_copy` takes two. Anything else keeps the opaque
+        // boundary. All three are modeled identically whether or not positional `va_arg`
         // recognition succeeded, so the list's write effect is recorded in both paths; the
         // opacity of the list *contents* is decided later, by the PAG.
         if matches!(callee, "llvm.va_start" | "llvm.va_end")
@@ -2959,6 +2959,20 @@ unsafe fn lower_intrinsic_call(
                 Stmt::VaStart { list, loc }
             } else {
                 Stmt::VaEnd { list, loc }
+            });
+            lowering.bump_modeled(callee);
+            return true;
+        }
+        if callee == "llvm.va_copy"
+            && LLVMGetNumArgOperands(inst) == 2
+            && is_pointer_like_type(LLVMTypeOf(LLVMGetOperand(inst, 0)))
+            && is_pointer_like_type(LLVMTypeOf(LLVMGetOperand(inst, 1)))
+            && LLVMGetTypeKind(LLVMTypeOf(inst)) == LLVMTypeKind::LLVMVoidTypeKind
+        {
+            body.push(Stmt::VaCopy {
+                dst: fctx.operand_key(LLVMGetOperand(inst, 0)),
+                src: fctx.operand_key(LLVMGetOperand(inst, 1)),
+                loc: loc(inst),
             });
             lowering.bump_modeled(callee);
             return true;

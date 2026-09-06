@@ -79,13 +79,18 @@ makes per-component soundness auditable); the TeaDSA call/return-site filter
 (instruction-local SSA validity filtering on call-argument/return-value edges — cheap,
 and its precision is frozen into the graph for every downstream phase).
 
-Variadic boundaries fail closed unless their consumption is explicit. `va_start` and `va_end`
-are explicit local operations rather than opaque operand escapes: they write the `va_list`
-storage and do not publish its address. What the list *contains* is a separate question. Unless
-positional recognition proved every extraction, the list's contents get one opaque external
-region, which is closed under load because every external region contains itself — a pointer
-`va_arg` on the SysV ABI is a two-level extraction, so an opaque region that stopped at the
-list's own fields would hand back an empty set and lose a store destination.
+Variadic boundaries fail closed unless their consumption is explicit. `va_start`, `va_end` and
+`va_copy` are explicit local operations rather than opaque operand escapes: they write the
+`va_list` storage they are given and do not publish its address. `va_copy` reads the source
+list's storage and writes the destination's, so its destination is a second cursor over one
+tail, not a second tail, and it gets the same opaque payload the source has. Modeling it is
+what keeps a `v*printf` implementation that walks its arguments twice from publishing *both*
+list addresses, which is what leaving the copy an unknown intrinsic costs. What the list
+*contains* is a separate question. Unless positional recognition proved every extraction, the
+list's contents get one opaque external region, which is closed under load because every
+external region contains itself — a pointer `va_arg` on the SysV ABI is a two-level extraction,
+so an opaque region that stopped at the list's own fields would hand back an empty set and lose
+a store destination.
 
 A direct variadic callsite avoids the tail boundary in one of three ways. Positional `va_arg`
 recognition binds the callee's accesses to the callsite's actuals. A callsite-sensitive
@@ -100,9 +105,11 @@ from it, requires each extracted pointer to be read and never written through, s
 converted, or invoked, follows internal direct calls by re-entering the callee at the argument
 positions carrying a list or tail pointer, rejects recursion, and stops at a fixed state budget.
 A value LLVM proved non-pointer never enters the tail set, so ordinary integer conversions read
-from the list freely. `va_copy`, an ambiguous join of a list address with a pointer read out of
-it, an escaping list alias, an uncontracted callee, and every unfamiliar dataflow retain the
-ordinary Ω boundary and audit. No callee is exempt by name.
+from the list freely. An ambiguous join of a list address with a pointer read out of it, an
+escaping list alias, an uncontracted callee, and every unfamiliar dataflow retain the ordinary
+Ω boundary and audit. So does `va_copy`: the copy is modeled where the list is lowered, but
+this proof does not audit a second cursor, so a callee that copies its list keeps its callers'
+boundary. No callee is exempt by name.
 
 One exact-name, ABI-shape-checked external-call contract table is shared by PAG construction and
 certificate assembly. A contract records every synchronous client-memory read/write, result

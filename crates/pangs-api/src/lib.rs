@@ -6590,6 +6590,10 @@ fn visit_runtime_operands(stmt: &Stmt, mut visit: impl FnMut(&str)) {
     match stmt {
         Stmt::Alloca { .. } | Stmt::VarArg { .. } | Stmt::GlobalRef { .. } => {}
         Stmt::VaStart { list, .. } | Stmt::VaEnd { list, .. } => visit(list),
+        Stmt::VaCopy { dst, src, .. } => {
+            visit(dst);
+            visit(src);
+        }
         Stmt::Assign { sources, .. } => sources.iter().for_each(|value| visit(value)),
         Stmt::ScalarOp { lhs, rhs, .. } => {
             visit(lhs);
