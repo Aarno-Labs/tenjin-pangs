@@ -823,6 +823,16 @@ Raw-cell stores and persistent overlap reads replace symmetric field bridges onl
 the enabled path. Memcpy stays whole-object; certificates, boundary traversal, and
 receiver payload/global consumers have explicit treatments and regression coverage.
 Receiver completeness proofs remain conservatively disabled in the combined C mode.
+
+A subsequent semantic callback fixture isolated a real allocation-escape hole:
+publishing an address through memory bypassed the fixed exact-address escape hook.
+The repair propagates a separate real-boundary escape obligation through solved
+allocation identities and late field/root growth, retaining the external-payload
+and independent-local-address precision controls. Both PIR and LLVM reproductions
+now pass, and the solver suite has 142 passing tests. Vim's full global records are
+unchanged and its same 26 unknown-call monotonicity failures remain. Performance
+measurements and the distinction between initial and optimized fixes are in
+`20260907_CALLBACK_ESCAPE_FIX_EVALUATION.md`.
 The retained prerequisite also exposes 26 Vim unknown-call monotonicity discrepancies
 with C off; these remain a blocker, not a passed soundness gate.
 

@@ -1,6 +1,6 @@
 ; Semantic counterpart of the PIR reproducer: foreign_use may overwrite field 1.
 ; The store/load round-trip preserves the runtime address, but defeats the solver's
-; fixed exact-address certificate. Expected current differential exit: 3.
+; fixed exact-address certificate. The repaired solver must still report unknown.
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-pc-linux-gnu"
 

@@ -1,6 +1,9 @@
 # Semantic callback reproduction
 
-2026-09-07. A small semantic fixture reproduces the same **direction** of unknown-call
+2026-09-07. **Fixed in the subsequent allocation-escape change**; see
+`20260907_CALLBACK_ESCAPE_FIX_EVALUATION.md` for implementation and Vim impact.
+The tables and diagnosis below preserve the original failure evidence.
+A small semantic fixture reproduces the same **direction** of unknown-call
 mismatch as the Vim investigation. It identifies a concrete escape-closure defect;
 it does not yet prove that this explains every one of Vim's 26 sites. No propagation
 fix is included in this change.
@@ -49,25 +52,25 @@ allocation escape envelope without conflating carriers, storage, and field conte
 
 ## Standalone reproduction
 
-`fixtures/reproducers/republished_aggregate_callback.pir.json` contains just the
+`fixtures/synthetic/m1_4/republished_aggregate_callback.pir.json` contains just the
 published-address, shifted-load case. Run:
 
 ```bash
 LD_LIBRARY_PATH=/home/brk/tenjin/_local/xj-llvm-14/lib \
 target/release/pangs differential \
-  fixtures/reproducers/republished_aggregate_callback.pir.json --build-mode executable
+  fixtures/synthetic/m1_4/republished_aggregate_callback.pir.json --build-mode executable
 ```
 
-Expected current exit code: **3**, with
+Original exit code: **3**, with
 `icall_unknown: andersen has main@!noloc#1 absent from steens`.
-This reproduces with asymmetric overlap off and on, including with static PWC enabled.
-The fixture is intentionally outside the all-green synthetic corpus. The two new
-characterization tests assert the current defect explicitly; when repaired, change
-them to require the sound unknown result rather than preserving the faulty behavior.
+This originally reproduced with asymmetric overlap off and on, including with static PWC enabled.
+After the repair, both solvers retain unknown, the differential exits **0**, and the
+fixture has moved into the all-green synthetic corpus. The former characterization
+tests now require the sound result. The field-0 payload and independent known-local
+address controls remain precise.
 
 The adjacent `republished_aggregate_callback.ll` is a typed LLVM-14 counterpart with
-a `{ i8*, void ()* }` aggregate. Substituting that filename in the command above also
-reproduces the same unknown-call violation (exit 3), independently validating the PIR
-pointer annotations and layout. `cargo test --workspace --all-targets` passes,
-including 141 solver tests; this includes the known-defect characterization, not a
-claim that the standalone differential now passes.
+a `{ i8*, void ()* }` aggregate. It independently reproduced the same violation,
+validating the PIR pointer annotations and layout. After the repair it also exits 0.
+The updated all-targets suite passes, including 142 solver tests requiring the sound
+result and preserving the precision controls.

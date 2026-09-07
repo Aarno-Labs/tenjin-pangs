@@ -166,3 +166,8 @@ and controls. Publishing the aggregate address through memory defeats the exact-
 escape hook: the owner escapes but its field-8 callback does not. This confirms a
 specific missing allocation escape envelope, not blanket sibling `ext` propagation,
 and has not yet been traced to all 26 Vim sites. No fix is included with the reproducer.
+
+The subsequent repair is documented in `20260907_CALLBACK_ESCAPE_FIX_EVALUATION.md`.
+It fixes the semantic reproducer and preserves its precision controls, but Vim's
+same 26 unknown-call mismatches remain; its full global facts and witnesses do not
+change. The repaired reproducer is now in the ordinary synthetic differential sweep.

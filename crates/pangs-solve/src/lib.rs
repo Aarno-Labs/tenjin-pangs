@@ -924,6 +924,9 @@ struct ClassData {
     ext: bool,
     external_escaped_union: bool,
     esc: bool,
+    /// A real escape boundary (or its reachable storage), distinct from the synthetic
+    /// escape bit used when pushing an external pointer identity through its pointee.
+    allocation_escape: bool,
     escape_sources: BTreeSet<ProvenanceId>,
     icall_sites: HashSet<usize>,
     fn_objs: HashSet<usize>,
@@ -961,6 +964,9 @@ struct ClassData {
     gep_processed_succ_len: usize,
     gep_processed_region_len: usize,
     gep_processed_summary: bool,
+    /// Region inventory already covered by allocation-wide escape. A UF join can only
+    /// grow the surviving inventory, so a changed length replays newly discovered roots.
+    escape_processed_regions: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2695,6 +2701,29 @@ impl<'a> Solver<'a> {
         let esc = self.classes[root].esc;
         let escape_sources = self.classes[root].escape_sources.clone();
 
+        // Escape belongs to the allocation, including addresses discovered through memory
+        // after the fixed exact-address proof. Revisit after late UF/address growth, but
+        // do not turn a field's external pointer payload into sibling external contents.
+        let allocation_escape = self.classes[root].allocation_escape;
+        if allocation_escape
+            && self.classes[root].escape_processed_regions != self.classes[root].field_regions.len()
+        {
+            self.classes[root].escape_processed_regions = self.classes[root].field_regions.len();
+            let owners = self.classes[root]
+                .field_regions
+                .iter()
+                .map(|(owner, _)| *owner)
+                .collect::<BTreeSet<_>>();
+            for owner in owners {
+                // The first root-wide witness already covers every current/future field.
+                // Re-unioning a large class's provenance into every covered root can dwarf
+                // the solve, even though no new escape fact would be generated.
+                if !self.field_escape_sources_by_root.contains_key(&owner) {
+                    self.escape_allocation_fields(owner, &escape_sources);
+                }
+            }
+        }
+
         if ext || esc {
             if let Some(pointee) = self.classes[root].pointee {
                 if external_escaped_union {
@@ -2705,10 +2734,15 @@ impl<'a> Solver<'a> {
                 if escape_sources.is_empty() {
                     let pointee = self.find(pointee);
                     if !self.classes[pointee].esc {
-                        self.set_esc_with_source(pointee, "derived:external-pointee".into());
+                        let source = self.provenance.intern("derived:external-pointee".into());
+                        self.set_esc_sources_kind(
+                            pointee,
+                            &BTreeSet::from([source]),
+                            allocation_escape,
+                        );
                     }
                 } else {
-                    self.set_esc_sources(pointee, &escape_sources);
+                    self.set_esc_sources_kind(pointee, &escape_sources, allocation_escape);
                 }
             }
         }
@@ -3117,7 +3151,8 @@ impl<'a> Solver<'a> {
             assert!(
                 expected_global
                     .is_none_or(|global| self.classes[field].global_objs.contains(&global))
-                    && (!expected_escape || self.classes[field].esc),
+                    && (!expected_escape
+                        || (self.classes[field].esc && self.classes[field].allocation_escape)),
                 "allocation-relative field class {field} lost root envelope from class {owner}"
             );
         }
@@ -3423,6 +3458,7 @@ impl<'a> Solver<'a> {
         }
         if let Some(sources) = self.field_escape_sources_by_root.get(&root) {
             data.esc = true;
+            data.allocation_escape = true;
             data.escape_sources.insert(
                 self.provenance
                     .first_lexicographic(sources.iter())
@@ -3480,20 +3516,34 @@ impl<'a> Solver<'a> {
     fn set_esc_with_id(&mut self, class: usize, source: ProvenanceId) {
         let root = self.find(class);
         let changed = self.classes[root].escape_sources.insert(source);
-        if !self.classes[root].esc || changed {
+        if !self.classes[root].esc || !self.classes[root].allocation_escape || changed {
             self.classes[root].esc = true;
+            self.classes[root].allocation_escape = true;
             self.enqueue(root);
         }
     }
 
     fn set_esc_sources(&mut self, class: usize, sources: &BTreeSet<ProvenanceId>) {
+        self.set_esc_sources_kind(class, sources, true);
+    }
+
+    fn set_esc_sources_kind(
+        &mut self,
+        class: usize,
+        sources: &BTreeSet<ProvenanceId>,
+        allocation_escape: bool,
+    ) {
         let root = self.find(class);
         let old_len = self.classes[root].escape_sources.len();
         self.classes[root]
             .escape_sources
             .extend(sources.iter().cloned());
-        if !self.classes[root].esc || self.classes[root].escape_sources.len() != old_len {
+        if !self.classes[root].esc
+            || self.classes[root].escape_sources.len() != old_len
+            || (allocation_escape && !self.classes[root].allocation_escape)
+        {
             self.classes[root].esc = true;
+            self.classes[root].allocation_escape |= allocation_escape;
             self.enqueue(root);
         }
     }
@@ -3543,6 +3593,7 @@ impl<'a> Solver<'a> {
         self.classes[a].ext |= self.classes[b].ext;
         self.classes[a].external_escaped_union |= self.classes[b].external_escaped_union;
         self.classes[a].esc |= self.classes[b].esc;
+        self.classes[a].allocation_escape |= self.classes[b].allocation_escape;
         self.classes[a].provenance |= self.classes[b].provenance | provenance;
         let mut other_escape_sources = std::mem::take(&mut self.classes[b].escape_sources);
         if self.classes[a].escape_sources.len() < other_escape_sources.len() {
@@ -4001,6 +4052,72 @@ mod tests {
         let contents = solver.find(contents);
         assert!(solver.classes[contents].ext);
         assert!(solver.classes[contents].esc);
+    }
+
+    #[test]
+    fn allocation_escape_replays_late_roots_and_fields_without_cross_root_leakage() {
+        let pir: Pir = serde_json::from_str(
+            r#"{
+            "module":"late-allocation-escape",
+            "globals":[{"key":"A"},{"key":"B"},{"key":"C"}],"functions":[]
+        }"#,
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let object = |key: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == format!("obj:global:{key}"))
+                .unwrap()
+                .id
+        };
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+        let a8 = solver.field_class(object("A"), FieldRegion::address(FieldLocation::Exact(8)));
+        let b8 = solver.field_class(object("B"), FieldRegion::address(FieldLocation::Exact(8)));
+        let c8 = solver.field_class(object("C"), FieldRegion::address(FieldLocation::Exact(8)));
+        // A boundary arrives before its target has any allocation identity.
+        let unbound = solver.pointee_of(a8);
+        solver.set_esc_with_source(unbound, "test:late-boundary".into());
+        let drain = |solver: &mut Solver<'_>| {
+            while let Some(class) = solver.worklist.pop_front() {
+                solver.queued[class] = false;
+                solver.process_class(class);
+            }
+        };
+        drain(&mut solver);
+        let a = solver.class_of(object("A"));
+        let escaped = solver.join(unbound, a, PROV_MEMORY_MERGING);
+        drain(&mut solver);
+        let field = solver.find(a8);
+        assert!(solver.classes[field].esc);
+        let b = solver.class_of(object("B"));
+        solver.join(escaped, b, PROV_MEMORY_MERGING);
+        drain(&mut solver);
+        let field = solver.find(b8);
+        assert!(
+            solver.classes[field].esc,
+            "a second late allocation root must replay escape"
+        );
+        let late = solver.field_class(object("B"), FieldRegion::address(FieldLocation::Exact(16)));
+        let contents = solver.pointee_of(late);
+        drain(&mut solver);
+        let late = solver.find(late);
+        let contents = solver.find(contents);
+        assert!(solver.classes[late].esc);
+        assert!(
+            !solver.classes[late].ext,
+            "escape is not an external field payload"
+        );
+        assert!(
+            solver.classes[contents].ext,
+            "late loads from escaped fields must remain unknown"
+        );
+        let unrelated = solver.find(c8);
+        assert!(!solver.classes[unrelated].esc);
+        assert!(!solver.classes[unrelated].ext);
+        assert!(!solver
+            .field_escape_sources_by_root
+            .contains_key(&object("C")));
     }
 
     #[test]
@@ -5662,11 +5779,11 @@ mod tests {
     }
 
     #[test]
-    fn semantic_callback_boundaries_characterize_republished_escape_gap() {
+    fn semantic_callback_boundaries_preserve_republished_escape() {
         use serde_json::json;
-        // Characterization of a known defect, not a claim that the false Steensgaard
-        // unknown bit in the two republished cases is sound. Foreign code may overwrite
-        // field 8 in both direct and republished cases. No solver state is injected.
+        // Foreign code may overwrite field 8 in both direct and republished cases.
+        // External payloads and externally addressed storage remain distinct controls.
+        // No solver state is injected.
         for case in [
             "escaped",
             "escaped-published",
@@ -5674,6 +5791,7 @@ mod tests {
             "payload",
             "identity",
             "identity-shifted",
+            "identity-escaped",
         ] {
             let mut body = vec![
                 json!({"kind":"gep","dest":"zero","base":"@aggregate","byte_off":0}),
@@ -5707,6 +5825,10 @@ mod tests {
                         json!({"kind":"gep","dest":"independent","base":"@aggregate","byte_off":0}),
                     );
                     body.push(json!({"kind":"gep","dest":"shifted","base":if case == "identity-shifted" { "mixed" } else { "independent" },"byte_off":8}));
+                    if case == "identity-escaped" {
+                        body.push(json!({"kind":"call_direct","callee":"foreign_use",
+                            "sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":["mixed"]}));
+                    }
                 }
             }
             body.extend([
@@ -5771,14 +5893,11 @@ mod tests {
                     "{case}: allocation itself must escape"
                 );
                 let direct = case == "escaped";
-                assert_eq!(
-                    solver.classes[field].esc, direct,
-                    "{case}: characterized field escape gap"
+                assert!(
+                    solver.classes[field].esc,
+                    "{case}: escaped allocation must cover field 8"
                 );
-                assert_eq!(
-                    solver.field_escape_sources_by_root.contains_key(&owner),
-                    direct
-                );
+                assert!(solver.field_escape_sources_by_root.contains_key(&owner));
                 if !direct {
                     assert!(
                         solver.exact_addresses[node("val:main:published").0 as usize].is_none()
@@ -5799,9 +5918,9 @@ mod tests {
                     ["cb"],
                     "{case} {tier}: known callback must remain reachable"
                 );
-                let unknown = case == "escaped"
+                let unknown = case.starts_with("escaped")
                     || case == "identity-shifted"
-                    || (tier == "andersen" && case.starts_with("escaped-published"));
+                    || case == "identity-escaped";
                 assert_eq!(call.unknown_callee, unknown, "{case} {tier}");
                 if case == "payload" {
                     assert!(solved.nodes["val:main:payload_read"].external);
@@ -5812,14 +5931,8 @@ mod tests {
     }
 
     #[test]
-    fn republished_aggregate_callback_fixture_reproduces_unknown_mismatch() {
-        // Kept outside the all-green synthetic corpus: this is an executable known-bug
-        // reproducer. Update this characterization when the escape-closure defect is fixed.
-        let pir = Pir::from_path(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../fixtures/reproducers/republished_aggregate_callback.pir.json"),
-        )
-        .unwrap();
+    fn republished_aggregate_callback_fixture_keeps_unknown() {
+        let pir = Pir::from_path(fixture("republished_aggregate_callback.pir.json")).unwrap();
         let pag = Pag::from_pir(&pir, &PagOpts::default());
         let steens = solve_steensgaard(&pir, &pag, BuildMode::Executable);
         let andersen = solve_andersen(&pir, &pag, BuildMode::Executable, u64::MAX);
@@ -5827,7 +5940,7 @@ mod tests {
         assert_eq!(andersen.indirect_calls.len(), 1);
         assert_eq!(steens.indirect_calls[0].targets, ["cb"]);
         assert_eq!(andersen.indirect_calls[0].targets, ["cb"]);
-        assert!(!steens.indirect_calls[0].unknown_callee, "known defect stopped reproducing; require the sound true result in the repaired regression");
+        assert!(steens.indirect_calls[0].unknown_callee);
         assert!(andersen.indirect_calls[0].unknown_callee);
     }
 

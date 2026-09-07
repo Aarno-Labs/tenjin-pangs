@@ -184,6 +184,13 @@ facts along those value transfers. Consequently every union-find class contains 
 carriers or locations (object, pointee, and field classes), never both; debug builds assert this
 carrier/location invariant after every solve.
 
+Allocation escape is also recovered from solved location-region identities, not just
+fixed exact-address certificates. Real boundary escape propagates to every field of
+each represented allocation, including roots discovered by later joins and fields
+materialized later. This obligation is distinct from the synthetic escape bit used
+for an external pointer's pointee: storing an external payload in one field does not
+externalize its siblings. A monotone region-count frontier bounds replay work.
+
 Content facts also push down through pointer targets. When a class is external or escaped, its
 pointee class becomes external and escaped. Everything reachable from an external, escaped, or
 integer-forged pointer is therefore external, and every value loaded from such storage is external
