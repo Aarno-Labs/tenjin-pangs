@@ -6,19 +6,23 @@ self-contained for the work items; the design rationale is in the note.*
 
 ## 0. Status and goal
 
-Not started. Two changes, in order, each behind a knob and each promoted to default only after
-the evaluation in §4 passes:
+Not started. Three work items, each behind a knob and each promoted to default only after
+the evaluation in §5 passes. A includes the bounded domain needed to represent its results;
+B is conditional, and C is a separate change evaluated after A:
 
 - **A. PWC lanes (static).** A constant-offset GEP that lies on a copy/GEP cycle in the fixed
-  PAG (a *positive-weight cycle*, e.g. `p++` in a loop) is rewritten to an affine lane whose
-  modulus is the gcd of the cycle's GEP weights. Both solvers then reuse the existing
-  `FieldLocation::Lane` machinery unchanged. Removes the chain of exact field cells that today
-  runs through the whole constant-offset vocabulary before collapsing to `Unknown`.
+  PAG with nonzero net displacement (e.g. `p++` or `p--` in a loop) is rewritten to an affine
+  lane. Constant-weight SCCs use the gcd of cycle displacements, computed with node potentials.
+  A bounded derived-lane vocabulary preserves shifted entries and member offsets. This aims
+  to avoid exact-field chains followed by `Unknown`, without requiring cycle detection to
+  establish termination. Andersen gains the new precision; Steensgaard's cycle-rejecting
+  address proof is unchanged.
 - **B. PWC lanes (dynamic).** Only if A leaves a large chained-derivation residue: detect
   cycles that arise through load/store-added copy edges inside the Andersen solve.
 - **C. Asymmetric field overlap.** Replace the bidirectional copy edges between overlapping
   field cells (summary ↔ exact, object ↔ summary) with "a store writes its own cell, a load
-  reads the union of overlapping cells". Same soundness, removes sibling-field leakage.
+  reads the union of overlapping cells". Loads and memcpy sources share persistent overlap-read
+  dependencies. Boundary and certificate consumers must use the same read interpretation.
 
 Measured motivation (2026-09-04, default knobs, executable mode): chained field derivation is
 96% of GEP pair work on `lib-sqlite-O1` (94 374 of 98 559 pairs) and 55% on
@@ -45,10 +49,13 @@ are 31–41% of all constraint-pair work there. On `exe-tmux-O1` the effect is n
 
 - Corpus: `/home/brk/pangs-corpus/_out_bc/`. Evaluation set: `exe-tmux-O1` (null case),
   `exe-jq-O1`, `lib-sqlite-O1`, `exe-vim-9.2-O1` (large; several minutes each for the last two).
-- Soundness posture (`DESIGN.md` §7): every change must only *narrow* answers. A lane is a
-  superset of every exact offset it replaces, and the union-on-load rule reads at least what
-  the bidirectional edges read, so both A and C are conservative by construction. Still run
-  the ledger checks in §4.
+- Soundness posture (`DESIGN.md` §7): preserve every concrete behavior under the supported
+  program contract. Replacing an exact offset with a lane is a conservative widening, not a
+  guarantee that final answers narrow. It can improve precision relative to an old `Unknown`
+  collapse or lose precision relative to a short exact cycle. Asymmetric overlap removes
+  transitive sibling leakage while retaining direct overlapping writes; it need not read
+  every spurious fact the old bidirectional graph carried. Validate correctness independently
+  of before/after precision, using §5.3.
 - Record results in `EXPERIMENT_HISTORY.md` and update the "Finite field domain" paragraph
   of `DESIGN_lite.md` §2 D′ when a knob is promoted.
 
@@ -74,11 +81,11 @@ B1/B2 (`crates/pangs-api/src/initval.rs`, `simple.rs`) read PIR, not the PAG, so
 rewrite does not touch them. `crates/pangs-solve/src/cfl.rs` is an experimental query
 prototype and may treat a lane as unknown; that is acceptable.
 
-### 2.2 Algorithm
+### 2.2 Static cycle algorithm
 
 Implement as a PAG post-pass `Pag::infer_pwc_lanes(&mut self)` in `crates/pangs-pag/src/lib.rs`,
-called at the end of `from_pir` when `PagOpts::pwc_lanes` is true (default true once promoted;
-env `PANGS_PAG_PWC_LANES=0` disables for ablation, threaded through the CLI like the other
+called at the end of `from_pir` when `PagOpts::pwc_lanes` is true (initially opt-in with
+`PANGS_PAG_PWC_LANES=1`; default true only after promotion, with `=0` for ablation, like other
 knobs). Doing it in the PAG makes every consumer (both solvers, the address proof, the
 prepartition graph, `dump-pag`, `check-pag`) see one consistent edge set.
 
@@ -86,93 +93,168 @@ prepartition graph, `dump-pag`, `check-pag`) see one consistent edge set.
    (`src → dst`). Ignore Load, Store, Memcpy, AddrOf.
 2. Compute SCCs (iterative Tarjan or Kosaraju; the Kosaraju in `collapse_copy_sccs`,
    `andersen.rs` ~L6252, is a good template — vector-indexed, no recursion).
-3. For each SCC with at least one *internal* GEP edge (both endpoints in the SCC):
-   - `g = gcd` over `|byte_off|` of every internal constant GEP edge, further gcd'ed with the
-     `modulus` of every internal lane GEP edge. Skip edges with neither (`Unknown`); they
-     stay as they are.
-   - If `g == 0` (all internal constant offsets are 0) do nothing: that is not a PWC.
-   - Rewrite every internal constant GEP edge `Gep { byte_off: Some(w), lane: None }` to
-     `Gep { byte_off: None, lane: Some(GepLane::new(g, w).unwrap()) }`. Internal lane edges
-     become `GepLane::new(g, residue)`. Edges leaving or entering the SCC are untouched.
-   - Record a PAG metric: `pwc_sccs`, `pwc_gep_edges_rewritten`, and a small histogram of
-     `g` (at least the count with `g == 1`), in `PagMetrics`.
+3. Process SCCs containing an internal GEP. For an SCC containing only Assign and constant
+   GEP edges, give Assign weight zero and compute potentials:
+   - Choose a deterministic start node with `h(start) = 0`. Traverse an internal directed
+     spanning tree, assigning `h(v) = h(u) + w` when first visiting `v` through `u → v`.
+   - Over **all** internal edges, including Assign edges, compute
+     `g = gcd(abs(h(u) + w - h(v)))`.
+   - If `g == 0`, every cycle has zero net displacement. Leave the SCC unchanged. A cycle
+     with `+8` followed by `-8` therefore needs no stride widening.
+   - Otherwise rewrite internal nonzero constant GEPs to `Lane { g, w mod g }`. Leave
+     zero-offset GEPs exact: they introduce no displacement and need no widening. Leave
+     entering and exiting edges unchanged.
+4. For an SCC containing existing lanes but no unknown GEP, use a deliberately coarser rule:
+   take the gcd of absolute constant weights and **both modulus and absolute residue** of
+   every lane edge. Rewrite nonzero constants and lane edges using that modulus and their
+   original offset/residue. Including residues ensures every possible edge displacement is
+   divisible by `g`. Do not apply the constant-only potential argument to lane edges.
+5. For an SCC containing an unknown GEP, skip stride inference for that SCC and retain the
+   existing unknown treatment and finite fallback. Record the skip; detecting finite
+   subcycles inside such SCCs is a later precision extension.
 
-Soundness argument to leave in a comment: every cycle weight is an integer combination of the
-internal edge weights, so `g` divides every cycle weight; offsets reachable from an entry
-offset `e` are all `≡ e (mod g)`, which `Lane { g, · }` denotes. `Lane` is a congruence class in
-both directions, a superset of the paper's forward-only stride set, so it is conservative.
-Negative weights (`p--`) are covered by the same argument. This is coarser than the paper's
-`Strides(e)` (set of cycle weights) but matches the gcd semantics `GepLane::combined` already
-uses.
+Use checked wide arithmetic for potentials and residuals, including negative weights and
+`i64::MIN`. If the computed modulus cannot be represented by `GepLane`, keep the original
+constraints and record a skip. Do not `unwrap` an unchecked lane construction. A skipped
+rewrite affects optimization only; §2.3 still bounds field generation.
 
-Why nothing else changes: in `field_of`, a base cell at `Lane { g, r }` plus a delta
-`Lane { g, w }` gives `Lane { g, r + w }`, and `combined == base_location` when it is the same
-residue, so the walk converges in one step. In `exact_allocation_addresses`, `from_gep` turns
-the rewritten edge into a `Lane` location; the proof still fails on cycles (see §2.4).
+For constant SCCs, residuals telescope around every cycle, so `g` divides every cycle's
+net displacement. The invariant is node-relative: a path from entry node `s` at offset `e`
+to node `v` ends at an offset congruent to `e + h(v) - h(s)` modulo `g`. Different nodes
+need not have the entry residue. Each rewritten edge also contains its original exact
+displacement, which directly establishes conservative transfer. A cycle with `+8` and
+`+16` gets modulus 24, not 8; distinct cycles of weights 8 and 12 get modulus 4.
 
-### 2.3 Counters (make permanent)
+Lanes include both signs and may include unreachable offsets. This is a sound superset of
+concrete arithmetic, not DEA's exact forward stride set. Propagation need not converge in
+one GEP step: different nodes and entries can require different residues. The bounded
+domain below supplies termination even for cycles this pass misses.
+
+### 2.3 Finite exact and derived-lane domain
+
+Keep the fixed exact-offset vocabulary and the per-allocation `Unknown` fallback. Do not
+allow replayed GEPs to create arbitrary exact offsets. In particular, adding a class or
+location to a memoization table is not itself a bound on that table.
+
+The current `field_of` accepts a composed location only if it is already in
+`known_locations` (or unchanged from its base). Registering `Lane(24, 0)` alone therefore
+does not preserve a later `+8`: `Lane(24, 8)` may be absent and collapse to `Unknown`.
+A must add bounded derived-lane admission as well as rewriting the PAG.
+
+Use one domain helper for root-relative composition and admission:
+
+- An unchanged location reuses its cell. A composed exact location must belong to the
+  fixed exact vocabulary; otherwise use that root's `Unknown`.
+- Admit newly composed, normalized lanes lazily into a per-root vocabulary with an explicit
+  cap. Start the experiment with **256 distinct lane locations per allocation**, including
+  directly requested lanes; expose and record the cap for evaluation. This number is a
+  tuning choice, not a soundness assumption.
+- A lane beyond the cap, unrepresentable arithmetic, or an unknown operand routes to that
+  root's `Unknown`. Retain all earlier cells and facts. Never discard an alternative or
+  reinterpret an existing cell more narrowly. Future fields must still overlap the summary.
+- Use this helper for direct, nested, and dynamically rewritten GEP materialization so no
+  path bypasses the cap. Compose lanes using the existing gcd/residue arithmetic; do not
+  eagerly enumerate all residues of a modulus.
+
+Each root then has a finite fixed exact vocabulary, at most the configured number of lane
+cells, and one unknown summary. Missing cycles, memory-mediated cycles, and late call
+bindings cannot create an unbounded location chain. Admission order can affect which lanes
+remain precise at the cap; every order must remain conservative and terminate. Use stable
+traversal where practical, and test different creation orders without demanding identical
+precision after overflow.
+
+The helper should be reusable by the proposed Steensgaard offset fix in
+`20260907_STEENS_ONE_HOP_OFFSET_HANDLING.md`. That fix still needs its own persistent GEP
+replay and representation of mixed field/summary alternatives. Stride inference does not
+solve those obligations, and this work item does not implement that fix.
+
+### 2.4 Counters (make permanent)
 
 Add to `Solve` in `andersen.rs` and print in the "joint solve done" profile line:
 
-- `chained_field_derivations`: increments in `field_of` when `base` is a field cell and the
-  combined location is in `known_locations` (the `self.field_of(root, combined)` branch).
-- `chain_collapses_to_unknown`: increments in the sibling `unknown_field_of(root)` branch.
+- `chained_field_derivations`: counts nontrivial compositions from a field cell admitted as
+  exact or lane locations. Split exact and lane counts so successful lane composition is
+  not mistaken for residual exact-chain work.
+- `chain_collapses_to_unknown`: split by missing exact vocabulary, lane cap, unknown input,
+  and arithmetic failure.
+- Derived lanes admitted, maximum lanes per root, and roots reaching the cap.
+
+PAG metrics: SCCs examined, nonzero-cycle SCCs, zero-cycle SCCs skipped, lane-containing
+SCCs using the coarse rule, unknown/arithmetic skips, rewritten edges, and a modulus
+histogram including `g == 1`. Keep the historical census separate: it used edge-weight gcd
+and did not distinguish zero-net cycles.
 
 Struct fields `field_cells_allocated: usize` appear in two structs; anchor the additions on
 `new_copy_edges_since_scc` (Solve struct ~L5328 and its initializer ~L5435), which is unique.
 
-### 2.4 Optional extension (skip unless a target needs it)
+### 2.5 Steensgaard scope and optional extension
 
 Extending `exact_allocation_addresses` to certify an SCC whose external producers all name one
 root as `Lane { g, entry residue }` would give Steensgaard per-field precision for
 `for (e = table; ...; e++)` walks over a global. The census found zero such SCCs in eight
 modules (tables are indexed, not walked, at O1), so do not build it now; re-run the census
-(§4.1) on any new target first.
+(§5.1) on any new target first. This is separate from carrying shifted field targets through
+uncertified GEPs in the one-hop proposal. Static rewriting alone gives no new cyclic address
+certificate and must not be advertised as precise Steensgaard pointer-walk support.
 
-### 2.5 Tests
+### 2.6 Tests
 
-- Unit test in `crates/pangs-pag`: a hand-built PAG with `p = phi(buf, p + 4)` (Assign from
-  `buf` and from `p4`, Gep `p → p4` with `byte_off 4`) rewrites the GEP to `Lane { 4, 0 }`; a
-  Gep with `byte_off 0` on a cycle is not rewritten; a GEP entering the SCC from outside is
-  not rewritten; two internal weights 8 and 12 give modulus 4.
-- Solver tests in `andersen.rs` (next to `andersen_distinguishes_struct_fn_ptr_fields`,
-  ~L7418) and `lib.rs` (next to `affine_gep_lanes_alias_only_matching_residue_classes`,
-  ~L3678) using a synthetic fixture under `fixtures/synthetic/` in the style of
-  `field_sensitive_fnptr.pir.json`:
-  1. byte walk `for (p = buf; *p; p++)` over an object: after solving, `pts(p)` contains one
-     lane cell for the object, `chained_field_derivations == 0`,
-     `chain_collapses_to_unknown == 0`.
-  2. struct-array walk, element size 24, storing to offset 8 (`e->flags = x`) and loading the
-     callback at offset 0: the store's pointee is `Lane { 24, 8 }` and does not alias
-     `Exact(0)`; the callback load resolves to exactly the initialized function. With the knob
-     off, the same fixture must show the pre-existing `Unknown` behaviour (assert the
-     collapse counter is positive) so the ablation is exercised.
-- Golden tests under `tests/golden` must be re-baselined only where the diff is a strict
-  narrowing; inspect every changed row.
+- PAG: `p = phi(buf, p + 4)` rewrites to `Lane(4, 0)`; zero-offset edges stay exact;
+  entering/exiting edges remain unchanged; `+8/-8` stays exact; `+8/+16` produces modulus
+  24; separate cycles of weights 8 and 12 produce modulus 4. Cover negative cycles,
+  multiple entries, existing nonzero-residue lanes, unknown edges, and arithmetic limits.
+- Andersen: a byte walk reaches a stable lane without walking the exact vocabulary.
+  Retaining an exact entry object alongside the lane is allowed. Do not require zero total
+  chained derivations: creating shifted lanes is legitimate work.
+- Andersen: a struct-array walk of stride 24 retains member lane 8 separately from member
+  lane 0. Use a fixture without whole-object writes that would legitimately bridge them.
+  Also start at offset 8 and access member 4, requiring `Lane(24, 12)` absent from the
+  fixed PAG vocabulary. Compare with knob-off behavior and report any old summary collapse.
+- Domain: force a tiny lane cap; check conservative unknown results for every rejected
+  alternative, no cross-root summary, and bounded cell counts. Exercise pointer-increment
+  cycles through memory, reordered constraints, and late call bindings with static
+  inference disabled or unable to detect the cycle.
+- Steensgaard: check termination, conservative writes/targets, and the carrier/location
+  invariant. Do not demand precise cyclic lanes while the address proof rejects cycles.
+  Any failure exposed by the one-hop defect blocks the affected correctness gate; record
+  and fix that dependency rather than weakening the expected concrete facts.
+- Goldens: inspect every changed row. Add explicit expected writes and callees to fixtures;
+  a smaller answer is not evidence that a disappearing fact was false.
 
 ## 3. Work item B: dynamic PWC lanes (conditional)
 
-Trigger: after A, `chained_field_derivations` on sqlite or vim is still more than 10% of
-`gep_pairs_processed`. Otherwise skip and record the numbers.
+Trigger: after A, residual **exact-chain** derivations on sqlite or vim are still more than
+10% of `gep_pairs_processed`, and profiling attributes substantial work to cycles created
+inside the solve. Successful member-lane compositions are not a reason to enable B.
+Otherwise skip and record the numbers. B is an optimization; §2.3 remains mandatory with
+B off, below detection thresholds, and between detection passes.
 
 Implementation sketch, all inside `Solve` in `andersen.rs`:
 
 1. In `collapse_copy_sccs`, build a second adjacency that adds, for every established and
    pending GEP constraint `(off, p)` in `geps[n]`/`pending_geps[n]`, an edge `n → p` tagged
-   with `off`. Run the same Kosaraju over copy ∪ GEP edges. **Do not merge** cells of an SCC
-   that contains a GEP edge; only copy-only SCCs are merged as today.
-2. For each SCC containing an internal GEP edge, compute `g` as in §2.2 and rewrite the
-   `FieldLocation` of those GEP constraints in place to `Lane { g, off }` (for `Exact(off)`)
-   or `Lane { g, residue }` (for lanes). Mark the rewritten constraints pending so they are
-   re-seeded from the full points-to set (the existing new-constraint seeding path).
+   with `off`. Run the same Kosaraju over copy ∪ GEP edges. Keep ordinary copy-only SCC
+   collapse as an independent pass: belonging to a cycle containing GEPs does not establish
+   equal contents, but must not prevent collapse of a true copy-only subcycle.
+2. Use §2.2's potential algorithm for constant-only SCCs and its coarse/skip rules for
+   lane/unknown SCCs. Rewrite only by a containing lane; never narrow a previously widened
+   transfer as SCCs grow. Mark changed constraints pending and reseed from the source's
+   full points-to set. Canonicalize and deduplicate constraints after copy-SCC remapping.
+   Keep old facts, including old `Unknown` results: this ascending solve cannot retract
+   them to recover precision after late detection. All new locations go through §2.3.
 3. The SCC pass is threshold-triggered (`copy_scc_min_edges`, default 4096). Add a cheap
    PWC-only detection that runs once before the first propagation and once after each
    resume round; profile its cost (`scc_nodes_scanned`/`scc_edges_scanned` already exist).
-4. Optional subsumption: when a lane cell enters `pts(p)`, congruent exact cells already there
-   stay. Leave them; measure first.
+4. Keep congruent exact cells already in `pts(p)`. Do not add fact deletion or subsumption
+   in this work item. Count detection runs, rewritten constraints, full-set replays, and
+   cycles first detected after an unknown collapse, alongside SCC scan costs.
 
-Knob: `PANGS_ANDERSEN_PWC_LANES=0` disables. Tests: a fixture where the cycle closes through
-memory (`p = *pp; ...; *pp = p + 4`) and A alone does not stop the chain.
+Knob: initially opt-in with `PANGS_ANDERSEN_PWC_LANES=1`; `=0` disables after promotion.
+Tests: a cycle through memory (`p = *pp; ...; *pp = p + 4`), a late indirect-call binding
+that closes a cycle, and a cycle whose modulus decreases after new edges arrive. Require
+full-set replay to preserve all concrete targets. Test with detection below threshold and
+disabled: the finite fallback must still terminate. Do not expect B to remove facts that
+were already conservatively derived before detection.
 
 ## 4. Work item C: asymmetric field overlap
 
@@ -192,23 +274,46 @@ loc(c) }`, where the root object cell itself is treated as location `Unknown` (a
 access may touch any byte) and the `Unknown` summary overlaps everything of that root.
 
 - **Store** (`*n = q`, ~L6691): for each pointee `o` of `n`, `add_copy(q, o)` only. No fan-out.
-- **Load** (`p = *n`, ~L6660): for each pointee `o` of `n`, `add_copy(o', p)` for every
-  `o' ∈ overlap(o)`.
-- **Late-created cells:** a load processed earlier with pointee `c` must also read a cell
-  `c''` of the same root created later that overlaps `c`. Keep
-  `loads_by_root: HashMap<Cell /*root*/, Vec<(Cell /*pointee*/, Cell /*dest*/)>>`; when
-  `field_of` creates `c''` for root `r`, add `add_copy(c'', dest)` for every recorded
-  `(c, dest)` with `c'' may_alias c`. This is the paper's `M_{o.f_i}` bookkeeping and is what
-  keeps the rule sound under lazy materialization.
-- **Memcpy** (summary cells, ~L5860): a source endpoint reads `overlap(src)`; a destination
-  endpoint is written only at its cell. Keep the endpoint bookkeeping used by the
-  closed-producer/closed-consumer audits unchanged.
+- **Shared read operation:** introduce `read_overlap(cell, destination)`. Register a
+  persistent dependency, indexed by allocation root, and add a copy from every currently
+  overlapping cell to the destination. Deduplicate dependencies and seed newly installed
+  edges from the source's complete facts using the existing copy-edge mechanism.
+- **Load** (`p = *n`, ~L6660): for each pointee `o` of `n`, call `read_overlap(o, p)`.
+- **Late-created cells:** when any field or summary is created, connect it to every
+  registered overlapping read of that root. This applies equally to exact, lane, and
+  unknown cells, regardless of creation order. Existing copy edges handle later writes.
+- **Memcpy** (summary cells, ~L5860): use `read_overlap` for each source endpoint, with the
+  propagation-only memcpy summary as destination; its contents flow to destination endpoint
+  cells. The direct Cartesian implementation must register equivalent source reads too.
+  Preserve endpoint activation/access guards and whole-object interpretation; this is not
+  byte-sliced memcpy. A field created after the memcpy must still reach its destination.
+- **Canonicalization:** remap read destinations after copy-SCC collapse, deduplicate merged
+  registrations, and replay newly required pairs. Preserve allocation and field identities;
+  a canonical value representative is not a replacement allocation root.
 - **External cells:** `field_of` returns the base itself for external cells; keep that, and
   keep the existing Ω/external propagation untouched.
 - Remove the bidirectional edges in `field_of` and the bridge in `note_direct_access` only
   when the knob is on; the old path must remain byte-for-byte for ablation until promotion.
 
-Do C after A is promoted, so its measurement is not confounded by chain cells.
+Here `pts(cell)` records payload written to that cell, while a read obtains the union over
+overlapping cells. Overlap is not transitive: exact 0 overlaps Unknown, and Unknown overlaps
+exact 8, but a write to exact 8 is not thereby a write to exact 0. This distinction is the
+precision gain and must hold outside the propagation loop too.
+
+Audit every consumer that previously relied on summary-copy closure, including closed-producer
+and closed-consumer certificates, boundary/escape reachability, receiver payloads, and exported
+through-memory facts. Preserve raw endpoint identities for auditing, but update reads and
+transfer checks to use the overlap relation. A missing field fact in raw `pts(summary)` cannot
+prove a producer closed or a callback unreachable. Keep an unsupported certificate incomplete
+until its overlap-aware proof is implemented; conservative boundary traversal must remain
+complete. Do not promote C with an unaudited consumer.
+
+Reuse the existing location-overlap semantics and conservative whole-object access model.
+Do not infer new byte-width precision from this change. Record dependency counts, overlap
+pairs, replay work, and index memory so removing copy edges does not hide a larger read cost.
+
+Do C after A is evaluated and promoted, as a separate change and ablation. B is not a
+prerequisite. Hold its setting fixed while measuring C.
 
 ### 4.3 Tests
 
@@ -217,6 +322,13 @@ Do C after A is promoted, so its measurement is not confounded by chain cells.
   value; the field-0 load does not (with the knob on) and does (with the knob off).
 - Late-cell test: process a load through the summary before the exact cell at 8 exists, then
   create it via a GEP and store to it; the earlier load's destination must gain the value.
+- Repeat the late-cell test with memcpy instead of a load, with memcpy summaries on and off.
+  Add the reverse order and a read destination merged by copy-SCC collapse.
+- Test both directions of lane/exact overlap, a write through Unknown followed by an exact
+  load, and unrelated roots. Keep real whole-object writes visible to all overlapping reads.
+- Pass a container containing a callback to an external boundary when its payload is only
+  in a field cell. The callback must remain externally reachable. Exercise closed-producer
+  and closed-consumer options and receiver payloads together with the new read semantics.
 - Re-run the bridge tests (`andersen.rs` ~L7632) under both knob settings; document which
   assertions encode the old symmetric semantics and gate them on the knob.
 
@@ -234,8 +346,10 @@ rm $OUT/<m>.json
 ```
 
 The census script from 2026-09-04 was ~80 lines (Tarjan over `assign`/`gep` edges, gcd of
-internal `byte_off`s, root-set classification through `addrof`/`assign`/`gep` producers);
-rewrite it under `scripts/` so it is kept. After A lands, `PagMetrics.pwc_*` replaces it.
+internal `byte_off`s, root-set classification through `addrof`/`assign`/`gep` producers).
+Keep a maintained script under `scripts/` if dumps are needed, or prefer the new PAG metrics
+once available. Label old edge-gcd counts separately from the new cycle-residual counts;
+do not silently reinterpret the historical measurements.
 
 ### 5.2 Solver measurements (A, B, C)
 
@@ -249,38 +363,56 @@ target/release/pangs analyze $CORPUS/<m>.bc --build-mode executable --stage ande
 
 Record from the "joint solve done" line: `steps`, `pts_facts`, `copy_edges`, `fields`,
 `unknown_fields`, `gep_pairs_processed`, `copy_fact_pairs_processed`,
-`chained_field_derivations`, `chain_collapses_to_unknown`, plus wall time and peak RSS.
+`chained_field_derivations` split by exact/lane, `chain_collapses_to_unknown` split by reason,
+domain caps and occupancy, overlap-read work for C, plus wall time and peak RSS. Record all
+knob settings, admission/fallback metrics, and build mode with each result.
 
-Acceptance for A: on sqlite and vim, chained derivations drop by an order of magnitude,
-`fields` and `gep_pairs_processed` drop, no metric rises materially, tmux unchanged. Expect
-roughly a third of solve time at most on sqlite/vim; do not expect the paper's 7×.
+Performance target for A: on sqlite and vim, exact-chain work drops by an order of magnitude
+and total field/GEP work falls, with tmux approximately unchanged. Treat this as a hypothesis,
+not a correctness invariant. Report increases in derived lanes, memory, solve time, or fallback
+sizes and explain the net tradeoff. The old GEP share motivates a possible substantial saving;
+it does not establish a wall-time ceiling or guarantee the paper's 7× speedup.
 
-### 5.3 Narrowing and soundness ledger (every item)
+### 5.3 Soundness and precision ledger (every item)
 
-- `target/release/pangs differential $CORPUS/<m>.bc --build-mode executable` for each module:
-  must pass with the knob on.
-- `cargo test --workspace` including golden files; inspect every re-baselined row.
-- Indirect calls: `pangs icall-census` before/after; per-site target sets must be equal or
-  subsets, `unknown_callee` never newly set.
+- Run `target/release/pangs differential $CORPUS/<m>.bc --build-mode executable` for each
+  module under both configurations. Cross-tier refinement is checked **within** one
+  configuration, including the target lattice's unknown/top semantics. Record existing
+  failures, including the one-hop write defect, as dependencies; a shared missing fact can
+  pass a differential check, so agreement is not an independent soundness proof.
+- `cargo test --workspace --all-targets`, including explicit expected writes/targets,
+  overflow, replay, and late-cell tests. Inspect every re-baselined golden row.
+- Indirect calls: use `pangs icall-census` before/after and classify added/removed targets and
+  changes in `unknown_callee`. A/B may widen or narrow relative to the old configuration;
+  justify losses and measure their client cost. Removed targets require evidence that they
+  are infeasible, not merely a subset check. For C with the same field domain, narrowing is
+  expected, but still does not prove soundness.
 - Clients: `pangs report` on both output directories; ModRef unknown rows, per-global
   `written` facts, and the disposition distribution (`HOWTO_MEASURE_DISPOSITION_COVERAGE.md`)
-  must not regress. For C specifically, count globals whose `written` witness disappears and
-  whose disposition moves up the cascade; that is the precision payoff to report.
+  must be compared in both directions. Every lost real write is a correctness failure;
+  extra conservative writes are a coverage cost to report. For C, audit disappearing
+  `written` witnesses and resulting disposition improvements against fixture semantics or
+  source evidence before counting them as recovered precision.
 - Dynamic check where traces exist: `pangs instrument` + `check-traces` (see `PLAN-M5.md`
   and the runbook) on at least one module.
 
 ### 5.4 Promotion
 
-Promote a knob to default only when §5.2 shows the expected gain on at least sqlite and vim,
-§5.3 is clean on the whole evaluation set, and the full workspace tests pass. Keep the
+Promote a knob to default only when §5.2 demonstrates a worthwhile measured benefit on sqlite
+and vim, §5.3's correctness gates pass on the whole evaluation set, precision losses have been
+reviewed and recorded, and the full workspace tests pass. Unresolved base-tier soundness
+failures are blockers, not acceptable precision tradeoffs. Keep the
 ablation value (`=0`) documented in `DESIGN_lite.md` next to the other
 `PANGS_ANDERSEN_*` knobs, and add the measured numbers to `EXPERIMENT_HISTORY.md` and
 `notes/07-dea-pwc.md`.
 
 ## 6. Non-goals
 
-- No change to the exact-address proof, Steensgaard's field classes, receiver payloads, or
-  memcpy byte slicing.
+- No cyclic extension of the exact-address proof or implementation of the Steensgaard
+  one-hop fix. The bounded domain may be reused there; its replay and mixed-summary
+  obligations remain separate.
+- No new receiver context abstraction or byte-sliced memcpy. C does include adapting their
+  existing content consumers, and the certificate/boundary consumers, to overlap-aware reads.
 - No adoption of the paper's field-index object model, max-field bounds, or wave
   propagation; the byte-offset vocabulary and semi-naive joins stay.
 - No per-round SCC detection (item B) unless A's residue measurement demands it.
