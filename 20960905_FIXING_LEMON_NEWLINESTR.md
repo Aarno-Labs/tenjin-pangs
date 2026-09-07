@@ -361,13 +361,15 @@ required checks were run on 2026-09-06:
   accesses only; the Ω source that used to open it, `lemon_sprintf`'s `va_list`, is gone because
   `va_start` and `va_end` are now modeled locally instead of being `unknown` statements.
 
-### 7.2 Two pre-existing findings, unchanged by this work
+### 7.2 Two pre-existing findings, unchanged by this work (both since fixed — see §8)
 
 Both were investigated on 2026-09-06.  Neither is caused by the varargs work: `pangs
 differential` prints byte-identical output before and after it.  Neither changes the §3.1
 result.
 
 #### 7.2.1 The `in_rewritable_components` drop is a defect in the metric, not in Andersen
+
+*Fixed on 2026-09-06; §8.1 records what changed.*
 
 `differential` reports `in_rewritable_components` falling from 6 at Steensgaard to 1 at
 Andersen and calls it a monotonicity break.  Andersen is right and the check is wrong.
@@ -428,6 +430,9 @@ Suggested fix, in two parts:
    the comment actually argues for.
 
 #### 7.2.2 A real write is missed, and the global is dispositioned `immutable`
+
+*Root-caused and fixed at the Andersen tier on 2026-09-06; the base-tier gap behind it is still
+open.  §8.2 records both.*
 
 This one is a soundness bug, found while checking the component sets above.  It is not specific
 to Lemon's varargs and it is not new.
@@ -513,3 +518,210 @@ Suggested first step: add exactly that check, as a debug assertion or a differen
 named `mod` ModRef row for a locally defined global must imply `written`.  It costs nothing, it
 would have caught this, and it decides the `tree` cases immediately by pointing at whichever side
 is wrong.
+
+## 8. Fixes applied, 2026-09-06
+
+Both §7.2 findings were fixed.  The changes are on three revisions: a tripwire, an ephemeral
+instrumentation revision that is not for keeping, and the fix itself.
+
+### 8.1 The rewritable coverage rule
+
+Two things were wrong and both are now corrected.
+
+**The metric.**  `in_rewritable_components` counted a global as rewritable if any non-frozen
+component named it.  It now requires that no frozen component name it.  On the 53-module sample
+this takes the corpus count from 102 to 55 at Steensgaard and from 92 to 55 at Andersen — the old
+number was inflated by roughly a factor of two, and the strict number is the same at both tiers.
+
+**The check.**  `differential` asserted that the rewritable set only grows from Steensgaard to
+Andersen.  That is not a theorem in either direction, because the set is built from ModRef rows:
+deleting a false row from a clean component removes a global, deleting one from a frozen
+component adds one, and both happen on the corpus.  The assertion is gone.  Coverage movement is
+now reported as a note, in both tier directions, with the gained and lost counts.
+
+**Its replacement.**  In its place is a rule that *is* a theorem.  A coarser tier
+over-approximates points-to, so every runtime write a finer tier attributes to a global must
+already be attributed to it by the coarser one:
+
+```text
+written_globals(andersen) ⊆ written_globals(steens)
+```
+
+A break means the base tier lost a store, and any `immutable` it selects for that global is
+unsound.  The conservative direction is deliberately *not* asserted: that tier is syntactic, does
+no aliased mod/ref at all, and therefore reports fewer writes than Steensgaard by construction.
+It is reported as a note instead, which is also the standing warning from §7.2.2 that
+conservative-tier `written` is not a floor.
+
+### 8.2 The missed write
+
+**Root cause.**  A seven-variant bisection from a fixture that works to one that fails isolates
+it to a single feature.  Neither bitcasts nor dynamic indices matter.  What matters is a
+**non-zero offset composed across a memory round trip**:
+
+```llvm
+%slot = getelementptr [3 x i32*], [3 x i32*]* %opts, i64 0, i64 1
+store i32* @flag, i32** %slot            ; &flag goes to lane 1 of a stack aggregate
+call void @publish(i32** %base)          ; the aggregate's base is republished ...
+store i32** %o, i32*** @table            ; ... through a global pointer
+%t = load i32**, i32*** @table           ; and read back
+%e = getelementptr i32*, i32** %t, i32 1 ; base + 1 is lane 1 again
+%p = load i32*, i32** %e
+store i32 1, i32* %p                     ; a real write to @flag
+```
+
+Instrumenting the solver shows the base tier resolving that final store's destination to a class
+that was never unified with `@flag`'s object class.  With the pointer at offset 0 the same
+fixture resolves correctly:
+
+```text
+offset 0 : store pointee root 28 = flag's object root  -> runtime_written = true
+offset 8 : store pointee root 24, flag's root is 28    -> runtime_written = false
+```
+
+So the base tier loses field-offset composition when a pointer is republished through memory.
+
+**The fix.**  `written` is a may-fact and a named `mod` row is may-write evidence, so it now
+fails closed on the row.  The initial PIR scan already applied exactly this rule to exact direct
+rows — it sets `runtime_written` when it pushes a direct `Mod` row — and the pointer rows the PAG
+pass adds later were simply never folded back the same way.  This is a completion of an existing
+rule, not a new policy.  It also removes a live contradiction: `stationarity_verdicts_from_modrefs`
+already reads these rows, so a global could be a known runtime writer for stationarity and
+unwritten for the disposition cascade at the same time.
+
+`showPrecedenceConflict_xjtr_0` now reports `written = true` and `localize` instead of
+`immutable`, and the tripwire reads zero on Lemon.
+
+**What is not fixed.**  The base-tier gap itself.  Steensgaard does not merely mis-attribute this
+store, it produces no ModRef row for it at all, so there is nothing for the reconciliation to
+fail closed on, and `--stage steens` still answers `immutable` for `showPrecedenceConflict_xjtr_0`.
+The conservative tier does too.  The fix repairs the Andersen tier — the one that decides
+production answers — and the new `written_globals` rule is what makes the residue visible rather
+than silent: `pangs differential` on Lemon now prints exactly one violation, naming that global.
+
+Repairing the base tier means changing the one-hop load/store equations' offset handling in
+`DESIGN_lite.md` §C', which is a design-level change with corpus-wide blast radius and is not
+attempted here.
+
+**Regression cover.**  `fixtures/synthetic/disposition/republished_aggregate_write.ll` is the
+minimal repro, asserted at the Andersen tier.  The tripwire added alongside —
+`modref_write_without_written_fact`, a metric plus a debug assertion — is zero across the entire
+fixture suite and now zero on the corpus, so a reintroduction fails the test run rather than
+waiting to be noticed on a module.
+
+### 8.3 Measured impact
+
+Both binaries were built from the two revisions and run over the same 53 corpus modules and
+1,917 keyed globals, at the Andersen tier.  The six heaviest modules are covered separately in
+§8.4.
+
+| disposition | before | after | delta |
+|---|---|---|---|
+| `immutable` | 433 | 399 | **−34** |
+| `once-lock` | 33 | 33 | 0 |
+| `atomic` | 333 | 333 | 0 |
+| `mutex` | 193 | 223 | **+30** |
+| `localize` | 206 | 210 | **+4** |
+| `unhandled` | 719 | 719 | **0** |
+| total | 1,917 | 1,917 | |
+
+| counter | before | after |
+|---|---|---|
+| `modref_write_without_written_fact` | 39 | **0** |
+| `in_rewritable_components` | 92 | 55 |
+
+The change is exactly as tightly bounded as the tripwire predicted.  **Every** global that moves
+is one the tripwire named, and nothing else in the corpus moves at all.
+
+In this sample the cost is a strategy downgrade, never a loss of handling: `unhandled` does not
+move by one global.  (That is *not* true of the whole corpus — see §8.4 for the one global that
+does lose handling.)  Thirty of the thirty-four are `tree`'s line-drawing tables, fifteen in each
+of the two `tree` builds, and they land on `mutex` — still a certified strategy.  The other four
+land on `localize`:
+
+| module | global | before → after |
+|---|---|---|
+| `exe-lemon-O0` | `showPrecedenceConflict_xjtr_0` | `immutable` → `localize` |
+| `exe-lemon-nostatic-O0` | `showPrecedenceConflict_xjtr_0` | `immutable` → `localize` |
+| `exe-curl-O0` | `opt_filestring.redir_protos` | `immutable` → `localize` |
+| `exe-apg_bore-O0` | `main.default_path_xjtr_0` | `immutable` → `localize` |
+
+The Lemon one is the confirmed bug.  The other three are the same shape — a global's address
+placed in a table or struct and written back through it — and are the right kind of answer to
+fail closed on.
+
+The tripwire fires 39 times across 11 modules but only 34 of those globals carry a disposition
+row; the other five, in `exe-curl-O1` and the four `lua` builds, are excluded from the
+disposition manifest, so they had nothing to change.
+
+`cargo test --workspace --all-targets` is green, and the debug assertion runs in every one of
+those tests.
+
+### 8.4 The six heaviest modules, and the one global that loses handling
+
+Run separately and strictly one at a time: `lib-placebo-O1-g`, `lib-zstd-O1-g`, `lib-sqlite-O1`,
+`exe-vim-9.2-O1`, `lib-openssl-4.1.0-O1`, `exe-vim-9.2-g-O1`.  7,236 keyed globals.
+
+| module | globals | tripwire | `in_rewritable_components` |
+|---|---|---|---|
+| `exe-vim-9.2-O1` | 3,691 | 2 → **0** | 28 → 0 |
+| `exe-vim-9.2-g-O1` | 3,204 | 0 → 0 | 36 → 0 |
+| `lib-openssl-4.1.0-O1` | 226 | 0 → 0 | 0 → 0 |
+| `lib-placebo-O1-g` | 73 | 0 → 0 | 0 → 0 |
+| `lib-sqlite-O1` | 40 | 0 → 0 | 1 → 0 |
+| `lib-zstd-O1-g` | 2 | 0 → 0 | 0 → 0 |
+
+Exactly one disposition moves, and it is the one case in the corpus where the fix costs real
+coverage:
+
+```text
+exe-vim-9.2-O1  highlight_tab   immutable -> unhandled
+```
+
+It is worth being precise about what happened, because it is not a new blocker.  `highlight_tab`
+now reports `written = true` from an aliased row witnessed in `au_del_group`.  Its localization
+was **already** blocked, independently and before this change, with 420 blockers whose first is:
+
+```text
+aggregate-initializer-address-dependency:
+  static initializer for highlight_index_tab retains the address of highlight_tab
+```
+
+So `immutable` was the only strategy standing between this global and `unhandled`, and it rested
+on the fact this change corrects.  Removing a wrong `immutable` does not create the gap; it
+reveals that vim's `highlight_tab` has no strategy available.  Whether the `au_del_group` row is
+a true write or a false alias could not be settled — vim's sources are not in the corpus tree —
+so this one is a candidate for triage, not a proven bug like Lemon's.
+
+### 8.5 Corpus totals and the residual base-tier gap
+
+All 59 modules, 9,153 keyed globals:
+
+| disposition | before | after | delta |
+|---|---|---|---|
+| `immutable` | 892 | 857 | **−35** |
+| `once-lock` | 33 | 33 | 0 |
+| `atomic` | 792 | 792 | 0 |
+| `mutex` | 200 | 230 | **+30** |
+| `localize` | 251 | 255 | **+4** |
+| `unhandled` | 6,985 | 6,986 | **+1** |
+
+| counter | before | after |
+|---|---|---|
+| `modref_write_without_written_fact` | 41 | **0** |
+| `in_rewritable_components` | 157 | 55 |
+
+`pangs differential` was then run over the 53-module sample.  The **only** violations anywhere
+are the new `written_globals` rule firing: 32 of them, in 4 modules.
+
+| module | globals the base tier loses |
+|---|---|
+| `exe-tree-O0` | 15 |
+| `exe-OMP__tree-O0` | 15 |
+| `exe-lemon-O0` | 1 (`showPrecedenceConflict_xjtr_0`) |
+| `exe-lemon-nostatic-O0` | 1 (`showPrecedenceConflict_xjtr_0`) |
+
+Every other check — indirect-call target narrowing, unknown-callee monotonicity, unknown-caller
+monotonicity — passes on all 53.  So the residual base-tier gap is real but narrow, it is now
+named rather than silent, and 4 modules is a small enough surface to work from when the one-hop
+offset handling is revisited.
