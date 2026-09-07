@@ -201,6 +201,10 @@
       "type": "integer",
       "minimum": 0
     },
+    "modref_write_without_written_fact": {
+      "type": "integer",
+      "minimum": 0
+    },
     "partition_count": {
       "type": "integer",
       "minimum": 0

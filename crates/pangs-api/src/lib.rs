@@ -577,6 +577,12 @@ pub struct Metrics {
     pub assumed_tag_returned: usize,
     pub mutable_globals_total: usize,
     pub in_rewritable_components: usize,
+    /// Locally defined globals carrying a named `mod` ModRef row whose `written` fact is
+    /// nevertheless false.  A `mod` row asserts a runtime write, so this must be zero; a
+    /// non-zero value means the solver's class-level write evidence and the PAG ModRef pass
+    /// disagree and the disposition cascade is trusting the weaker of the two.
+    #[serde(default)]
+    pub modref_write_without_written_fact: usize,
     pub partition_count: usize,
     pub partition_p50_size: usize,
     pub partition_p95_size: usize,
@@ -1908,6 +1914,32 @@ impl Analysis {
             .collect::<BTreeSet<_>>()
             .len();
 
+        // Soundness tripwire.  `written` is derived from the solver's class-level write
+        // evidence (`runtime_written`) plus external linkage; it never consults ModRef rows,
+        // which are produced separately by the PAG pass.  A named `mod` row for a locally
+        // defined global asserts a runtime write through that global, so the two must agree.
+        // When they do not, the cascade sees the weaker fact and can select `immutable` for a
+        // global something writes.
+        let modref_write_without_written_fact = modrefs
+            .iter()
+            .filter(|mr| mr.access == Access::Mod)
+            .filter_map(|mr| match mr.global {
+                GlobalTarget::Name(gid) => Some(gid),
+                GlobalTarget::Unknown(_) => None,
+            })
+            .filter(|gid| {
+                let global = &globals[gid.0 as usize];
+                global.is_definition
+                    && !global.runtime_written
+                    && global.escape != EscapeStatus::External
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
+        debug_assert_eq!(
+            modref_write_without_written_fact, 0,
+            "a named `mod` ModRef row must imply the global's `written` fact",
+        );
+
         let metrics_bookkeeping_started = Instant::now();
         // M2.0 flat per-provenance icall attribution: one verdict per indirect callsite
         // (all of a site's edges share its `tier`), plus a count of sites carrying an
@@ -1966,6 +1998,7 @@ impl Analysis {
             assumed_tag_returned,
             mutable_globals_total,
             in_rewritable_components,
+            modref_write_without_written_fact,
             partition_count: 0,
             partition_p50_size: 0,
             partition_p95_size: 0,

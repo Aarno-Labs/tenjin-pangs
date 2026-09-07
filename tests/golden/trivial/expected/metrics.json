@@ -5,6 +5,7 @@
   "call_edges": 4,
   "mutable_globals_total": 1,
   "in_rewritable_components": 0,
+  "modref_write_without_written_fact": 0,
   "partition_count": 0,
   "partition_p50_size": 0,
   "partition_p95_size": 0,
