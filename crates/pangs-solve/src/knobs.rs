@@ -30,6 +30,10 @@ pub(crate) const ANDERSEN_COPY_SCC_MIN_EDGES: usize = 4_096;
 /// termination guard, not a soundness assumption: overflow routes to that root's Unknown cell.
 pub(crate) const ANDERSEN_PWC_LANE_CAP: usize = 256;
 
+/// Bounded vocabulary for lazily derived affine lanes in Steensgaard's persistent one-hop GEP
+/// replay. Overflow uses the owning allocation's Unknown cell.
+pub(crate) const STEENS_ONE_HOP_DERIVED_LANE_CAP: usize = 256;
+
 /// Emit an Andersen progress record every this many propagation steps when
 /// profiling is enabled.
 pub(crate) const ANDERSEN_PROFILE_STEP_INTERVAL: usize = 10_000;

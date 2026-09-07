@@ -128,6 +128,14 @@ pub struct SolveMetrics {
     pub steens_max_class_fn_objs: usize,
     #[serde(default)]
     pub steens_max_class_candidate_pairs: u64,
+    #[serde(default)]
+    pub steens_gep_replay_transfers: u64,
+    #[serde(default)]
+    pub steens_gep_region_shifts: u64,
+    #[serde(default)]
+    pub steens_gep_missing_exact_widenings: u64,
+    #[serde(default)]
+    pub steens_gep_lane_cap_widenings: u64,
 }
 
 fn default_true() -> bool {
@@ -936,6 +944,29 @@ struct ClassData {
     /// Debug-only semantic roles. A solved class may contain carriers or locations, never both.
     has_carrier: bool,
     has_location: bool,
+    /// True when this location class has an ordinary, whole-object alternative.  A class made
+    /// solely from allocation-relative cells may be shifted by an uncertified GEP; once it joins
+    /// a summary location it must retain that summary alternative instead.
+    has_summary_region: bool,
+    /// Roots represented by ordinary summary alternatives. A nonzero GEP must connect each to
+    /// its own Unknown cell so later materialized fields are not missed.
+    summary_roots: BTreeSet<NodeId>,
+    /// Reverse identity for allocation-relative cells.  This deliberately survives UF joins:
+    /// a cross-root join is a real alias and therefore carries alternatives for every root.
+    field_regions: BTreeSet<(NodeId, FieldRegion)>,
+    /// Uncertified GEPs are one-hop constraints on this location.  Keeping them here, rather
+    /// than applying them once while reading the PAG, replays them after late bindings and UF
+    /// joins enlarge the target class.
+    gep_succ: Vec<GepTransfer>,
+    gep_processed_succ_len: usize,
+    gep_processed_region_len: usize,
+    gep_processed_summary: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GepTransfer {
+    dst: usize,
+    delta: FieldLocation,
 }
 
 /// Compact identity for a diagnostic provenance string. Provenance flows through the same hot
@@ -1088,8 +1119,19 @@ struct Solver<'a> {
     global_address_exposed: Vec<bool>,
     violation_exposure: ViolationExposure,
     exact_addresses: Vec<Option<ExactAddress>>,
+    /// Finite, fixed exact vocabulary derived from the PAG certificate.  One-hop arithmetic may
+    /// reuse only these exact cells; a new arbitrary exact offset becomes the root summary.
+    exact_field_locations: HashMap<NodeId, BTreeSet<FieldLocation>>,
+    /// Direct constant GEP deltas are also a finite exact vocabulary for every allocation.
+    direct_gep_exact_offsets: BTreeSet<i64>,
+    /// Lazily admitted derived lanes.  The fixed PAG vocabulary is finite; this cap prevents a
+    /// cyclic or late-bound one-hop replay from manufacturing an unbounded second vocabulary.
+    derived_lanes_by_root: HashMap<NodeId, BTreeSet<FieldLocation>>,
     field_classes: HashMap<(NodeId, FieldRegion), usize>,
     fields_by_root: HashMap<NodeId, Vec<usize>>,
+    /// Direct per-allocation inventory keeps replay proportional to fields of this allocation,
+    /// not to every synthetic field in the module.
+    field_inventory: HashMap<NodeId, Vec<(FieldRegion, usize)>>,
     /// Allocation-specific escape sources for certified fields. Retain this precision when
     /// legacy unification merges the allocation's owner class with unrelated objects.
     field_escape_sources_by_root: HashMap<NodeId, BTreeSet<ProvenanceId>>,
@@ -1133,7 +1175,7 @@ pub(crate) enum FieldLocation {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct FieldRegion {
     location: FieldLocation,
     /// `Some(0)` denotes an address identity, while `None` is an access of unknown extent.
@@ -1697,6 +1739,14 @@ impl<'a> Solver<'a> {
             match &node.kind {
                 NodeKind::Object { object, key, .. } => {
                     data.has_location = true;
+                    // Function addresses retain the historical summary treatment: nonzero
+                    // function-pointer arithmetic is unsupported, and synthetic fields do not
+                    // carry function-object identity. Ordinary data allocations are registered
+                    // below as their concrete root-relative Exact(0) location instead.
+                    if matches!(object, pangs_pag::ObjectKind::Function) {
+                        data.has_summary_region = true;
+                        data.summary_roots.insert(node.id);
+                    }
                     match object {
                         pangs_pag::ObjectKind::Function => {
                             if let Some(&func_index) = function_name_to_index.get(key) {
@@ -1740,6 +1790,52 @@ impl<'a> Solver<'a> {
         let callsites_by_index = pag.callsites.iter().collect();
         let queued = vec![false; classes.len()];
         let exact_addresses = exact_allocation_addresses(pag, &storage_roots);
+        let mut exact_field_locations = HashMap::<NodeId, BTreeSet<FieldLocation>>::new();
+        for address in exact_addresses.iter().flatten() {
+            exact_field_locations
+                .entry(address.root)
+                .or_default()
+                .insert(address.location);
+        }
+        let direct_gep_exact_offsets = pag
+            .edges
+            .iter()
+            .filter_map(|edge| match edge.kind {
+                pangs_pag::EdgeKind::Gep {
+                    byte_off: Some(offset),
+                    ..
+                } => Some(offset),
+                _ => None,
+            })
+            .collect();
+        let mut field_classes = HashMap::new();
+        let mut fields_by_root = HashMap::<NodeId, Vec<usize>>::new();
+        let mut field_inventory = HashMap::<NodeId, Vec<(FieldRegion, usize)>>::new();
+        for node in &pag.nodes {
+            let NodeKind::Object { object, .. } = &node.kind else {
+                continue;
+            };
+            if matches!(object, pangs_pag::ObjectKind::Function) {
+                continue;
+            }
+            let region = FieldRegion::address(FieldLocation::Exact(0));
+            exact_field_locations
+                .entry(node.id)
+                .or_default()
+                .insert(FieldLocation::Exact(0));
+            classes[node.id.0 as usize]
+                .field_regions
+                .insert((node.id, region));
+            field_classes.insert((node.id, region), node.id.0 as usize);
+            fields_by_root
+                .entry(node.id)
+                .or_default()
+                .push(node.id.0 as usize);
+            field_inventory
+                .entry(node.id)
+                .or_default()
+                .push((region, node.id.0 as usize));
+        }
         let mut global_object_index_by_node = vec![None; pag.nodes.len()];
         for (global_index, node) in global_object_nodes.iter().copied().enumerate() {
             if let Some(node) = node {
@@ -1763,8 +1859,12 @@ impl<'a> Solver<'a> {
             global_address_exposed,
             violation_exposure,
             exact_addresses,
-            field_classes: HashMap::new(),
-            fields_by_root: HashMap::new(),
+            exact_field_locations,
+            direct_gep_exact_offsets,
+            derived_lanes_by_root: HashMap::new(),
+            field_classes,
+            fields_by_root,
+            field_inventory,
             field_escape_sources_by_root: HashMap::new(),
             provenance: ProvenanceInterner::default(),
             callsites_by_index,
@@ -1912,7 +2012,7 @@ impl<'a> Solver<'a> {
                     );
                     self.add_content_edge(src, storage);
                 }
-                pangs_pag::EdgeKind::Gep { .. } => {
+                pangs_pag::EdgeKind::Gep { byte_off, lane } => {
                     let dst = self.class_of(edge.dst);
                     if self.node_is_proven_empty(edge.src) {
                         // Pointer arithmetic on an empty address is outside the contract. Keep the
@@ -1927,7 +2027,7 @@ impl<'a> Solver<'a> {
                         self.join(dst_p, storage, PROV_DIRECT_ADDRESS);
                     } else {
                         let src = self.class_of(edge.src);
-                        self.unify_pointees(dst, src, PROV_DIRECT_ADDRESS);
+                        self.add_gep_transfer(src, dst, FieldLocation::from_gep(byte_off, lane));
                         self.add_content_edge(src, dst);
                     }
                 }
@@ -2585,7 +2685,11 @@ impl<'a> Solver<'a> {
 
     fn process_class(&mut self, class: usize) {
         self.metrics.steens_process_class_calls += 1;
-        let root = self.find(class);
+        let mut root = self.find(class);
+        self.replay_gep_transfers(root);
+        // Replaying can join this location with a destination target.  All remaining one-hop
+        // processing must observe the canonical post-replay class.
+        root = self.find(root);
         let ext = self.classes[root].ext;
         let external_escaped_union = self.classes[root].external_escaped_union;
         let esc = self.classes[root].esc;
@@ -3083,6 +3187,181 @@ impl<'a> Solver<'a> {
         id
     }
 
+    fn add_gep_transfer(&mut self, src: usize, dst: usize, delta: FieldLocation) {
+        let target = self.pointee_of(src);
+        let target = self.find(target);
+        self.classes[target]
+            .gep_succ
+            .push(GepTransfer { dst, delta });
+        self.enqueue(target);
+    }
+
+    /// Replay one-hop arithmetic whenever its source target changes.  A field-only target may
+    /// translate each recorded allocation-relative alternative.  A summary alternative wins
+    /// conservatively: translating only the fields would drop the ordinary alternative.
+    fn replay_gep_transfers(&mut self, class: usize) {
+        let root = self.find(class);
+        let transfer_len = self.classes[root].gep_succ.len();
+        if transfer_len == 0 {
+            return;
+        }
+        let summary = self.classes[root].has_summary_region;
+        let region_len = self.classes[root].field_regions.len();
+        if self.classes[root].gep_processed_succ_len == transfer_len
+            && self.classes[root].gep_processed_region_len == region_len
+            && self.classes[root].gep_processed_summary == summary
+        {
+            return;
+        }
+        self.classes[root].gep_processed_succ_len = transfer_len;
+        self.classes[root].gep_processed_region_len = region_len;
+        self.classes[root].gep_processed_summary = summary;
+        let transfers = self.classes[root].gep_succ.clone();
+        let regions = self.classes[root].field_regions.clone();
+        let regions_empty = regions.is_empty();
+        if summary {
+            let destinations = transfers
+                .iter()
+                .map(|transfer| transfer.dst)
+                .collect::<HashSet<_>>();
+            for dst in destinations {
+                let dst_p = self.pointee_of(dst);
+                self.join(dst_p, root, PROV_DIRECT_ADDRESS);
+            }
+            if transfers
+                .iter()
+                .any(|transfer| transfer.delta != FieldLocation::Exact(0))
+            {
+                let canonical_root = self.find(root);
+                let mut roots = self.classes[canonical_root].summary_roots.clone();
+                roots.extend(regions.iter().map(|(allocation, _)| *allocation));
+                for allocation in roots {
+                    let unknown =
+                        self.field_class(allocation, FieldRegion::address(FieldLocation::Unknown));
+                    self.join(canonical_root, unknown, PROV_DIRECT_ADDRESS);
+                }
+            }
+            self.metrics.steens_gep_replay_transfers += transfers.len() as u64;
+            return;
+        }
+        let transfers = transfers.into_iter().collect::<HashSet<_>>();
+        // Unknown subsumes every exact/lane alternative of its own allocation.  Retain other
+        // roots independently: a cross-root join is real aliasing, not permission to discard
+        // their precise alternatives.
+        let mut regions_by_root = BTreeMap::<NodeId, Vec<FieldRegion>>::new();
+        for (allocation, region) in regions {
+            let entry = regions_by_root.entry(allocation).or_default();
+            if matches!(region.location, FieldLocation::Unknown) {
+                entry.clear();
+                entry.push(region);
+            } else if !entry
+                .iter()
+                .any(|existing| matches!(existing.location, FieldLocation::Unknown))
+            {
+                entry.push(region);
+            }
+        }
+        if !regions_by_root.is_empty()
+            && regions_by_root.values().all(|regions| {
+                regions.len() == 1 && matches!(regions[0].location, FieldLocation::Unknown)
+            })
+        {
+            for dst in transfers
+                .iter()
+                .map(|transfer| transfer.dst)
+                .collect::<HashSet<_>>()
+            {
+                let dst_p = self.pointee_of(dst);
+                self.join(dst_p, root, PROV_DIRECT_ADDRESS);
+            }
+            self.metrics.steens_gep_replay_transfers += transfers.len() as u64;
+            return;
+        }
+        for transfer in transfers {
+            self.metrics.steens_gep_replay_transfers += 1;
+            let dst_p = self.pointee_of(transfer.dst);
+            if transfer.delta == FieldLocation::Exact(0) {
+                self.join(dst_p, root, PROV_DIRECT_ADDRESS);
+                continue;
+            }
+            // An unbound synthetic pointee is neither a summary nor a field alternative yet.
+            // Deferring it is essential: equating `p + d` with that placeholder before its late
+            // F0 binding arrives irreversibly aliases F0 and the shifted result.
+            if regions_empty {
+                continue;
+            }
+            // `p = p + exact_nonzero` requires every repeated exact shift.  In our finite exact
+            // vocabulary that closure necessarily reaches this allocation's Unknown cell; jump
+            // there directly instead of walking every named offset.  Do not apply this to lanes:
+            // their congruence class is a meaningful bounded invariant.
+            let exact_self_cycle = matches!(transfer.delta, FieldLocation::Exact(offset) if offset != 0)
+                && self.find(dst_p) == self.find(root);
+            for (allocation, regions) in &regions_by_root {
+                for region in regions {
+                    self.metrics.steens_gep_region_shifts += 1;
+                    let target = if exact_self_cycle
+                        && matches!(region.location, FieldLocation::Exact(_))
+                    {
+                        self.field_class(
+                            *allocation,
+                            FieldRegion::access(FieldLocation::Unknown, region.width),
+                        )
+                    } else {
+                        let shifted =
+                            FieldRegion::access(region.location.add(transfer.delta), region.width);
+                        self.shifted_field_class(*allocation, shifted)
+                    };
+                    self.join(dst_p, target, PROV_DIRECT_ADDRESS);
+                }
+            }
+        }
+    }
+
+    /// Select a bounded root-relative target for replayed pointer arithmetic.  Exact locations
+    /// may only reuse the fixed certificate vocabulary.  Lanes are admitted lazily but capped;
+    /// every failure routes to this allocation's own unknown cell.
+    fn shifted_field_class(&mut self, allocation: NodeId, region: FieldRegion) -> usize {
+        let precise = match region.location {
+            FieldLocation::Exact(offset) => {
+                self.exact_field_locations
+                    .get(&allocation)
+                    .is_some_and(|locations| locations.contains(&region.location))
+                    || self.direct_gep_exact_offsets.contains(&offset)
+            }
+            FieldLocation::Lane(_) => {
+                let fixed = self
+                    .exact_field_locations
+                    .get(&allocation)
+                    .is_some_and(|locations| locations.contains(&region.location));
+                fixed || self.admit_derived_lane(allocation, region.location)
+            }
+            FieldLocation::Unknown => false,
+        };
+        if !precise {
+            match region.location {
+                FieldLocation::Exact(_) => self.metrics.steens_gep_missing_exact_widenings += 1,
+                FieldLocation::Lane(_) => self.metrics.steens_gep_lane_cap_widenings += 1,
+                FieldLocation::Unknown => {}
+            }
+        }
+        let region = precise
+            .then_some(region)
+            .unwrap_or(FieldRegion::access(FieldLocation::Unknown, region.width));
+        self.field_class(allocation, region)
+    }
+
+    fn admit_derived_lane(&mut self, allocation: NodeId, location: FieldLocation) -> bool {
+        let lanes = self.derived_lanes_by_root.entry(allocation).or_default();
+        if lanes.contains(&location) {
+            return true;
+        }
+        if lanes.len() >= knobs::STEENS_ONE_HOP_DERIVED_LANE_CAP {
+            return false;
+        }
+        lanes.insert(location);
+        true
+    }
+
     /// Return the independently certified allocation-relative storage cell for `address`,
     /// using the same per-allocation field identities as certified GEPs.
     fn exact_storage_class(
@@ -3138,6 +3417,7 @@ impl<'a> Solver<'a> {
             has_location: true,
             ..ClassData::default()
         };
+        data.field_regions.insert((root, region));
         if let Some(global_index) = self.global_object_index_by_node[root.0 as usize] {
             data.global_objs.insert(global_index);
         }
@@ -3154,14 +3434,18 @@ impl<'a> Solver<'a> {
         self.field_classes.insert((root, region), id);
 
         self.fields_by_root.entry(root).or_default().push(id);
+        self.field_inventory
+            .entry(root)
+            .or_default()
+            .push((region, id));
         let aliasing = self
-            .field_classes
-            .iter()
-            .filter_map(|(&(candidate_root, candidate_region), &class)| {
-                (candidate_root == root
-                    && candidate_region != region
-                    && region.may_overlap(candidate_region))
-                .then_some(class)
+            .field_inventory
+            .get(&root)
+            .into_iter()
+            .flatten()
+            .filter_map(|&(candidate_region, class)| {
+                (candidate_region != region && region.may_overlap(candidate_region))
+                    .then_some(class)
             })
             .collect::<Vec<_>>();
         let mut class = id;
@@ -3232,12 +3516,29 @@ impl<'a> Solver<'a> {
         if self.classes[a].size < self.classes[b].size {
             std::mem::swap(&mut a, &mut b);
         }
+        // GEP replay depends only on address alternatives/subscriptions, not on content, Ω, or
+        // callsite facts. Do not invalidate its frontier for an otherwise unrelated UF join.
+        let gep_structure_grew = (self.classes[b].has_summary_region
+            && (!self.classes[a].has_summary_region
+                || self.classes[b]
+                    .summary_roots
+                    .iter()
+                    .any(|root| !self.classes[a].summary_roots.contains(root))))
+            || self.classes[b]
+                .field_regions
+                .iter()
+                .any(|region| !self.classes[a].field_regions.contains(region))
+            || self.classes[b]
+                .gep_succ
+                .iter()
+                .any(|transfer| !self.classes[a].gep_succ.contains(transfer));
 
         self.classes[b].parent = a;
         self.classes[a].size += self.classes[b].size;
         self.classes[a].node_count += self.classes[b].node_count;
         self.classes[a].has_carrier |= self.classes[b].has_carrier;
         self.classes[a].has_location |= self.classes[b].has_location;
+        self.classes[a].has_summary_region |= self.classes[b].has_summary_region;
         self.classes[a].has_empty_witness |= self.classes[b].has_empty_witness;
         self.classes[a].ext |= self.classes[b].ext;
         self.classes[a].external_escaped_union |= self.classes[b].external_escaped_union;
@@ -3258,6 +3559,12 @@ impl<'a> Solver<'a> {
         self.classes[a].fn_objs.extend(other_fns);
         let other_globals = std::mem::take(&mut self.classes[b].global_objs);
         self.classes[a].global_objs.extend(other_globals);
+        let other_field_regions = std::mem::take(&mut self.classes[b].field_regions);
+        self.classes[a].field_regions.extend(other_field_regions);
+        let other_summary_roots = std::mem::take(&mut self.classes[b].summary_roots);
+        self.classes[a].summary_roots.extend(other_summary_roots);
+        let other_gep_succ = std::mem::take(&mut self.classes[b].gep_succ);
+        self.classes[a].gep_succ.extend(other_gep_succ);
         let other_content_succ = std::mem::take(&mut self.classes[b].content_succ);
         self.classes[a].content_succ.extend(other_content_succ);
         // The merged fact set must be offered to both roots' successor lists. Most joins happen
@@ -3267,6 +3574,11 @@ impl<'a> Solver<'a> {
         self.classes[a].content_pushed_ext = false;
         self.classes[a].content_pushed_external_escaped_union = false;
         self.classes[a].content_pushed_empty = false;
+        if gep_structure_grew {
+            self.classes[a].gep_processed_succ_len = 0;
+            self.classes[a].gep_processed_region_len = 0;
+            self.classes[a].gep_processed_summary = false;
+        }
         let other_external_sites =
             std::mem::take(&mut self.classes[b].processed_external_icall_sites);
         self.classes[a]
@@ -3328,7 +3640,8 @@ impl<'a> Solver<'a> {
             "pangs steens profile {label}: elapsed_ms={} worklist_pops={} process_class_calls={} \
              candidate_pairs={} seen_new={} seen_duplicate={} fsa_compatible={} \
              fsa_rejected={} bindings={} joins={}/{} pointee_classes_created={} \
-             max_class_sites={} max_class_fns={} max_class_candidate_pairs={} worklist_len={}",
+             max_class_sites={} max_class_fns={} max_class_candidate_pairs={} gep_replays={} \
+             gep_shifts={} gep_missing_exact={} gep_lane_cap={} worklist_len={}",
             self.profile_started.elapsed().as_millis(),
             self.metrics.steens_worklist_pops,
             self.metrics.steens_process_class_calls,
@@ -3344,6 +3657,10 @@ impl<'a> Solver<'a> {
             self.metrics.steens_max_class_icall_sites,
             self.metrics.steens_max_class_fn_objs,
             self.metrics.steens_max_class_candidate_pairs,
+            self.metrics.steens_gep_replay_transfers,
+            self.metrics.steens_gep_region_shifts,
+            self.metrics.steens_gep_missing_exact_widenings,
+            self.metrics.steens_gep_lane_cap_widenings,
             self.worklist.len(),
         );
     }
@@ -3842,7 +4159,11 @@ mod tests {
     #[test]
     fn constant_only_object_retains_distinct_field_storage() {
         let (pir, pag) = field_contamination_fixture(
-            Vec::new(),
+            vec![Stmt::Assign {
+                dest: "%f::result".into(),
+                sources: vec!["%f::field".into()],
+                loc: None,
+            }],
             vec![Global {
                 key: "aggregate".into(),
                 ..Global::default()
@@ -3873,6 +4194,457 @@ mod tests {
         let field = class_for_label(&classes, &pag, "val:f:%f::field");
         let dynamic = class_for_label(&classes, &pag, "val:f:%f::dynamic");
         assert_eq!(classes.pointee[field], classes.pointee[dynamic]);
+    }
+
+    #[test]
+    fn one_hop_gep_replays_after_late_field_binding_without_aliasing_base() {
+        let (pir, pag) = field_contamination_fixture(
+            vec![Stmt::Assign {
+                dest: "%f::result".into(),
+                sources: vec!["%f::field".into()],
+                loc: None,
+            }],
+            vec![Global {
+                key: "aggregate".into(),
+                ..Global::default()
+            }],
+        );
+        let carrier = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:f:%f::field")
+            .unwrap()
+            .id;
+        let allocation = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "obj:global:aggregate")
+            .unwrap()
+            .id;
+        let result = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:f:%f::result")
+            .unwrap()
+            .id;
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+        let carrier_class = solver.class_of(carrier);
+        let result_class = solver.class_of(result);
+        let derived = solver.pointee_of(carrier_class);
+        solver.add_gep_transfer(carrier_class, result_class, FieldLocation::Exact(8));
+        // This is the reordered schedule: the one-hop GEP sees an unbound placeholder first.
+        while let Some(class) = solver.worklist.pop_front() {
+            solver.queued[class] = false;
+            solver.process_class(class);
+        }
+        let result_target = solver.pointee_of(result_class);
+        assert_ne!(solver.find(derived), solver.find(result_target));
+        let f0 = solver.field_class(allocation, FieldRegion::address(FieldLocation::Exact(0)));
+        let f8 = solver.field_class(allocation, FieldRegion::address(FieldLocation::Exact(8)));
+        solver.join(derived, f0, PROV_DIRECT_ADDRESS);
+        while let Some(class) = solver.worklist.pop_front() {
+            solver.queued[class] = false;
+            solver.process_class(class);
+        }
+        let result_target = solver.pointee_of(result_class);
+        let target = solver.find(result_target);
+        assert_eq!(target, solver.find(f8));
+        assert_ne!(target, solver.find(f0));
+        // A second field arriving after the first successful replay must be translated too.
+        let source_f8 =
+            solver.field_class(allocation, FieldRegion::address(FieldLocation::Exact(8)));
+        solver
+            .exact_field_locations
+            .entry(allocation)
+            .or_default()
+            .insert(FieldLocation::Exact(16));
+        let f16 = solver.field_class(allocation, FieldRegion::address(FieldLocation::Exact(16)));
+        solver.join(derived, source_f8, PROV_DIRECT_ADDRESS);
+        while let Some(class) = solver.worklist.pop_front() {
+            solver.queued[class] = false;
+            solver.process_class(class);
+        }
+        assert_eq!(solver.find(result_target), solver.find(f16));
+        solver.assert_one_hop_invariant();
+    }
+
+    #[test]
+    fn one_hop_gep_from_ordinary_root_connects_late_field_and_excludes_other_root() {
+        let (pir, pag) = field_contamination_fixture(
+            vec![Stmt::Assign {
+                dest: "%f::result".into(),
+                sources: vec!["%f::field".into()],
+                loc: None,
+            }],
+            vec![
+                Global {
+                    key: "aggregate".into(),
+                    ..Global::default()
+                },
+                Global {
+                    key: "other".into(),
+                    ..Global::default()
+                },
+            ],
+        );
+        let id = |label: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == label)
+                .unwrap()
+                .id
+        };
+        let carrier = id("val:f:%f::field");
+        let result = id("val:f:%f::result");
+        let aggregate = id("obj:global:aggregate");
+        let other = id("obj:global:other");
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+        let carrier_class = solver.class_of(carrier);
+        let result_class = solver.class_of(result);
+        let source = solver.pointee_of(carrier_class);
+        let f8 = solver.field_class(aggregate, FieldRegion::address(FieldLocation::Exact(8)));
+        let other_f8 = solver.field_class(other, FieldRegion::address(FieldLocation::Exact(8)));
+        let aggregate_class = solver.class_of(aggregate);
+        solver.join(source, aggregate_class, PROV_DIRECT_ADDRESS);
+        solver.add_gep_transfer(carrier_class, result_class, FieldLocation::Exact(8));
+        while let Some(class) = solver.worklist.pop_front() {
+            solver.queued[class] = false;
+            solver.process_class(class);
+        }
+        let result_target = solver.pointee_of(result_class);
+        assert_eq!(solver.find(result_target), solver.find(f8));
+        assert_ne!(solver.find(result_target), solver.find(other_f8));
+    }
+
+    #[test]
+    fn one_hop_zero_gep_over_summary_does_not_materialize_unknown() {
+        let (pir, pag) = field_contamination_fixture(
+            vec![Stmt::Assign {
+                dest: "%f::result".into(),
+                sources: vec!["%f::field".into()],
+                loc: None,
+            }],
+            vec![Global {
+                key: "aggregate".into(),
+                ..Global::default()
+            }],
+        );
+        let id = |label: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == label)
+                .unwrap()
+                .id
+        };
+        let carrier = id("val:f:%f::field");
+        let result = id("val:f:%f::result");
+        let aggregate = id("obj:global:aggregate");
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+        let carrier_class = solver.class_of(carrier);
+        let result_class = solver.class_of(result);
+        let source = solver.pointee_of(carrier_class);
+        let aggregate_class = solver.class_of(aggregate);
+        solver.join(source, aggregate_class, PROV_DIRECT_ADDRESS);
+        solver.add_gep_transfer(carrier_class, result_class, FieldLocation::Exact(0));
+        while let Some(class) = solver.worklist.pop_front() {
+            solver.queued[class] = false;
+            solver.process_class(class);
+        }
+        assert!(!solver
+            .field_classes
+            .contains_key(&(aggregate, FieldRegion::address(FieldLocation::Unknown))));
+    }
+
+    #[test]
+    fn one_hop_gep_self_cycle_stays_in_finite_field_domain() {
+        let (pir, pag) = field_contamination_fixture(
+            Vec::new(),
+            vec![Global {
+                key: "aggregate".into(),
+                ..Global::default()
+            }],
+        );
+        let carrier = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "val:f:%f::field")
+            .unwrap()
+            .id;
+        let aggregate = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "obj:global:aggregate")
+            .unwrap()
+            .id;
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+        let carrier_class = solver.class_of(carrier);
+        let source = solver.pointee_of(carrier_class);
+        let f0 = solver.field_class(aggregate, FieldRegion::address(FieldLocation::Exact(0)));
+        solver.join(source, f0, PROV_DIRECT_ADDRESS);
+        // A cyclic p = p + 8 may widen, but cannot manufacture a chain of new exact cells.
+        solver.add_gep_transfer(carrier_class, carrier_class, FieldLocation::Exact(8));
+        while let Some(class) = solver.worklist.pop_front() {
+            solver.queued[class] = false;
+            solver.process_class(class);
+        }
+        assert!(
+            solver.field_classes.len() <= 3,
+            "{:#?}",
+            solver.field_classes
+        );
+        assert!(solver
+            .field_classes
+            .contains_key(&(aggregate, FieldRegion::address(FieldLocation::Unknown))));
+        solver.assert_one_hop_invariant();
+    }
+
+    #[test]
+    fn one_hop_gep_mixed_summary_widens_each_field_root() {
+        let (pir, pag) = field_contamination_fixture(
+            vec![Stmt::Assign {
+                dest: "%f::result".into(),
+                sources: vec!["%f::field".into()],
+                loc: None,
+            }],
+            vec![
+                Global {
+                    key: "aggregate".into(),
+                    ..Global::default()
+                },
+                Global {
+                    key: "summary".into(),
+                    ..Global::default()
+                },
+            ],
+        );
+        let id = |label: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == label)
+                .unwrap()
+                .id
+        };
+        let carrier = id("val:f:%f::field");
+        let result = id("val:f:%f::result");
+        let allocation = id("obj:global:aggregate");
+        let summary = id("obj:global:summary");
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+        let carrier_class = solver.class_of(carrier);
+        let result_class = solver.class_of(result);
+        let summary_class = solver.class_of(summary);
+        // Model an actual unstructured alternative, rather than treating a normal allocation
+        // base (now Exact(0)) as a summary.
+        solver.classes[summary_class].has_summary_region = true;
+        solver.classes[summary_class].summary_roots.insert(summary);
+        let source = solver.pointee_of(carrier_class);
+        let f0 = solver.field_class(allocation, FieldRegion::address(FieldLocation::Exact(0)));
+        let f8 = solver.field_class(allocation, FieldRegion::address(FieldLocation::Exact(8)));
+        solver.join(source, f0, PROV_DIRECT_ADDRESS);
+        solver.join(source, summary_class, PROV_DIRECT_ADDRESS);
+        solver.add_gep_transfer(carrier_class, result_class, FieldLocation::Exact(8));
+        while let Some(class) = solver.worklist.pop_front() {
+            solver.queued[class] = false;
+            solver.process_class(class);
+        }
+        // Do not materialize the expected summary here: doing so would itself join F8
+        // and could hide a replay that failed to widen the mixed source.
+        let unknown =
+            solver.field_classes[&(allocation, FieldRegion::address(FieldLocation::Unknown))];
+        let result_target = solver.pointee_of(result_class);
+        let target = solver.find(result_target);
+        assert_eq!(target, solver.find(unknown));
+        assert_eq!(target, solver.find(summary_class));
+        assert_eq!(target, solver.find(f8));
+        solver.assert_one_hop_invariant();
+    }
+
+    #[test]
+    fn one_hop_shift_uses_fixed_exact_vocabulary_or_root_unknown() {
+        let (pir, pag) = field_contamination_fixture(
+            Vec::new(),
+            vec![Global {
+                key: "aggregate".into(),
+                ..Global::default()
+            }],
+        );
+        let allocation = pag
+            .nodes
+            .iter()
+            .find(|node| node.label == "obj:global:aggregate")
+            .unwrap()
+            .id;
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+        let unknown = solver.field_class(allocation, FieldRegion::address(FieldLocation::Unknown));
+        let shifted = solver.shifted_field_class(
+            allocation,
+            FieldRegion::address(FieldLocation::Exact(1_234_567)),
+        );
+        assert_eq!(solver.find(shifted), solver.find(unknown));
+        solver.direct_gep_exact_offsets.insert(-8);
+        let negative = solver.shifted_field_class(
+            allocation,
+            FieldRegion::access(FieldLocation::Exact(-8), Some(8)),
+        );
+        let negative_region = FieldRegion::access(FieldLocation::Exact(-8), Some(8));
+        let expected_negative = solver.field_class(allocation, negative_region);
+        assert_eq!(solver.find(negative), solver.find(expected_negative));
+        let lane = FieldLocation::Lane(pangs_pir::GepLane::new(24, 8).unwrap());
+        assert!(solver.admit_derived_lane(allocation, lane));
+        for residue in 0..knobs::STEENS_ONE_HOP_DERIVED_LANE_CAP {
+            let lane = FieldLocation::Lane(pangs_pir::GepLane::new(512, residue as i64).unwrap());
+            let _ = solver.admit_derived_lane(allocation, lane);
+        }
+        let overflow = FieldLocation::Lane(pangs_pir::GepLane::new(1024, 777).unwrap());
+        assert!(!solver.admit_derived_lane(allocation, overflow));
+    }
+
+    #[test]
+    fn one_hop_replayed_negative_and_lane_shifts_keep_disjoint_targets() {
+        for (source_location, delta, expected_location, sibling_location) in [
+            (
+                FieldLocation::Exact(8),
+                FieldLocation::Exact(-8),
+                FieldLocation::Exact(0),
+                FieldLocation::Exact(16),
+            ),
+            (
+                FieldLocation::Lane(pangs_pir::GepLane::new(24, 8).unwrap()),
+                FieldLocation::Exact(8),
+                FieldLocation::Lane(pangs_pir::GepLane::new(24, 16).unwrap()),
+                FieldLocation::Lane(pangs_pir::GepLane::new(24, 0).unwrap()),
+            ),
+        ] {
+            let (pir, pag) = field_contamination_fixture(
+                vec![Stmt::Assign {
+                    dest: "%f::result".into(),
+                    sources: vec!["%f::field".into()],
+                    loc: None,
+                }],
+                vec![Global {
+                    key: "aggregate".into(),
+                    ..Global::default()
+                }],
+            );
+            let id = |label: &str| {
+                pag.nodes
+                    .iter()
+                    .find(|node| node.label == label)
+                    .unwrap()
+                    .id
+            };
+            let allocation = id("obj:global:aggregate");
+            let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+            let src = solver.class_of(id("val:f:%f::field"));
+            let dst = solver.class_of(id("val:f:%f::result"));
+            let source = solver.field_class(allocation, FieldRegion::address(source_location));
+            let expected = solver.field_class(allocation, FieldRegion::address(expected_location));
+            let sibling = solver.field_class(allocation, FieldRegion::address(sibling_location));
+            let source_target = solver.pointee_of(src);
+            solver.join(source_target, source, PROV_DIRECT_ADDRESS);
+            solver.add_gep_transfer(src, dst, delta);
+            while let Some(class) = solver.worklist.pop_front() {
+                solver.queued[class] = false;
+                solver.process_class(class);
+            }
+            let target = solver.pointee_of(dst);
+            assert_eq!(solver.find(target), solver.find(expected));
+            assert_ne!(solver.find(target), solver.find(sibling));
+            assert_ne!(solver.find(target), solver.find(source));
+            solver.assert_one_hop_invariant();
+        }
+    }
+
+    #[test]
+    fn one_hop_lane_overflow_reaches_a_late_field_payload() {
+        let (pir, pag) = field_contamination_fixture(
+            Vec::new(),
+            vec![
+                Global {
+                    key: "aggregate".into(),
+                    ..Global::default()
+                },
+                Global {
+                    key: "payload".into(),
+                    ..Global::default()
+                },
+            ],
+        );
+        let id = |label: &str| {
+            pag.nodes
+                .iter()
+                .find(|node| node.label == label)
+                .unwrap()
+                .id
+        };
+        let allocation = id("obj:global:aggregate");
+        let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+        for residue in 0..knobs::STEENS_ONE_HOP_DERIVED_LANE_CAP {
+            assert!(solver.admit_derived_lane(
+                allocation,
+                FieldLocation::Lane(pangs_pir::GepLane::new(512, residue as i64).unwrap()),
+            ));
+        }
+        let rejected = solver.shifted_field_class(
+            allocation,
+            FieldRegion::address(FieldLocation::Lane(
+                pangs_pir::GepLane::new(1024, 777).unwrap(),
+            )),
+        );
+        assert_eq!(solver.metrics.steens_gep_lane_cap_widenings, 1);
+        let result_payload = solver.pointee_of(rejected);
+        let late = solver.field_class(allocation, FieldRegion::address(FieldLocation::Exact(8)));
+        let late_payload = solver.pointee_of(late);
+        let payload = solver.class_of(id("obj:global:payload"));
+        solver.join(late_payload, payload, PROV_MEMORY_MERGING);
+        assert_eq!(solver.find(result_payload), solver.find(payload));
+        assert_eq!(
+            solver.derived_lanes_by_root[&allocation].len(),
+            knobs::STEENS_ONE_HOP_DERIVED_LANE_CAP
+        );
+        solver.assert_one_hop_invariant();
+    }
+
+    #[test]
+    fn one_hop_memory_roundtrip_preserves_base_zero_and_unknown_arithmetic() {
+        for (unknown_first, offset, reaches_payload) in
+            [(false, 8, true), (false, 16, false), (true, 16, true)]
+        {
+            let mut body = vec![
+                serde_json::json!({"kind":"gep", "dest":"slot", "base":"@aggregate", "byte_off":8}),
+                serde_json::json!({"kind":"store", "address":"slot", "value":"@payload", "access_bytes":8}),
+                // Publish the actual allocation base, without a certified zero-offset GEP.
+                serde_json::json!({"kind":"store", "address":"@table", "value":"@aggregate", "access_bytes":8}),
+                serde_json::json!({"kind":"load", "dest":"loaded", "address":"@table", "access_bytes":8}),
+            ];
+            if unknown_first {
+                body.push(serde_json::json!({"kind":"gep", "dest":"dynamic", "base":"loaded", "byte_off":null}));
+            }
+            body.push(serde_json::json!({"kind":"gep", "dest":"shifted", "base":if unknown_first {"dynamic"} else {"loaded"}, "byte_off":offset}));
+            body.push(serde_json::json!({"kind":"load", "dest":"result", "address":"shifted", "access_bytes":8}));
+            let mut pir: Pir = serde_json::from_value(serde_json::json!({
+                "module":"one-hop-root-zero",
+                "globals":[{"key":"@aggregate"},{"key":"@payload"},{"key":"@table"}],
+                "functions":[{"key":"f", "sig":{"ret":{"class":"void"}, "params":[]}, "body":body}],
+            }))
+            .unwrap();
+            for value in ["slot", "loaded", "dynamic", "shifted", "result"] {
+                pir.lowering
+                    .semantic_value_kinds
+                    .insert(value.into(), ValueKind::Pointer);
+            }
+            let pag = Pag::from_pir(&pir, &PagOpts::default());
+            let solved = solve_steensgaard(&pir, &pag, BuildMode::Executable);
+            assert_eq!(
+                solved.nodes["val:f:result"]
+                    .pointee_globals_unfiltered
+                    .iter()
+                    .chain(solved.nodes["val:f:result"].pointee_globals.iter())
+                    .any(|name| name == "@payload"),
+                reaches_payload,
+                "unknown_first={unknown_first} offset={offset}: {:?}",
+                solved.nodes["val:f:result"],
+            );
+        }
     }
 
     #[test]

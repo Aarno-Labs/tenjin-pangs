@@ -20,7 +20,10 @@ its base's target is a field class of a known allocation, resolve the result aga
 allocation instead of reusing the base's field: shift the field exactly when the base names one
 unambiguous region, and fall back to that allocation's unknown-offset summary when it does not.
 
-This document is a proposal.  It is not implemented.
+2026-09-07: the correction is being implemented and evaluated as the prerequisite for
+asymmetric overlap. The original sketch below is historical, not the implementation
+contract. Its one-shot replay, mixed-summary, and finite-domain omissions are corrected
+by §3.0. See `20260907_ONE_HOP_OFFSET_EVALUATION.md` for the acceptance ledger.
 
 ## 1. The defect
 
@@ -182,6 +185,48 @@ should have moved.  Others are probably false alias rows that a correct base tie
 argue about on better evidence.  Fixing the base tier is what makes that distinction available.
 
 ## 3. Proposed fix
+
+### 3.0 Implementation corrections to the original sketch
+
+The implementation retains persistent GEP constraints on source pointee classes.
+Class joins merge these subscriptions and invalidate their replay frontier when
+address alternatives or subscriptions grow. Data allocation objects start as
+`(root, Exact(0))` address identities in the same field inventory. Function objects
+remain conservative summaries; a fresh synthetic pointee placeholder has neither
+an allocation address nor a summary witness. Nonzero arithmetic waits for producers
+instead of prematurely equating that placeholder with the result.
+
+For field-only sources, replay composes the displacement with every recorded region,
+preserving its access width conservatively. Exact results must belong to the fixed
+certificate/direct-GEP vocabulary. Lanes have a bounded derived vocabulary per root;
+missing exact offsets, arithmetic failure, and cap overflow use that root's Unknown.
+Zero displacement keeps the original target. Unknown alternatives subsume other
+locations only within their own root during replay. A class containing only Unknown
+alternatives is already stable under displacement. For a nonzero exact self-cycle,
+an exact region goes directly to its inevitable finite-vocabulary Unknown fallback;
+invariant affine lanes are not widened by this shortcut.
+
+For a genuine or mixed summary source, retaining the source target alone is not
+sufficient: a class containing field 0 does not automatically contain field 8.
+Nonzero arithmetic explicitly widens each represented allocation to its Unknown
+region. Data allocation bases do not take this branch just because they are ordinary
+objects: their zero offset is known, and replay shifts it normally. New fields
+overlap an existing Unknown summary. Equivalent summary
+transfers are batched so roots are widened once per dirty replay, not once per GEP.
+
+The content edge still carries external/null facts, and processing re-canonicalizes
+the source after replay because replay itself may join it. Metadata and subscriptions
+are finite; memoization alone is not the termination argument.
+
+Cross-allocation UF joins really unify the alternatives. Widening never invents an
+unrelated root, but it cannot promise to keep roots separate when the input already
+equates them. Likewise multiple regions and affine lanes do not inherently imply
+Unknown: representable shifts may stay as separate recorded alternatives until UF
+overlap or the finite fallback merges them.
+
+Sections 3.1–3.5 preserve the original proposal for context. In particular, the code
+in §3.3 must not be implemented verbatim: it omits persistent replay, bounded
+admission, and mixed-summary preservation.
 
 ### 3.1 The idea
 

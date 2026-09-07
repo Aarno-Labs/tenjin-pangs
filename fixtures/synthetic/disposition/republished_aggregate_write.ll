@@ -1,9 +1,8 @@
 ; Soundness fixture: `&flag` is stored at a non-zero lane of a stack aggregate, the
 ; aggregate's base is republished through a global pointer, and a third function stores
-; through `base + 1`.  The base tier loses the field-offset composition across that memory
-; round trip, so its class-level write evidence does not reach @flag.  The pointer ModRef
-; pass does reach it, and the `written` fact must fail closed on that row rather than
-; letting the cascade select `immutable` for a global something writes.
+; through `base + 1`. Both solver tiers must retain the shifted field target across that
+; memory round trip. Pointer ModRef and the `written` fact must agree so the cascade
+; cannot select `immutable` for a global that the program writes.
 
 source_filename = "fixtures/synthetic/disposition/republished_aggregate_write.c"
 target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"

@@ -5675,17 +5675,10 @@ int call_reader(void) { return read_pointer(&target); }
     #[test]
     fn a_pointer_modref_write_is_visible_in_the_written_fact() {
         // `&flag` is stored at lane 1 of a stack aggregate whose base is republished through
-        // a global pointer, then written through `base + 1`.  The base tier's class evidence
-        // loses the offset across that memory round trip, so `runtime_written` alone does not
-        // see the store.  The pointer ModRef pass does, and `written` must fail closed on it —
-        // otherwise the cascade selects `immutable` for a global something writes.
-        //
-        // Andersen only.  Steensgaard misses this write outright and produces no row at all,
-        // so there is nothing here to fail closed on; that base-tier gap is separate and still
-        // open, and the differential ledger's `written_globals` rule is what reports it.
-        // `20260907_STEENS_ONE_HOP_OFFSET_HANDLING.md` proposes the fix; when it lands, add
-        // `Stage::Steens` back to this loop.
-        for stage in [Stage::Andersen] {
+        // a global pointer, then written through `base + 1`. Both tiers must preserve the
+        // shifted target across that memory round trip. Independently, pointer ModRef and
+        // `written` must agree so the cascade cannot select `immutable` for a real write.
+        for stage in [Stage::Steens, Stage::Andersen] {
             let (analysis, manifest) =
                 disposition_fixture_artifacts("republished_aggregate_write.ll", stage);
             let gid = analysis.lookup_global("flag").unwrap();
