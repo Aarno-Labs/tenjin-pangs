@@ -18,9 +18,10 @@ struct StageFacts {
     icall_unknown: BTreeSet<String>,
     /// functions reachable from an unknown (escaped) caller
     unknown_callers: BTreeSet<String>,
-    /// mutable globals that live in a non-frozen (rewritable) component
+    /// mutable globals named by a non-frozen component and by no frozen one
     rewritable_globals: BTreeSet<String>,
-    in_rewritable_components: usize,
+    /// locally defined globals the stage reports as written at runtime
+    written_globals: BTreeSet<String>,
 }
 
 impl StageFacts {
@@ -49,22 +50,33 @@ impl StageFacts {
             }
         }
 
-        let mut rewritable_globals = BTreeSet::new();
+        // A global is rewritable only when *no* frozen component names it.  Counting the
+        // clean components alone calls a global rewritable while a frozen component also
+        // reaches it, which both overstates coverage and makes the number fall when a
+        // refinement removes a false row from a clean component.
+        let mut clean = BTreeSet::new();
+        let mut frozen = BTreeSet::new();
         for comp in analysis.components() {
-            if comp.frozen {
-                continue;
-            }
+            let side = if comp.frozen { &mut frozen } else { &mut clean };
             for gid in &comp.mutable_globals {
-                rewritable_globals.insert(analysis.globals()[*gid].key.clone());
+                side.insert(analysis.globals()[*gid].key.clone());
             }
         }
+        let rewritable_globals = clean.difference(&frozen).cloned().collect();
+
+        let written_globals = analysis
+            .globals()
+            .iter()
+            .filter(|global| global.is_definition && global.runtime_written)
+            .map(|global| global.key.clone())
+            .collect();
 
         Self {
             icall_targets,
             icall_unknown,
             unknown_callers,
             rewritable_globals,
-            in_rewritable_components: analysis.metrics().in_rewritable_components,
+            written_globals,
         }
     }
 }
@@ -158,29 +170,62 @@ pub fn run_differential(
         &cons.unknown_callers,
     );
 
-    // steens → andersen share the pointer-aware mod/ref machinery; Andersen only refines
-    // pts, so it can never *reveal* new aliased taint — coverage must be monotone here.
-    check_subset(
-        &mut report,
-        "rewritable_globals",
-        "steens",
-        &steens.rewritable_globals,
-        "andersen",
-        &ander.rewritable_globals,
-    );
-    if steens.in_rewritable_components > ander.in_rewritable_components {
-        report.violations.push(format!(
-            "in_rewritable_components dropped steens→andersen: steens={}, andersen={}",
-            steens.in_rewritable_components, ander.in_rewritable_components
-        ));
+    // Rewritable coverage is *not* monotone in either direction and never was.  It is built
+    // from ModRef rows, and a refinement that deletes a false row legitimately removes a
+    // global from a clean component; conversely, deleting a false row from a frozen component
+    // can add one.  Both were observed on the corpus.  Surface the movement for triage.
+    for (coarse_name, coarse, fine_name, fine) in [
+        (
+            "conservative",
+            &cons.rewritable_globals,
+            "steens",
+            &steens.rewritable_globals,
+        ),
+        (
+            "steens",
+            &steens.rewritable_globals,
+            "andersen",
+            &ander.rewritable_globals,
+        ),
+    ] {
+        if coarse != fine {
+            report.notes.push(format!(
+                "rewritable coverage moved {coarse_name}→{fine_name}: {} → {} ({} gained, {} lost)",
+                coarse.len(),
+                fine.len(),
+                fine.difference(coarse).count(),
+                coarse.difference(fine).count(),
+            ));
+        }
     }
 
-    // conservative → steens coverage can move either way (syntactic vs aliased-Ω mod/ref);
-    // surface the delta for triage rather than failing on it.
-    if cons.in_rewritable_components != steens.in_rewritable_components {
+    // Writes, unlike coverage, *are* monotone: a coarser tier over-approximates points-to, so
+    // every runtime write a finer tier can attribute to a global must already be attributed to
+    // it by the coarser one.  A global written at Andersen and unwritten at Steensgaard means
+    // the base tier lost the store, and its `immutable` answer for that global is unsound.
+    check_subset(
+        &mut report,
+        "written_globals",
+        "andersen",
+        &ander.written_globals,
+        "steens",
+        &steens.written_globals,
+    );
+    // The conservative tier is syntactic: it attributes direct writes only and does no aliased
+    // mod/ref at all, so it reports *fewer* writes than Steensgaard rather than more.  That is
+    // a known property of the tier, not a break, but it means conservative-tier `written` — and
+    // therefore any `immutable` it selects — is not a floor.  Surface it.
+    let conservative_missing: Vec<_> = steens
+        .written_globals
+        .difference(&cons.written_globals)
+        .cloned()
+        .collect();
+    if !conservative_missing.is_empty() {
         report.notes.push(format!(
-            "coverage moved conservative→steens: {} → {} (mod/ref completeness differs)",
-            cons.in_rewritable_components, steens.in_rewritable_components
+            "written_globals: {} global(s) written at steens are unwritten at conservative \
+             (the conservative tier has no aliased mod/ref; its `written` is not a floor): {}",
+            conservative_missing.len(),
+            conservative_missing.join(", "),
         ));
     }
 

@@ -820,7 +820,9 @@ fn run() -> Result<()> {
                 eprintln!("differential note: {note}");
             }
             if report.is_clean() {
-                eprintln!("differential: ok (andersen ⊆ steens ⊆ conservative; coverage sound)");
+                eprintln!(
+                    "differential: ok (targets, unknowns and writes all narrow monotonically)"
+                );
             } else {
                 for violation in &report.violations {
                     eprintln!("differential: {violation}");

@@ -4428,8 +4428,14 @@ mod tests {
     }
 
     fn external_result_after_escape_artifacts(stage: Stage) -> (Analysis, DispositionManifest) {
-        let fixture =
-            workspace_root().join("fixtures/synthetic/disposition/external_result_after_escape.ll");
+        disposition_fixture_artifacts("external_result_after_escape.ll", stage)
+    }
+
+    fn disposition_fixture_artifacts(
+        name: &str,
+        stage: Stage,
+    ) -> (Analysis, DispositionManifest) {
+        let fixture = workspace_root().join(format!("fixtures/synthetic/disposition/{name}"));
         let pir = Pir::from_path(&fixture).unwrap();
         let target = pir.target.clone().unwrap();
         let opts = Opts {
@@ -5631,6 +5637,39 @@ int call_reader(void) { return read_pointer(&target); }
                 ["globals"],
             17
         );
+    }
+
+    #[test]
+    fn a_pointer_modref_write_is_visible_in_the_written_fact() {
+        // `&flag` is stored at lane 1 of a stack aggregate whose base is republished through
+        // a global pointer, then written through `base + 1`.  The base tier's class evidence
+        // loses the offset across that memory round trip, so `runtime_written` alone does not
+        // see the store.  The pointer ModRef pass does, and `written` must fail closed on it —
+        // otherwise the cascade selects `immutable` for a global something writes.
+        //
+        // Andersen only.  Steensgaard misses this write outright and produces no row at all,
+        // so there is nothing here to fail closed on; that base-tier gap is separate and still
+        // open, and the differential ledger's `written_globals` rule is what reports it.
+        for stage in [Stage::Andersen] {
+            let (analysis, manifest) =
+                disposition_fixture_artifacts("republished_aggregate_write.ll", stage);
+            let gid = analysis.lookup_global("flag").unwrap();
+
+            let write_row = analysis.modrefs().iter().any(|row| {
+                row.access == pangs_pir::Access::Mod
+                    && matches!(row.global, pangs_api::GlobalTarget::Name(id) if id == gid)
+            });
+            assert!(write_row, "expected a named mod row for flag at {stage:?}");
+
+            assert_eq!(
+                analysis.metrics().modref_write_without_written_fact,
+                0,
+                "{stage:?}"
+            );
+
+            let global = manifest_global_by_llvm_name(&manifest, "flag");
+            assert!(global.facts.written.value, "{stage:?}");
+        }
     }
 
     #[test]

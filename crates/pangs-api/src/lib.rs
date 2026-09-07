@@ -1813,6 +1813,31 @@ impl Analysis {
         let modref_dedup_us = modref_dedup_started.elapsed().as_micros() as u64;
         print_memory_profile("api-modref-materialized");
 
+        // A named `mod` row asserts a runtime write through the global, so the write facts
+        // must see it.  The initial PIR scan already applies that rule to exact direct rows;
+        // the pointer rows the PAG pass adds above reach the same conclusion through aliasing
+        // and were never folded back, because the solver derives `runtime_written` from
+        // base-tier class evidence alone.  That evidence loses field-offset composition when a
+        // pointer is republished through memory, so a store through `base + k` need not reach
+        // the object stored at lane k, and the global stays `written = false` while its `mod`
+        // row exists.  `stationarity_verdicts_from_modrefs` below already reads these rows, so
+        // leaving the two unreconciled also makes a global a known runtime writer for
+        // stationarity and unwritten for the disposition cascade at the same time.  Fail
+        // closed on the row: `written` is a may-fact and the row is may-write evidence.
+        for modref in &modrefs {
+            if modref.access != Access::Mod {
+                continue;
+            }
+            let GlobalTarget::Name(gid) = modref.global else {
+                continue;
+            };
+            let global = &mut globals[gid.0 as usize];
+            if global.is_definition {
+                global.never_written = false;
+                global.runtime_written = true;
+            }
+        }
+
         let stationarity_started = Instant::now();
         let (initval_stable_globals, stationarity) = if opts.stage == Stage::Conservative {
             conservative_stationarity_verdicts(module, &global_lookup)
@@ -1907,12 +1932,17 @@ impl Analysis {
             .iter()
             .filter(|g| g.mutable && !g.initval_stable)
             .count();
-        let in_rewritable_components = components
-            .iter()
-            .filter(|c| !c.frozen)
-            .flat_map(|c| c.mutable_globals.iter())
-            .collect::<BTreeSet<_>>()
-            .len();
+        // A global counts as rewritable only when no frozen component reaches it.  Counting
+        // the clean components alone calls a global rewritable while a frozen component also
+        // names it, which overstates coverage and, worse, makes the number *fall* when a
+        // refinement deletes a false row from a clean component.
+        let (clean_globals, frozen_globals): (BTreeSet<_>, BTreeSet<_>) =
+            components.iter().fold(Default::default(), |mut acc, c| {
+                let side = if c.frozen { &mut acc.1 } else { &mut acc.0 };
+                side.extend(c.mutable_globals.iter().copied());
+                acc
+            });
+        let in_rewritable_components = clean_globals.difference(&frozen_globals).count();
 
         // Soundness tripwire.  `written` is derived from the solver's class-level write
         // evidence (`runtime_written`) plus external linkage; it never consults ModRef rows,
