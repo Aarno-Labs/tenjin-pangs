@@ -124,6 +124,9 @@
     "pwc_lanes_enabled": {
       "type": "boolean"
     },
+    "asymmetric_field_overlap_enabled": {
+      "type": "boolean"
+    },
     "pwc_lane_cap": {
       "type": "integer",
       "minimum": 0

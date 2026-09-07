@@ -204,6 +204,7 @@ struct AndersenControls {
     closed_producers: bool,
     closed_consumers: bool,
     offline_quotient: bool,
+    asymmetric_field_overlap: bool,
 }
 
 impl AndersenControls {
@@ -221,6 +222,7 @@ impl AndersenControls {
             closed_producers: closed_producers_enabled(),
             closed_consumers: closed_consumers_enabled(),
             offline_quotient: std::env::var_os(knobs::ENV_ANDERSEN_OFFLINE_QUOTIENT).is_some(),
+            asymmetric_field_overlap: asymmetric_field_overlap_enabled(),
         }
     }
 }
@@ -2496,7 +2498,7 @@ impl<'a> Refiner<'a> {
             }
         }
 
-        let mut solve = self.build_base_solve();
+        let mut solve = self.build_base_solve(controls.asymmetric_field_overlap);
         let mut activated: HashMap<usize, BTreeSet<usize>> = HashMap::new();
         let mut external_summaries = HashSet::new();
         let mut initial = exact_map
@@ -2649,6 +2651,7 @@ impl<'a> Refiner<'a> {
                 &envelopes,
                 &exact_map,
                 controls.offline_quotient,
+                controls.asymmetric_field_overlap,
             );
             for &site in &in_scope_sites {
                 let additive = activated.get(&site).cloned().unwrap_or_default();
@@ -2671,7 +2674,7 @@ impl<'a> Refiner<'a> {
         let activated_targets = activated.values().map(BTreeSet::len).sum();
         if andersen_profile_enabled() {
             eprintln!(
-                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} chained_field_derivations_exact={} chained_field_derivations_lane={} chain_collapses_missing_exact={} chain_collapses_lane_cap={} chain_collapses_unknown_input={} chain_collapses_arithmetic={} derived_lanes_admitted={} max_lanes_per_root={} roots_reaching_lane_cap={} lane_cap={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
+                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} overlap_reads={} overlap_pairs={} overlap_late_replays={} overlap_index_roots={} overlap_index_entries={} overlap_index_capacity_bytes={} chained_field_derivations_exact={} chained_field_derivations_lane={} chain_collapses_missing_exact={} chain_collapses_lane_cap={} chain_collapses_unknown_input={} chain_collapses_arithmetic={} derived_lanes_admitted={} max_lanes_per_root={} roots_reaching_lane_cap={} lane_cap={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
                 solve.steps,
                 resume_rounds,
                 activated_targets,
@@ -2682,6 +2685,12 @@ impl<'a> Refiner<'a> {
                 solve.copy_edges(),
                 solve.fields.len(),
                 solve.unknown_fields.len(),
+                solve.overlap_read_dependencies,
+                solve.overlap_read_pairs,
+                solve.overlap_read_late_replays,
+                solve.overlap_reads.len(),
+                solve.overlap_reads.values().map(Vec::len).sum::<usize>(),
+                solve.overlap_read_index_bytes(),
                 solve.chained_exact_field_derivations,
                 solve.chained_lane_field_derivations,
                 solve.chain_missing_exact_collapses,
@@ -2832,9 +2841,14 @@ impl<'a> Refiner<'a> {
 
     // ----- the persistent inclusion solve -----------------------------------------------
 
-    fn build_base_solve(&mut self) -> Solve {
+    fn build_base_solve(&mut self, asymmetric_field_overlap: bool) -> Solve {
         let profile = andersen_profile_enabled();
-        let mut solve = Solve::new_with_pwc(self.n_base, profile, self.pag.pwc_lanes_enabled);
+        let mut solve = Solve::new_with_pwc_and_overlap(
+            self.n_base,
+            profile,
+            self.pag.pwc_lanes_enabled,
+            asymmetric_field_overlap,
+        );
         solve.known_locations.extend(
             self.exact_addresses
                 .iter()
@@ -3007,6 +3021,10 @@ impl<'a> Refiner<'a> {
 
         let selected_roots = self.receiver_payload_context_roots();
         let mut payload_cells = HashMap::<(NodeId, FieldLocation), Cell>::new();
+        // Receiver payloads are synthetic allocation-relative storage.  They deliberately
+        // stay out of `Solve::field_of` (receiver roots are PAG nodes, not object cells),
+        // but use the identical direct-overlap read interpretation when C is enabled.
+        let mut payload_reads = HashMap::<NodeId, Vec<(FieldLocation, Cell)>>::new();
 
         let mut summarized_calls = 0usize;
         let mut singleton_payloads = 0usize;
@@ -3025,9 +3043,19 @@ impl<'a> Refiner<'a> {
                 if let Some(argument) = callsite.args.get(index) {
                     if self.node_may_carry_pointer(*argument) {
                         for &location in locations {
-                            let payload = *payload_cells
-                                .entry((root, location))
-                                .or_insert_with(|| solve.allocate_cell());
+                            let payload =
+                                if let Some(&payload) = payload_cells.get(&(root, location)) {
+                                    payload
+                                } else {
+                                    let payload = solve.allocate_cell();
+                                    payload_cells.insert((root, location), payload);
+                                    solve
+                                        .receiver_payload_fields
+                                        .entry(root.0)
+                                        .or_default()
+                                        .push(payload);
+                                    payload
+                                };
                             let origins = &self.receiver_payload_origins[argument.0 as usize];
                             for &origin in &origins.roots {
                                 solve.add_pts(payload, origin.0);
@@ -3060,14 +3088,41 @@ impl<'a> Refiner<'a> {
             for &location in &operation.returned_regions {
                 if let Some(result) = callsite.result {
                     if self.node_may_carry_pointer(result) {
-                        let payload = *payload_cells
-                            .entry((root, location))
-                            .or_insert_with(|| solve.allocate_cell());
-                        solve.add_copy(payload, result.0);
+                        let payload = if let Some(&payload) = payload_cells.get(&(root, location)) {
+                            payload
+                        } else {
+                            let payload = solve.allocate_cell();
+                            payload_cells.insert((root, location), payload);
+                            solve
+                                .receiver_payload_fields
+                                .entry(root.0)
+                                .or_default()
+                                .push(payload);
+                            payload
+                        };
+                        if solve.asymmetric_field_overlap {
+                            let reads = payload_reads.entry(root).or_default();
+                            if !reads.contains(&(location, result.0)) {
+                                reads.push((location, result.0));
+                            }
+                        } else {
+                            solve.add_copy(payload, result.0);
+                        }
                     }
                 }
             }
             summarized_calls += 1;
+        }
+        if solve.asymmetric_field_overlap {
+            for (root, reads) in payload_reads {
+                for (read_location, destination) in reads {
+                    for (&(payload_root, payload_location), &payload) in &payload_cells {
+                        if payload_root == root && read_location.may_alias(payload_location) {
+                            solve.add_copy(payload, destination);
+                        }
+                    }
+                }
+            }
         }
         if andersen_profile_enabled() {
             let mut context_labels = selected_roots
@@ -3163,6 +3218,7 @@ impl<'a> Refiner<'a> {
         envelopes: &HashMap<usize, Vec<usize>>,
         exact: &HashMap<usize, Vec<usize>>,
         offline_quotient: bool,
+        asymmetric_field_overlap: bool,
     ) -> HashMap<usize, BTreeSet<usize>> {
         let mut targets = sites
             .iter()
@@ -3180,7 +3236,7 @@ impl<'a> Refiner<'a> {
         let max_rounds = targets.values().map(BTreeSet::len).sum::<usize>() + 1;
 
         for _ in 0..max_rounds {
-            let mut solve = self.build_base_solve();
+            let mut solve = self.build_base_solve(asymmetric_field_overlap);
             let mut installed = HashMap::new();
             let mut summaries = HashSet::new();
             for (&site, functions) in &targets {
@@ -3543,6 +3599,14 @@ impl<'a> Refiner<'a> {
 
     fn closed_producer_analysis(&self, solve: &Solve) -> ClosedProducerAnalysis {
         let node_count = solve.next_field as usize;
+        // Receiver payload cells are allocation-relative synthetic storage outside the
+        // ordinary field inventory. Until their overlap projection is represented in this
+        // certificate graph, never use the producer certificate to clear an unknown bit.
+        if solve.asymmetric_field_overlap && !self.receiver_payload_ops.is_empty() {
+            return ClosedProducerAnalysis {
+                complete: vec![false; node_count],
+            };
+        }
         let mut dependencies = Vec::<(usize, usize)>::new();
         let mut terminal = vec![false; node_count];
         let mut explicit_open = vec![false; node_count];
@@ -3620,7 +3684,9 @@ impl<'a> Refiner<'a> {
                         if solve.external_region(object).is_some() {
                             explicit_open[destination] = true;
                         } else {
-                            add_dependency(object, edge.dst.0);
+                            for source in solve.overlap_read_cells(object) {
+                                add_dependency(source, edge.dst.0);
+                            }
                         }
                     }
                 }
@@ -3649,14 +3715,20 @@ impl<'a> Refiner<'a> {
                                 .unwrap_or_default()
                         });
                     for destination in destinations {
+                        // C bulk writes project an exact endpoint to the whole destination
+                        // allocation. Keep the raw endpoint for the logical audit, but make
+                        // every actual root/field content cell incomplete here.
+                        let destination = if solve.asymmetric_field_overlap {
+                            solve.allocation_root(destination)
+                        } else {
+                            destination
+                        };
                         if solve.external_region(destination).is_some() {
                             continue;
                         }
                         explicit_open[solve.canonical(destination) as usize] = true;
-                        for (&(base, _), &field) in &solve.fields {
-                            if base == destination {
-                                explicit_open[solve.canonical(field) as usize] = true;
-                            }
+                        for field in solve.content_fields(destination) {
+                            explicit_open[solve.canonical(field) as usize] = true;
                         }
                     }
                 }
@@ -3782,6 +3854,11 @@ impl<'a> Refiner<'a> {
     /// partitions. If an address seed or transfer was cut from the solve, its function fails
     /// closed instead of triggering a module-wide address solve.
     fn closed_consumer_certificates(&self, solve: &Solve) -> BTreeSet<String> {
+        // See the producer-side note above.  This is deliberately a coverage loss, not an
+        // unsound claim about a receiver-local payload that has not been made overlap-aware.
+        if solve.asymmetric_field_overlap && !self.receiver_payload_ops.is_empty() {
+            return BTreeSet::new();
+        }
         let mut seeded = vec![false; self.pir.functions.len()];
         let mut open = vec![false; self.pir.functions.len()];
         let mut boundary_roots = HashSet::<Cell>::new();
@@ -3795,6 +3872,13 @@ impl<'a> Refiner<'a> {
                     let root = solve.field_base.get(&cell).copied().unwrap_or(cell);
                     self.fn_cell_to_index.get(&root).copied()
                 })
+                .collect::<BTreeSet<_>>()
+        };
+        let functions_read = |cell: Cell| {
+            solve
+                .overlap_read_cells(cell)
+                .into_iter()
+                .flat_map(|source| functions_in(source))
                 .collect::<BTreeSet<_>>()
         };
 
@@ -3848,7 +3932,7 @@ impl<'a> Refiner<'a> {
                         if solve.is_external(object) {
                             continue;
                         }
-                        for function in functions_in(object).difference(&destination) {
+                        for function in functions_read(object).difference(&destination) {
                             open[*function] = true;
                         }
                     }
@@ -3890,14 +3974,41 @@ impl<'a> Refiner<'a> {
                         // storage open rather than clearing an unknown-caller bit.
                         if let Some(sources) = solve.points_to(edge.src.0) {
                             for source in sources {
-                                mark_open(functions_in(source), &mut open);
+                                let source = if solve.asymmetric_field_overlap {
+                                    solve.allocation_root(source)
+                                } else {
+                                    source
+                                };
+                                let copied = solve
+                                    .overlap_read_cells(source)
+                                    .into_iter()
+                                    .flat_map(|source| functions_in(source))
+                                    .collect::<BTreeSet<_>>();
+                                mark_open(copied, &mut open);
                             }
                         }
                         continue;
                     };
                     for source in sources {
-                        let copied = functions_in(source);
+                        // C's bulk operation projects a field endpoint to its owning
+                        // allocation before reading: memcpy(base + 0, ..., 16) may carry a
+                        // pointer from byte 8. The old path remains raw-endpoint based.
+                        let source = if solve.asymmetric_field_overlap {
+                            solve.allocation_root(source)
+                        } else {
+                            source
+                        };
+                        let copied = solve
+                            .overlap_read_cells(source)
+                            .into_iter()
+                            .flat_map(|source| functions_in(source))
+                            .collect::<BTreeSet<_>>();
                         for &destination in &destinations {
+                            let destination = if solve.asymmetric_field_overlap {
+                                solve.allocation_root(destination)
+                            } else {
+                                destination
+                            };
                             if solve.is_external(destination) {
                                 mark_open(copied.clone(), &mut open);
                                 continue;
@@ -3915,7 +4026,7 @@ impl<'a> Refiner<'a> {
         // External regions model foreign storage. Anything recursively reachable from one
         // can be retained and invoked outside the module.
         for &region in solve.region_of_cell.keys() {
-            boundary_roots.insert(solve.canonical(region));
+            boundary_roots.insert(region);
         }
 
         for seed in &self.pag.omega_seeds {
@@ -3930,19 +4041,19 @@ impl<'a> Refiner<'a> {
                     if let Some(&function) = self.fn_cell_to_index.get(&node.0) {
                         open[function] = true;
                     }
-                    boundary_roots.insert(solve.canonical(node.0));
+                    boundary_roots.insert(node.0);
                 }
                 (OmegaSeedKind::ExternalCallBoundary, SeedTarget::Callsite(id)) => {
                     if let Some(callsite) = self.pag.callsites.get(id.0 as usize) {
                         for &argument in &callsite.args {
-                            boundary_roots.insert(solve.canonical(argument.0));
+                            boundary_roots.insert(argument.0);
                         }
                     }
                 }
                 (OmegaSeedKind::VarargCallBoundary, SeedTarget::Callsite(id)) => {
                     if let Some(callsite) = self.pag.callsites.get(id.0 as usize) {
                         for &argument in callsite.args.iter().skip(callsite.sig.params.len()) {
-                            boundary_roots.insert(solve.canonical(argument.0));
+                            boundary_roots.insert(argument.0);
                         }
                     }
                 }
@@ -3956,7 +4067,7 @@ impl<'a> Refiner<'a> {
         for node in &self.pag.nodes {
             if let NodeKind::Return { func } = &node.kind {
                 if self.base.unknown_callers.contains(func) {
-                    boundary_roots.insert(solve.canonical(node.id.0));
+                    boundary_roots.insert(node.id.0);
                 }
             }
         }
@@ -3967,9 +4078,19 @@ impl<'a> Refiner<'a> {
         let mut seen = HashSet::new();
         let mut pending = boundary_roots.into_iter().collect::<Vec<_>>();
         while let Some(cell) = pending.pop() {
-            let cell = solve.canonical(cell);
+            // Keep the raw storage identity here. A copy SCC representative describes its
+            // content variable, not which allocation's materialized fields an external
+            // caller may inspect.
             if !seen.insert(cell) {
                 continue;
+            }
+            let root = solve.allocation_root(cell);
+            if !solve.is_external(cell) {
+                // Do this before inspecting raw contents: a directly exported global root
+                // may have no root-cell payload while a materialized field holds a callback.
+                if cell == root {
+                    pending.extend(solve.content_fields(root));
+                }
             }
             let Some(points_to) = solve.points_to(cell) else {
                 continue;
@@ -3983,9 +4104,7 @@ impl<'a> Refiner<'a> {
                     // A boundary receiving an allocation address may inspect any of its
                     // materialized fields. Field cells are content variables rather than
                     // ordinary points-to successors, so include them explicitly.
-                    if let Some(fields) = solve.obj_fields.get(&root) {
-                        pending.extend(fields.iter().copied());
-                    }
+                    pending.extend(solve.content_fields(root));
                 }
             }
         }
@@ -4065,11 +4184,12 @@ impl<'a> Refiner<'a> {
                 let exact = self.exact_targets.contains_key(&cs.key);
                 let mut fallback = !exact && eager_sites.contains(&idx);
                 let steens_unknown = steens.map(|r| r.unknown_callee).unwrap_or(false);
-                let mut unknown_callee = if !self.receiver_payload_ops.is_empty() {
-                    operand_unknown || (targets.is_empty() && steens_unknown)
-                } else {
-                    steens_unknown || operand_unknown
-                };
+                let mut unknown_callee =
+                    if !self.receiver_payload_ops.is_empty() && !pts.asymmetric_field_overlap {
+                        operand_unknown || (targets.is_empty() && steens_unknown)
+                    } else {
+                        steens_unknown || operand_unknown
+                    };
                 if let (Some(analysis), Some(operand)) = (&closed_producers, cs.operand) {
                     let certificate = self.query_closed_producer(analysis, pts, operand);
                     let certified = certificate.complete
@@ -4336,9 +4456,7 @@ impl<'a> Refiner<'a> {
             }
             let obj = node.id.0;
             let mut content_cells = vec![obj];
-            if let Some(fields) = pts.obj_fields.get(&obj) {
-                content_cells.extend(fields.iter().copied());
-            }
+            content_cells.extend(pts.content_fields(obj));
             let mut allocs = BTreeSet::new();
             for cell in content_cells {
                 let Some(set) = pts.points_to(cell) else {
@@ -4443,6 +4561,13 @@ fn memcpy_edge_summaries_enabled_for(value: Option<&str>) -> bool {
 fn memcpy_edge_summaries_enabled() -> bool {
     let value = std::env::var(knobs::ENV_ANDERSEN_MEMCPY_EDGE_SUMMARIES).ok();
     memcpy_edge_summaries_enabled_for(value.as_deref())
+}
+
+fn asymmetric_field_overlap_enabled() -> bool {
+    matches!(
+        std::env::var(knobs::ENV_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP).as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 fn graph_reachable(start: usize, adjacency: &[Vec<usize>]) -> HashSet<usize> {
@@ -5274,6 +5399,13 @@ struct Solve {
     unknown_fields: HashMap<Cell, Cell>,
     /// unknown-offset summary cell -> base object cell.
     unknown_field_base: HashMap<Cell, Cell>,
+    /// Persistent allocation-relative memory reads.  The key is deliberately the raw
+    /// allocation root: copy representatives describe contents, never locations.
+    overlap_reads: HashMap<Cell, Vec<(FieldLocation, Cell)>>,
+    /// Receiver-summary raw payload cells by their receiver allocation root. Unlike ordinary
+    /// field cells these are synthetic, but aggregate export and boundary traversal must still
+    /// be able to inspect them after propagation-state compaction.
+    receiver_payload_fields: HashMap<Cell, Vec<Cell>>,
     /// base object cells that have had a direct load/store through the whole object. If the
     /// object also has an unknown-offset summary, the direct cell aliases the summary.
     direct_accessed: HashSet<Cell>,
@@ -5315,6 +5447,10 @@ struct Solve {
     scc_copy_edges_removed: usize,
     hybrid_points_to: bool,
     memcpy_edge_summaries: bool,
+    asymmetric_field_overlap: bool,
+    overlap_read_dependencies: usize,
+    overlap_read_pairs: usize,
+    overlap_read_late_replays: usize,
 }
 
 #[derive(Debug, Default)]
@@ -5360,10 +5496,15 @@ fn offline_union_into(parent: &mut [Cell], member: Cell, representative: Cell) -
 impl Solve {
     #[cfg(test)]
     fn new(n_base: usize, profile: bool) -> Self {
-        Self::new_with_pwc(n_base, profile, false)
+        Self::new_with_pwc_and_overlap(n_base, profile, false, false)
     }
 
-    fn new_with_pwc(n_base: usize, profile: bool, pwc_lanes: bool) -> Self {
+    fn new_with_pwc_and_overlap(
+        n_base: usize,
+        profile: bool,
+        pwc_lanes: bool,
+        asymmetric_field_overlap: bool,
+    ) -> Self {
         Self {
             next_field: n_base as Cell,
             representative: (0..n_base as Cell).collect(),
@@ -5393,6 +5534,8 @@ impl Solve {
             obj_fields: HashMap::new(),
             unknown_fields: HashMap::new(),
             unknown_field_base: HashMap::new(),
+            overlap_reads: HashMap::new(),
+            receiver_payload_fields: HashMap::new(),
             direct_accessed: HashSet::new(),
             memcpy_summary_cells: HashSet::new(),
             worklist: Vec::new(),
@@ -5430,6 +5573,10 @@ impl Solve {
             scc_copy_edges_removed: 0,
             hybrid_points_to: hybrid_points_to_enabled(),
             memcpy_edge_summaries: memcpy_edge_summaries_enabled(),
+            asymmetric_field_overlap,
+            overlap_read_dependencies: 0,
+            overlap_read_pairs: 0,
+            overlap_read_late_replays: 0,
         }
     }
 
@@ -5457,6 +5604,7 @@ impl Solve {
         self.lane_cells_by_root = HashMap::new();
         self.unknown_fields = HashMap::new();
         self.unknown_field_base = HashMap::new();
+        self.overlap_reads = HashMap::new();
         self.direct_accessed = HashSet::new();
         self.memcpy_summary_cells = HashSet::new();
         self.worklist = Vec::new();
@@ -5863,20 +6011,122 @@ impl Solve {
             self.memcpy_summary_sites = self.memcpy_summary_sites.saturating_add(1);
             for source in all_sources {
                 self.note_direct_access(source);
-                self.add_memcpy_summary_edge(source, summary);
+                if self.asymmetric_field_overlap {
+                    // Bulk copies retain their whole-object interpretation even when the
+                    // endpoint happened to be a field address.
+                    self.read_overlap(self.allocation_root(source), summary);
+                } else {
+                    self.add_memcpy_summary_edge(source, summary);
+                }
             }
             for destination in all_destinations {
-                self.add_memcpy_summary_edge(summary, destination);
+                self.add_memcpy_summary_edge(
+                    summary,
+                    if self.asymmetric_field_overlap {
+                        self.allocation_root(destination)
+                    } else {
+                        destination
+                    },
+                );
             }
             return;
         }
 
         for source in delta.new_sources {
             self.note_direct_access(source);
-            self.add_memcpy_summary_edge(source, summary);
+            if self.asymmetric_field_overlap {
+                self.read_overlap(self.allocation_root(source), summary);
+            } else {
+                self.add_memcpy_summary_edge(source, summary);
+            }
         }
         for destination in delta.new_destinations {
-            self.add_memcpy_summary_edge(summary, destination);
+            self.add_memcpy_summary_edge(
+                summary,
+                if self.asymmetric_field_overlap {
+                    self.allocation_root(destination)
+                } else {
+                    destination
+                },
+            );
+        }
+    }
+
+    fn allocation_root(&self, cell: Cell) -> Cell {
+        self.field_base.get(&cell).copied().unwrap_or(cell)
+    }
+
+    fn location_of(&self, cell: Cell) -> FieldLocation {
+        self.field_location
+            .get(&cell)
+            .copied()
+            .unwrap_or(FieldLocation::Unknown)
+    }
+
+    /// Raw content cells contributing to a memory read. Value queries intentionally do not
+    /// use this helper: only location-aware consumers may reinterpret a cell this way.
+    fn overlap_read_cells(&self, cell: Cell) -> Vec<Cell> {
+        if !self.asymmetric_field_overlap || self.is_external(cell) {
+            return vec![cell];
+        }
+        let root = self.allocation_root(cell);
+        let location = self.location_of(cell);
+        let mut cells = vec![root];
+        if let Some(fields) = self.obj_fields.get(&root) {
+            cells.extend(fields.iter().copied());
+        }
+        cells.retain(|candidate| location.may_alias(self.location_of(*candidate)));
+        cells
+    }
+
+    /// Register an allocation-relative memory read and seed it from every currently
+    /// directly-overlapping raw cell.  This is intentionally not a transitive closure.
+    fn read_overlap(&mut self, cell: Cell, destination: Cell) {
+        if !self.asymmetric_field_overlap || self.is_external(cell) {
+            self.add_copy(cell, destination);
+            return;
+        }
+        let root = self.allocation_root(cell);
+        let location = self.location_of(cell);
+        let destination = self.canonical(destination);
+        let reads = self.overlap_reads.entry(root).or_default();
+        if reads
+            .iter()
+            .any(|&(loc, dst)| loc == location && dst == destination)
+        {
+            return;
+        }
+        reads.push((location, destination));
+        self.overlap_read_dependencies = self.overlap_read_dependencies.saturating_add(1);
+        let mut sources = vec![root];
+        if let Some(fields) = self.obj_fields.get(&root) {
+            sources.extend(fields.iter().copied());
+        }
+        for source in sources {
+            if location.may_alias(self.location_of(source)) {
+                let before = self.copy_edges_inserted;
+                self.add_copy(source, destination);
+                self.overlap_read_pairs = self
+                    .overlap_read_pairs
+                    .saturating_add(self.copy_edges_inserted.saturating_sub(before));
+            }
+        }
+    }
+
+    fn replay_overlap_reads_for_field(&mut self, root: Cell, cell: Cell, location: FieldLocation) {
+        if !self.asymmetric_field_overlap {
+            return;
+        }
+        let reads = self.overlap_reads.get(&root).cloned().unwrap_or_default();
+        for (read_location, destination) in reads {
+            if read_location.may_alias(location) {
+                let before = self.copy_edges_inserted;
+                self.add_copy(cell, destination);
+                let inserted = self.copy_edges_inserted.saturating_sub(before);
+                self.overlap_read_pairs = self.overlap_read_pairs.saturating_add(inserted);
+                self.overlap_read_late_replays =
+                    self.overlap_read_late_replays.saturating_add(inserted);
+            }
         }
     }
 
@@ -5979,18 +6229,25 @@ impl Solve {
             self.unknown_fields.insert(base, cell);
             self.unknown_field_base.insert(cell, base);
         }
-        for field in existing {
-            let candidate = self
-                .field_location
-                .get(&field)
-                .copied()
-                .unwrap_or(FieldLocation::Unknown);
-            if location.may_alias(candidate) {
-                self.add_copy(cell, field);
-                self.add_copy(field, cell);
+        if self.asymmetric_field_overlap {
+            self.replay_overlap_reads_for_field(base, cell, location);
+        } else {
+            for field in existing {
+                let candidate = self
+                    .field_location
+                    .get(&field)
+                    .copied()
+                    .unwrap_or(FieldLocation::Unknown);
+                if location.may_alias(candidate) {
+                    self.add_copy(cell, field);
+                    self.add_copy(field, cell);
+                }
             }
         }
-        if location == FieldLocation::Unknown && self.direct_accessed.contains(&base) {
+        if !self.asymmetric_field_overlap
+            && location == FieldLocation::Unknown
+            && self.direct_accessed.contains(&base)
+        {
             self.add_copy(base, cell);
             self.add_copy(cell, base);
         }
@@ -6018,8 +6275,10 @@ impl Solve {
         // `Unknown` location with every field of `base` that already exists. Keep the
         // explicit bridge for an already-present summary as well.
         let summary = self.unknown_field_of(base);
-        self.add_copy(base, summary);
-        self.add_copy(summary, base);
+        if !self.asymmetric_field_overlap {
+            self.add_copy(base, summary);
+            self.add_copy(summary, base);
+        }
     }
 
     fn copy_edge_pairs(&self) -> Vec<(Cell, Cell)> {
@@ -6108,6 +6367,15 @@ impl Solve {
             .flatten()
         {
             fixed_generator[*destination as usize] = true;
+        }
+        // A future field may feed an overlap read.  Its destination therefore has an
+        // independent generator even when no ordinary load names it.
+        for reads in self.overlap_reads.values() {
+            for &(_, destination) in reads {
+                if (destination as usize) < original_nodes {
+                    fixed_generator[destination as usize] = true;
+                }
+            }
         }
         for &(_, destination) in self
             .geps
@@ -6481,6 +6749,17 @@ impl Solve {
         }
         self.pending_geps = replay_geps;
 
+        let mut remapped_reads = HashMap::<Cell, Vec<(FieldLocation, Cell)>>::new();
+        for (root, registrations) in std::mem::take(&mut self.overlap_reads) {
+            let remapped = remapped_reads.entry(root).or_default();
+            for (location, destination) in registrations {
+                remapped.push((location, representatives[destination as usize]));
+            }
+            remapped.sort_unstable();
+            remapped.dedup();
+        }
+        self.overlap_reads = remapped_reads;
+
         let mut merged_memcpy_endpoints = HashMap::<Cell, Vec<usize>>::new();
         for (cell, joins) in std::mem::take(&mut self.memcpy_by_endpoint) {
             merged_memcpy_endpoints
@@ -6569,10 +6848,43 @@ impl Solve {
                 .count()
     }
 
+    fn overlap_read_index_bytes(&self) -> usize {
+        // Capacity-based lower-bound estimate for the persistent registration index; the
+        // allocator/hash-table control bytes are intentionally not guessed here.
+        self.overlap_reads
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(Cell, Vec<(FieldLocation, Cell)>)>())
+            .saturating_add(
+                self.overlap_reads
+                    .values()
+                    .map(|reads| {
+                        reads
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<(FieldLocation, Cell)>())
+                    })
+                    .sum::<usize>(),
+            )
+    }
+
+    fn content_fields(&self, root: Cell) -> impl Iterator<Item = Cell> + '_ {
+        self.obj_fields
+            .get(&root)
+            .into_iter()
+            .flatten()
+            .copied()
+            .chain(
+                self.receiver_payload_fields
+                    .get(&root)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
+    }
+
     fn maybe_report_progress(&self) {
         if self.profile && self.steps % knobs::ANDERSEN_PROFILE_STEP_INTERVAL == 0 {
             eprintln!(
-                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} new_copy_edges_since_scc={}",
+                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} overlap_reads={} overlap_pairs={} overlap_late_replays={} overlap_index_roots={} overlap_index_entries={} overlap_index_capacity_bytes={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} new_copy_edges_since_scc={}",
                 self.steps,
                 self.worklist.len(),
                 self.queued.len(),
@@ -6582,6 +6894,12 @@ impl Solve {
                 self.copy_edges(),
                 self.fields.len(),
                 self.unknown_fields.len(),
+                self.overlap_read_dependencies,
+                self.overlap_read_pairs,
+                self.overlap_read_late_replays,
+                self.overlap_reads.len(),
+                self.overlap_reads.values().map(Vec::len).sum::<usize>(),
+                self.overlap_read_index_bytes(),
                 self.memcpy_pairs_processed,
                 self.memcpy_logical_pairs_covered,
                 self.memcpy_summary_edges_inserted,
@@ -6696,7 +7014,11 @@ impl Solve {
                 for p in ps {
                     for o in &pts_delta {
                         self.note_direct_access(o);
-                        self.add_copy(o, p);
+                        if self.asymmetric_field_overlap {
+                            self.read_overlap(o, p);
+                        } else {
+                            self.add_copy(o, p);
+                        }
                     }
                 }
             }
@@ -6713,7 +7035,11 @@ impl Solve {
                 for &p in &ps {
                     for &o in &all_pts {
                         self.note_direct_access(o);
-                        self.add_copy(o, p);
+                        if self.asymmetric_field_overlap {
+                            self.read_overlap(o, p);
+                        } else {
+                            self.add_copy(o, p);
+                        }
                     }
                 }
                 self.loads.entry(n).or_default().extend(ps);
@@ -6819,7 +7145,14 @@ impl Solve {
                         self.note_direct_access(od);
                         for &os in &delta.all_sources {
                             self.note_direct_access(os);
-                            self.add_copy(os, od);
+                            if self.asymmetric_field_overlap {
+                                self.read_overlap(
+                                    self.allocation_root(os),
+                                    self.allocation_root(od),
+                                );
+                            } else {
+                                self.add_copy(os, od);
+                            }
                         }
                     }
                     self.report_large_product(
@@ -6845,7 +7178,14 @@ impl Solve {
                         self.note_direct_access(od);
                         for &os in &delta.new_sources {
                             self.note_direct_access(os);
-                            self.add_copy(os, od);
+                            if self.asymmetric_field_overlap {
+                                self.read_overlap(
+                                    self.allocation_root(os),
+                                    self.allocation_root(od),
+                                );
+                            } else {
+                                self.add_copy(os, od);
+                            }
                         }
                     }
                 }
@@ -7301,7 +7641,7 @@ mod tests {
             &confined_targets,
             false,
         );
-        let mut solve = refiner.build_base_solve();
+        let mut solve = refiner.build_base_solve(false);
         solve.run();
         let analysis = refiner.closed_producer_analysis(&solve);
         let indirect = pag
@@ -7379,6 +7719,54 @@ mod tests {
     }
 
     #[test]
+    fn asymmetric_exact_endpoint_memcpy_keeps_closed_producer_incomplete() {
+        // Rewrite the existing two-field bulk-copy fixture so the source endpoint is its
+        // exact-zero field. C still treats the copy as whole-object, and the producer audit
+        // must therefore fail the destination root/fields incomplete rather than certifying
+        // the callback loaded from the destination's exact-zero field.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic/m1_4b/aggregate_copy_fnptr_table.pir.json");
+        let text = std::fs::read_to_string(path).unwrap();
+        let text = text.replace(
+            r#"{ "kind": "memcpy", "dst": "@lc", "src": "%lit", "bytes": 16 }"#,
+            r#"{ "kind": "memcpy", "dst": "@lc", "src": "%lit.intro", "bytes": 16 }"#,
+        );
+        let pir: Pir = serde_json::from_str(&text).unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let labels = BTreeSet::new();
+        let (base, classes) =
+            crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
+        let exact = BTreeMap::new();
+        let confined = BTreeSet::new();
+        let mut refiner = Refiner::new(
+            &pir,
+            &pag,
+            &classes,
+            &base,
+            BuildMode::Library,
+            u64::MAX,
+            &exact,
+            &confined,
+            false,
+        );
+        let mut solve = refiner.build_base_solve(true);
+        solve.run();
+        let analysis = refiner.closed_producer_analysis(&solve);
+        let operand = pag
+            .callsites
+            .iter()
+            .find(|callsite| callsite.kind == pangs_pag::CallKind::Indirect)
+            .and_then(|callsite| callsite.operand)
+            .expect("fixture indirect operand");
+        assert!(
+            !refiner
+                .query_closed_producer(&analysis, &solve, operand)
+                .complete,
+            "whole-object exact-endpoint memcpy must not receive a closed-producer certificate"
+        );
+    }
+
+    #[test]
     fn closed_consumer_certificate_clears_spurious_unknown_caller() {
         let (pir, pag) = load("closed_producer_compositional.pir.json");
         let labels = BTreeSet::new();
@@ -7386,22 +7774,25 @@ mod tests {
             crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
         // Model the class-level false positive this certificate is intended to override.
         base.unknown_callers.insert("target".to_string());
-        let result = finish_andersen_controlled(
-            &pir,
-            &pag,
-            &classes,
-            base,
-            BuildMode::Library,
-            u64::MAX,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-            false,
-            AndersenControls {
-                closed_consumers: true,
-                ..AndersenControls::default()
-            },
-        );
-        assert!(!result.unknown_callers.contains("target"));
+        for asymmetric_field_overlap in [false, true] {
+            let result = finish_andersen_controlled(
+                &pir,
+                &pag,
+                &classes,
+                base.clone(),
+                BuildMode::Library,
+                u64::MAX,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                false,
+                AndersenControls {
+                    asymmetric_field_overlap,
+                    closed_consumers: true,
+                    ..AndersenControls::default()
+                },
+            );
+            assert!(!result.unknown_callers.contains("target"));
+        }
     }
 
     #[test]
@@ -7411,6 +7802,38 @@ mod tests {
         let (mut base, classes) =
             crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
         base.unknown_callers.insert("target".to_string());
+        for asymmetric_field_overlap in [false, true] {
+            let result = finish_andersen_controlled(
+                &pir,
+                &pag,
+                &classes,
+                base.clone(),
+                BuildMode::Library,
+                u64::MAX,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                false,
+                AndersenControls {
+                    asymmetric_field_overlap,
+                    closed_consumers: true,
+                    ..AndersenControls::default()
+                },
+            );
+            assert!(result.unknown_callers.contains("target"));
+        }
+    }
+
+    #[test]
+    fn asymmetric_exported_field_callback_remains_an_unknown_external_consumer() {
+        // The exported root cell itself has no payload: the callback exists only in a
+        // materialized field. This exercises raw-root boundary traversal under C, including
+        // both certificates, without relying on process-global environment mutation.
+        let (pir, pag) = load_m1_4("exported_field_callback.pir.json");
+        let labels = BTreeSet::new();
+        let (mut base, classes) =
+            crate::solve_steensgaard_classes_targeted(&pir, &pag, BuildMode::Library, &labels);
+        base.unknown_callers.insert("cb".to_string());
+        base.unknown_callers.insert("local_cb".to_string());
         let result = finish_andersen_controlled(
             &pir,
             &pag,
@@ -7422,11 +7845,17 @@ mod tests {
             &BTreeSet::new(),
             false,
             AndersenControls {
+                asymmetric_field_overlap: true,
+                closed_producers: true,
                 closed_consumers: true,
                 ..AndersenControls::default()
             },
         );
-        assert!(result.unknown_callers.contains("target"));
+        assert!(result.unknown_callers.contains("cb"));
+        assert!(
+            !result.unknown_callers.contains("local_cb"),
+            "the unexported table must not inherit the exported table boundary"
+        );
     }
 
     #[test]
@@ -7724,6 +8153,163 @@ mod tests {
             solve.points_to(field).is_some_and(|set| set.contains(&4)),
             "whole-object access did not reach its field cell"
         );
+    }
+
+    #[test]
+    fn asymmetric_overlap_keeps_exact_siblings_isolated_but_unknown_reads_them() {
+        fn problem(asymmetric: bool) -> (bool, bool) {
+            let mut solve = Solve::new_with_pwc_and_overlap(10, false, false, asymmetric);
+            let root = 0;
+            let exact0 = solve.field_of(root, FieldLocation::Exact(0));
+            let exact8 = solve.field_of(root, FieldLocation::Exact(8));
+            let unknown = solve.unknown_field_of(root);
+            solve.add_pts(1, exact0);
+            solve.add_pts(2, unknown);
+            solve.add_pts(exact8, 9);
+            solve.add_load(1, 3);
+            solve.add_load(2, 4);
+            solve.run();
+            (
+                solve.points_to(3).is_some_and(|set| set.contains(&9)),
+                solve.points_to(4).is_some_and(|set| set.contains(&9)),
+            )
+        }
+
+        assert_eq!(
+            problem(false),
+            (true, true),
+            "baseline retains symmetric bridges"
+        );
+        assert_eq!(problem(true), (false, true));
+    }
+
+    #[test]
+    fn asymmetric_overlap_replays_a_late_exact_field_into_an_existing_read() {
+        let mut solve = Solve::new_with_pwc_and_overlap(10, false, false, true);
+        let unknown = solve.unknown_field_of(0);
+        solve.add_pts(1, unknown);
+        solve.add_load(1, 2);
+        solve.run();
+
+        let late = solve.field_of(0, FieldLocation::Exact(8));
+        solve.add_pts(late, 9);
+        solve.run();
+        assert!(solve.points_to(2).is_some_and(|set| set.contains(&9)));
+        assert!(solve.overlap_read_late_replays > 0);
+    }
+
+    #[test]
+    fn asymmetric_overlap_remaps_read_destination_after_copy_scc() {
+        let mut solve = Solve::new_with_pwc_and_overlap(12, false, false, true);
+        solve.scc_min_edges = 1;
+        let unknown = solve.unknown_field_of(0);
+        solve.add_pts(1, unknown);
+        solve.add_load(1, 3);
+        solve.add_copy(3, 4);
+        solve.add_copy(4, 3);
+        solve.run();
+        assert_eq!(solve.canonical(3), solve.canonical(4));
+
+        let late = solve.field_of(0, FieldLocation::Exact(8));
+        solve.add_pts(late, 10);
+        solve.run();
+        assert!(solve.points_to(3).is_some_and(|set| set.contains(&10)));
+        assert!(solve.points_to(4).is_some_and(|set| set.contains(&10)));
+    }
+
+    #[test]
+    fn asymmetric_memcpy_uses_whole_object_source_for_both_join_forms() {
+        for summarized in [false, true] {
+            let mut solve = Solve::new_with_pwc_and_overlap(16, false, false, true);
+            solve.memcpy_edge_summaries = summarized;
+            // Both endpoints are exact-zero fields.  A whole-object memcpy still transfers
+            // the pointer stored at byte 8 without relying on an Unknown cell bridge.
+            let source0 = solve.field_of(2, FieldLocation::Exact(0));
+            let source8 = solve.field_of(2, FieldLocation::Exact(8));
+            let destination0 = solve.field_of(3, FieldLocation::Exact(0));
+            let destination8 = solve.field_of(3, FieldLocation::Exact(8));
+            solve.add_pts(0, destination0);
+            solve.add_pts(1, source0);
+            solve.add_pts(source8, 12);
+            solve.add_memcpy(0, 1);
+            solve.add_pts(4, destination8);
+            solve.add_load(4, 5);
+            solve.run();
+            assert!(
+                solve.points_to(5).is_some_and(|set| set.contains(&12)),
+                "whole-object field memcpy lost byte-8 payload with summaries={summarized}"
+            );
+        }
+    }
+
+    #[test]
+    fn asymmetric_memcpy_replays_late_source_fields_for_direct_and_summary_joins() {
+        for summarized in [false, true] {
+            let mut solve = Solve::new_with_pwc_and_overlap(16, false, false, true);
+            solve.memcpy_edge_summaries = summarized;
+            solve.add_pts(0, 2);
+            solve.add_pts(1, 3);
+            solve.add_memcpy(0, 1);
+            solve.run();
+
+            let late_source = solve.field_of(3, FieldLocation::Exact(8));
+            let destination = solve.field_of(2, FieldLocation::Exact(8));
+            solve.add_pts(late_source, 12);
+            solve.add_pts(4, destination);
+            solve.add_load(4, 5);
+            solve.run();
+            assert!(
+                solve.points_to(5).is_some_and(|set| set.contains(&12)),
+                "late memcpy source field was not replayed with summaries={summarized}"
+            );
+        }
+    }
+
+    #[test]
+    fn asymmetric_unknown_and_whole_object_writes_reach_each_exact_read_without_cross_root_leakage()
+    {
+        let mut solve = Solve::new_with_pwc_and_overlap(16, false, false, true);
+        let exact_a = solve.field_of(0, FieldLocation::Exact(8));
+        let exact_b = solve.field_of(1, FieldLocation::Exact(8));
+        let unknown_a = solve.unknown_field_of(0);
+        solve.add_pts(2, exact_a);
+        solve.add_pts(3, exact_b);
+        solve.add_pts(4, unknown_a);
+        solve.add_pts(unknown_a, 12);
+        solve.add_pts(0, 13); // raw whole-object write
+        solve.add_load(2, 5);
+        solve.add_load(3, 6);
+        solve.add_load(4, 7);
+        solve.run();
+        assert!(solve
+            .points_to(5)
+            .is_some_and(|set| set.contains(&12) && set.contains(&13)));
+        assert!(solve
+            .points_to(7)
+            .is_some_and(|set| set.contains(&12) && set.contains(&13)));
+        assert!(solve
+            .points_to(6)
+            .is_none_or(|set| !set.contains(&12) && !set.contains(&13)));
+    }
+
+    #[test]
+    fn asymmetric_overlap_reads_lane_and_exact_in_both_directions() {
+        let lane = FieldLocation::Lane(pangs_pir::GepLane::new(16, 0).unwrap());
+        for reversed in [false, true] {
+            let mut solve = Solve::new_with_pwc_and_overlap(12, false, true, true);
+            let exact = solve.field_of(0, FieldLocation::Exact(0));
+            let lane_cell = solve.field_of(0, lane);
+            let (written, addressed) = if reversed {
+                (exact, lane_cell)
+            } else {
+                (lane_cell, exact)
+            };
+            solve.add_pts(1, addressed);
+            solve.add_pts(written, 10);
+            solve.add_load(1, 2);
+            solve.run();
+            assert!(solve.points_to(2).is_some_and(|set| set.contains(&10)));
+        }
     }
 
     #[test]
@@ -8340,13 +8926,13 @@ mod tests {
             baseline.unknown_field_of(0)
         );
 
-        let mut enabled = Solve::new_with_pwc(2, false, true);
+        let mut enabled = Solve::new_with_pwc_and_overlap(2, false, true, false);
         let field = enabled.field_of(0, FieldLocation::Lane(lane));
         let shifted_cell = enabled.field_of(field, FieldLocation::Exact(8));
         assert_eq!(enabled.field_location[&shifted_cell], shifted);
         assert_eq!(enabled.derived_lanes_admitted, 2);
 
-        let mut capped = Solve::new_with_pwc(2, false, true);
+        let mut capped = Solve::new_with_pwc_and_overlap(2, false, true, false);
         capped.lane_cap = Some(1);
         let field = capped.field_of(0, FieldLocation::Lane(lane));
         assert_eq!(
@@ -8359,7 +8945,7 @@ mod tests {
     #[test]
     fn pwc_lane_cycle_keeps_a_shifted_struct_member_without_fixed_vocabulary() {
         let lane = FieldLocation::Lane(pangs_pir::GepLane::new(24, 0).unwrap());
-        let mut solve = Solve::new_with_pwc(10, false, true);
+        let mut solve = Solve::new_with_pwc_and_overlap(10, false, true, false);
         solve.add_pts(1, 0); // base allocation
         solve.add_gep(1, lane, 2); // statically inferred pointer-walk lane
         solve.add_gep(2, lane, 2); // the PWC replay itself
@@ -8381,7 +8967,7 @@ mod tests {
         );
         assert!(solve.chain_lane_cap_collapses == 0);
 
-        let mut capped = Solve::new_with_pwc(10, false, true);
+        let mut capped = Solve::new_with_pwc_and_overlap(10, false, true, false);
         capped.lane_cap = Some(1);
         capped.add_pts(1, 0);
         capped.add_gep(1, lane, 2);
@@ -8548,7 +9134,7 @@ mod tests {
             base.indirect_calls[0].unknown_callee,
             "the context-insensitive container should carry the forged payload to the call"
         );
-        refiner.receiver_payload_ops = operations;
+        refiner.receiver_payload_ops = operations.clone();
         refiner.receiver_payload_origins = super::bounded_allocation_origins(
             &pag,
             super::knobs::ANDERSEN_RECEIVER_PAYLOAD_ORIGIN_LIMIT,
@@ -8560,6 +9146,75 @@ mod tests {
         };
         assert_eq!(output.indirect_calls[0].targets, vec!["target".to_string()]);
         assert!(!output.indirect_calls[0].unknown_callee);
+
+        let mut asymmetric_refiner = Refiner::new(
+            &pir,
+            &pag,
+            &classes,
+            &base,
+            BuildMode::Library,
+            u64::MAX,
+            &exact_targets,
+            &confined_targets,
+            false,
+        );
+        asymmetric_refiner.receiver_payload_ops = operations.clone();
+        asymmetric_refiner.receiver_payload_origins = super::bounded_allocation_origins(
+            &pag,
+            super::knobs::ANDERSEN_RECEIVER_PAYLOAD_ORIGIN_LIMIT,
+        );
+        asymmetric_refiner.build_scope();
+        let super::RefinerOutcome::Complete(output) = asymmetric_refiner.run(AndersenControls {
+            asymmetric_field_overlap: true,
+            closed_producers: true,
+            closed_consumers: true,
+            ..AndersenControls::default()
+        }) else {
+            panic!("receiver payload regression unexpectedly exhausted")
+        };
+        assert_eq!(output.indirect_calls[0].targets, vec!["target".to_string()]);
+        assert!(
+            output.indirect_calls[0].unknown_callee,
+            "C keeps receiver-payload certificates incomplete until the synthetic producer proof is implemented"
+        );
+
+        // Aggregate global export must include the receiver-local synthetic payload cell,
+        // which is not in the ordinary `field_of` inventory.
+        let mut aggregate_refiner = Refiner::new(
+            &pir,
+            &pag,
+            &classes,
+            &base,
+            BuildMode::Library,
+            u64::MAX,
+            &exact_targets,
+            &confined_targets,
+            false,
+        );
+        aggregate_refiner.receiver_payload_ops = operations;
+        aggregate_refiner.receiver_payload_origins = super::bounded_allocation_origins(
+            &pag,
+            super::knobs::ANDERSEN_RECEIVER_PAYLOAD_ORIGIN_LIMIT,
+        );
+        aggregate_refiner.build_scope();
+        let mut aggregate = aggregate_refiner.build_base_solve(true);
+        aggregate.run();
+        let globals = aggregate_refiner
+            .emit_global_points_to(&aggregate)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            globals
+                .get("obj:global:map_a")
+                .is_some_and(|allocs| allocs.contains("target")),
+            "global aggregate export omitted receiver payload callback"
+        );
+        assert!(
+            globals
+                .get("obj:global:map_b")
+                .is_none_or(|allocs| !allocs.contains("target")),
+            "receiver payload roots leaked into one another"
+        );
     }
 
     #[test]

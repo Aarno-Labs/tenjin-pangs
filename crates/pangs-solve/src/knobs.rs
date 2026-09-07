@@ -133,6 +133,12 @@ pub(crate) const ENV_ANDERSEN_COPY_SCC_MIN_EDGES: &str = "PANGS_ANDERSEN_COPY_SC
 /// Overrides the per-allocation lane vocabulary cap for the opt-in PWC experiment.
 pub(crate) const ENV_ANDERSEN_PWC_LANE_CAP: &str = "PANGS_ANDERSEN_PWC_LANE_CAP";
 
+/// Enables the opt-in asymmetric interpretation of reads from materialized allocation
+/// fields. Writes retain their raw destination; loads and memcpy sources read directly
+/// overlapping locations only.
+pub(crate) const ENV_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP: &str =
+    "PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP";
+
 /// Disables Andersen copy-graph SCC collapsing when present.
 pub(crate) const ENV_ANDERSEN_DISABLE_COPY_SCC: &str = "PANGS_ANDERSEN_DISABLE_COPY_SCC";
 

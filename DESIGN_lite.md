@@ -172,8 +172,14 @@ equivalence class verbatim as its admission unit: it builds an independent const
 prepartition graph and uses Steensgaard at cut boundaries.
 
 Load and store use one-hop target equations rather than unifying a value carrier with a storage
-location: `P(V(load)) ≡ P(S(address))` and `P(S(address)) ≡ P(V(value))`. Unknown-root GEP and
-memcpy use the same target primitive. Directed content edges carry external and null
+location: `P(V(load)) ≡ P(S(address))` and `P(S(address)) ≡ P(V(value))`. Memcpy uses the
+same target primitive. Uncertified GEPs retain displacement subscriptions on source
+pointee classes and replay when address alternatives arrive. Ordinary data allocations
+start at root-relative Exact(0); unbound placeholders defer nonzero shifts. Exact shifts
+use the fixed vocabulary, derived lanes have a per-root cap of 256, and overflow widens
+to that allocation's Unknown region. A nonzero exact self-cycle widens directly to its
+inevitable Unknown result. Genuine summary alternatives are retained conservatively.
+Directed content edges carry external and null
 facts along those value transfers. Consequently every union-find class contains either value-like
 carriers or locations (object, pointee, and field classes), never both; debug builds assert this
 carrier/location invariant after every solve.
@@ -442,6 +448,16 @@ occurs in the fixed PAG's finite location vocabulary. Other nested or recursive 
 route to the root's unknown summary rather than creating an unbounded field-of-field
 chain. Receiver payload summaries reuse this same `Exact`/`Lane`/`Unknown`
 `FieldLocation` domain; they do not introduce a second layout model.
+
+Two experiments remain opt-in. `PANGS_PAG_PWC_LANES=1` rewrites fixed-PAG nonzero
+copy/GEP cycles to affine lanes and permits bounded derived lanes (256 per root by
+default). `PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP=1` replaces symmetric field bridges
+with raw-cell stores and persistent, directly overlapping memory reads. Late fields
+replay these reads; memcpy remains conservatively whole-object. Value queries remain
+raw, while boundary traversal and global exports include allocation field inventories.
+Receiver payloads retain a separate root-local inventory; C plus receiver summaries
+conservatively disables completeness certificates until their full proof is implemented.
+Neither experiment is promoted. See `20260907_ASYMMETRIC_OVERLAP_EVALUATION.md`.
 
 C' uses the same exact/lane/unknown distinction for independently rooted GEPs. Its classes
 are intentionally coarser than D's inclusion sets, but field contents no longer merge

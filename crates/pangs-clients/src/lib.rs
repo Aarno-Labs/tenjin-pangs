@@ -113,6 +113,10 @@ pub fn export_analysis(
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(256),
+        asymmetric_field_overlap_enabled: matches!(
+            std::env::var("PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP").as_deref(),
+            Ok("1") | Ok("true")
+        ),
         files,
         wall_ms: pipeline_started.elapsed().as_millis() as u64,
     };
@@ -524,6 +528,15 @@ pub fn assemble_disposition_artifacts(
                 entry_spine,
                 extra: BTreeMap::from([
                     ("phase_stationarity_report".into(), phase_report),
+                    (
+                        "asymmetric_field_overlap".into(),
+                        serde_json::json!({
+                            "enabled": matches!(
+                                std::env::var("PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP").as_deref(),
+                                Ok("1") | Ok("true")
+                            ),
+                        }),
+                    ),
                     (
                         "pwc_lanes".into(),
                         serde_json::json!({
@@ -3865,6 +3878,8 @@ struct Manifest<'a> {
     pwc_lane_cap: Option<usize>,
     /// Resolved cap used by the solver, including its compiled default.
     pwc_lane_cap_effective: usize,
+    /// Effective process-wide opt-in setting for overlap-aware memory reads.
+    asymmetric_field_overlap_enabled: bool,
     files: Vec<FileRecord>,
     wall_ms: u64,
 }

@@ -2205,6 +2205,10 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         disposition["run"]["analysis"]["pwc_lanes"]["lane_cap_effective"], 256,
         "the default derived-lane cap is part of the reproducible run configuration"
     );
+    assert_eq!(
+        disposition["run"]["analysis"]["asymmetric_field_overlap"]["enabled"], false,
+        "default analysis should leave asymmetric field overlap disabled"
+    );
     assert!(out.join("pangs-audit.json").exists());
     let export_index: Value =
         serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
@@ -2239,7 +2243,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "3fc25bc37077247026158f1afebc298857f258b600f7b644abf2e7db704058f9"
+        "02ea7ed08a27995f5f694cf4e92d5a20e1da51557efabe8ff434e2f970388ba9"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(

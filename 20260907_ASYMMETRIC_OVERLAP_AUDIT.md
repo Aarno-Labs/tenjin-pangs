@@ -1,7 +1,8 @@
 # Asymmetric overlap: implementation audit
 
 2026-09-07. This is the consumer checklist for work item C in
-`20260904_STRIDE_FIELDS.md`, not a claim that C is implemented or promoted.
+`20260904_STRIDE_FIELDS.md`. C is now implemented opt-in, not promoted; the companion
+`20260907_ASYMMETRIC_OVERLAP_EVALUATION.md` records validation and remaining gates.
 The first dependency is the Steensgaard one-hop offset correction; the static
 stride experiment remains opt-in until its promotion gates pass.
 
@@ -57,3 +58,14 @@ For C evaluation, hold the static stride setting fixed. Record the effective C f
 read dependency count, overlap pairs installed, late replay work, and index size.
 Compare full client facts and witnesses, not just disposition histograms. Every
 removed real write or callback is a failure; a smaller answer alone proves nothing.
+
+## Implemented consumer decisions
+
+The C path retains the raw/value distinction above. `content_fields` combines ordinary
+and receiver-payload inventories for boundary and global aggregate enumeration; the
+inventories survive propagation-state release. Receiver payload return reads union
+directly overlapping locations after collecting all synthetic payload cells, without
+connecting the raw payload cells to one another. Completeness certificates are
+conservatively disabled for C when receiver summaries are active, including the
+receiver-specific unknown-clearing shortcut. This proof limitation remains explicit
+even though positive callback target discovery and aggregate exports are tested.

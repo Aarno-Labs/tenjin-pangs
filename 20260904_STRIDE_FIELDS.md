@@ -7,10 +7,14 @@ self-contained for the work items; the design rationale is in the note.*
 ## 0. Status and goal
 
 2026-09-07: A is implemented experimentally behind `PANGS_PAG_PWC_LANES=1` and its four-module
-evaluation is complete. It is not promoted because the one-hop Steensgaard soundness dependency
-remains open. B is skipped:
-the measured residual exact-chain/GEP ratios are below its 10% trigger. C remains gated on A
-promotion. See `20260907_STRIDE_FIELDS_EVALUATION.md` for the current ledger. Three work items,
+evaluation is complete. It is not promoted. The one-hop Steensgaard correction is now
+implemented separately, with regression and performance evaluation recorded in
+`20260907_ONE_HOP_OFFSET_EVALUATION.md`. B is skipped:
+the measured residual exact-chain/GEP ratios are below its 10% trigger. C is implemented
+experimentally and evaluated with A held enabled; see
+`20260907_ASYMMETRIC_OVERLAP_EVALUATION.md`. Development sequencing has been relaxed to
+allow this opt-in experiment before A promotion; promotion gates have not been relaxed.
+See `20260907_STRIDE_FIELDS_EVALUATION.md` for A's original ledger. Three work items,
 each behind a knob and each promoted to default only after the
 evaluation in §5 passes. A includes the bounded domain needed to represent its results; B is
 conditional, and C is a separate change evaluated after A:
@@ -387,8 +391,10 @@ it does not establish a wall-time ceiling or guarantee the paper's 7× speedup.
   pass a differential check, so agreement is not an independent soundness proof.
 - `cargo test --workspace --all-targets`, including explicit expected writes/targets,
   overflow, replay, and late-cell tests. Inspect every re-baselined golden row.
-- Indirect calls: use `pangs icall-census` before/after and classify added/removed targets and
-  changes in `unknown_callee`. A/B may widen or narrow relative to the old configuration;
+- Indirect calls: use `pangs icall-census` before/after for target counts and
+  `unknown_callee` status, and compare callgraph exports for actual target identities.
+  Equal counts do not rule out exchanged targets. Classify added/removed targets.
+  A/B may widen or narrow relative to the old configuration;
   justify losses and measure their client cost. Removed targets require evidence that they
   are infeasible, not merely a subset check. For C with the same field domain, narrowing is
   expected, but still does not prove soundness.

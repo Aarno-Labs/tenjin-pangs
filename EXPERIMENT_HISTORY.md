@@ -807,3 +807,27 @@ The durable ledger is in
 [20260907_STRIDE_FIELDS_EVALUATION.md](20260907_STRIDE_FIELDS_EVALUATION.md). Compact logs are in
 `/tmp/pangs-stride-a/` and `/tmp/pangs-stride-final.myu2Gp/`; large Vim exports were temporary.
 Timing comparisons are single runs on a shared machine, not repeatable speedup claims.
+
+### One-hop correction and opt-in asymmetric overlap (2026-09-07)
+
+The next change corrects uncertified Steensgaard GEPs with persistent root-relative
+replay, deferred unbound placeholders, a fixed exact vocabulary, bounded derived lanes,
+and allocation-local Unknown fallback. The four known defective modules now pass
+differential checks, eliminating the 32 missing-write discrepancies. This correction
+has material performance costs; its prototype and retained-candidate ledger is in
+[20260907_ONE_HOP_OFFSET_EVALUATION.md](20260907_ONE_HOP_OFFSET_EVALUATION.md).
+
+Work item C is now implemented behind `PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP=1`.
+This relaxes the earlier development ordering, not the default-promotion gates.
+Raw-cell stores and persistent overlap reads replace symmetric field bridges only on
+the enabled path. Memcpy stays whole-object; certificates, boundary traversal, and
+receiver payload/global consumers have explicit treatments and regression coverage.
+Receiver completeness proofs remain conservatively disabled in the combined C mode.
+The retained prerequisite also exposes 26 Vim unknown-call monotonicity discrepancies
+with C off; these remain a blocker, not a passed soundness gate.
+
+With static PWC lanes held on, initial paired tmux and jq measurements sharply reduce
+copy fact work while preserving complete disposition records; SQLite's smaller work
+reduction does not improve measured wall time. Both flags remain opt-in. The current
+measurement and correctness ledger, including limitations, is in
+[20260907_ASYMMETRIC_OVERLAP_EVALUATION.md](20260907_ASYMMETRIC_OVERLAP_EVALUATION.md).
