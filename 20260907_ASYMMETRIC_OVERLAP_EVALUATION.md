@@ -160,3 +160,9 @@ assertion is not proof of a whole-allocation boundary and was not retained as a 
 Loss of a storage-identity external envelope during shifting is a hypothesis, not
 the established cause of the 26 corpus discrepancies; no blanket sibling `ext`
 propagation was applied.
+
+Follow-up: `20260907_CALLBACK_ESCAPE_REPRODUCTION.md` now gives a semantic reproducer
+and controls. Publishing the aggregate address through memory defeats the exact-address
+escape hook: the owner escapes but its field-8 callback does not. This confirms a
+specific missing allocation escape envelope, not blanket sibling `ext` propagation,
+and has not yet been traced to all 26 Vim sites. No fix is included with the reproducer.

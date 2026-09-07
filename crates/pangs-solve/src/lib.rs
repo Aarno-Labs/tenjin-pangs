@@ -5662,6 +5662,176 @@ mod tests {
     }
 
     #[test]
+    fn semantic_callback_boundaries_characterize_republished_escape_gap() {
+        use serde_json::json;
+        // Characterization of a known defect, not a claim that the false Steensgaard
+        // unknown bit in the two republished cases is sound. Foreign code may overwrite
+        // field 8 in both direct and republished cases. No solver state is injected.
+        for case in [
+            "escaped",
+            "escaped-published",
+            "escaped-published-shifted",
+            "payload",
+            "identity",
+            "identity-shifted",
+        ] {
+            let mut body = vec![
+                json!({"kind":"gep","dest":"zero","base":"@aggregate","byte_off":0}),
+                json!({"kind":"gep","dest":"member","base":"@aggregate","byte_off":8}),
+                json!({"kind":"store","address":"member","value":"cb","access_bytes":8}),
+            ];
+            if case.starts_with("escaped") {
+                if case.starts_with("escaped-published") {
+                    body.push(json!({"kind":"store","address":"@slot","value":"@aggregate","access_bytes":8}));
+                    body.push(json!({"kind":"load","dest":"published","address":"@slot","access_bytes":8}));
+                }
+                body.push(json!({"kind":"call_direct","callee":"foreign_use",
+                    "sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"args":[if case.starts_with("escaped-published") { "published" } else { "@aggregate" }]}));
+                if case == "escaped-published-shifted" {
+                    body.push(
+                        json!({"kind":"gep","dest":"shifted","base":"published","byte_off":8}),
+                    );
+                }
+            } else {
+                body.push(json!({"kind":"call_direct","callee":"foreign_ptr",
+                    "sig":{"ret":{"class":"integer"},"params":[]},"args":[],"dest":"foreign"}));
+                if case == "payload" {
+                    body.push(
+                        json!({"kind":"store","address":"zero","value":"foreign","access_bytes":8}),
+                    );
+                    body.push(json!({"kind":"load","dest":"payload_read","address":"zero","access_bytes":8}));
+                } else {
+                    body.push(json!({"kind":"assign","dest":"mixed","sources":["zero","foreign"]}));
+                    // Distinct address carrier for the same allocation, not a copy of mixed.
+                    body.push(
+                        json!({"kind":"gep","dest":"independent","base":"@aggregate","byte_off":0}),
+                    );
+                    body.push(json!({"kind":"gep","dest":"shifted","base":if case == "identity-shifted" { "mixed" } else { "independent" },"byte_off":8}));
+                }
+            }
+            body.extend([
+                json!({"kind":"load","dest":"callback","address":if case.starts_with("identity") || case == "escaped-published-shifted" { "shifted" } else { "member" },"access_bytes":8}),
+                json!({"kind":"call_indirect","operand":"callback","sig":{"ret":{"class":"void"},"params":[]},"args":[]}),
+            ]);
+            let mut pir: Pir = serde_json::from_value(json!({
+                "module":case,"globals":[{"key":"@aggregate"},{"key":"@slot"}],
+                "functions":[
+                    {"key":"cb","address_taken":true,"sig":{"ret":{"class":"void"},"params":[]},"body":[]},
+                    {"key":"foreign_use","external":true,"sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},"body":[]},
+                    {"key":"foreign_ptr","external":true,"sig":{"ret":{"class":"integer"},"params":[]},"body":[]},
+                    {"key":"main","sig":{"ret":{"class":"void"},"params":[]},"body":body}
+                ]
+            })).unwrap();
+            for name in [
+                "zero",
+                "member",
+                "foreign",
+                "mixed",
+                "independent",
+                "shifted",
+                "callback",
+                "published",
+                "payload_read",
+            ] {
+                pir.lowering
+                    .semantic_value_kinds
+                    .insert(name.into(), ValueKind::Pointer);
+            }
+            let pag = Pag::from_pir(&pir, &PagOpts::default());
+            let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
+            solver.run();
+            if case.starts_with("identity") {
+                let owner = pag
+                    .nodes
+                    .iter()
+                    .find(|node| node.label == "obj:global:@aggregate")
+                    .unwrap()
+                    .id;
+                let owner = solver.class_of(owner);
+                assert!(
+                    solver.classes[owner].ext,
+                    "{case}: the allocation-location class must actually carry external identity"
+                );
+            }
+            if case.starts_with("escaped") {
+                let node = |label: &str| {
+                    pag.nodes
+                        .iter()
+                        .find(|node| node.label == label)
+                        .unwrap()
+                        .id
+                };
+                let owner = node("obj:global:@aggregate");
+                let owner_class = solver.class_of(owner);
+                let member = solver.class_of(node("val:main:member"));
+                let field = solver.classes[member].pointee.unwrap();
+                let field = solver.find(field);
+                assert!(
+                    solver.classes[owner_class].esc,
+                    "{case}: allocation itself must escape"
+                );
+                let direct = case == "escaped";
+                assert_eq!(
+                    solver.classes[field].esc, direct,
+                    "{case}: characterized field escape gap"
+                );
+                assert_eq!(
+                    solver.field_escape_sources_by_root.contains_key(&owner),
+                    direct
+                );
+                if !direct {
+                    assert!(
+                        solver.exact_addresses[node("val:main:published").0 as usize].is_none()
+                    );
+                }
+            }
+            for (tier, solved) in [
+                ("steens", solver.finish()),
+                (
+                    "andersen",
+                    solve_andersen(&pir, &pag, BuildMode::Executable, u64::MAX),
+                ),
+            ] {
+                assert_eq!(solved.indirect_calls.len(), 1);
+                let call = &solved.indirect_calls[0];
+                assert_eq!(
+                    call.targets,
+                    ["cb"],
+                    "{case} {tier}: known callback must remain reachable"
+                );
+                let unknown = case == "escaped"
+                    || case == "identity-shifted"
+                    || (tier == "andersen" && case.starts_with("escaped-published"));
+                assert_eq!(call.unknown_callee, unknown, "{case} {tier}");
+                if case == "payload" {
+                    assert!(solved.nodes["val:main:payload_read"].external);
+                    assert!(!solved.nodes["val:main:callback"].external);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn republished_aggregate_callback_fixture_reproduces_unknown_mismatch() {
+        // Kept outside the all-green synthetic corpus: this is an executable known-bug
+        // reproducer. Update this characterization when the escape-closure defect is fixed.
+        let pir = Pir::from_path(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/reproducers/republished_aggregate_callback.pir.json"),
+        )
+        .unwrap();
+        let pag = Pag::from_pir(&pir, &PagOpts::default());
+        let steens = solve_steensgaard(&pir, &pag, BuildMode::Executable);
+        let andersen = solve_andersen(&pir, &pag, BuildMode::Executable, u64::MAX);
+        assert_eq!(steens.indirect_calls.len(), 1);
+        assert_eq!(andersen.indirect_calls.len(), 1);
+        assert_eq!(steens.indirect_calls[0].targets, ["cb"]);
+        assert_eq!(andersen.indirect_calls[0].targets, ["cb"]);
+        assert!(!steens.indirect_calls[0].unknown_callee, "known defect stopped reproducing; require the sound true result in the repaired regression");
+        assert!(andersen.indirect_calls[0].unknown_callee);
+    }
+
+    #[test]
     fn external_pointer_boundary_survives_gep_in_steens_envelope() {
         let mut pir: Pir = serde_json::from_str(
             r#"{
