@@ -5650,6 +5650,8 @@ int call_reader(void) { return read_pointer(&target); }
         // Andersen only.  Steensgaard misses this write outright and produces no row at all,
         // so there is nothing here to fail closed on; that base-tier gap is separate and still
         // open, and the differential ledger's `written_globals` rule is what reports it.
+        // `20260907_STEENS_ONE_HOP_OFFSET_HANDLING.md` proposes the fix; when it lands, add
+        // `Stage::Steens` back to this loop.
         for stage in [Stage::Andersen] {
             let (analysis, manifest) =
                 disposition_fixture_artifacts("republished_aggregate_write.ll", stage);
