@@ -21,6 +21,10 @@ pub struct PagOpts {
     pub exports: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub safe_indirect_vararg_callsites: BTreeSet<String>,
+    /// Infer affine lanes for constant-offset GEPs in fixed-PAG positive-weight cycles.
+    /// This experiment is deliberately opt-in until its corpus and soundness gates pass.
+    #[serde(default)]
+    pub pwc_lanes: bool,
 }
 
 /// Policy for otherwise fail-closed LLVM integer/pointer operations.
@@ -71,11 +75,187 @@ pub struct Pag {
     /// `IntToPtr` as an Ω source unless the stricter lossless-round-trip proof also succeeds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pointer_integer_origins: Vec<PointerIntegerOrigin>,
+    /// True when this in-memory PAG was rewritten by the opt-in static PWC experiment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pwc_lanes_enabled: bool,
 }
 
 impl Pag {
     pub fn from_pir(pir: &Pir, opts: &PagOpts) -> Self {
-        Builder::new(pir, opts).build()
+        let mut pag = Builder::new(pir, opts).build();
+        if opts.pwc_lanes || knobs::pwc_lanes_enabled() {
+            pag.infer_pwc_lanes();
+        }
+        pag
+    }
+
+    /// Replace constant GEPs that participate in a non-zero displacement copy/GEP SCC with
+    /// conservative affine lanes.  Only internal edges change; callers and the allocation
+    /// address proof continue to see the same graph topology.
+    pub fn infer_pwc_lanes(&mut self) {
+        self.pwc_lanes_enabled = true;
+        let n = self.nodes.len();
+        let mut arcs = Vec::<(usize, usize, Option<i64>, Option<GepLane>, usize)>::new();
+        for (index, edge) in self.edges.iter().enumerate() {
+            match edge.kind {
+                EdgeKind::Assign => arcs.push((
+                    edge.src.0 as usize,
+                    edge.dst.0 as usize,
+                    Some(0),
+                    None,
+                    index,
+                )),
+                EdgeKind::Gep { byte_off, lane } => arcs.push((
+                    edge.src.0 as usize,
+                    edge.dst.0 as usize,
+                    byte_off,
+                    lane,
+                    index,
+                )),
+                _ => {}
+            }
+        }
+        let bare_edges = arcs.iter().map(|&(u, v, ..)| (u, v)).collect::<Vec<_>>();
+        let (component, sizes) = directed_sccs(n, &bare_edges);
+        let mut internal_by_component = vec![Vec::new(); sizes.len()];
+        for arc @ (u, v, ..) in arcs {
+            if component[u] == component[v] {
+                internal_by_component[component[u]].push(arc);
+            }
+        }
+        for internal in internal_by_component {
+            if !internal.iter().any(|&(_, _, _, _, edge_index)| {
+                matches!(self.edges[edge_index].kind, EdgeKind::Gep { .. })
+            }) {
+                continue;
+            }
+            self.metrics.pwc_sccs_examined += 1;
+            if internal
+                .iter()
+                .any(|(_, _, byte_off, lane, _)| byte_off.is_none() && lane.is_none())
+            {
+                self.metrics.pwc_unknown_sccs_skipped += 1;
+                continue;
+            }
+            let has_lane = internal.iter().any(|(_, _, _, lane, _)| lane.is_some());
+            let modulus = if has_lane {
+                self.metrics.pwc_lane_sccs_coarsened += 1;
+                internal
+                    .iter()
+                    .fold(0_u128, |g, &(_, _, byte_off, lane, _)| {
+                        let value = match lane {
+                            Some(lane) => gcd_u128(
+                                u128::from(lane.modulus),
+                                u128::from(lane.residue.unsigned_abs()),
+                            ),
+                            None => {
+                                u128::from(byte_off.expect("known constant GEP").unsigned_abs())
+                            }
+                        };
+                        gcd_u128(g, value)
+                    })
+            } else {
+                // Use SCC-local maps: allocating a node-sized potential table for every PWC
+                // SCC is prohibitive on large modules with hundreds of small cycles.
+                let mut outgoing = BTreeMap::<usize, Vec<(usize, i128)>>::new();
+                let mut start = None;
+                for &(u, v, byte_off, _, _) in &internal {
+                    let weight = byte_off.expect("constant-only SCC");
+                    // The reverse edge only builds an undirected spanning tree to assign a
+                    // potential to every SCC member; residuals are still checked solely on
+                    // original directed edges.
+                    outgoing.entry(u).or_default().push((v, i128::from(weight)));
+                    outgoing
+                        .entry(v)
+                        .or_default()
+                        .push((u, -i128::from(weight)));
+                    start = Some(start.map_or(u, |old: usize| old.min(u)));
+                }
+                let Some(start) = start else { continue };
+                let mut potentials = BTreeMap::<usize, i128>::new();
+                potentials.insert(start, 0);
+                let mut stack = vec![start];
+                let mut overflowed = false;
+                while let Some(u) = stack.pop() {
+                    let h = potentials[&u];
+                    for &(v, weight) in outgoing.get(&u).into_iter().flatten() {
+                        if !potentials.contains_key(&v) {
+                            let Some(value) = h.checked_add(weight) else {
+                                overflowed = true;
+                                break;
+                            };
+                            potentials.insert(v, value);
+                            stack.push(v);
+                        }
+                    }
+                    if overflowed {
+                        break;
+                    }
+                }
+                if overflowed
+                    || internal.iter().any(|&(u, v, _, _, _)| {
+                        !potentials.contains_key(&u) || !potentials.contains_key(&v)
+                    })
+                {
+                    self.metrics.pwc_arithmetic_sccs_skipped += 1;
+                    continue;
+                }
+                let mut gcd = 0_u128;
+                for &(u, v, byte_off, _, _) in &internal {
+                    let Some(residual) = potentials[&u]
+                        .checked_add(i128::from(byte_off.expect("constant GEP")))
+                        .and_then(|x| x.checked_sub(potentials[&v]))
+                    else {
+                        overflowed = true;
+                        break;
+                    };
+                    gcd = gcd_u128(gcd, residual.unsigned_abs());
+                }
+                if overflowed {
+                    self.metrics.pwc_arithmetic_sccs_skipped += 1;
+                    continue;
+                }
+                gcd
+            };
+            if modulus == 0 {
+                self.metrics.pwc_zero_cycle_sccs_skipped += 1;
+                continue;
+            }
+            let Ok(modulus) = u64::try_from(modulus) else {
+                self.metrics.pwc_arithmetic_sccs_skipped += 1;
+                continue;
+            };
+            if i64::try_from(modulus).is_err() {
+                self.metrics.pwc_arithmetic_sccs_skipped += 1;
+                continue;
+            }
+            self.metrics.pwc_nonzero_cycle_sccs += 1;
+            *self
+                .metrics
+                .pwc_modulus_histogram
+                .entry(modulus)
+                .or_default() += 1;
+            for (_, _, byte_off, lane, edge_index) in internal {
+                let offset = match (byte_off, lane) {
+                    (Some(offset), _) if offset != 0 => offset,
+                    (_, Some(lane)) => lane.residue,
+                    _ => continue,
+                };
+                if let Some(lane) = GepLane::new(modulus, offset) {
+                    if let EdgeKind::Gep {
+                        byte_off,
+                        lane: edge_lane,
+                    } = &mut self.edges[edge_index].kind
+                    {
+                        *byte_off = None;
+                        *edge_lane = Some(lane);
+                        self.metrics.pwc_edges_rewritten += 1;
+                    }
+                } else {
+                    self.metrics.pwc_arithmetic_sccs_skipped += 1;
+                }
+            }
+        }
     }
 
     pub fn metrics(&self) -> &PagMetrics {
@@ -251,6 +431,7 @@ impl Pag {
             callsites,
             omega_seeds,
             pointer_integer_origins,
+            pwc_lanes_enabled: self.pwc_lanes_enabled,
         }
     }
 
@@ -518,6 +699,86 @@ pub struct PagMetrics {
     /// Relaxed values returned from their defining function.
     #[serde(default)]
     pub assumed_tag_returned: usize,
+    /// Static assign/GEP SCCs examined by the opt-in positive-weight-cycle rewrite.
+    #[serde(default)]
+    pub pwc_sccs_examined: usize,
+    #[serde(default)]
+    pub pwc_nonzero_cycle_sccs: usize,
+    #[serde(default)]
+    pub pwc_zero_cycle_sccs_skipped: usize,
+    #[serde(default)]
+    pub pwc_lane_sccs_coarsened: usize,
+    #[serde(default)]
+    pub pwc_unknown_sccs_skipped: usize,
+    #[serde(default)]
+    pub pwc_arithmetic_sccs_skipped: usize,
+    #[serde(default)]
+    pub pwc_edges_rewritten: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pwc_modulus_histogram: BTreeMap<u64, usize>,
+}
+
+fn gcd_u128(mut lhs: u128, mut rhs: u128) -> u128 {
+    while rhs != 0 {
+        (lhs, rhs) = (rhs, lhs % rhs);
+    }
+    lhs
+}
+
+/// Iterative Kosaraju: PAGs can contain deeply inlined CFGs, so never recurse here.
+fn directed_sccs(nodes: usize, edges: &[(usize, usize)]) -> (Vec<usize>, Vec<usize>) {
+    let mut forward = vec![Vec::new(); nodes];
+    let mut reverse = vec![Vec::new(); nodes];
+    for &(source, destination) in edges {
+        if source < nodes && destination < nodes {
+            forward[source].push(destination);
+            reverse[destination].push(source);
+        }
+    }
+    let mut seen = vec![false; nodes];
+    let mut order = Vec::with_capacity(nodes);
+    for start in 0..nodes {
+        if seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![(start, 0_usize)];
+        while let Some((node, next)) = stack.last_mut() {
+            if *next < forward[*node].len() {
+                let successor = forward[*node][*next];
+                *next += 1;
+                if !seen[successor] {
+                    seen[successor] = true;
+                    stack.push((successor, 0));
+                }
+            } else {
+                order.push(*node);
+                stack.pop();
+            }
+        }
+    }
+    let mut component = vec![usize::MAX; nodes];
+    let mut sizes = Vec::new();
+    for start in order.into_iter().rev() {
+        if component[start] != usize::MAX {
+            continue;
+        }
+        let id = sizes.len();
+        let mut count = 0;
+        let mut stack = vec![start];
+        component[start] = id;
+        while let Some(node) = stack.pop() {
+            count += 1;
+            for &predecessor in &reverse[node] {
+                if component[predecessor] == usize::MAX {
+                    component[predecessor] = id;
+                    stack.push(predecessor);
+                }
+            }
+        }
+        sizes.push(count);
+    }
+    (component, sizes)
 }
 
 impl PagMetrics {
@@ -1738,6 +1999,7 @@ impl<'a> Builder<'a> {
             callsites: self.callsites,
             omega_seeds: self.omega_seeds,
             pointer_integer_origins: self.pointer_integer_origins,
+            pwc_lanes_enabled: false,
         }
     }
 
@@ -3135,8 +3397,6 @@ pub fn positionally_modeled_vararg_functions(pir: &Pir, opts: &PagOpts) -> BTree
         .map(|func| func.key.clone())
         .collect()
 }
-
-
 /// Whether this direct variadic call has a proved pointer-safe ABI boundary. Project-specific
 /// wrappers retain their inspected whole-function contracts. Standard printf-family calls are
 /// accepted only when every constant LLVM byte string selected by the format operand contains no
@@ -4411,12 +4671,206 @@ fn is_exported_global(marked: bool, key: &str, opts: &PagOpts) -> bool {
 mod tests {
     use super::{
         allocation_storage_roots, direct_vararg_call_is_benign, proven_external_call_contract,
-        trusted_free_call, CallKind, Edge, EdgeId, EdgeKind, IntegerPointerPolicy, NodeKind,
-        ObjectKind, OmegaSeedKind, Owner, Pag, PagOpts, PointerIntegerOrigin, SeedTarget,
-        StorageRoot, StorageRootState, VarargCallProof,
+        trusted_free_call, CallKind, Edge, EdgeId, EdgeKind, GepLane, IntegerPointerPolicy, Node,
+        NodeId, NodeKind, ObjectKind, OmegaSeedKind, Owner, Pag, PagOpts, PointerIntegerOrigin,
+        Scope, SeedTarget, StorageRoot, StorageRootState, VarargCallProof,
     };
     use pangs_pir::{ExternalArgEffect, Global, Pir, Stmt, ValueKind};
     use std::collections::BTreeSet;
+
+    fn pwc_test_pag(weights: &[i64]) -> Pag {
+        let nodes = (0..weights.len())
+            .map(|index| Node {
+                id: NodeId(index as u32),
+                label: format!("%{index}"),
+                kind: NodeKind::Value {
+                    scope: Scope::Module,
+                },
+                value_kind: ValueKind::Pointer,
+                canonical_pointer_null: false,
+                has_empty_witness: false,
+            })
+            .collect::<Vec<_>>();
+        let edges = weights
+            .iter()
+            .enumerate()
+            .map(|(index, &weight)| Edge {
+                id: EdgeId(index as u32),
+                kind: EdgeKind::Gep {
+                    byte_off: Some(weight),
+                    lane: None,
+                },
+                src: NodeId(index as u32),
+                dst: NodeId(((index + 1) % weights.len()) as u32),
+                owner: Owner::Module,
+                access_bytes: None,
+                access_extent_unknown: false,
+                volatile: false,
+                modeled_external_write: false,
+                loc: None,
+            })
+            .collect();
+        Pag {
+            module: "pwc-test".into(),
+            source: None,
+            metrics: Default::default(),
+            nodes,
+            edges,
+            callsites: Vec::new(),
+            omega_seeds: Vec::new(),
+            pointer_integer_origins: Vec::new(),
+            pwc_lanes_enabled: false,
+        }
+    }
+
+    #[test]
+    fn pwc_lanes_use_cycle_residual_gcd_and_preserve_zero_cycles() {
+        let mut plus = pwc_test_pag(&[8, 16]);
+        plus.infer_pwc_lanes();
+        assert_eq!(plus.metrics.pwc_edges_rewritten, 2);
+        for edge in &plus.edges {
+            assert_eq!(
+                edge.kind,
+                EdgeKind::Gep {
+                    byte_off: None,
+                    lane: GepLane::new(
+                        24,
+                        match edge.id.0 {
+                            0 => 8,
+                            _ => 16,
+                        }
+                    )
+                }
+            );
+        }
+        let mut cancel = pwc_test_pag(&[8, -8]);
+        cancel.infer_pwc_lanes();
+        assert_eq!(cancel.metrics.pwc_zero_cycle_sccs_skipped, 1);
+        assert!(cancel.edges.iter().all(|edge| matches!(
+            edge.kind,
+            EdgeKind::Gep {
+                byte_off: Some(_),
+                lane: None
+            }
+        )));
+    }
+
+    #[test]
+    fn pwc_lanes_rewrite_only_internal_geps_across_assign_cycles() {
+        let mut pag = pwc_test_pag(&[4]);
+        let cycle_member = pag.nodes[0].clone();
+        pag.nodes.push(Node {
+            id: NodeId(1),
+            label: "%cycle".into(),
+            ..cycle_member
+        });
+        pag.edges[0].dst = NodeId(1);
+        pag.edges.push(Edge {
+            id: EdgeId(1),
+            kind: EdgeKind::Assign,
+            src: NodeId(1),
+            dst: NodeId(0),
+            owner: Owner::Module,
+            access_bytes: None,
+            access_extent_unknown: false,
+            volatile: false,
+            modeled_external_write: false,
+            loc: None,
+        });
+        let entry = pag.nodes[0].clone();
+        let exit = pag.nodes[0].clone();
+        pag.nodes.push(Node {
+            id: NodeId(2),
+            label: "%entry".into(),
+            ..entry
+        });
+        pag.nodes.push(Node {
+            id: NodeId(3),
+            label: "%exit".into(),
+            ..exit
+        });
+        pag.edges.push(Edge {
+            id: EdgeId(2),
+            kind: EdgeKind::Assign,
+            src: NodeId(2),
+            dst: NodeId(0),
+            owner: Owner::Module,
+            access_bytes: None,
+            access_extent_unknown: false,
+            volatile: false,
+            modeled_external_write: false,
+            loc: None,
+        });
+        pag.edges.push(Edge {
+            id: EdgeId(3),
+            kind: EdgeKind::Gep {
+                byte_off: Some(12),
+                lane: None,
+            },
+            src: NodeId(1),
+            dst: NodeId(3),
+            owner: Owner::Module,
+            access_bytes: None,
+            access_extent_unknown: false,
+            volatile: false,
+            modeled_external_write: false,
+            loc: None,
+        });
+        pag.infer_pwc_lanes();
+        assert!(
+            matches!(pag.edges[0].kind, EdgeKind::Gep { byte_off: None, lane: Some(lane) } if lane == GepLane::new(4, 0).unwrap())
+        );
+        assert!(matches!(pag.edges[1].kind, EdgeKind::Assign));
+        assert!(matches!(pag.edges[2].kind, EdgeKind::Assign));
+        assert!(matches!(
+            pag.edges[3].kind,
+            EdgeKind::Gep {
+                byte_off: Some(12),
+                lane: None
+            }
+        ));
+    }
+
+    #[test]
+    fn pwc_lanes_cover_negative_coarse_unknown_and_arithmetic_cases() {
+        let mut negative = pwc_test_pag(&[-4, -4]);
+        negative.infer_pwc_lanes();
+        assert!(negative.edges.iter().all(|edge| matches!(
+            edge.kind,
+            EdgeKind::Gep { byte_off: None, lane: Some(lane) }
+                if lane == GepLane::new(8, -4).unwrap()
+        )));
+
+        let mut mixed = pwc_test_pag(&[8, 8]);
+        mixed.edges[0].kind = EdgeKind::Gep {
+            byte_off: None,
+            lane: GepLane::new(12, 4),
+        };
+        mixed.infer_pwc_lanes();
+        assert_eq!(mixed.metrics.pwc_lane_sccs_coarsened, 1);
+        assert!(
+            matches!(mixed.edges[0].kind, EdgeKind::Gep { lane: Some(lane), .. } if lane == GepLane::new(4, 4).unwrap())
+        );
+
+        let mut unknown = pwc_test_pag(&[4]);
+        unknown.edges[0].kind = EdgeKind::Gep {
+            byte_off: None,
+            lane: None,
+        };
+        unknown.infer_pwc_lanes();
+        assert_eq!(unknown.metrics.pwc_unknown_sccs_skipped, 1);
+
+        let mut too_wide = pwc_test_pag(&[i64::MAX, i64::MAX]);
+        too_wide.infer_pwc_lanes();
+        assert_eq!(too_wide.metrics.pwc_arithmetic_sccs_skipped, 1);
+        assert!(too_wide.edges.iter().all(|edge| matches!(
+            edge.kind,
+            EdgeKind::Gep {
+                byte_off: Some(_),
+                lane: None
+            }
+        )));
+    }
 
     #[test]
     fn printf_format_proof_decodes_literals_and_fails_closed() {

@@ -2197,6 +2197,14 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
     assert!(measurements["would_be_eligibility"]["mutex"]["eligible"].is_u64());
     assert!(measurements["context_struct_pressure"]["components"].is_object());
     assert_eq!(measurements["override_usage"]["honored"], 0);
+    assert_eq!(
+        disposition["run"]["analysis"]["pwc_lanes"]["enabled"], false,
+        "the default disposition artifact must record that static PWC lanes remain opt-in"
+    );
+    assert_eq!(
+        disposition["run"]["analysis"]["pwc_lanes"]["lane_cap_effective"], 256,
+        "the default derived-lane cap is part of the reproducible run configuration"
+    );
     assert!(out.join("pangs-audit.json").exists());
     let export_index: Value =
         serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
@@ -2231,7 +2239,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "2b763428d651fad09744fe7fb563e6768c6d92b1f810564f842ed0041a520300"
+        "3fc25bc37077247026158f1afebc298857f258b600f7b644abf2e7db704058f9"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(

@@ -785,3 +785,25 @@ sweep, summed internal analysis time fell 30.5% and the per-module geomean ratio
 timings are diagnostic, not a substitute for interleaved repetitions. Full implementation notes,
 transition tables, metrics, hashes, and protocol are in
 `ju_out/external_contract_20260903/REPORT.md`.
+
+### Experimental static PWC lanes (2026-09-07; not promoted)
+
+`PANGS_PAG_PWC_LANES=1` enables a fixed-PAG assign/GEP SCC rewrite to affine lanes, with a
+per-allocation derived-lane cap of 256 (`PANGS_ANDERSEN_PWC_LANE_CAP`).  The knob remains opt-in.
+On single sequential executable-mode runs, SQLite reduced exact chained derivations from 86,603 to
+96 and GEP pairs from 90,142 to 1,094 (steps 104,690 to 32,546; exported wall time 8.179 s to
+8.034 s). Vim reduced them
+from 76,407 to 32 and 138,089 to 2,827 respectively (steps 284,859 to 190,377); 800 lane
+compositions remained, no lane cap was reached, and no new unknown collapse occurred. Tmux was a
+null/negative case (6 exact and 2 lane chains in both variants; solve time 0.762 s to 0.780 s).
+
+The dynamic-PWC trigger is not met: residual exact-chain/GEP work is 8.78% on SQLite and 1.13% on
+Vim, below the 10% threshold. Work item B is therefore skipped. Work item C is gated behind A
+promotion and was not started. A is not promoted: the independent one-hop Steensgaard field-offset
+soundness defect remains unresolved. All eight off/on differential cases passed, and globals,
+callgraph, ModRef exports, and full disposition global records were unchanged across tmux, jq,
+SQLite, and Vim. The final workspace suite and enabled synthetic runtime-trace tests passed.
+The durable ledger is in
+[20260907_STRIDE_FIELDS_EVALUATION.md](20260907_STRIDE_FIELDS_EVALUATION.md). Compact logs are in
+`/tmp/pangs-stride-a/` and `/tmp/pangs-stride-final.myu2Gp/`; large Vim exports were temporary.
+Timing comparisons are single runs on a shared machine, not repeatable speedup claims.

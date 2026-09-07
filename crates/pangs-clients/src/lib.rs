@@ -102,6 +102,17 @@ pub fn export_analysis(
         input_path: input_path.display().to_string(),
         input_sha256: sha256_file(input_path)?,
         opts,
+        pwc_lanes_enabled: matches!(
+            std::env::var("PANGS_PAG_PWC_LANES").as_deref(),
+            Ok("1") | Ok("true")
+        ),
+        pwc_lane_cap: std::env::var("PANGS_ANDERSEN_PWC_LANE_CAP")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok()),
+        pwc_lane_cap_effective: std::env::var("PANGS_ANDERSEN_PWC_LANE_CAP")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(256),
         files,
         wall_ms: pipeline_started.elapsed().as_millis() as u64,
     };
@@ -511,7 +522,22 @@ pub fn assemble_disposition_artifacts(
                 data_layout: target.data_layout.clone(),
                 supported_atomic_widths: target.supported_atomic_widths.clone(),
                 entry_spine,
-                extra: BTreeMap::from([("phase_stationarity_report".into(), phase_report)]),
+                extra: BTreeMap::from([
+                    ("phase_stationarity_report".into(), phase_report),
+                    (
+                        "pwc_lanes".into(),
+                        serde_json::json!({
+                            "enabled": matches!(
+                                std::env::var("PANGS_PAG_PWC_LANES").as_deref(),
+                                Ok("1") | Ok("true")
+                            ),
+                            "lane_cap_effective": std::env::var("PANGS_ANDERSEN_PWC_LANE_CAP")
+                                .ok()
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(256),
+                        }),
+                    ),
+                ]),
             },
             dispose: None,
             extra: Extra::new(),
@@ -3832,6 +3858,13 @@ struct Manifest<'a> {
     input_path: String,
     input_sha256: String,
     opts: &'a Opts,
+    /// Effective process-wide setting for the experimental static PWC rewrite.
+    pwc_lanes_enabled: bool,
+    /// Explicit override of the derived-lane cap; absence means the compiled default applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pwc_lane_cap: Option<usize>,
+    /// Resolved cap used by the solver, including its compiled default.
+    pwc_lane_cap_effective: usize,
     files: Vec<FileRecord>,
     wall_ms: u64,
 }

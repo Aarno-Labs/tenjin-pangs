@@ -120,6 +120,17 @@
     "wall_ms": {
       "type": "integer",
       "minimum": 0
+    },
+    "pwc_lanes_enabled": {
+      "type": "boolean"
+    },
+    "pwc_lane_cap": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pwc_lane_cap_effective": {
+      "type": "integer",
+      "minimum": 0
     }
   }
 }

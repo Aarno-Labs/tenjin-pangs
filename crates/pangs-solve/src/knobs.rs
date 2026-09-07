@@ -26,6 +26,10 @@ pub(crate) const ANDERSEN_PROVENANCE_PROMOTION_MAX_EDGES: u64 = 4_096;
 /// requires at least half of the current graph to be new.
 pub(crate) const ANDERSEN_COPY_SCC_MIN_EDGES: usize = 4_096;
 
+/// Bounded vocabulary for lazily derived root-relative affine lane locations.  It is a
+/// termination guard, not a soundness assumption: overflow routes to that root's Unknown cell.
+pub(crate) const ANDERSEN_PWC_LANE_CAP: usize = 256;
+
 /// Emit an Andersen progress record every this many propagation steps when
 /// profiling is enabled.
 pub(crate) const ANDERSEN_PROFILE_STEP_INTERVAL: usize = 10_000;
@@ -121,6 +125,9 @@ pub(crate) const ENV_ANDERSEN_HYBRID_BITSETS_PROFILE: &str =
 
 /// Overrides the minimum number of copy edges between SCC passes.
 pub(crate) const ENV_ANDERSEN_COPY_SCC_MIN_EDGES: &str = "PANGS_ANDERSEN_COPY_SCC_MIN_EDGES";
+
+/// Overrides the per-allocation lane vocabulary cap for the opt-in PWC experiment.
+pub(crate) const ENV_ANDERSEN_PWC_LANE_CAP: &str = "PANGS_ANDERSEN_PWC_LANE_CAP";
 
 /// Disables Andersen copy-graph SCC collapsing when present.
 pub(crate) const ENV_ANDERSEN_DISABLE_COPY_SCC: &str = "PANGS_ANDERSEN_DISABLE_COPY_SCC";

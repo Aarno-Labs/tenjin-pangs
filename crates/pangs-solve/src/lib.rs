@@ -4127,6 +4127,7 @@ mod tests {
                 detail: None,
             }],
             pointer_integer_origins: Vec::new(),
+            pwc_lanes_enabled: false,
         };
         let mut solver = Solver::new(&pir, &pag, BuildMode::Executable);
         let pointee = solver.join(0, 1, 0);
@@ -4469,6 +4470,7 @@ mod tests {
             callsites: vec![frontier_test_callsite(0), frontier_test_callsite(1)],
             omega_seeds: Vec::new(),
             pointer_integer_origins: Vec::new(),
+            pwc_lanes_enabled: false,
         };
         let mut solver = Solver::new(&pir, &pag, BuildMode::Library);
         solver.classes[0].icall_sites.insert(0);
@@ -4537,6 +4539,7 @@ mod tests {
             callsites: vec![frontier_test_callsite(0), frontier_test_callsite(1)],
             omega_seeds: Vec::new(),
             pointer_integer_origins: Vec::new(),
+            pwc_lanes_enabled: false,
         };
         let mut solver = Solver::new(&pir, &pag, BuildMode::Library);
         solver.classes[0].ext = true;

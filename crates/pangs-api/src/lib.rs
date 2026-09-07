@@ -1476,6 +1476,7 @@ impl Analysis {
                             exports: opts.exports.clone(),
                             integer_pointer_policy: opts.integer_pointer_policy,
                             safe_indirect_vararg_callsites: safe_indirect_varargs.clone(),
+                            pwc_lanes: false,
                         },
                     );
                     pag_build_us += pag_started.elapsed().as_micros() as u64;

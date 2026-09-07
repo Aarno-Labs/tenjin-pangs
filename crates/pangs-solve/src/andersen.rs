@@ -2671,7 +2671,7 @@ impl<'a> Refiner<'a> {
         let activated_targets = activated.values().map(BTreeSet::len).sum();
         if andersen_profile_enabled() {
             eprintln!(
-                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
+                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} chained_field_derivations_exact={} chained_field_derivations_lane={} chain_collapses_missing_exact={} chain_collapses_lane_cap={} chain_collapses_unknown_input={} chain_collapses_arithmetic={} derived_lanes_admitted={} max_lanes_per_root={} roots_reaching_lane_cap={} lane_cap={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
                 solve.steps,
                 resume_rounds,
                 activated_targets,
@@ -2682,6 +2682,16 @@ impl<'a> Refiner<'a> {
                 solve.copy_edges(),
                 solve.fields.len(),
                 solve.unknown_fields.len(),
+                solve.chained_exact_field_derivations,
+                solve.chained_lane_field_derivations,
+                solve.chain_missing_exact_collapses,
+                solve.chain_lane_cap_collapses,
+                solve.chain_unknown_input_collapses,
+                solve.chain_arithmetic_collapses,
+                solve.derived_lanes_admitted,
+                solve.max_lanes_per_root,
+                solve.roots_reaching_lane_cap,
+                solve.lane_cap.unwrap_or(0),
                 solve.memcpy_pairs_processed,
                 solve.memcpy_logical_pairs_covered,
                 solve.memcpy_summary_edges_inserted,
@@ -2824,7 +2834,7 @@ impl<'a> Refiner<'a> {
 
     fn build_base_solve(&mut self) -> Solve {
         let profile = andersen_profile_enabled();
-        let mut solve = Solve::new(self.n_base, profile);
+        let mut solve = Solve::new_with_pwc(self.n_base, profile, self.pag.pwc_lanes_enabled);
         solve.known_locations.extend(
             self.exact_addresses
                 .iter()
@@ -4389,6 +4399,13 @@ fn copy_scc_min_edges() -> usize {
         .unwrap_or(knobs::ANDERSEN_COPY_SCC_MIN_EDGES)
 }
 
+fn lane_cap() -> usize {
+    std::env::var(knobs::ENV_ANDERSEN_PWC_LANE_CAP)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(knobs::ANDERSEN_PWC_LANE_CAP)
+}
+
 fn andersen_max_steps() -> Option<usize> {
     std::env::var(knobs::ENV_ANDERSEN_MAX_STEPS)
         .ok()
@@ -5244,6 +5261,10 @@ struct Solve {
     /// Locations certified in the fixed constraint graph. Nested GEPs are canonicalized
     /// only into this finite vocabulary.
     known_locations: HashSet<FieldLocation>,
+    /// Per-root count of admitted affine lane cells. Exact cells retain their fixed PAG
+    /// vocabulary; only lanes are bounded by the PWC experiment's finite domain.
+    lane_cells_by_root: HashMap<Cell, usize>,
+    lane_cap: Option<usize>,
     /// base object cell -> its materialized constant-offset field cells. Needed to
     /// retroactively connect them when the base later receives a non-constant access (M2.1).
     obj_fields: HashMap<Cell, Vec<Cell>>,
@@ -5275,6 +5296,15 @@ struct Solve {
     points_to_facts_inserted: usize,
     copy_edges_inserted: usize,
     field_cells_allocated: usize,
+    chained_exact_field_derivations: usize,
+    chained_lane_field_derivations: usize,
+    chain_missing_exact_collapses: usize,
+    chain_lane_cap_collapses: usize,
+    chain_unknown_input_collapses: usize,
+    chain_arithmetic_collapses: usize,
+    derived_lanes_admitted: usize,
+    max_lanes_per_root: usize,
+    roots_reaching_lane_cap: usize,
     scc_nodes_scanned: usize,
     scc_edges_scanned: usize,
     new_copy_edges_since_scc: usize,
@@ -5328,7 +5358,12 @@ fn offline_union_into(parent: &mut [Cell], member: Cell, representative: Cell) -
 }
 
 impl Solve {
+    #[cfg(test)]
     fn new(n_base: usize, profile: bool) -> Self {
+        Self::new_with_pwc(n_base, profile, false)
+    }
+
+    fn new_with_pwc(n_base: usize, profile: bool, pwc_lanes: bool) -> Self {
         Self {
             next_field: n_base as Cell,
             representative: (0..n_base as Cell).collect(),
@@ -5353,6 +5388,8 @@ impl Solve {
             field_base: HashMap::new(),
             field_location: HashMap::new(),
             known_locations: HashSet::new(),
+            lane_cells_by_root: HashMap::new(),
+            lane_cap: pwc_lanes.then(lane_cap),
             obj_fields: HashMap::new(),
             unknown_fields: HashMap::new(),
             unknown_field_base: HashMap::new(),
@@ -5374,6 +5411,15 @@ impl Solve {
             points_to_facts_inserted: 0,
             copy_edges_inserted: 0,
             field_cells_allocated: 0,
+            chained_exact_field_derivations: 0,
+            chained_lane_field_derivations: 0,
+            chain_missing_exact_collapses: 0,
+            chain_lane_cap_collapses: 0,
+            chain_unknown_input_collapses: 0,
+            chain_arithmetic_collapses: 0,
+            derived_lanes_admitted: 0,
+            max_lanes_per_root: 0,
+            roots_reaching_lane_cap: 0,
             scc_nodes_scanned: 0,
             scc_edges_scanned: 0,
             new_copy_edges_since_scc: 0,
@@ -5408,6 +5454,7 @@ impl Solve {
         self.fields = HashMap::new();
         self.field_location = HashMap::new();
         self.known_locations = HashSet::new();
+        self.lane_cells_by_root = HashMap::new();
         self.unknown_fields = HashMap::new();
         self.unknown_field_base = HashMap::new();
         self.direct_accessed = HashSet::new();
@@ -5861,20 +5908,71 @@ impl Solve {
             if combined == base_location {
                 return base;
             }
-            return if self.known_locations.contains(&combined) {
-                self.field_of(root, combined)
-            } else {
-                self.unknown_field_of(root)
-            };
+            match (base_location, location, combined) {
+                (_, FieldLocation::Unknown, _) | (FieldLocation::Unknown, _, _) => {
+                    self.chain_unknown_input_collapses =
+                        self.chain_unknown_input_collapses.saturating_add(1);
+                    return self.unknown_field_of(root);
+                }
+                (_, _, FieldLocation::Unknown) => {
+                    self.chain_arithmetic_collapses =
+                        self.chain_arithmetic_collapses.saturating_add(1);
+                    return self.unknown_field_of(root);
+                }
+                (_, _, FieldLocation::Exact(_)) if self.known_locations.contains(&combined) => {
+                    self.chained_exact_field_derivations =
+                        self.chained_exact_field_derivations.saturating_add(1);
+                    return self.field_of(root, combined);
+                }
+                (_, _, FieldLocation::Exact(_)) => {
+                    self.chain_missing_exact_collapses =
+                        self.chain_missing_exact_collapses.saturating_add(1);
+                    return self.unknown_field_of(root);
+                }
+                (_, _, FieldLocation::Lane(_)) => {
+                    self.chained_lane_field_derivations =
+                        self.chained_lane_field_derivations.saturating_add(1);
+                    // Outside the opt-in PWC experiment retain the historical finite fixed
+                    // vocabulary rule. Dynamic LLVM lanes alone must not alter defaults.
+                    if self.lane_cap.is_none() && !self.known_locations.contains(&combined) {
+                        self.chain_missing_exact_collapses =
+                            self.chain_missing_exact_collapses.saturating_add(1);
+                        return self.unknown_field_of(root);
+                    }
+                    return self.field_of(root, combined);
+                }
+            }
         }
         if let Some(&cell) = self.fields.get(&(base, location)) {
             return cell;
+        }
+        if matches!(location, FieldLocation::Lane(_)) {
+            if let Some(cap) = self.lane_cap {
+                let count = self
+                    .lane_cells_by_root
+                    .get(&base)
+                    .copied()
+                    .unwrap_or_default();
+                if count >= cap {
+                    self.chain_lane_cap_collapses = self.chain_lane_cap_collapses.saturating_add(1);
+                    return self.unknown_field_of(base);
+                }
+            }
         }
         let cell = self.allocate_cell();
         self.field_cells_allocated = self.field_cells_allocated.saturating_add(1);
         self.fields.insert((base, location), cell);
         self.field_base.insert(cell, base);
         self.field_location.insert(cell, location);
+        if matches!(location, FieldLocation::Lane(_)) {
+            let count = self.lane_cells_by_root.entry(base).or_default();
+            *count = count.saturating_add(1);
+            self.derived_lanes_admitted = self.derived_lanes_admitted.saturating_add(1);
+            self.max_lanes_per_root = self.max_lanes_per_root.max(*count);
+            if self.lane_cap == Some(*count) {
+                self.roots_reaching_lane_cap = self.roots_reaching_lane_cap.saturating_add(1);
+            }
+        }
         let existing = self.obj_fields.entry(base).or_default().clone();
         self.obj_fields.entry(base).or_default().push(cell);
         if location == FieldLocation::Unknown {
@@ -8228,6 +8326,81 @@ mod tests {
             andersen.indirect_calls[0].targets,
             vec!["target".to_string()]
         );
+    }
+
+    #[test]
+    fn pwc_lane_domain_admits_shifted_lanes_only_when_enabled_and_bounds_overflow() {
+        let lane = pangs_pir::GepLane::new(24, 0).unwrap();
+        let shifted = FieldLocation::Lane(lane.shifted(8).unwrap());
+
+        let mut baseline = Solve::new(2, false);
+        let field = baseline.field_of(0, FieldLocation::Lane(lane));
+        assert_eq!(
+            baseline.field_of(field, FieldLocation::Exact(8)),
+            baseline.unknown_field_of(0)
+        );
+
+        let mut enabled = Solve::new_with_pwc(2, false, true);
+        let field = enabled.field_of(0, FieldLocation::Lane(lane));
+        let shifted_cell = enabled.field_of(field, FieldLocation::Exact(8));
+        assert_eq!(enabled.field_location[&shifted_cell], shifted);
+        assert_eq!(enabled.derived_lanes_admitted, 2);
+
+        let mut capped = Solve::new_with_pwc(2, false, true);
+        capped.lane_cap = Some(1);
+        let field = capped.field_of(0, FieldLocation::Lane(lane));
+        assert_eq!(
+            capped.field_of(field, FieldLocation::Exact(8)),
+            capped.unknown_field_of(0)
+        );
+        assert_eq!(capped.chain_lane_cap_collapses, 1);
+    }
+
+    #[test]
+    fn pwc_lane_cycle_keeps_a_shifted_struct_member_without_fixed_vocabulary() {
+        let lane = FieldLocation::Lane(pangs_pir::GepLane::new(24, 0).unwrap());
+        let mut solve = Solve::new_with_pwc(10, false, true);
+        solve.add_pts(1, 0); // base allocation
+        solve.add_gep(1, lane, 2); // statically inferred pointer-walk lane
+        solve.add_gep(2, lane, 2); // the PWC replay itself
+        solve.add_gep(2, FieldLocation::Exact(8), 3); // member absent from PAG vocabulary
+        solve.add_gep(1, lane, 6); // member 0, deliberately disjoint from member 8
+        solve.add_pts(4, 9); // callback/object stored in member 8
+        solve.add_store(3, 4, None);
+        solve.add_load(3, 5);
+        solve.add_load(6, 7);
+        solve.run();
+        assert!(solve.points_to(5).unwrap().contains(&9));
+        assert!(!solve
+            .points_to(7)
+            .is_some_and(|targets| targets.contains(&9)));
+        let member = solve.points_to(3).unwrap().iter().next().unwrap();
+        assert_eq!(
+            solve.field_location[&member],
+            FieldLocation::Lane(pangs_pir::GepLane::new(24, 8).unwrap())
+        );
+        assert!(solve.chain_lane_cap_collapses == 0);
+
+        let mut capped = Solve::new_with_pwc(10, false, true);
+        capped.lane_cap = Some(1);
+        capped.add_pts(1, 0);
+        capped.add_gep(1, lane, 2);
+        capped.add_gep(2, FieldLocation::Exact(8), 3);
+        capped.add_pts(4, 9);
+        capped.add_store(3, 4, None);
+        capped.add_load(3, 5);
+        capped.run();
+        // Overflow widens only this root's summary; it retains the concrete payload.
+        assert!(capped.points_to(5).unwrap().contains(&9));
+        assert!(capped.chain_lane_cap_collapses > 0);
+
+        // Create an independent exact cell only after the capped derived access exists. The
+        // root-local Unknown fallback must retain that late payload for the earlier read.
+        let late_exact = capped.field_of(0, FieldLocation::Exact(16));
+        capped.add_pts(late_exact, 8);
+        capped.add_load(3, 8);
+        capped.run();
+        assert!(capped.points_to(8).unwrap().contains(&8));
     }
 
     #[test]
