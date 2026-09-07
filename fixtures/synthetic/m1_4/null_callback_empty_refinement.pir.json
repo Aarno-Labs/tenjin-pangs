@@ -1,0 +1,351 @@
+{
+  "module": "null-callback-empty-refinement",
+  "source": "fixtures/synthetic/m1_4/null_callback_empty_refinement.ll",
+  "lowering": {
+    "semantic_value_kinds": {
+      "0": "non_pointer",
+      "%invoke_null::fp": "pointer",
+      "%invoke_null::member": "pointer",
+      "%invoke_null::p": "pointer",
+      "%main::a": "pointer",
+      "%main::am": "pointer",
+      "%main::b": "pointer",
+      "%main::bm": "pointer",
+      "%observe::p": "pointer",
+      "null": "pointer"
+    },
+    "functions": 4,
+    "declarations": 0,
+    "globals": 1,
+    "aliases": 0,
+    "ifuncs": 0,
+    "instruction_counts": {
+      "alloca": 2,
+      "call": 4,
+      "getelementptr": 3,
+      "icmp": 1,
+      "load": 1,
+      "store": 2
+    },
+    "terminator_counts": {
+      "br": 1,
+      "condbr": 1,
+      "ret": 4
+    },
+    "modeled_counts": {
+      "alloca": 2,
+      "call_direct": 3,
+      "call_indirect": 1,
+      "gep": 3,
+      "gep_byte_offset": 3,
+      "global_init_mod": 1,
+      "global_init_store": 1,
+      "load": 1,
+      "return": 4,
+      "store": 2
+    },
+    "skipped_counts": {
+      "unmodeled_instruction:icmp": 1
+    },
+    "tainted_counts": {},
+    "missing_debug_locations": {
+      "alloca": 2,
+      "call": 4,
+      "function": 4,
+      "gep": 3,
+      "global": 1,
+      "load": 1,
+      "return": 4,
+      "store": 2
+    },
+    "non_ccc_calling_conventions": {}
+  },
+  "target": {
+    "triple": "",
+    "data_layout": "",
+    "supported_atomic_widths": [
+      8,
+      16,
+      32,
+      64
+    ]
+  },
+  "functions": [
+    {
+      "key": "cb",
+      "sig": {
+        "ret": {
+          "class": "void"
+        },
+        "params": [],
+        "vararg": false,
+        "cc": "ccc"
+      },
+      "file": null,
+      "line": null,
+      "external": false,
+      "exported": false,
+      "address_taken": true,
+      "body": [
+        {
+          "kind": "return",
+          "value": null,
+          "loc": null
+        }
+      ]
+    },
+    {
+      "key": "observe",
+      "sig": {
+        "ret": {
+          "class": "void"
+        },
+        "params": [
+          {
+            "class": "integer"
+          }
+        ],
+        "vararg": false,
+        "cc": "ccc"
+      },
+      "param_names": [
+        "%observe::p"
+      ],
+      "file": null,
+      "line": null,
+      "external": false,
+      "exported": false,
+      "address_taken": false,
+      "body": [
+        {
+          "kind": "return",
+          "value": null,
+          "loc": null
+        }
+      ]
+    },
+    {
+      "key": "invoke_null",
+      "sig": {
+        "ret": {
+          "class": "void"
+        },
+        "params": [
+          {
+            "class": "integer"
+          }
+        ],
+        "vararg": false,
+        "cc": "ccc"
+      },
+      "param_names": [
+        "%invoke_null::p"
+      ],
+      "file": null,
+      "line": null,
+      "external": false,
+      "exported": false,
+      "address_taken": false,
+      "body": [
+        {
+          "kind": "gep",
+          "dest": "%invoke_null::member",
+          "base": "%invoke_null::p",
+          "byte_off": 16,
+          "loc": null
+        },
+        {
+          "kind": "load",
+          "dest": "%invoke_null::fp",
+          "address": "%invoke_null::member",
+          "access_bytes": 8,
+          "loc": null
+        },
+        {
+          "kind": "call_indirect",
+          "operand": "%invoke_null::fp",
+          "sig": {
+            "ret": {
+              "class": "void"
+            },
+            "params": [],
+            "vararg": false,
+            "cc": "ccc"
+          },
+          "args": [],
+          "dest": null,
+          "loc": null
+        },
+        {
+          "kind": "return",
+          "value": null,
+          "loc": null
+        }
+      ]
+    },
+    {
+      "key": "main",
+      "sig": {
+        "ret": {
+          "class": "integer"
+        },
+        "params": [],
+        "vararg": false,
+        "cc": "ccc"
+      },
+      "file": null,
+      "line": null,
+      "external": false,
+      "exported": true,
+      "address_taken": false,
+      "body": [
+        {
+          "kind": "alloca",
+          "dest": "%main::a",
+          "ty": "%Pair = type { i8*, i8*, void ()* }",
+          "loc": null
+        },
+        {
+          "kind": "alloca",
+          "dest": "%main::b",
+          "ty": "%Pair = type { i8*, i8*, void ()* }",
+          "loc": null
+        },
+        {
+          "kind": "gep",
+          "dest": "%main::am",
+          "base": "%main::a",
+          "byte_off": 16,
+          "loc": null
+        },
+        {
+          "kind": "gep",
+          "dest": "%main::bm",
+          "base": "%main::b",
+          "byte_off": 16,
+          "loc": null
+        },
+        {
+          "kind": "store",
+          "address": "%main::am",
+          "value": "@cb",
+          "access_bytes": 8,
+          "loc": null
+        },
+        {
+          "kind": "store",
+          "address": "%main::bm",
+          "value": "null",
+          "access_bytes": 8,
+          "loc": null
+        },
+        {
+          "kind": "call_direct",
+          "callee": "observe",
+          "sig": {
+            "ret": {
+              "class": "void"
+            },
+            "params": [
+              {
+                "class": "integer"
+              }
+            ],
+            "vararg": false,
+            "cc": "ccc"
+          },
+          "args": [
+            "%main::a"
+          ],
+          "dest": null,
+          "loc": null
+        },
+        {
+          "kind": "call_direct",
+          "callee": "observe",
+          "sig": {
+            "ret": {
+              "class": "void"
+            },
+            "params": [
+              {
+                "class": "integer"
+              }
+            ],
+            "vararg": false,
+            "cc": "ccc"
+          },
+          "args": [
+            "%main::b"
+          ],
+          "dest": null,
+          "loc": null
+        },
+        {
+          "kind": "call_direct",
+          "callee": "invoke_null",
+          "sig": {
+            "ret": {
+              "class": "void"
+            },
+            "params": [
+              {
+                "class": "integer"
+              }
+            ],
+            "vararg": false,
+            "cc": "ccc"
+          },
+          "args": [
+            "%main::b"
+          ],
+          "dest": null,
+          "loc": null
+        },
+        {
+          "kind": "return",
+          "value": "0",
+          "loc": null
+        }
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "key": "keep",
+      "file": null,
+      "line": null,
+      "is_const": false,
+      "mutable": true,
+      "exported": false,
+      "is_definition": true,
+      "linkage": "internal",
+      "thread_local": false,
+      "type_spelling": null,
+      "size_bits": 64,
+      "align_bits": 64,
+      "path_error": null,
+      "scalar_class": null,
+      "signed": null,
+      "initializer_ir": "define internal void @cb() {\n  ret void\n}\n",
+      "init_refs": [
+        "cb"
+      ]
+    }
+  ],
+  "global_init": [
+    {
+      "kind": "global_ref",
+      "global": "keep",
+      "access": "mod",
+      "loc": null
+    },
+    {
+      "kind": "store",
+      "address": "@keep",
+      "value": "@cb",
+      "access_bytes": 8,
+      "loc": null
+    }
+  ]
+}

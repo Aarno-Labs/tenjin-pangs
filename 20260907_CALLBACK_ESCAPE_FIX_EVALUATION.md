@@ -1,5 +1,10 @@
 # Allocation escape fix and Vim evaluation
 
+Follow-up: `20260907_VIM_CALLBACK_ADMISSION_INVESTIGATION.md` traces the retained
+26 mismatches. All arise at empty-target fallback, not external operand provenance.
+An admission control recovers 20 missing callbacks; six remain consistent with
+null/unreachable callback paths and the empty-result policy.
+
 2026-09-07. Fixes the republished aggregate callback defect described in
 `20260907_CALLBACK_ESCAPE_REPRODUCTION.md`. PWC and asymmetric overlap remain opt-in.
 

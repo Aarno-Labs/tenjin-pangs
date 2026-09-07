@@ -184,6 +184,14 @@ facts along those value transfers. Consequently every union-find class contains 
 carriers or locations (object, pointee, and field classes), never both; debug builds assert this
 carrier/location invariant after every solve.
 
+For investigations of widening caused by that persistent replay, setting
+`PANGS_STEENS_ONE_HOP_WIDENING_PROFILE=1` emits bounded aggregate records to stderr. It classifies
+replay work by exact/lane/unknown displacement, mixed summary-plus-field alternatives, and
+multi-allocation field alternatives; it also attributes successful replay-originated unions to
+their final identity roots, including added class nodes, global identities, field regions, and a
+small sample of source/delta witnesses. The knob is diagnostic-only and does not alter solver
+constraints, metrics serialized into results, or exported answers.
+
 Allocation escape is also recovered from solved location-region identities, not just
 fixed exact-address certificates. Real boundary escape propagates to every field of
 each represented allocation, including roots discovered by later joins and fields
@@ -237,6 +245,12 @@ threshold-triggered collapse of strongly connected copy variables.
 Steensgaard supplies the complete base-tier answer everywhere. D' independently builds a
 prepartition graph from the actual inclusion constraints, with synthetic vertices for
 allocation-relative fields. Weak components are the ordinary admission unit. An
+uncertified memory access additionally imports possible writer-to-reader dependencies
+from the solved Steensgaard storage envelope. Two linear-size dependency hubs per
+envelope cover uncertified readers and uncertified writers without equating certified
+regions merely because Steensgaard merged them. These support edges count toward the
+admission budget and participate in directed SCC predecessor closure, so a callback
+load cannot be admitted without its possible initializer producers. An
 interesting component is admitted to Andersen when its quadratic cost proxy fits the
 configured budget. An oversize component remains at its Steensgaard answer, and the
 result records the number and largest size of such fallbacks. Provenance separation also
@@ -252,6 +266,11 @@ the complete Steensgaard summary when refined and base facts are merged. If the 
 slice exceeds its budget or contains a disallowed forged source, the whole site keeps
 the ordinary fallback. Complete Andersen facts overwrite only admitted nodes, so omission
 by the refiner is conservative.
+
+An indirect-call refinement with no targets and no external operand is not itself
+an empty-result proof. It retains the complete Steensgaard call answer, including
+its target/census provenance, and is marked fallback. A genuine external operand
+still carries unknown; no unknown is cleared merely because the refined set is empty.
 
 **Receiver-allocation-relative payload summaries (experimental):**
 

@@ -975,6 +975,102 @@ struct GepTransfer {
     delta: FieldLocation,
 }
 
+/// The kind of displacement currently being replayed.  This deliberately describes the
+/// original one-hop constraint rather than its eventual bounded target: an exact shift may be
+/// widened to Unknown by the finite vocabulary guard, and that loss is already counted by the
+/// ordinary Steensgaard metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OneHopShiftKind {
+    Exact,
+    Lane,
+    Unknown,
+}
+
+impl OneHopShiftKind {
+    fn of(location: FieldLocation) -> Self {
+        match location {
+            FieldLocation::Exact(_) => Self::Exact,
+            FieldLocation::Lane(_) => Self::Lane,
+            FieldLocation::Unknown => Self::Unknown,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Lane => "lane",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The dimensions needed to distinguish the replay paths that can widen a Steensgaard class.
+/// `mixed_summary` means an ordinary summary alternative and certified field alternatives were
+/// both present; `cross_root` means the latter name more than one allocation root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct OneHopReplayKind {
+    shift: OneHopShiftKind,
+    mixed_summary: bool,
+    cross_root: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OneHopReplayAttribution {
+    source: usize,
+    kind: OneHopReplayKind,
+    delta: FieldLocation,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OneHopWideningCounts {
+    events: u64,
+    joins: u64,
+    class_nodes_added: u64,
+    global_identities_added: u64,
+    field_regions_added: u64,
+}
+
+impl OneHopWideningCounts {
+    fn add_assign(&mut self, other: &Self) {
+        self.events += other.events;
+        self.joins += other.joins;
+        self.class_nodes_added += other.class_nodes_added;
+        self.global_identities_added += other.global_identities_added;
+        self.field_regions_added += other.field_regions_added;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct OneHopWidenedRoot {
+    counts: OneHopWideningCounts,
+    by_kind: BTreeMap<OneHopReplayKind, OneHopWideningCounts>,
+    witnesses: Vec<OneHopReplayAttribution>,
+}
+
+#[derive(Debug, Default)]
+struct OneHopWideningProfile {
+    /// Set only around one persistent-GEP replay.  `join` uses it to attribute both the direct
+    /// union and any nested pointee/overlap unions it triggers.
+    active: Option<OneHopReplayAttribution>,
+    totals: OneHopWideningCounts,
+    by_kind: BTreeMap<OneHopReplayKind, OneHopWideningCounts>,
+    roots: HashMap<usize, OneHopWidenedRoot>,
+}
+
+fn merge_one_hop_widened_root(dst: &mut OneHopWidenedRoot, src: OneHopWidenedRoot) {
+    dst.counts.add_assign(&src.counts);
+    for (kind, counts) in src.by_kind {
+        dst.by_kind.entry(kind).or_default().add_assign(&counts);
+    }
+    for witness in src.witnesses {
+        if !dst.witnesses.contains(&witness)
+            && dst.witnesses.len() < knobs::STEENS_ONE_HOP_WIDENING_PROFILE_WITNESSES
+        {
+            dst.witnesses.push(witness);
+        }
+    }
+}
+
 /// Compact identity for a diagnostic provenance string. Provenance flows through the same hot
 /// union/find worklist as points-to state, but its text is only needed while materializing the
 /// final result. Keeping IDs in classes avoids repeatedly cloning source strings during joins and
@@ -1150,6 +1246,10 @@ struct Solver<'a> {
     escaped_fn_applied: HashSet<usize>,
     metrics: SolveMetrics,
     profile: bool,
+    /// Opt-in, bounded attribution for class growth caused by persistent one-hop GEP replay.
+    /// Kept separate from the general Steens profile so SQLite investigations can enable it
+    /// without candidate-pair progress records.
+    one_hop_widening_profile: Option<OneHopWideningProfile>,
     profile_started: Instant,
     profile_interval_candidate_pairs: u64,
     next_profile_candidate_pairs: u64,
@@ -1881,6 +1981,8 @@ impl<'a> Solver<'a> {
             escaped_fn_applied: HashSet::new(),
             metrics: SolveMetrics::default(),
             profile: steens_profile_enabled(),
+            one_hop_widening_profile: steens_one_hop_widening_profile_enabled()
+                .then(OneHopWideningProfile::default),
             profile_started: Instant::now(),
             profile_interval_candidate_pairs: steens_profile_interval_candidate_pairs(),
             next_profile_candidate_pairs: steens_profile_interval_candidate_pairs(),
@@ -1905,6 +2007,7 @@ impl<'a> Solver<'a> {
         self.assert_canonical_null_isolated();
         self.assert_one_hop_invariant();
         self.print_steens_profile("done");
+        self.print_one_hop_widening_profile();
     }
 
     /// Snapshot the solved union-find for the Andersen pass. Must be called after
@@ -3231,6 +3334,87 @@ impl<'a> Solver<'a> {
         self.enqueue(target);
     }
 
+    fn begin_one_hop_replay_attribution(
+        &mut self,
+        source: usize,
+        delta: FieldLocation,
+        mixed_summary: bool,
+        cross_root: bool,
+    ) {
+        let Some(profile) = self.one_hop_widening_profile.as_mut() else {
+            return;
+        };
+        debug_assert!(
+            profile.active.is_none(),
+            "one-hop replay attribution leaked"
+        );
+        let attribution = OneHopReplayAttribution {
+            source,
+            kind: OneHopReplayKind {
+                shift: OneHopShiftKind::of(delta),
+                mixed_summary,
+                cross_root,
+            },
+            delta,
+        };
+        profile.active = Some(attribution.clone());
+        profile.totals.events += 1;
+        profile.by_kind.entry(attribution.kind).or_default().events += 1;
+        let root = profile.roots.entry(source).or_default();
+        root.counts.events += 1;
+        root.by_kind.entry(attribution.kind).or_default().events += 1;
+        if !root.witnesses.contains(&attribution)
+            && root.witnesses.len() < knobs::STEENS_ONE_HOP_WIDENING_PROFILE_WITNESSES
+        {
+            root.witnesses.push(attribution);
+        }
+    }
+
+    fn end_one_hop_replay_attribution(&mut self) {
+        if let Some(profile) = self.one_hop_widening_profile.as_mut() {
+            profile.active = None;
+        }
+    }
+
+    /// Account for a successful union while a replay attribution is active.  This runs before
+    /// the union mutates either class, so the deltas are true additions to the surviving class
+    /// rather than a later, potentially much larger final-class snapshot.
+    fn note_one_hop_replay_join(&mut self, survivor: usize, absorbed: usize) {
+        let Some(profile) = self.one_hop_widening_profile.as_mut() else {
+            return;
+        };
+        let Some(attribution) = profile.active.clone() else {
+            return;
+        };
+        let added_nodes = self.classes[absorbed].node_count as u64;
+        let added_globals = self.classes[absorbed]
+            .global_objs
+            .iter()
+            .filter(|global| !self.classes[survivor].global_objs.contains(global))
+            .count() as u64;
+        let added_regions = self.classes[absorbed]
+            .field_regions
+            .iter()
+            .filter(|region| !self.classes[survivor].field_regions.contains(region))
+            .count() as u64;
+        let apply = |counts: &mut OneHopWideningCounts| {
+            counts.joins += 1;
+            counts.class_nodes_added += added_nodes;
+            counts.global_identities_added += added_globals;
+            counts.field_regions_added += added_regions;
+        };
+        apply(&mut profile.totals);
+        apply(profile.by_kind.entry(attribution.kind).or_default());
+        let root = profile.roots.entry(survivor).or_default();
+        apply(&mut root.counts);
+        apply(root.by_kind.entry(attribution.kind).or_default());
+        if !root.witnesses.contains(&attribution)
+            && root.witnesses.len() < knobs::STEENS_ONE_HOP_WIDENING_PROFILE_WITNESSES
+        {
+            root.witnesses.push(attribution);
+        }
+    }
+
     /// Replay one-hop arithmetic whenever its source target changes.  A field-only target may
     /// translate each recorded allocation-relative alternative.  A summary alternative wins
     /// conservatively: translating only the fields would drop the ordinary alternative.
@@ -3255,13 +3439,28 @@ impl<'a> Solver<'a> {
         let regions = self.classes[root].field_regions.clone();
         let regions_empty = regions.is_empty();
         if summary {
+            let mixed_summary = !regions_empty;
+            let cross_root = self.classes[root].summary_roots.len() > 1
+                || regions
+                    .iter()
+                    .map(|(allocation, _)| allocation)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    > 1;
             let destinations = transfers
                 .iter()
                 .map(|transfer| transfer.dst)
                 .collect::<HashSet<_>>();
             for dst in destinations {
                 let dst_p = self.pointee_of(dst);
+                let delta = transfers
+                    .iter()
+                    .find(|transfer| transfer.dst == dst)
+                    .expect("GEP replay destination came from its transfer list")
+                    .delta;
+                self.begin_one_hop_replay_attribution(root, delta, mixed_summary, cross_root);
                 self.join(dst_p, root, PROV_DIRECT_ADDRESS);
+                self.end_one_hop_replay_attribution();
             }
             if transfers
                 .iter()
@@ -3273,7 +3472,17 @@ impl<'a> Solver<'a> {
                 for allocation in roots {
                     let unknown =
                         self.field_class(allocation, FieldRegion::address(FieldLocation::Unknown));
+                    // A summary alternative can only retain a nonzero displacement through its
+                    // owning Unknown cell. Attribute that explicit summary widening separately
+                    // from the destination joins above.
+                    self.begin_one_hop_replay_attribution(
+                        canonical_root,
+                        FieldLocation::Unknown,
+                        mixed_summary,
+                        cross_root,
+                    );
                     self.join(canonical_root, unknown, PROV_DIRECT_ADDRESS);
+                    self.end_one_hop_replay_attribution();
                 }
             }
             self.metrics.steens_gep_replay_transfers += transfers.len() as u64;
@@ -3301,13 +3510,20 @@ impl<'a> Solver<'a> {
                 regions.len() == 1 && matches!(regions[0].location, FieldLocation::Unknown)
             })
         {
-            for dst in transfers
+            let destinations = transfers
                 .iter()
                 .map(|transfer| transfer.dst)
-                .collect::<HashSet<_>>()
-            {
+                .collect::<HashSet<_>>();
+            for dst in destinations {
                 let dst_p = self.pointee_of(dst);
+                let delta = transfers
+                    .iter()
+                    .find(|transfer| transfer.dst == dst)
+                    .expect("GEP replay destination came from its transfer list")
+                    .delta;
+                self.begin_one_hop_replay_attribution(root, delta, false, false);
                 self.join(dst_p, root, PROV_DIRECT_ADDRESS);
+                self.end_one_hop_replay_attribution();
             }
             self.metrics.steens_gep_replay_transfers += transfers.len() as u64;
             return;
@@ -3316,7 +3532,9 @@ impl<'a> Solver<'a> {
             self.metrics.steens_gep_replay_transfers += 1;
             let dst_p = self.pointee_of(transfer.dst);
             if transfer.delta == FieldLocation::Exact(0) {
+                self.begin_one_hop_replay_attribution(root, transfer.delta, false, false);
                 self.join(dst_p, root, PROV_DIRECT_ADDRESS);
+                self.end_one_hop_replay_attribution();
                 continue;
             }
             // An unbound synthetic pointee is neither a summary nor a field alternative yet.
@@ -3346,7 +3564,14 @@ impl<'a> Solver<'a> {
                             FieldRegion::access(region.location.add(transfer.delta), region.width);
                         self.shifted_field_class(*allocation, shifted)
                     };
+                    self.begin_one_hop_replay_attribution(
+                        root,
+                        transfer.delta,
+                        false,
+                        regions_by_root.len() > 1,
+                    );
                     self.join(dst_p, target, PROV_DIRECT_ADDRESS);
+                    self.end_one_hop_replay_attribution();
                 }
             }
         }
@@ -3566,6 +3791,7 @@ impl<'a> Solver<'a> {
         if self.classes[a].size < self.classes[b].size {
             std::mem::swap(&mut a, &mut b);
         }
+        self.note_one_hop_replay_join(a, b);
         // GEP replay depends only on address alternatives/subscriptions, not on content, Ω, or
         // callsite facts. Do not invalidate its frontier for an otherwise unrelated UF join.
         let gep_structure_grew = (self.classes[b].has_summary_region
@@ -3716,6 +3942,181 @@ impl<'a> Solver<'a> {
         );
     }
 
+    fn print_one_hop_widening_profile(&mut self) {
+        let Some(profile) = self.one_hop_widening_profile.take() else {
+            return;
+        };
+        eprintln!(
+            "pangs steens one-hop widening profile: events={} joins={} class_nodes_added={} \
+             global_identities_added={} field_regions_added={}",
+            profile.totals.events,
+            profile.totals.joins,
+            profile.totals.class_nodes_added,
+            profile.totals.global_identities_added,
+            profile.totals.field_regions_added,
+        );
+        for (kind, counts) in &profile.by_kind {
+            eprintln!(
+                "pangs steens one-hop widening kind: shift={} mixed_summary={} cross_root={} \
+                 events={} joins={} class_nodes_added={} global_identities_added={} \
+                 field_regions_added={}",
+                kind.shift.label(),
+                kind.mixed_summary,
+                kind.cross_root,
+                counts.events,
+                counts.joins,
+                counts.class_nodes_added,
+                counts.global_identities_added,
+                counts.field_regions_added,
+            );
+        }
+
+        // A root can be absorbed after it has accumulated replay-attributed growth.  Resolve
+        // every recorded key only at the end so the top list describes final identity classes.
+        let mut final_roots = HashMap::<usize, OneHopWidenedRoot>::new();
+        for (root, stats) in profile.roots {
+            let root = self.find(root);
+            merge_one_hop_widened_root(final_roots.entry(root).or_default(), stats);
+        }
+        let mut roots = final_roots.into_iter().collect::<Vec<_>>();
+        roots.sort_by(|(left_root, left), (right_root, right)| {
+            right
+                .counts
+                .class_nodes_added
+                .cmp(&left.counts.class_nodes_added)
+                .then_with(|| {
+                    right
+                        .counts
+                        .global_identities_added
+                        .cmp(&left.counts.global_identities_added)
+                })
+                .then_with(|| {
+                    right
+                        .counts
+                        .field_regions_added
+                        .cmp(&left.counts.field_regions_added)
+                })
+                .then_with(|| right.counts.joins.cmp(&left.counts.joins))
+                .then_with(|| left_root.cmp(right_root))
+        });
+        for (root, stats) in roots
+            .into_iter()
+            .filter(|(_, stats)| stats.counts.joins != 0)
+            .take(knobs::STEENS_ONE_HOP_WIDENING_PROFILE_TOP)
+        {
+            let labels = self.one_hop_profile_root_labels(root).join(",");
+            let witnesses = stats
+                .witnesses
+                .iter()
+                .map(|witness| {
+                    format!(
+                        "source={}({}) delta={} shift={} mixed_summary={} cross_root={}",
+                        witness.source,
+                        self.one_hop_profile_class_label(witness.source),
+                        one_hop_field_location_label(witness.delta),
+                        witness.kind.shift.label(),
+                        witness.kind.mixed_summary,
+                        witness.kind.cross_root,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            eprintln!(
+                "pangs steens one-hop widening top: root={} final_nodes={} final_globals={} \
+                 final_regions={} events={} joins={} class_nodes_added={} \
+                 global_identities_added={} field_regions_added={} labels=[{}] witnesses=[{}]",
+                root,
+                self.classes[root].node_count,
+                self.classes[root].global_objs.len(),
+                self.classes[root].field_regions.len(),
+                stats.counts.events,
+                stats.counts.joins,
+                stats.counts.class_nodes_added,
+                stats.counts.global_identities_added,
+                stats.counts.field_regions_added,
+                labels,
+                witnesses,
+            );
+        }
+    }
+
+    fn one_hop_profile_root_labels(&self, root: usize) -> Vec<String> {
+        let mut labels = Vec::new();
+        if let Some(node) = self.pag.nodes.get(root) {
+            labels.push(node.label.clone());
+        }
+        labels.extend(
+            self.classes[root]
+                .global_objs
+                .iter()
+                .filter_map(|&index| self.global_keys.get(index))
+                .cloned(),
+        );
+        labels.extend(
+            self.classes[root]
+                .field_regions
+                .iter()
+                .filter_map(|(owner, region)| {
+                    self.pag.nodes.get(owner.0 as usize).map(|node| {
+                        format!(
+                            "{}@{}",
+                            node.label,
+                            one_hop_field_location_label(region.location)
+                        )
+                    })
+                }),
+        );
+        sample_one_hop_profile_labels(labels, knobs::PARTITION_PROFILE_CLASS_LABEL_SAMPLE_LIMIT)
+    }
+
+    fn one_hop_profile_class_label(&self, class: usize) -> String {
+        let node_label = self.pag.nodes.get(class).map(|node| node.label.clone());
+        if node_label
+            .as_deref()
+            .is_some_and(|label| !one_hop_profile_label_is_string_literal(label))
+        {
+            return node_label.expect("checked source node label");
+        }
+        if let Some(data) = self.classes.get(class) {
+            let labels = data
+                .field_regions
+                .iter()
+                .filter_map(|(owner, region)| {
+                    self.pag.nodes.get(owner.0 as usize).map(|node| {
+                        format!(
+                            "{}@{}",
+                            node.label,
+                            one_hop_field_location_label(region.location)
+                        )
+                    })
+                })
+                .collect();
+            if let Some(label) = sample_one_hop_profile_labels(labels, 1).into_iter().next() {
+                return label;
+            }
+        }
+        // Synthetic pointee classes normally have no direct PAG label. Resolve just this bounded
+        // report-time witness to its final identity root so it still names representative storage.
+        let canonical = self.find_readonly(class);
+        if canonical != class {
+            if let Some(label) = self
+                .one_hop_profile_root_labels(canonical)
+                .into_iter()
+                .next()
+            {
+                return label;
+            }
+        }
+        node_label.unwrap_or_else(|| format!("class:{class}"))
+    }
+
+    fn find_readonly(&self, mut class: usize) -> usize {
+        while self.classes[class].parent != class {
+            class = self.classes[class].parent;
+        }
+        class
+    }
+
     fn find(&mut self, class: usize) -> usize {
         let parent = self.classes[class].parent;
         if parent == class {
@@ -3729,6 +4130,41 @@ impl<'a> Solver<'a> {
 
 fn steens_profile_enabled() -> bool {
     std::env::var_os(knobs::ENV_STEENS_PROFILE).is_some()
+}
+
+fn steens_one_hop_widening_profile_enabled() -> bool {
+    std::env::var_os(knobs::ENV_STEENS_ONE_HOP_WIDENING_PROFILE).is_some()
+}
+
+fn one_hop_field_location_label(location: FieldLocation) -> String {
+    match location {
+        FieldLocation::Exact(offset) => format!("exact:{offset}"),
+        FieldLocation::Lane(lane) => format!("lane:{}:{}", lane.modulus, lane.residue),
+        FieldLocation::Unknown => "unknown".to_string(),
+    }
+}
+
+fn one_hop_profile_label_is_string_literal(label: &str) -> bool {
+    label.starts_with(".str") || label.contains(":.str")
+}
+
+/// Return a small, deterministic label sample without allowing a large string-literal pool to
+/// hide every named storage identity.  If any named non-literal exists, every returned label is
+/// drawn from that set up to `limit`; literals are only a fallback for literal-only classes.
+fn sample_one_hop_profile_labels(mut labels: Vec<String>, limit: usize) -> Vec<String> {
+    labels.sort();
+    labels.dedup();
+    let mut named = labels
+        .iter()
+        .filter(|label| !one_hop_profile_label_is_string_literal(label))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !named.is_empty() {
+        named.truncate(limit);
+        return named;
+    }
+    labels.truncate(limit);
+    labels
 }
 
 fn steens_profile_interval_candidate_pairs() -> u64 {
@@ -3778,6 +4214,81 @@ mod tests {
             global_storage_roots_index(&classes, 3),
             vec![vec![0, 4], vec![2, 4], vec![0]]
         );
+    }
+
+    #[test]
+    fn one_hop_widening_classifies_exact_lane_and_unknown_shifts() {
+        assert_eq!(
+            OneHopShiftKind::of(FieldLocation::Exact(-8)),
+            OneHopShiftKind::Exact
+        );
+        assert_eq!(
+            OneHopShiftKind::of(FieldLocation::Lane(
+                pangs_pir::GepLane::new(16, 4).expect("valid lane"),
+            )),
+            OneHopShiftKind::Lane
+        );
+        assert_eq!(
+            OneHopShiftKind::of(FieldLocation::Unknown),
+            OneHopShiftKind::Unknown
+        );
+    }
+
+    #[test]
+    fn one_hop_widening_label_sample_reserves_named_storage_over_string_literals() {
+        let labels = vec![
+            ".str".to_string(),
+            "obj:global:.str.100@exact:0".to_string(),
+            "obj:global:sqlite3Config@exact:8".to_string(),
+            "obj:global:sqlite3GlobalConfig@exact:16".to_string(),
+        ];
+        assert_eq!(
+            sample_one_hop_profile_labels(labels, 4),
+            vec![
+                "obj:global:sqlite3Config@exact:8".to_string(),
+                "obj:global:sqlite3GlobalConfig@exact:16".to_string(),
+            ]
+        );
+        assert_eq!(
+            sample_one_hop_profile_labels(vec![".str.1".to_string(), ".str".to_string()], 1),
+            vec![".str".to_string()]
+        );
+    }
+
+    #[test]
+    fn one_hop_widening_aggregation_merges_absorbed_root_contributions() {
+        let kind = OneHopReplayKind {
+            shift: OneHopShiftKind::Exact,
+            mixed_summary: true,
+            cross_root: true,
+        };
+        let witness = OneHopReplayAttribution {
+            source: 41,
+            kind,
+            delta: FieldLocation::Exact(8),
+        };
+        let mut survivor = OneHopWidenedRoot::default();
+        survivor.counts.events = 1;
+        survivor.counts.joins = 1;
+        survivor.witnesses.push(witness.clone());
+        let mut absorbed = OneHopWidenedRoot::default();
+        absorbed.counts.events = 2;
+        absorbed.counts.joins = 3;
+        absorbed.counts.class_nodes_added = 17;
+        absorbed.counts.global_identities_added = 5;
+        absorbed.counts.field_regions_added = 9;
+        absorbed.by_kind.insert(kind, absorbed.counts.clone());
+        absorbed.witnesses.push(witness.clone());
+
+        merge_one_hop_widened_root(&mut survivor, absorbed);
+
+        assert_eq!(survivor.counts.events, 3);
+        assert_eq!(survivor.counts.joins, 4);
+        assert_eq!(survivor.counts.class_nodes_added, 17);
+        assert_eq!(survivor.counts.global_identities_added, 5);
+        assert_eq!(survivor.counts.field_regions_added, 9);
+        assert_eq!(survivor.by_kind[&kind].joins, 3);
+        assert_eq!(survivor.witnesses, vec![witness]);
     }
 
     #[test]

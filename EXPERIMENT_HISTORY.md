@@ -833,8 +833,16 @@ now pass, and the solver suite has 142 passing tests. Vim's full global records 
 unchanged and its same 26 unknown-call monotonicity failures remain. Performance
 measurements and the distinction between initial and optimized fixes are in
 `20260907_CALLBACK_ESCAPE_FIX_EVALUATION.md`.
+The subsequent investigation separates those Vim discrepancies from escape:
+20 callback initializers were excluded by admission, and six empty refinements
+were promoted to unknown. Directional memory-support dependencies now connect
+uncertified accesses to their possible producers, including inside SCC slices;
+uncertified empty callback answers retain explicit finite base fallback. Vim's
+census returns to 206 unknowns, with the 20 initializers actually recovered and
+the other six sites marked fallback. See
+`20260907_CALLBACK_ADMISSION_FIX_EVALUATION.md` for validation and client impact.
 The retained prerequisite also exposes 26 Vim unknown-call monotonicity discrepancies
-with C off; these remain a blocker, not a passed soundness gate.
+with C off in the historical pre-admission-fix measurements.
 
 With static PWC lanes held on, initial paired tmux and jq measurements sharply reduce
 copy fact work while preserving complete disposition records; SQLite's smaller work

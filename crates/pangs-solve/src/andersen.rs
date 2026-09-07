@@ -1361,6 +1361,11 @@ impl<'a> Refiner<'a> {
         self.prepartition_flow_edges.clear();
         let mut regions = HashMap::new();
         let suppressed_payload_bindings = self.receiver_payload_binding_edges();
+        // Storage support is directional: a possibly aliased write is a producer
+        // of a read, not an equality between their value carriers. Keep certified
+        // region-to-region accesses independent; bridge them only when an access
+        // lacks a fixed allocation-relative certificate.
+        let mut memory_support = BTreeMap::<usize, Vec<(usize, bool, bool)>>::new();
 
         for (edge_index, edge) in self.pag.edges.iter().enumerate() {
             if suppressed_payload_bindings.contains(&(edge.src, edge.dst)) {
@@ -1445,7 +1450,64 @@ impl<'a> Refiner<'a> {
                 }
             }
             self.prepartition_edge_vertices[edge_index] = endpoints;
+            if let Some((left, right)) = endpoints {
+                let accesses = match edge.kind {
+                    EdgeKind::Load => vec![(edge.src, left, false)],
+                    EdgeKind::Store => vec![(edge.dst, left, true)],
+                    EdgeKind::Memcpy { .. } => {
+                        vec![(edge.src, right, false), (edge.dst, left, true)]
+                    }
+                    _ => Vec::new(),
+                };
+                for (address, vertex, write) in accesses {
+                    let class = self.classes.class_of(address);
+                    if let Some(storage) = self.classes.pointee[class] {
+                        memory_support.entry(storage).or_default().push((
+                            vertex,
+                            write,
+                            self.exact_addresses[address.0 as usize].is_some(),
+                        ));
+                    }
+                }
+            }
         }
+
+        // Two stars per storage envelope encode the producer/consumer join in
+        // linear space. The first joins all writers to uncertified readers; the
+        // second joins uncertified writers to certified readers. These edges
+        // participate in BOTH weak-component admission and SCC predecessor closure.
+        let support_start = self.prepartition_flow_edges.len();
+        for accesses in memory_support.values() {
+            for certified_read in [false, true] {
+                let writers = accesses
+                    .iter()
+                    .filter_map(|&(vertex, write, certified)| {
+                        (write && (!certified_read || !certified)).then_some(vertex)
+                    })
+                    .collect::<BTreeSet<_>>();
+                let readers = accesses
+                    .iter()
+                    .filter_map(|&(vertex, write, certified)| {
+                        (!write && certified == certified_read).then_some(vertex)
+                    })
+                    .collect::<BTreeSet<_>>();
+                if writers.is_empty() || readers.is_empty() {
+                    continue;
+                }
+                let hub = self.ap_parent.len();
+                self.ap_parent.push(hub);
+                self.prepartition_regions.push(None);
+                for writer in writers {
+                    self.ap_union(writer, hub);
+                    self.prepartition_flow_edges.push((writer, hub));
+                }
+                for reader in readers {
+                    self.ap_union(hub, reader);
+                    self.prepartition_flow_edges.push((hub, reader));
+                }
+            }
+        }
+        let support_edges = self.prepartition_flow_edges[support_start..].to_vec();
 
         // Receiver-relative payload cells participate in admission, not just in the final
         // inclusion solve. Otherwise a source-closed slice could admit a get while excluding
@@ -1642,6 +1704,10 @@ impl<'a> Refiner<'a> {
         }
 
         let mut oversize: HashSet<usize> = HashSet::new();
+        for (source, _) in support_edges {
+            let ap = self.ap_find(source);
+            *edges_in.entry(ap).or_insert(0) += 1;
+        }
         let forged_partitions = self
             .pag
             .omega_seeds
@@ -4253,6 +4319,18 @@ impl<'a> Refiner<'a> {
                 }
                 // Preserve the target-lattice invariant at the final refinement boundary:
                 // empty-without-top is analysis silence, never a conservative call answer.
+                // Without an empty witness, retain the already conservative base envelope
+                // and its census provenance instead of widening a finite answer to top.
+                // An actual external operand must still carry unknown.
+                if targets.is_empty() && !operand_unknown {
+                    if let Some(base) = steens {
+                        out.push(IndirectCallResolution {
+                            fallback: true,
+                            ..base.clone()
+                        });
+                        continue;
+                    }
+                }
                 unknown_callee |= targets.is_empty();
                 out.push(IndirectCallResolution {
                     callsite_key: cs.key.clone(),
@@ -9030,6 +9108,214 @@ mod tests {
             .unwrap();
         assert_eq!(andersen_a.targets, vec!["g".to_string()]);
         assert!(andersen.metrics.rounds >= 1);
+    }
+
+    #[test]
+    fn uncertified_memory_admission_includes_initializers_and_respects_budget() {
+        let (mut pir, _) = load_m1_4("internal_aggregate_callback_admission.pir.json");
+        // Outgoing users make the weak component oversize without enlarging the
+        // callback's producer closure. The initializer must survive SCC slicing.
+        let invoke = pir
+            .functions
+            .iter_mut()
+            .find(|f| f.key == "invoke")
+            .unwrap();
+        let mut source = "fp".to_string();
+        for index in 0..100 {
+            let dest = format!("out{index}");
+            invoke.body.push(Stmt::Assign {
+                dest: dest.clone(),
+                sources: vec![source],
+                loc: None,
+            });
+            source = dest;
+        }
+        let pag = Pag::from_pir(
+            &pir,
+            &PagOpts {
+                build_mode: BuildMode::Executable,
+                ..PagOpts::default()
+            },
+        );
+        let (base, classes) = crate::solve_steensgaard_classes_targeted(
+            &pir,
+            &pag,
+            BuildMode::Executable,
+            &BTreeSet::new(),
+        );
+        for overlap in [false, true] {
+            for budget in [1, 1_000, u64::MAX] {
+                let result = finish_andersen_controlled(
+                    &pir,
+                    &pag,
+                    &classes,
+                    base.clone(),
+                    BuildMode::Executable,
+                    budget,
+                    &BTreeMap::new(),
+                    &BTreeSet::new(),
+                    false,
+                    AndersenControls {
+                        asymmetric_field_overlap: overlap,
+                        ..AndersenControls::default()
+                    },
+                );
+                let site = &result.indirect_calls[0];
+                assert_eq!(site.targets, vec!["cb".to_string()]);
+                assert!(!site.unknown_callee);
+                assert_eq!(
+                    site.fallback,
+                    budget == 1,
+                    "overlap={overlap} budget={budget}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uncertified_store_supports_a_certified_load() {
+        let (mut pir, _) = load_m1_4("internal_aggregate_callback_admission.pir.json");
+        let store = pir
+            .functions
+            .iter_mut()
+            .find(|f| f.key == "main")
+            .unwrap()
+            .body
+            .remove(2);
+        let invoke = pir
+            .functions
+            .iter_mut()
+            .find(|f| f.key == "invoke")
+            .unwrap();
+        let load_and_call = invoke.body.split_off(1);
+        invoke.body.push(store);
+        pir.functions
+            .iter_mut()
+            .find(|f| f.key == "main")
+            .unwrap()
+            .body
+            .extend(load_and_call);
+        let pag = Pag::from_pir(
+            &pir,
+            &PagOpts {
+                build_mode: BuildMode::Executable,
+                ..PagOpts::default()
+            },
+        );
+        let (base, classes) = crate::solve_steensgaard_classes_targeted(
+            &pir,
+            &pag,
+            BuildMode::Executable,
+            &BTreeSet::new(),
+        );
+        for overlap in [false, true] {
+            let result = finish_andersen_controlled(
+                &pir,
+                &pag,
+                &classes,
+                base.clone(),
+                BuildMode::Executable,
+                u64::MAX,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                false,
+                AndersenControls {
+                    asymmetric_field_overlap: overlap,
+                    ..AndersenControls::default()
+                },
+            );
+            let site = &result.indirect_calls[0];
+            assert_eq!(site.targets, vec!["cb".to_string()]);
+            assert!(!site.fallback && !site.unknown_callee);
+        }
+    }
+
+    #[test]
+    fn null_callback_semantic_fixture_uses_finite_base_fallback() {
+        let (pir, _) = load_m1_4("null_callback_empty_refinement.pir.json");
+        let pag = Pag::from_pir(
+            &pir,
+            &PagOpts {
+                build_mode: BuildMode::Executable,
+                ..PagOpts::default()
+            },
+        );
+        let (base, classes) = crate::solve_steensgaard_classes_targeted(
+            &pir,
+            &pag,
+            BuildMode::Executable,
+            &BTreeSet::new(),
+        );
+        for overlap in [false, true] {
+            let result = finish_andersen_controlled(
+                &pir,
+                &pag,
+                &classes,
+                base.clone(),
+                BuildMode::Executable,
+                u64::MAX,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                false,
+                AndersenControls {
+                    asymmetric_field_overlap: overlap,
+                    ..AndersenControls::default()
+                },
+            );
+            let site = &result.indirect_calls[0];
+            assert_eq!(site.targets, vec!["cb".to_string()]);
+            assert!(site.fallback && !site.unknown_callee);
+        }
+    }
+
+    #[test]
+    fn empty_refinement_retains_base_but_external_operand_does_not_clear_unknown() {
+        let (pir, pag) = load_m1_4("internal_aggregate_callback_admission.pir.json");
+        let (base, classes) = crate::solve_steensgaard_classes_targeted(
+            &pir,
+            &pag,
+            BuildMode::Executable,
+            &BTreeSet::new(),
+        );
+        let exact = BTreeMap::new();
+        let confined = BTreeSet::new();
+        let refiner = Refiner::new(
+            &pir,
+            &pag,
+            &classes,
+            &base,
+            BuildMode::Executable,
+            u64::MAX,
+            &exact,
+            &confined,
+            false,
+        );
+        let site = pag
+            .callsites
+            .iter()
+            .position(|cs| cs.kind == pangs_pag::CallKind::Indirect)
+            .unwrap();
+        let mut solve = Solve::new(pag.nodes.len(), false);
+        let empty = refiner.emit_indirect_calls(
+            &[site],
+            &Default::default(),
+            &HashSet::new(),
+            &solve,
+            false,
+        );
+        assert_eq!(empty[0].targets, base.indirect_calls[0].targets);
+        assert!(!empty[0].unknown_callee);
+        assert!(empty[0].fallback);
+        let external = solve.region(ExternalRegion::GenericStorage);
+        solve.add_pts(pag.callsites[site].operand.unwrap().0, external);
+        let unknown = refiner.emit_indirect_calls(
+            &[site],
+            &Default::default(),
+            &HashSet::new(),
+            &solve,
+            false,
+        );
+        assert!(unknown[0].unknown_callee);
     }
 
     #[test]

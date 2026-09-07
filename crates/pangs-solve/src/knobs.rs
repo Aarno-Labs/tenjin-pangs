@@ -100,6 +100,12 @@ pub(crate) const CFL_VISIT_HISTOGRAM_LARGE_MAX: usize = 1_000;
 /// Candidate-pair interval between Steensgaard profiling records.
 pub(crate) const STEENS_PROFILE_INTERVAL_CANDIDATE_PAIRS: u64 = 10_000_000;
 
+/// Number of final identity roots shown by the opt-in one-hop replay widening profile.
+pub(crate) const STEENS_ONE_HOP_WIDENING_PROFILE_TOP: usize = 12;
+
+/// Number of replay witnesses retained for a widened identity root.
+pub(crate) const STEENS_ONE_HOP_WIDENING_PROFILE_WITNESSES: usize = 4;
+
 /// Enables Andersen solver profiling when present.
 pub(crate) const ENV_ANDERSEN_PROFILE: &str = "PANGS_ANDERSEN_PROFILE";
 
@@ -210,3 +216,9 @@ pub(crate) const ENV_STEENS_PROFILE: &str = "PANGS_STEENS_PROFILE";
 
 /// Overrides the Steensgaard candidate-pair profiling interval.
 pub(crate) const ENV_STEENS_PROFILE_INTERVAL: &str = "PANGS_STEENS_PROFILE_INTERVAL";
+
+/// Attributes union-find growth caused while replaying persistent one-hop GEP constraints.
+/// This is diagnostic-only: it prints bounded aggregate records to stderr and does not change
+/// Steensgaard's constraints or exported results.
+pub(crate) const ENV_STEENS_ONE_HOP_WIDENING_PROFILE: &str =
+    "PANGS_STEENS_ONE_HOP_WIDENING_PROFILE";
