@@ -57,6 +57,12 @@ directions are:
 | `Gep` | root-relative region → derived address carrier |
 | `Memcpy` | source region/carriers → destination region |
 
+Overlapping allocation-relative storage regions contribute flow edges in both directions;
+joining them only for weak admission omits content producers from SCC slices. Indirect-call
+operands also feed every parameter/result whose binding depends on their target activation.
+These activation dependencies participate in weak connectivity as well as directed closure, so
+a consumer cannot be refined while the call that supplies it remains outside scope.
+
 Indirect-call argument/parameter and return/result bindings from the complete Steensgaard target
 envelope are inserted before condensation.  Receiver-payload support edges are likewise inserted
 before admission when that experiment is enabled.  This is important: the directed graph must
@@ -572,6 +578,8 @@ compare budget 200 with forced admission and independently require `{f0, f1}` an
 `{other, target}`, respectively.  Each includes an independent target so a missing producer
 leaves a nonempty answer and cannot be hidden by empty-result fallback.  Run both with
 `cargo test -p pangs-solve sc_admission_preserves_ -- --nocapture`.
+The tests also append an outgoing-only tail and use budget 5,000 to require a finite Andersen
+answer from an admitted producer slice while the enclosing weak component remains oversize.
 
 ### 9.3 Client merge fixtures
 

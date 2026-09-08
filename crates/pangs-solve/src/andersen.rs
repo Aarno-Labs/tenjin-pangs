@@ -1204,6 +1204,11 @@ impl<'a> Refiner<'a> {
             .collect::<Vec<_>>();
         for alias in aliases {
             self.ap_union(vertex, alias);
+            // The solve exchanges contents between overlapping regions. Weak connectivity
+            // alone does not retain those producers in a directed SCC slice: either region
+            // must bring the other's stores into its predecessor closure as well.
+            self.prepartition_flow_edges.push((vertex, alias));
+            self.prepartition_flow_edges.push((alias, vertex));
         }
         vertex
     }
@@ -1593,7 +1598,9 @@ impl<'a> Refiner<'a> {
         // On-the-fly indirect-call bindings are constraints too. Add every binding admitted
         // by the sound Steensgaard target envelope (plus independently exact overrides) so
         // an argument's address-producing constraints cannot be stranded outside the
-        // callee parameter's component.
+        // callee parameter's component. A binding also depends on resolving the call operand:
+        // run() activates targets only for in-scope operands. Without that dependency a
+        // parameter or return consumer can be admitted while its binding is never installed.
         let base_targets = self
             .base
             .indirect_calls
@@ -1618,6 +1625,7 @@ impl<'a> Refiner<'a> {
                 .collect::<Vec<_>>();
             targets.sort_unstable();
             targets.dedup();
+            let mut activation_destinations = BTreeSet::new();
             for function in targets {
                 for (index, &argument) in callsite.args.iter().enumerate() {
                     if let Some(&parameter) = self.param_nodes.get(&(function, index)) {
@@ -1625,6 +1633,7 @@ impl<'a> Refiner<'a> {
                             self.ap_union(argument.0 as usize, parameter.0 as usize);
                             self.prepartition_flow_edges
                                 .push((argument.0 as usize, parameter.0 as usize));
+                            activation_destinations.insert(parameter.0 as usize);
                         }
                     }
                 }
@@ -1634,7 +1643,15 @@ impl<'a> Refiner<'a> {
                         self.ap_union(ret.0 as usize, result.0 as usize);
                         self.prepartition_flow_edges
                             .push((ret.0 as usize, result.0 as usize));
+                        activation_destinations.insert(result.0 as usize);
                     }
+                }
+            }
+            if let Some(operand) = callsite.operand {
+                for destination in activation_destinations {
+                    self.ap_union(operand.0 as usize, destination);
+                    self.prepartition_flow_edges
+                        .push((operand.0 as usize, destination));
                 }
             }
         }
@@ -9647,6 +9664,42 @@ mod tests {
             "{name}: admission dropped required targets at {callsite}: bounded={:?}, forced={:?}",
             partial.targets,
             full.targets
+        );
+
+        // A larger budget should actually solve the complete producer slice. Add only
+        // outgoing consumers so the weak component stays oversize without enlarging the
+        // query's predecessor closure. This distinguishes selective refinement from a fix
+        // which simply falls back for every affected callsite.
+        let mut tailed = pir.clone();
+        let caller = callsite.split('@').next().unwrap();
+        let function = tailed
+            .functions
+            .iter_mut()
+            .find(|function| function.key == caller)
+            .unwrap();
+        let mut source = "%q".to_string();
+        for index in 0..100 {
+            let destination = format!("%sc_outgoing{index}");
+            function.body.push(Stmt::Assign {
+                dest: destination.clone(),
+                sources: vec![source],
+                loc: None,
+            });
+            source = destination;
+        }
+        let tailed_pag = Pag::from_pir(&tailed, &PagOpts::default());
+        let admitted = solve_andersen(&tailed, &tailed_pag, BuildMode::Library, 5_000);
+        assert!(admitted.metrics.andersen_complete);
+        assert!(admitted.metrics.oversize_fallbacks > 0);
+        let selected = row(&admitted);
+        assert!(
+            !selected.fallback,
+            "{name}: complete producer slice should fit"
+        );
+        assert!(!selected.unknown_callee);
+        assert_eq!(
+            selected.targets, full.targets,
+            "{name}: admitted producer slice"
         );
     }
 

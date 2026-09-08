@@ -251,6 +251,11 @@ envelope cover uncertified readers and uncertified writers without equating cert
 regions merely because Steensgaard merged them. These support edges count toward the
 admission budget and participate in directed SCC predecessor closure, so a callback
 load cannot be admitted without its possible initializer producers. An
+overlap between allocation-relative storage regions likewise contributes dependencies in
+both directions, matching the solver's exchange of contents. Indirect-call parameter and
+return bindings depend on the call operand as well as their data source: admitting a binding's
+consumer must also admit the operand whose resolution activates it. These dependencies
+participate in weak connectivity and directed predecessor closure. An
 interesting component is admitted to Andersen when its quadratic cost proxy fits the
 configured budget. An oversize component remains at its Steensgaard answer, and the
 result records the number and largest size of such fallbacks. Provenance separation also
