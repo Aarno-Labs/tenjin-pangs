@@ -938,6 +938,11 @@ struct ClassData {
     /// Classes whose contents include this class's contents. Targets are raw class ids and are
     /// resolved through `find` when the edge fires, just like the other union-find side tables.
     content_succ: Vec<usize>,
+    /// This location receives pointer contents from a Store or Memcpy. If it later becomes
+    /// reachable by foreign code, the stored pointer publishes its target allocation. Keep this
+    /// obligation separate from ordinary external-content propagation: an external pointer
+    /// payload in private storage must not make sibling fields escape.
+    pointer_write_destination: bool,
     /// Content propagation frontier. Facts are monotone, so unchanged facts need visit only
     /// successors appended since the previous push. A class join resets this compact frontier.
     content_pushed_succ_len: usize,
@@ -2119,6 +2124,7 @@ impl<'a> Solver<'a> {
                         src,
                         PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
                     );
+                    self.mark_pointer_write_destination(storage);
                     self.add_content_edge(src, storage);
                 }
                 pangs_pag::EdgeKind::Gep { byte_off, lane } => {
@@ -2159,6 +2165,7 @@ impl<'a> Solver<'a> {
                         src_storage,
                         PROV_MEMORY_MERGING | PROV_SCALAR_OR_UNKNOWN_PAYLOAD,
                     );
+                    self.mark_pointer_write_destination(dst_storage);
                     self.add_content_edge(src_storage, dst_storage);
                 }
             }
@@ -2802,6 +2809,7 @@ impl<'a> Solver<'a> {
         let ext = self.classes[root].ext;
         let external_escaped_union = self.classes[root].external_escaped_union;
         let esc = self.classes[root].esc;
+        let publishes_stored_pointer = esc && self.classes[root].pointer_write_destination;
         let escape_sources = self.classes[root].escape_sources.clone();
 
         // Escape belongs to the allocation, including addresses discovered through memory
@@ -2829,6 +2837,7 @@ impl<'a> Solver<'a> {
 
         if ext || esc {
             if let Some(pointee) = self.classes[root].pointee {
+                let pointee_allocation_escape = allocation_escape || publishes_stored_pointer;
                 if external_escaped_union {
                     self.set_external_escaped_union(pointee);
                 } else {
@@ -2836,16 +2845,18 @@ impl<'a> Solver<'a> {
                 }
                 if escape_sources.is_empty() {
                     let pointee = self.find(pointee);
-                    if !self.classes[pointee].esc {
+                    if !self.classes[pointee].esc
+                        || (pointee_allocation_escape && !self.classes[pointee].allocation_escape)
+                    {
                         let source = self.provenance.intern("derived:external-pointee".into());
                         self.set_esc_sources_kind(
                             pointee,
                             &BTreeSet::from([source]),
-                            allocation_escape,
+                            pointee_allocation_escape,
                         );
                     }
                 } else {
-                    self.set_esc_sources_kind(pointee, &escape_sources, allocation_escape);
+                    self.set_esc_sources_kind(pointee, &escape_sources, pointee_allocation_escape);
                 }
             }
         }
@@ -3202,6 +3213,14 @@ impl<'a> Solver<'a> {
         self.classes[src].content_succ.push(dst);
         self.metrics.steens_content_edges += 1;
         self.enqueue(src);
+    }
+
+    fn mark_pointer_write_destination(&mut self, storage: usize) {
+        let storage = self.find(storage);
+        if !self.classes[storage].pointer_write_destination {
+            self.classes[storage].pointer_write_destination = true;
+            self.enqueue(storage);
+        }
     }
 
     fn escape_allocation_fields(&mut self, root: NodeId, sources: &BTreeSet<ProvenanceId>) {
@@ -3820,6 +3839,7 @@ impl<'a> Solver<'a> {
         self.classes[a].external_escaped_union |= self.classes[b].external_escaped_union;
         self.classes[a].esc |= self.classes[b].esc;
         self.classes[a].allocation_escape |= self.classes[b].allocation_escape;
+        self.classes[a].pointer_write_destination |= self.classes[b].pointer_write_destination;
         self.classes[a].provenance |= self.classes[b].provenance | provenance;
         let mut other_escape_sources = std::mem::take(&mut self.classes[b].escape_sources);
         if self.classes[a].escape_sources.len() < other_escape_sources.len() {
@@ -6263,6 +6283,173 @@ mod tests {
         assert!(!result.globals["@Esc"].never_written);
         assert!(!result.globals["@Local"].escape_external);
         assert!(result.globals["@Local"].never_written);
+    }
+
+    #[test]
+    fn pointer_stored_in_foreign_storage_escapes_target_allocation_fields() {
+        let mut pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"foreign-store-publishes-row",
+                "globals":[{"key":"table"}],
+                "global_init":[
+                    {"kind":"gep","dest":"encode.field","base":"@table","byte_off":8},
+                    {"kind":"store","address":"encode.field","value":"encode","access_bytes":8},
+                    {"kind":"gep","dest":"size.field","base":"@table","byte_off":16},
+                    {"kind":"store","address":"size.field","value":"size","access_bytes":8}
+                ],
+                "functions":[
+                    {"key":"encode","address_taken":true,
+                     "sig":{"ret":{"class":"void"},"params":[]},"body":[]},
+                    {"key":"size","address_taken":true,
+                     "sig":{"ret":{"class":"void"},"params":[]},"body":[]},
+                    {"key":"publish","exported":true,
+                     "sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},
+                     "param_names":["%publish::part"],
+                     "body":[
+                        {"kind":"gep","dest":"%publish::row","base":"@table",
+                         "lane":{"modulus":24,"residue":0}},
+                        {"kind":"gep","dest":"%publish::field","base":"%publish::part",
+                         "byte_off":128},
+                        {"kind":"store","address":"%publish::field","value":"%publish::row",
+                         "access_bytes":8}
+                     ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        for name in [
+            "encode.field",
+            "size.field",
+            "%publish::part",
+            "%publish::row",
+            "%publish::field",
+        ] {
+            pir.lowering
+                .semantic_value_kinds
+                .insert(name.into(), ValueKind::Pointer);
+        }
+        let pag = Pag::from_pir(
+            &pir,
+            &PagOpts {
+                build_mode: BuildMode::Library,
+                pwc_lanes: true,
+                ..PagOpts::default()
+            },
+        );
+
+        for result in [
+            solve_steensgaard(&pir, &pag, BuildMode::Library),
+            solve_andersen(&pir, &pag, BuildMode::Library, u64::MAX),
+        ] {
+            assert!(result.globals["table"].escape_external);
+            assert!(result.unknown_callers.contains("encode"));
+            assert!(result.unknown_callers.contains("size"));
+        }
+    }
+
+    #[test]
+    fn pointer_stored_in_private_storage_does_not_publish_target_allocation_fields() {
+        let mut pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"private-store-does-not-publish-row",
+                "globals":[{"key":"table"},{"key":"slot"}],
+                "global_init":[
+                    {"kind":"gep","dest":"callback.field","base":"@table","byte_off":8},
+                    {"kind":"store","address":"callback.field","value":"callback","access_bytes":8}
+                ],
+                "functions":[
+                    {"key":"callback","address_taken":true,
+                     "sig":{"ret":{"class":"void"},"params":[]},"body":[]},
+                    {"key":"foreign_pointer","external":true,
+                     "sig":{"ret":{"class":"integer"},"params":[]},"body":[]},
+                    {"key":"keep_private",
+                     "sig":{"ret":{"class":"void"},"params":[]},
+                     "body":[
+                        {"kind":"gep","dest":"row","base":"@table",
+                         "lane":{"modulus":24,"residue":0}},
+                        {"kind":"call_direct","callee":"foreign_pointer",
+                         "sig":{"ret":{"class":"integer"},"params":[]},"args":[],
+                         "dest":"foreign"},
+                        {"kind":"assign","dest":"mixed","sources":["row","foreign"]},
+                        {"kind":"store","address":"@slot","value":"mixed","access_bytes":8}
+                     ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        for name in ["callback.field", "row", "foreign", "mixed"] {
+            pir.lowering
+                .semantic_value_kinds
+                .insert(name.into(), ValueKind::Pointer);
+        }
+        let pag = Pag::from_pir(
+            &pir,
+            &PagOpts {
+                build_mode: BuildMode::Library,
+                pwc_lanes: true,
+                ..PagOpts::default()
+            },
+        );
+
+        for result in [
+            solve_steensgaard(&pir, &pag, BuildMode::Library),
+            solve_andersen(&pir, &pag, BuildMode::Library, u64::MAX),
+        ] {
+            assert!(!result.globals["table"].escape_external);
+            assert!(!result.unknown_callers.contains("callback"));
+        }
+    }
+
+    #[test]
+    fn pointer_copied_into_foreign_storage_escapes_target_allocation_fields() {
+        let mut pir: Pir = serde_json::from_str(
+            r#"{
+                "module":"foreign-memcpy-publishes-row",
+                "globals":[{"key":"table"},{"key":"slot"}],
+                "global_init":[
+                    {"kind":"gep","dest":"callback.field","base":"@table","byte_off":8},
+                    {"kind":"store","address":"callback.field","value":"callback","access_bytes":8},
+                    {"kind":"gep","dest":"row","base":"@table",
+                     "lane":{"modulus":24,"residue":0}},
+                    {"kind":"store","address":"@slot","value":"row","access_bytes":8}
+                ],
+                "functions":[
+                    {"key":"callback","address_taken":true,
+                     "sig":{"ret":{"class":"void"},"params":[]},"body":[]},
+                    {"key":"publish_copy","exported":true,
+                     "sig":{"ret":{"class":"void"},"params":[{"class":"integer"}]},
+                     "param_names":["%publish_copy::destination"],
+                     "body":[
+                        {"kind":"memcpy","dst":"%publish_copy::destination","src":"@slot",
+                         "bytes":8}
+                     ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        for name in ["callback.field", "row", "%publish_copy::destination"] {
+            pir.lowering
+                .semantic_value_kinds
+                .insert(name.into(), ValueKind::Pointer);
+        }
+        let pag = Pag::from_pir(
+            &pir,
+            &PagOpts {
+                build_mode: BuildMode::Library,
+                pwc_lanes: true,
+                ..PagOpts::default()
+            },
+        );
+
+        for (tier, result) in [
+            ("steens", solve_steensgaard(&pir, &pag, BuildMode::Library)),
+            (
+                "andersen",
+                solve_andersen(&pir, &pag, BuildMode::Library, u64::MAX),
+            ),
+        ] {
+            assert!(result.unknown_callers.contains("callback"), "{tier}");
+        }
     }
 
     #[test]

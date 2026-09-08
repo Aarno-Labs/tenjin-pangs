@@ -197,7 +197,12 @@ fixed exact-address certificates. Real boundary escape propagates to every field
 each represented allocation, including roots discovered by later joins and fields
 materialized later. This obligation is distinct from the synthetic escape bit used
 for an external pointer's pointee: storing an external payload in one field does not
-externalize its siblings. A monotone region-count frontier bounds replay work.
+externalize its siblings. A pointer-valued store or pointer-bearing memcpy records a
+separate monotone obligation on its destination location: if that location itself
+becomes foreign-reachable, the written pointer publishes its target allocation and
+upgrades the target to real allocation escape. This obligation survives late location
+joins without confusing an external payload in private storage with foreign-reachable
+storage. A monotone region-count frontier bounds replay work.
 
 Content facts also push down through pointer targets. When a class is external or escaped, its
 pointee class becomes external and escaped. Everything reachable from an external, escaped, or
