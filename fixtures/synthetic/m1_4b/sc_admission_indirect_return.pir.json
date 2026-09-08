@@ -1,0 +1,70 @@
+{
+  "module": "m1_4b.sc_admission_indirect_return",
+  "functions": [
+    {
+      "key": "driver",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "assign", "dest": "%producer0", "sources": ["choose"] },
+        { "kind": "assign", "dest": "%producer1", "sources": ["%producer0"] },
+        { "kind": "assign", "dest": "%producer2", "sources": ["%producer1"] },
+        { "kind": "assign", "dest": "%producer3", "sources": ["%producer2"] },
+        { "kind": "assign", "dest": "%producer4", "sources": ["%producer3"] },
+        { "kind": "assign", "dest": "%producer5", "sources": ["%producer4"] },
+        { "kind": "assign", "dest": "%producer6", "sources": ["%producer5"] },
+        { "kind": "assign", "dest": "%producer7", "sources": ["%producer6"] },
+        { "kind": "assign", "dest": "%producer8", "sources": ["%producer7"] },
+        { "kind": "assign", "dest": "%producer9", "sources": ["%producer8"] },
+        { "kind": "assign", "dest": "%producer10", "sources": ["%producer9"] },
+        { "kind": "assign", "dest": "%producer11", "sources": ["%producer10"] },
+        { "kind": "assign", "dest": "%producer12", "sources": ["%producer11"] },
+        { "kind": "assign", "dest": "%producer13", "sources": ["%producer12"] },
+        { "kind": "assign", "dest": "%producer14", "sources": ["%producer13"] },
+        { "kind": "assign", "dest": "%producer15", "sources": ["%producer14"] },
+        { "kind": "assign", "dest": "%producer16", "sources": ["%producer15"] },
+        { "kind": "assign", "dest": "%producer17", "sources": ["%producer16"] },
+        { "kind": "assign", "dest": "%producer18", "sources": ["%producer17"] },
+        { "kind": "assign", "dest": "%producer19", "sources": ["%producer18"] },
+        { "kind": "alloca", "dest": "%box", "ty": "ptr" },
+        { "kind": "store", "address": "%box", "value": "%producer19" },
+        { "kind": "load", "dest": "%choose", "address": "%box" },
+        {
+          "kind": "call_indirect",
+          "operand": "%choose",
+          "sig": { "ret": { "class": "integer" }, "params": [], "cc": "ccc" },
+          "dest": "%fp",
+          "args": []
+        },
+        { "kind": "alloca", "dest": "%resultbox", "ty": "ptr" },
+        { "kind": "assign", "dest": "%joined", "sources": ["%fp", "other"] },
+        { "kind": "store", "address": "%resultbox", "value": "%joined" },
+        { "kind": "load", "dest": "%q", "address": "%resultbox" },
+        {
+          "kind": "call_indirect",
+          "operand": "%q",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "choose",
+      "sig": { "ret": { "class": "integer" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": [ { "kind": "return", "value": "target" } ]
+    },
+    {
+      "key": "target",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    },
+    {
+      "key": "other",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": []
+}

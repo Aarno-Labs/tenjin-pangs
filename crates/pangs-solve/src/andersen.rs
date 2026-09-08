@@ -9564,6 +9564,93 @@ mod tests {
     }
 
     #[test]
+    fn sc_admission_preserves_overlapping_field_producers() {
+        // The dynamic load may read either initialized field. The independent f0 arm keeps
+        // the partial answer nonempty, so the empty-result fallback cannot hide a missing f1.
+        assert_sc_admission_preserves_targets(
+            "sc_admission_overlapping_fields.pir.json",
+            "setup@!noloc#0",
+            &["f0", "f1"],
+        );
+    }
+
+    #[test]
+    fn sc_admission_preserves_indirect_return_activation() {
+        // The producer chain makes the first call's operand exceed the small budget while
+        // its returned callback fits. The return binding still requires activating choose.
+        // Joining other keeps the partial answer nonempty even when target is lost.
+        assert_sc_admission_preserves_targets(
+            "sc_admission_indirect_return.pir.json",
+            "driver@!noloc#1",
+            &["other", "target"],
+        );
+    }
+
+    fn assert_sc_admission_preserves_targets(
+        name: &str,
+        callsite: &str,
+        expected_targets: &[&str],
+    ) {
+        let (pir, pag) = load(name);
+        let steens = solve_steensgaard(&pir, &pag, BuildMode::Library);
+        let forced = solve_andersen(&pir, &pag, BuildMode::Library, u64::MAX);
+        let bounded = solve_andersen(&pir, &pag, BuildMode::Library, 200);
+        assert!(forced.metrics.andersen_complete);
+        assert!(bounded.metrics.andersen_complete);
+        assert_eq!(forced.metrics.oversize_fallbacks, 0);
+        assert!(
+            bounded.metrics.oversize_fallbacks > 0,
+            "{name}: fixture must exercise the admission boundary"
+        );
+        let row = |result: &crate::SolveResult| {
+            result
+                .indirect_calls
+                .iter()
+                .find(|row| row.callsite_key == callsite)
+                .unwrap_or_else(|| panic!("{name}: missing callsite {callsite}"))
+                .clone()
+        };
+        let base = row(&steens);
+        let full = row(&forced);
+        let partial = row(&bounded);
+        assert!(!full.unknown_callee);
+        assert_eq!(
+            full.targets, expected_targets,
+            "{name}: forced-solve oracle"
+        );
+        assert!(
+            base.unknown_callee
+                || full
+                    .targets
+                    .iter()
+                    .all(|target| base.targets.contains(target)),
+            "{name}: forced targets must fit the Steensgaard envelope"
+        );
+        assert!(
+            base.unknown_callee
+                || (!partial.unknown_callee
+                    && partial
+                        .targets
+                        .iter()
+                        .all(|target| base.targets.contains(target))),
+            "{name}: bounded targets must fit the Steensgaard envelope"
+        );
+        // Unknown is top, so a conservative fallback is a valid repair. A finite answer
+        // must retain every required target; the usual partial ⊆ Steens check cannot detect
+        // this omission. Check the hand-specified oracle above before comparing the solves.
+        assert!(
+            partial.unknown_callee
+                || full
+                    .targets
+                    .iter()
+                    .all(|target| partial.targets.contains(target)),
+            "{name}: admission dropped required targets at {callsite}: bounded={:?}, forced={:?}",
+            partial.targets,
+            full.targets
+        );
+    }
+
+    #[test]
     fn andersen_subset_of_steensgaard_and_terminates_on_suite() {
         // Walk every solver fixture and assert the narrowing ledger holds and the
         // CG-refinement loop converges within the round budget.

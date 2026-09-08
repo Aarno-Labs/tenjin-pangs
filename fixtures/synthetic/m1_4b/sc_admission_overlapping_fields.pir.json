@@ -1,0 +1,38 @@
+{
+  "module": "m1_4b.sc_admission_overlapping_fields",
+  "functions": [
+    {
+      "key": "setup",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "body": [
+        { "kind": "alloca", "dest": "%s", "ty": "struct.S" },
+        { "kind": "gep", "dest": "%p0", "base": "%s", "byte_off": 0 },
+        { "kind": "store", "address": "%p0", "value": "f0" },
+        { "kind": "gep", "dest": "%p1", "base": "%s", "byte_off": 8 },
+        { "kind": "store", "address": "%p1", "value": "f1" },
+        { "kind": "gep", "dest": "%dynamic", "base": "%s", "byte_off": null },
+        { "kind": "load", "dest": "%fp", "address": "%dynamic" },
+        { "kind": "assign", "dest": "%q", "sources": ["%fp", "f0"] },
+        {
+          "kind": "call_indirect",
+          "operand": "%q",
+          "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+          "args": []
+        }
+      ]
+    },
+    {
+      "key": "f0",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    },
+    {
+      "key": "f1",
+      "sig": { "ret": { "class": "void" }, "params": [], "cc": "ccc" },
+      "address_taken": true,
+      "body": []
+    }
+  ],
+  "globals": []
+}

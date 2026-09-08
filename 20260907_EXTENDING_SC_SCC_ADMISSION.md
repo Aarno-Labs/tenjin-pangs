@@ -173,7 +173,17 @@ The public analysis API should distinguish two concepts that are currently easy 
 `solve_andersen_with_overrides_and_target_points_to` already carries label information for
 registry handling.  The first extension can add a separate `refinement_labels` set rather than
 changing the meaning of existing targeted labels.  This preserves callers that request a base
-row but do not authorize additional solve work.
+row but do not authorize additional solve work.  Before solving Steensgaard, materialize the
+union of the base labels and every resolved refinement label: requesting refinement must also
+request its fallback.  An unresolved label is reported as a missing-label rejection; it has no
+PAG row to materialize and must never be interpreted as a certified empty points-to set.
+
+M1's `NodeLabel` consumer denotes the **direct value points-to projection**.  Its output bundle
+contains both the named allocation set in `node_points_to[label]` and the corresponding
+`RefinedNodeResolution` properties, including external status and provenance.  The existing
+`RefinedNodeResolution` alone cannot supply this projection: it contains summary properties and
+global candidates, but no named function/allocation set.  Admission coverage must identify the
+projection being replaced, not merely the label that seeded it.
 
 ## 4. Seed families and staging
 
@@ -192,12 +202,26 @@ telemetry, and deterministic profile output.
 ### 4.2 M1: explicit node-label seeds
 
 Permit a caller to nominate value-like PAG node labels.  Resolve labels before admission and add
-their SCC predecessor closures as candidates.  A selected label receives an Andersen
-`RefinedNodeResolution`; a rejected or missing label retains its materialized Steensgaard row.
+their SCC predecessor closures as candidates.  After successful completion of the joint solve,
+a covered direct projection receives its Andersen allocation set in `node_points_to[label]`
+and its matching node properties as one bundle.  A rejected or uncovered projection retains the
+complete materialized Steensgaard bundle.  Solver exhaustion restores every such bundle together;
+do not combine a narrowed external bit with a stale allocation set.  An empty named allocation
+set does not itself certify an empty value: retain external/unknown alternatives and the
+independently justified empty-witness semantics.
+
+Registry resolution reads `node_points_to` for direct operands, but reads
+`node_pointee_points_to` and `node_pointee_external` for registrations through memory.  The
+predecessor closure of a pointer value does not necessarily cover the contents of its pointees.
+M1 therefore refines only direct registry operands (`pointee = false`).  Registrations through
+memory retain their complete baseline registry inputs until a separate projection requirement
+covers every possible pointee, relevant field, content producer, and external alternative,
+including late-materialized fields.  Publishing that projection must replace its allocation
+and external-provenance rows together; admitting the address label alone is insufficient.
 
 Good first consumers are already explicit and bounded:
 
-- spawn/signal registry target operands;
+- direct spawn/signal registry target operands;
 - values attached to deferred pointer/integer or aggregate-flow audits; and
 - diagnostic `PANGS_ANDERSEN_EXPLAIN_NODE` labels.
 
@@ -276,7 +300,11 @@ an additional composition proof and is out of scope.
 The merge rules are:
 
 - an admitted callsite may replace its Steensgaard call row only after the joint solve completes;
-- an admitted value node may replace its Steensgaard node row;
+- an admitted value node may replace its Steensgaard node summary; a covered M1 direct
+  projection additionally replaces its materialized allocation set and corresponding node
+  properties together, as specified in §4.2;
+- a registration through memory retains its baseline input bundle unless that separate content
+  projection is covered; direct-value coverage cannot authorize its replacement;
 - a global object row may be replaced only when its `GlobalProjection` requirement is covered;
 - global escape and baseline unknown-caller facts remain Steensgaard except where an existing
   independent certificate explicitly permits narrowing;
@@ -530,18 +558,33 @@ hash before and after the sequence; root numbers alone are not comparable across
 - assign and GEP producer chains;
 - load with separately produced address and storage contents;
 - store with separately produced address and stored value;
+- an unknown-offset load overlapping separately initialized exact fields;
 - bounded and whole-object memcpy;
 - a late indirect target whose parameter/return bindings were preinstalled from the envelope;
+- an admitted callback result whose producing indirect-call operand exceeds the budget;
 - receiver payload support components when enabled; and
 - an outgoing-only tail that remains Steensgaard, extending the current directional-admission
   fixture.
+
+The executable regressions `sc_admission_overlapping_fields.pir.json` and
+`sc_admission_indirect_return.pir.json` live in `fixtures/synthetic/m1_4b/`.  Their solver tests
+compare budget 200 with forced admission and independently require `{f0, f1}` and
+`{other, target}`, respectively.  Each includes an independent target so a missing producer
+leaves a nonempty answer and cannot be hidden by empty-result fallback.  Run both with
+`cargo test -p pangs-solve sc_admission_preserves_ -- --nocapture`.
 
 ### 9.3 Client merge fixtures
 
 - selected node label narrows while an adjacent unselected label stays byte-identical to Steens;
 - rejected label retains its base points-to row and fallback provenance;
+- a refinement-only label has its Steensgaard fallback materialized before admission;
+- a missing label is rejected explicitly, never emitted as an empty resolution;
+- a direct registry operand narrows its named target set and external status together;
+- a registration through memory retains its complete baseline inputs when only the address
+  value's closure is covered;
 - partially covered global fields do not overwrite the global object projection;
-- fully covered global projection may narrow and passes the global subset ledger;
+- fully covered global projection may narrow and agrees with the same projection of the forced
+  solve, in addition to passing the global subset ledger;
 - deferred audit remains module-wide/base when one required value is uncovered;
 - two client consumers sharing a closure both become covered;
 - solver exhaustion publishes no partial SC result; and
@@ -552,11 +595,26 @@ hash before and after the sequence; root numbers alone are not comparable across
 - `cargo test --workspace --all-targets`;
 - conservative→Steens→Andersen differential checks with SC off/on;
 - schema validation for all exported artifacts;
-- per-site call targets are subsets of the same-run Steens envelope, with unknown/top handled as
-  a lattice value rather than an empty target set;
-- ModRef/global rows are subsets only when their coverage marker is complete;
+- per-site call targets and covered ModRef/global projections satisfy both sides of the
+  same-input refinement ledger: `forced(q) ⊑ SC(q) ⊑ Steensgaard(q)`, where `⊑` means no more
+  possible behavior and unknown/top is a lattice value rather than an empty target set;
+- fully covered raw points-to projections equal the forced-solve projections under identical
+  solver semantics; compare the named allocations and external alternatives, not just counts;
+- uncovered projections retain their complete baseline rows;
 - full disposition global records compared off/on, not only distribution counts; and
 - dynamic icall traces where available.
+
+The forced arm must complete, cover all producers of the compared projection, and use the same
+bitcode, semantic knobs, exact overrides, and projection definition as the SC arm.  An exhausted
+forced solve is inconclusive, not an oracle.  Compare raw projections separately from certificate
+or policy decisions whose eligibility may depend on broader coverage.
+
+The Steensgaard subset check is only an upper-bound check: dropping a real target also satisfies
+it.  The forced-to-SC direction detects missing producers, and focused fixtures must additionally
+assert their known required targets so a defect shared by both solves cannot make the test pass.
+Likewise, an incoming-edge assertion over `prepartition_flow_edges` checks closure in that graph;
+it cannot detect semantic dependencies omitted from the graph itself.  Keep these independent
+checks alongside the graph assertions.
 
 ## 10. Evaluation plan
 
