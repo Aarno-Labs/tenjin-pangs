@@ -136,7 +136,7 @@ pub(crate) const ENV_ANDERSEN_HYBRID_BITSETS_PROFILE: &str =
 /// Overrides the minimum number of copy edges between SCC passes.
 pub(crate) const ENV_ANDERSEN_COPY_SCC_MIN_EDGES: &str = "PANGS_ANDERSEN_COPY_SCC_MIN_EDGES";
 
-/// Overrides the per-allocation lane vocabulary cap for the opt-in PWC experiment.
+/// Overrides the per-allocation PWC lane vocabulary cap.
 pub(crate) const ENV_ANDERSEN_PWC_LANE_CAP: &str = "PANGS_ANDERSEN_PWC_LANE_CAP";
 
 /// Enables the opt-in asymmetric interpretation of reads from materialized allocation

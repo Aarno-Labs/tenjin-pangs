@@ -2194,8 +2194,8 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
     assert!(measurements["context_struct_pressure"]["components"].is_object());
     assert_eq!(measurements["override_usage"]["honored"], 0);
     assert_eq!(
-        disposition["run"]["analysis"]["pwc_lanes"]["enabled"], false,
-        "the default disposition artifact must record that static PWC lanes remain opt-in"
+        disposition["run"]["analysis"]["pwc_lanes"]["enabled"], true,
+        "the default disposition artifact must record that static PWC lanes are enabled"
     );
     assert_eq!(
         disposition["run"]["analysis"]["pwc_lanes"]["lane_cap_effective"], 256,
@@ -2208,6 +2208,10 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
     assert!(out.join("pangs-audit.json").exists());
     let export_index: Value =
         serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        export_index["pwc_lanes_enabled"], true,
+        "the normal export manifest must record the effective default"
+    );
     assert!(
         !export_index["files"]
             .as_array()
@@ -2239,7 +2243,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "02ea7ed08a27995f5f694cf4e92d5a20e1da51557efabe8ff434e2f970388ba9"
+        "3dfeefb4fb4f1ccc258ebf2707da732d63edaf0ece4846781f6ade04fd67a376"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(

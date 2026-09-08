@@ -10,7 +10,7 @@ use thiserror::Error;
 
 pub mod knobs;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PagOpts {
     pub build_mode: BuildMode,
     /// How to model integer/pointer conversions that do not already satisfy one of the
@@ -22,9 +22,25 @@ pub struct PagOpts {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub safe_indirect_vararg_callsites: BTreeSet<String>,
     /// Infer affine lanes for constant-offset GEPs in fixed-PAG positive-weight cycles.
-    /// This experiment is deliberately opt-in until its corpus and soundness gates pass.
-    #[serde(default)]
+    /// Enabled by default; set false (or use `PANGS_PAG_PWC_LANES=0`) for an ablation.
+    #[serde(default = "default_pwc_lanes")]
     pub pwc_lanes: bool,
+}
+
+fn default_pwc_lanes() -> bool {
+    knobs::DEFAULT_PWC_LANES
+}
+
+impl Default for PagOpts {
+    fn default() -> Self {
+        Self {
+            build_mode: BuildMode::default(),
+            integer_pointer_policy: IntegerPointerPolicy::default(),
+            exports: BTreeSet::new(),
+            safe_indirect_vararg_callsites: BTreeSet::new(),
+            pwc_lanes: default_pwc_lanes(),
+        }
+    }
 }
 
 /// Policy for otherwise fail-closed LLVM integer/pointer operations.
@@ -75,7 +91,7 @@ pub struct Pag {
     /// `IntToPtr` as an Ω source unless the stricter lossless-round-trip proof also succeeds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pointer_integer_origins: Vec<PointerIntegerOrigin>,
-    /// True when this in-memory PAG was rewritten by the opt-in static PWC experiment.
+    /// True when this in-memory PAG was rewritten by static PWC lanes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pwc_lanes_enabled: bool,
 }
@@ -83,7 +99,7 @@ pub struct Pag {
 impl Pag {
     pub fn from_pir(pir: &Pir, opts: &PagOpts) -> Self {
         let mut pag = Builder::new(pir, opts).build();
-        if opts.pwc_lanes || knobs::pwc_lanes_enabled() {
+        if knobs::pwc_lanes_enabled(opts.pwc_lanes) {
             pag.infer_pwc_lanes();
         }
         pag
@@ -699,7 +715,7 @@ pub struct PagMetrics {
     /// Relaxed values returned from their defining function.
     #[serde(default)]
     pub assumed_tag_returned: usize,
-    /// Static assign/GEP SCCs examined by the opt-in positive-weight-cycle rewrite.
+    /// Static assign/GEP SCCs examined by the positive-weight-cycle rewrite.
     #[serde(default)]
     pub pwc_sccs_examined: usize,
     #[serde(default)]
@@ -4753,6 +4769,13 @@ mod tests {
                 lane: None
             }
         )));
+    }
+
+    #[test]
+    fn pwc_lanes_are_the_api_and_deserialization_default() {
+        assert!(PagOpts::default().pwc_lanes);
+        let opts: PagOpts = serde_json::from_str(r#"{"build_mode":"library"}"#).unwrap();
+        assert!(opts.pwc_lanes);
     }
 
     #[test]

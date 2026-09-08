@@ -6277,8 +6277,8 @@ impl Solve {
                 (_, _, FieldLocation::Lane(_)) => {
                     self.chained_lane_field_derivations =
                         self.chained_lane_field_derivations.saturating_add(1);
-                    // Outside the opt-in PWC experiment retain the historical finite fixed
-                    // vocabulary rule. Dynamic LLVM lanes alone must not alter defaults.
+                    // With PWC lanes disabled, retain the historical finite fixed
+                    // vocabulary rule. Dynamic LLVM lanes alone must not alter the ablation path.
                     if self.lane_cap.is_none() && !self.known_locations.contains(&combined) {
                         self.chain_missing_exact_collapses =
                             self.chain_missing_exact_collapses.saturating_add(1);

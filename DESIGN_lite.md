@@ -485,15 +485,17 @@ route to the root's unknown summary rather than creating an unbounded field-of-f
 chain. Receiver payload summaries reuse this same `Exact`/`Lane`/`Unknown`
 `FieldLocation` domain; they do not introduce a second layout model.
 
-Two experiments remain opt-in. `PANGS_PAG_PWC_LANES=1` rewrites fixed-PAG nonzero
-copy/GEP cycles to affine lanes and permits bounded derived lanes (256 per root by
-default). `PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP=1` replaces symmetric field bridges
+Static PWC lanes are enabled by default: fixed-PAG nonzero copy/GEP cycles are rewritten
+to affine lanes, with bounded derived lanes (256 per root by default).
+`PANGS_PAG_PWC_LANES=0` disables the rewrite for ablations.
+`PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP=1` remains opt-in and replaces symmetric field bridges
 with raw-cell stores and persistent, directly overlapping memory reads. Late fields
 replay these reads; memcpy remains conservatively whole-object. Value queries remain
 raw, while boundary traversal and global exports include allocation field inventories.
 Receiver payloads retain a separate root-local inventory; C plus receiver summaries
 conservatively disables completeness certificates until their full proof is implemented.
-Neither experiment is promoted. See `20260907_ASYMMETRIC_OVERLAP_EVALUATION.md`.
+See `20260907_ASYMMETRIC_OVERLAP_EVALUATION.md` and the PWC promotion record in
+`EXPERIMENT_HISTORY.md`.
 
 C' uses the same exact/lane/unknown distinction for independently rooted GEPs. Its classes
 are intentionally coarser than D's inclusion sets, but field contents no longer merge

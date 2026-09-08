@@ -10,6 +10,9 @@
     "exports": [],
     "partition_budget": 1000000
   },
+  "pwc_lanes_enabled": true,
+  "pwc_lane_cap_effective": 256,
+  "asymmetric_field_overlap_enabled": false,
   "files": [
     {
       "name": "functions.jsonl",

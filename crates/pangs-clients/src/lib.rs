@@ -27,6 +27,7 @@ use pangs_manifest::{
     ViolationRelevance as ManifestViolationRelevance, ViolationRelevanceDiagnostic, Witness,
     WordSizedScalar, SCHEMA_VERSION,
 };
+use pangs_pag::PagOpts;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -102,10 +103,7 @@ pub fn export_analysis(
         input_path: input_path.display().to_string(),
         input_sha256: sha256_file(input_path)?,
         opts,
-        pwc_lanes_enabled: matches!(
-            std::env::var("PANGS_PAG_PWC_LANES").as_deref(),
-            Ok("1") | Ok("true")
-        ),
+        pwc_lanes_enabled: pangs_pag::knobs::pwc_lanes_enabled(PagOpts::default().pwc_lanes),
         pwc_lane_cap: std::env::var("PANGS_ANDERSEN_PWC_LANE_CAP")
             .ok()
             .and_then(|value| value.parse::<usize>().ok()),
@@ -540,9 +538,8 @@ pub fn assemble_disposition_artifacts(
                     (
                         "pwc_lanes".into(),
                         serde_json::json!({
-                            "enabled": matches!(
-                                std::env::var("PANGS_PAG_PWC_LANES").as_deref(),
-                                Ok("1") | Ok("true")
+                            "enabled": pangs_pag::knobs::pwc_lanes_enabled(
+                                PagOpts::default().pwc_lanes
                             ),
                             "lane_cap_effective": std::env::var("PANGS_ANDERSEN_PWC_LANE_CAP")
                                 .ok()
@@ -3871,7 +3868,7 @@ struct Manifest<'a> {
     input_path: String,
     input_sha256: String,
     opts: &'a Opts,
-    /// Effective process-wide setting for the experimental static PWC rewrite.
+    /// Effective process-wide setting for the static PWC rewrite.
     pwc_lanes_enabled: bool,
     /// Explicit override of the derived-lane cap; absence means the compiled default applies.
     #[serde(skip_serializing_if = "Option::is_none")]

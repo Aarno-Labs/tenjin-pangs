@@ -849,3 +849,25 @@ copy fact work while preserving complete disposition records; SQLite's smaller w
 reduction does not improve measured wall time. Both flags remain opt-in. The current
 measurement and correctness ledger, including limitations, is in
 [20260907_ASYMMETRIC_OVERLAP_EVALUATION.md](20260907_ASYMMETRIC_OVERLAP_EVALUATION.md).
+
+### Static PWC lanes promoted to default-on (2026-09-08)
+
+Static PWC lanes are now enabled by default in PAG construction and may be disabled with
+`PANGS_PAG_PWC_LANES=0` for controlled ablations. The default API `PagOpts`, safe-vararg PAG
+rebuild, normal export manifest, and disposition effective-setting metadata all use the same
+resolved setting; an explicit API `pwc_lanes: false` remains supported when no environment
+override is present. The per-allocation derived-lane cap remains 256 by default.
+
+The promotion follows the current-commit reevaluation and the subsequent curl audit. Across tmux,
+jq, SQLite, and Vim, enabling PWC reduced exact chained derivations and GEP-pair work without any
+lane-cap collapse (maximum observed lanes per root was 15). A 56-module below-Vim output sweep
+found six changed modules. The substantive curl changes separated into intended narrowing and one
+missing store-to-foreign-storage escape obligation; the latter was repaired with monotone late
+root/field replay and dedicated Store/Memcpy regressions. Fixed libcurl restores exactly the seven
+MIME callback external-caller rows and all lost ModRef identities while retaining the intended
+internal-call precision gains, and the workspace suite plus the affected differential checks pass.
+OpenSSL remains excluded from the timing evidence because its full export exhausted the available
+scratch-space budget. Detailed evidence is in
+`ju_out/pwc_current_reevaluation_20260908/REPORT.md`,
+`ju_out/pwc_smaller_than_vim_20260908/REPORT.md`, and
+`ju_out/pwc_store_publication_fix_20260908/REPORT.md`.
