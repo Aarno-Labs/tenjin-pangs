@@ -58,12 +58,15 @@ The policy stage assigns each client-relevant global the **first applicable** en
 
 ```
 1. immutable   iff  never-written ∧ ¬omega-escaped-address
-2. once-lock   iff  phase-stationarity certificate present
-3. atomic      iff  atomic-eligibility certificate present
-4. mutex       iff  mutex-eligibility certificate present
-5. localize    iff  build mode = application ∧ localization verdict OK
-6. unhandled   otherwise (with the accumulated failure witnesses)
+2. atomic      iff  atomic-eligibility certificate present
+3. localize    iff  build mode = application ∧ localization verdict OK
+4. unhandled   otherwise (with the accumulated failure witnesses)
 ```
+
+`once-lock` and `mutex` are temporarily omitted from this automatic default. Their analysis
+passes, facts, certificates, group support, schema variants, and override machinery remain in
+place. An explicit cascade order may still opt into either strategy; omission affects automatic
+selection only and keeps the eventual re-enable a policy change rather than an analysis change.
 
 Guard-shape rule: **a strategy backed by an eligibility pass has a certificate-only
 guard** — the cascade reads one slot, and the pass's certificate internally requires
@@ -78,8 +81,9 @@ failed, and that is what `cascade_trace` reports (a mutex skip is
 `guard-failed: ["mutex_eligibility"]` or `fact-not-computed`, with the detail in
 the slot).
 
-Rationale for the order: **prefer the applicable strategy that encodes the strongest
-verified property in the Rust type system.** `immutable` makes illegal writes
+Rationale for the full order when all strategies are explicitly enabled: **prefer the
+applicable strategy that encodes the strongest verified property in the Rust type system.**
+`immutable` makes illegal writes
 unrepresentable; `once-lock` makes re-initialization a loud panic and needs no
 per-access synchronization reasoning; `atomic` constrains every access site but
 permits torn multi-global invariants; `mutex` is the general fallback with runtime cost
@@ -106,13 +110,13 @@ fail artifact validation rather than silently satisfying the filtered localizati
 guard. If the skip histogram (§10.2) shows taint dominating the `unhandled` bucket for
 the four access-property strategies, the remedy remains analysis-side narrowing.
 
-Two knobs, both policy-level (never analysis-level):
+Two controls, both policy-level (never analysis-level):
 
-- **`localize` vs `mutex` preference.** Applications default to the order above
-  (historically `localize` was the whole point; but see the M3 note in §10 — `mutex`
-  may become the preferred default if context-struct bloat dominates). Libraries have
-  no `localize`; the "applications only" restriction of the original client lives
-  *here*, in the cascade config, and nowhere in the analysis.
+- **Strategy enablement and preference.** Applications currently default to
+  `immutable`, `atomic`, `localize`; libraries default to `immutable`, `atomic`.
+  An explicit order can re-enable `once-lock` or `mutex` and choose their position.
+  Libraries have no `localize`; the "applications only" restriction of the original
+  client lives *here*, in the cascade config, and nowhere in the analysis.
 - **Uniformity mode** (`DESIGN.md` §11.4 discussion): a client may shrink the
   configured order (e.g., `order = ["localize"]` — "no statics at all — everything
   localizes") without touching facts. Earlier strategies are disabled by *omission*:
@@ -238,7 +242,7 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
     },
     "dispose": {                         // dispose-owned; replaced wholesale on every
       "mode": "application",             //   pangs-dispose run ("application"|"library")
-      "cascade": ["immutable","once-lock","atomic","mutex","localize"],
+      "cascade": ["immutable","atomic","localize"],
       "overrides_file": "pangs-overrides.toml",   // null if none
       "overrides_sha256": "..."          // null if none
     }

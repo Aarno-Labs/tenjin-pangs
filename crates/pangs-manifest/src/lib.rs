@@ -149,15 +149,10 @@ pub enum Strategy {
 }
 
 impl Strategy {
-    pub const DEFAULT_APPLICATION: [Self; 5] = [
-        Self::Immutable,
-        Self::OnceLock,
-        Self::Atomic,
-        Self::Mutex,
-        Self::Localize,
-    ];
-    pub const DEFAULT_LIBRARY: [Self; 4] =
-        [Self::Immutable, Self::OnceLock, Self::Atomic, Self::Mutex];
+    // OnceLock and Mutex remain valid strategies, facts, and explicit cascade choices, but are
+    // temporarily omitted from the automatic policy while their rewrite paths are disabled.
+    pub const DEFAULT_APPLICATION: [Self; 3] = [Self::Immutable, Self::Atomic, Self::Localize];
+    pub const DEFAULT_LIBRARY: [Self; 2] = [Self::Immutable, Self::Atomic];
 
     pub fn as_str(self) -> &'static str {
         match self {

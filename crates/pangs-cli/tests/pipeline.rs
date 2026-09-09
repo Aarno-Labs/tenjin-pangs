@@ -2243,7 +2243,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "3dfeefb4fb4f1ccc258ebf2707da732d63edaf0ece4846781f6ade04fd67a376"
+        "adbfb16dccf08a0c6e8c376d5aaa506a3165cc1aaa6a39738df453a41ba38a50"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(
@@ -2395,7 +2395,7 @@ fn analyze_dispose_reports_registry_reachability_and_coupling() {
 }
 
 #[test]
-fn analyze_dispose_certifies_a_source_mapped_once_lock_candidate() {
+fn analyze_dispose_retains_once_lock_evidence_while_strategy_is_disabled() {
     let tmp = TempDir::new().unwrap();
     let bc = tmp.path().join("phase-once-lock.bc");
     let out = tmp.path().join("out");
@@ -2443,7 +2443,11 @@ fn analyze_dispose_certifies_a_source_mapped_once_lock_candidate() {
     assert_eq!(certificate["publication"]["publication_function"], "main");
     assert_eq!(certificate["writers"][0]["function"], "initialize");
     assert_eq!(certificate["init_subtree"][0]["function"], "initialize");
-    assert_eq!(configured["disposition"]["chosen"], "once-lock");
+    assert_eq!(configured["disposition"]["chosen"], "atomic");
+    assert_eq!(
+        manifest["run"]["dispose"]["cascade"],
+        serde_json::json!(["immutable", "atomic", "localize"])
+    );
     assert_eq!(
         manifest["run"]["analysis"]["phase_stationarity_report"]["coverage"]["certified_globals"],
         1
@@ -2451,7 +2455,7 @@ fn analyze_dispose_certifies_a_source_mapped_once_lock_candidate() {
 }
 
 #[test]
-fn analyze_dispose_derives_common_once_lock_group_support() {
+fn analyze_dispose_retains_common_once_lock_group_support_while_strategy_is_disabled() {
     let tmp = TempDir::new().unwrap();
     let bc = tmp.path().join("phase-once-lock-group.bc");
     let out = tmp.path().join("out");
@@ -2505,7 +2509,7 @@ fn analyze_dispose_derives_common_once_lock_group_support() {
             .unwrap()
             .ends_with("::main")
     );
-    assert_eq!(group["group_disposition"], "once-lock");
+    assert!(group["group_disposition"].is_null());
     assert!(group["evidence"]
         .as_array()
         .unwrap()
@@ -2522,7 +2526,7 @@ fn analyze_dispose_derives_common_once_lock_group_support() {
         .as_array()
         .unwrap()
         .iter()
-        .all(|global| global["disposition"]["chosen"] == "once-lock"));
+        .all(|global| global["disposition"]["chosen"] == "atomic"));
     assert!(manifest["globals"]
         .as_array()
         .unwrap()

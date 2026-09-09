@@ -1344,11 +1344,24 @@ mod tests {
         let mut facts = base_facts();
         facts.written.value = true;
         facts.phase_stationarity = Some(certified());
+        facts.atomic_eligibility = Some(certified());
         let config = CascadeConfig::default_for(DisposeMode::Application);
         let (chosen, trace) = cascade(&facts, &config).unwrap();
-        assert_eq!(chosen, Strategy::OnceLock);
+        assert_eq!(chosen, Strategy::Atomic);
         assert_eq!(trace.len(), 1);
         assert_eq!(trace[0].strategy, Strategy::Immutable);
+    }
+
+    #[test]
+    fn default_cascades_temporarily_exclude_once_lock_and_mutex() {
+        assert_eq!(
+            CascadeConfig::default_for(DisposeMode::Application).order,
+            vec![Strategy::Immutable, Strategy::Atomic, Strategy::Localize]
+        );
+        assert_eq!(
+            CascadeConfig::default_for(DisposeMode::Library).order,
+            vec![Strategy::Immutable, Strategy::Atomic]
+        );
     }
 
     #[test]

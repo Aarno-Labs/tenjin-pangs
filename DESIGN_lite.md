@@ -618,10 +618,12 @@ With an exhaustive materialized solution, every client is a scan, not a query en
   eligibility gate.
 - **Disposition:** the fact vector is routed by the policy stage in `DISPOSITION.md`.
   The default cascade selects the first independently applicable strategy among
-  `immutable`, `once-lock`, `atomic`, `mutex`, and application-only `localize`, falling
-  back to `unhandled` with accumulated witnesses. Coupling-group support, overrides,
-  accepted-risk records, source-materialization recipes, and the marker inventory are
-  emitted in the shared manifest. `access_set_complete` gates every certificate or verdict
+  `immutable`, `atomic`, and application-only `localize`, falling back to `unhandled`
+  with accumulated witnesses. `once-lock` and `mutex` are temporarily absent from the
+  automatic cascade, while their facts, certificates, coupling-group support, and explicit
+  cascade configuration remain available. Overrides, accepted-risk records,
+  source-materialization recipes, and the marker inventory are emitted in the shared
+  manifest. `access_set_complete` gates every certificate or verdict
   that would rewrite accesses: phase stationarity, atomic, mutex, and localization all fail
   closed when a module-wide row, address escape, or library name boundary leaves possible
   accessors unenumerated. Violation taint gates the four access-property
