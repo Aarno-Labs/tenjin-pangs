@@ -1,0 +1,90 @@
+name: build and release pangs
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip-release:
+        type: boolean
+        description: Skip release creation? For build testing
+        default: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
+        include:
+          - runner: ubuntu-latest
+            plat_machine: linux-x86_64
+            llvm_platform: Linux-x86_64
+          - runner: ubuntu-24.04-arm
+            plat_machine: linux-aarch64
+            llvm_platform: Linux-aarch64
+          - runner: macos-15
+            plat_machine: macos-aarch64
+            llvm_platform: Darwin-aarch64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get Git commit timestamp
+        run: echo "TIMESTAMP=$(git log -1 --pretty=%ct)" >> $GITHUB_ENV
+
+      - name: Download LLVM 14.0.6
+        run: |
+          archive=LLVM-14.0.6-${{ matrix.llvm_platform }}.tar.xz
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/Aarno-Labs/tenjin-build-deps/releases/download/llvmorg-14.0.6/$archive"
+          tar xf "$archive"
+          echo "$PWD/${archive%.tar.xz}/bin" >> "$GITHUB_PATH"
+
+      - name: Build release binaries
+        run: cargo build --release --locked --package pangs-cli --package pangs-dispose
+
+      - name: Package release binaries
+        run: |
+          mkdir -p pangs/bin
+          cp target/release/pangs target/release/pangs-dispose pangs/bin/
+          tar caf pangs_${{ matrix.plat_machine }}.tar.xz pangs
+        env:
+          SOURCE_DATE_EPOCH: ${{ env.TIMESTAMP }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.plat_machine }}
+          path: pangs_*.tar.xz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+
+      - name: Get short hash
+        run: echo "SHORTHASH=$(echo ${{ github.sha }} | cut -c1-9)" >> $GITHUB_ENV
+
+      - name: Emit job summary
+        run: |
+          echo "- shorthash is $SHORTHASH" >> $GITHUB_STEP_SUMMARY
+          echo "- skipped release: ${{ inputs.skip-release }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create Release via gh
+        if: ${{ ! inputs.skip-release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create \
+              rev-${{ env.SHORTHASH }} \
+              --notes "release for rev ${{ github.sha }}" \
+              --target ${{ github.sha }} \
+              *.tar.xz
