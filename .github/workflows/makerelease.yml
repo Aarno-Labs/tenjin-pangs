@@ -39,7 +39,9 @@ jobs:
           curl --fail --location --retry 3 --output "$archive" \
             "https://github.com/Aarno-Labs/tenjin-build-deps/releases/download/llvmorg-14.0.6/$archive"
           tar xf "$archive"
-          echo "$PWD/${archive%.tar.xz}/bin" >> "$GITHUB_PATH"
+          llvm_prefix="$PWD/${archive%.tar.xz}"
+          echo "$llvm_prefix/bin" >> "$GITHUB_PATH"
+          echo "LLVM_SYS_140_PREFIX=$llvm_prefix" >> "$GITHUB_ENV"
 
       - name: Build release binaries
         run: cargo build --release --locked --package pangs-cli --package pangs-dispose
