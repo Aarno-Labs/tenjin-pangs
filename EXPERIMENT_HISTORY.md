@@ -755,3 +755,33 @@ mutex counts were unchanged. Every one of the 115 proof-status transitions was c
 global's own external address escape, not an export-only or module-wide boundary. Solver and
 ModRef semantic metrics were unchanged. Full per-module and per-global results are in
 `ju_out/certificate_gate_20260903/REPORT.md`.
+
+### Shared external-call contracts (2026-09-03)
+
+PAG construction, vararg audit admission, and phase-certificate assembly now use one exact-name,
+ABI-checked external-call contract table. The table describes complete synchronous client-memory
+effects, result provenance, copies, pointer stores, retention, and callback behavior. Calls with an
+internal replacement, mismatched ABI, unresolved target, callback behavior, or no table entry keep
+the ordinary fail-closed external boundary. A checked-in `strncpy` fixture verifies both the direct
+destination write and a downstream store through its returned destination; `scanf` pointer outputs,
+dynamic-format `printf`, `realloc`, `strtoul`, and `strtok` have explicit conservative payload
+semantics.
+
+The 59-module Andersen sweep recovered all eight source-reviewed over-conservative OMP tree
+results without restoring the unsound once-lock for `initlinedraw.ansi_xjtr_0`: that object now
+fails phase stationarity on the fully modeled access set and receives a mutex certificate instead.
+Corpus-wide, 94 unhandled globals became actionable and two actionable globals became unhandled,
+for a net gain of 92 (1,973 to 2,065). The safety side of the table matters: 112 false address
+escapes disappeared, while previously missing result/copy/store propagation discovered 236 real or
+fail-closed escapes. Vim's `event_tab` consequently lost an unsound immutable disposition. Audit
+findings fell by 1,070 and callgraph edges by 43,336; oversize fallback count stayed 39, although the
+Andersen-coarser-than-Steens diagnostic grew from 182 to 772 nodes.
+
+The initial exact Vim evaluation exposed severe scaling bugs and was stopped after 81 minutes.
+Preserving constant external-copy extents, batching memcpy ModRef emission, caching summaries by
+interned candidate-list identity, and using bitsets plus a once-per-spine external-callsite index in
+phase assembly reduced ordinary Vim to 114 seconds end to end. In the single sequential whole-corpus
+sweep, summed internal analysis time fell 30.5% and the per-module geomean ratio was 0.682; these
+timings are diagnostic, not a substitute for interleaved repetitions. Full implementation notes,
+transition tables, metrics, hashes, and protocol are in
+`ju_out/external_contract_20260903/REPORT.md`.
