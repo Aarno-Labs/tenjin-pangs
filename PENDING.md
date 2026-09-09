@@ -4,6 +4,246 @@ Pending Ideas/Tasks
 
 ########################################
 
+## promote asymmetric field overlap with per-read hubs
+
+### Decision to make
+
+Determine whether `PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP` should become default-on while
+retaining `PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP=0` as a documented rollback and ablation.
+This plan evaluates the current contents-only implementation, including one propagation-only hub
+per persistent `(allocation root, read location)`. It does not evaluate removing the opt-out or
+claim that asymmetric overlap fixes Steensgaard megapartitions; the feature changes only
+Andersen's interpretation of field contents.
+
+With the feature enabled, stores continue to write one raw cell. A load reads the union of cells
+that directly overlap its addressed location. Every overlapping source feeds the location hub
+once, every read destination receives from the hub once, and a field created after the read adds
+one source-to-hub edge. The hub is propagation-only and must never become an allocation identity
+or a member of a points-to set. Memcpy remains conservatively whole-object.
+
+### Evidence already available
+
+The following results may be reused only if their binary and input hashes still match the
+candidate being promoted. Otherwise rerun the corresponding gate.
+
+- `ju_out/asymmetric_overlap_reevaluation_20260908/REPORT.md` compares C=0/C=1 on 57 primary
+  modules with PWC lanes enabled. Fifty-three modules are identical in all seven exported
+  families. Only figlet O0, jpegoptim O0/O1, and Speex O0 change. Their changes are confined to
+  ModRef and derived component taints, introduce no access identity, preserve final indirect-call
+  semantics, and have source-level explanations consistent with removing sibling-field
+  contamination.
+- `ju_out/per_read_overlap_hubs_20260908/REPORT.md` shows that the hub candidate is byte-identical
+  to the prior C=1 implementation in `functions.jsonl`, `globals.jsonl`, `callgraph.jsonl`,
+  `modref.jsonl`, `stationarity.jsonl`, `audit.jsonl`, and `components.json` on all 57 primary
+  modules. Relative to the direct-fanout C=1 implementation, aggregate copy edges fall 48.4%,
+  copy-fact pairs 50.0%, physical overlap edges 66.1%, and late replay edges 82.8%.
+- Five-pair hub timings turn the former direct-fanout regressions into improvements: mbedx509
+  wall/solver fall 17.0%/26.6%, Cairo 9.2%/12.1%, and SurpriseTalk wall falls 9.1%. SQLite is
+  neutral. Vim is also best classified as neutral, but its five-pair run overlapped a background
+  OpenSSL analysis and should be repeated cleanly.
+- Hub points-to facts rise 28.0% in aggregate, concentrated in mbedx509 and SurpriseTalk. Observed
+  RSS rises 5.3% on mbedx509 and is flat on Cairo, SQLite, and Vim. This is a retained resource
+  risk to measure, not a semantic failure.
+- The hub candidate's OpenSSL disposition run validates and finishes in 16m29s at 18,759,672 KiB
+  peak RSS. Its three-tier differential finishes in 32m50s at 21,270,132 KiB and passes. Results
+  are in `ju_out/per_read_overlap_hubs_20260908/openssl-supplement/`.
+- The older debug-Vim C=1 disposition exit 2 was `No space left on device`, not an analysis or
+  validation failure. Its icall census and differential passed. Debug Vim has not yet received
+  the complete hub-candidate supplement below.
+- The full workspace suite, feature fixtures, synthetic differential tests, and two instrumented
+  LLVM indirect-call tests pass. The old globally-forced C=1 workspace run had one CLI test that
+  hard-coded disabled effective-setting metadata; that expectation must change during the
+  default-on rehearsal.
+
+### Freeze the experiment
+
+1. Start from a clean jj commit containing the per-read hubs. Build one release executable in an
+   isolated target directory and copy or otherwise freeze it for the entire experiment. Record:
+
+   - jj commit and change IDs;
+   - executable SHA-256;
+   - `rustc`, Cargo, and LLVM versions;
+   - input SHA-256 for every bitcode module;
+   - hostname, CPU affinity, date, and effective environment settings.
+
+2. Use `/home/brk/pangs-corpus/_out_bc` as the corpus. The primary set is the same 57 modules used
+   by the 2026-09-08 reevaluation: exclude `exe-vim-9.2-g-O1.bc` and
+   `lib-openssl-4.1.0-O1.bc`, then run those two as the large-module supplement. Save the exact
+   sorted module list in the result directory.
+
+3. Hold every non-C choice fixed in the primary comparison:
+
+   ```text
+   PANGS_PAG_PWC_LANES=1
+   PANGS_ANDERSEN_PWC_LANE_CAP=256
+   --integer-pointer-policy=conservative
+   receiver payload summaries unset
+   closed-producer and closed-consumer certificates unset
+   ```
+
+   Compare explicit `PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP=0` and `=1`; never use an unset
+   value for this portion. Supply LLVM 14 through
+   `LD_LIBRARY_PATH=/home/brk/tenjin/_local/xj-llvm-14/lib` when required. Select executable or
+   library build mode from the artifact under test.
+
+4. Preflight at least 30 GiB of free space. Keep compact ledgers, logs, metrics, fingerprints, and
+   explained row diffs permanently. Full Vim/OpenSSL exports are regenerable and should be deleted
+   after their hashes and comparison results are durable. Never run timing samples concurrently
+   with another PANGS analysis.
+
+### Gate 1: current-candidate semantic and soundness closure
+
+For every primary module and both explicit C values, run a validated full Andersen export with
+profiling enabled. The command shape is:
+
+```text
+PANGS_PAG_PWC_LANES=1
+PANGS_ANDERSEN_PWC_LANE_CAP=256
+PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP=<0-or-1>
+PANGS_ANDERSEN_PROFILE=1
+PANGS_MEMORY_PROFILE=1
+target/release/pangs analyze <module.bc> --out <arm-directory> \
+  --stage andersen --build-mode <executable-or-library> \
+  --integer-pointer-policy conservative --validate
+```
+
+Collect exact canonical hashes and row counts for `functions.jsonl`, `globals.jsonl`,
+`callgraph.jsonl`, `modref.jsonl`, `stationarity.jsonl`, `audit.jsonl`, and `components.json`.
+Also collect an icall census for each arm and compare target identities, `unknown_callee`, and
+fallback status—not merely target counts.
+
+For every off/on difference:
+
+- classify added and removed access identities, named globals, unknown rows, call targets,
+  writes, escapes, component taints, and dispositions;
+- inspect the source/LLVM and the emitted witnesses for every removed real write, callback, or
+  target;
+- reject an unexplained narrowing; a smaller answer is not by itself soundness evidence;
+- confirm Steensgaard partition count, largest partition, oversize-fallback count and maximum,
+  and lane-cap behavior are invariant. These are controls, not expected benefits.
+
+Run `pangs differential` under both explicit C values on all 57 modules. The candidate passes
+only if it introduces no new differential category or row. The known jq O0 and FLAC O1 failures
+may be waived only if C=0 and C=1 reproduce exactly the same rows and evidence; record them as
+pre-existing base-tier issues rather than silently treating the sweep as passing.
+
+Run the compact validated disposition export, icall census, and C=1 three-tier differential on
+debug Vim with the hub binary. OpenSSL's completed hub results may satisfy its correctness and
+resource gate if the hashes match; otherwise rerun OpenSSL asynchronously with a two-hour limit
+per command. OpenSSL should not delay analysis of the primary results, but it must finish before
+the default is merged.
+
+Finally run:
+
+```text
+cargo test --workspace --all-targets
+PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP=1 \
+  cargo test -p pangs-cli --test pipeline dynamic_
+```
+
+All feature fixtures must continue to cover sibling isolation, both creation orders, pending and
+established loads, exact/lane overlap in both directions, Unknown/root writes, unrelated roots,
+late fields, SCC-remapped destinations, both memcpy implementations, external containers, and
+receiver payload root isolation.
+
+### Gate 2: interaction and certificate closure
+
+Rerun the four semantic-change modules—figlet O0, jpegoptim O0/O1, and Speex O0—with the hub
+candidate in paired C=0/C=1 configurations under each of:
+
+1. PWC disabled;
+2. PWC enabled with `--integer-pointer-policy=assume-tags`;
+3. PWC enabled with receiver payload summaries plus closed-producer and closed-consumer
+   certificates.
+
+Require validation, differential success relative to the recorded baseline, exact disposition
+comparison, icall identity comparison, and the same explained semantic delta as the primary run.
+This rerun is necessary because the previous interaction matrix used the direct-fanout C=1
+implementation.
+
+There is also one independent promotion blocker: when C and receiver payload summaries are both
+enabled, completeness certificates are currently disabled because the overlap-aware synthetic
+producer proof is unfinished. Resolve it in one of two explicit ways:
+
+- implement the producer/completeness proof, add negative and positive fixtures, and run the
+  receiver/certificate configuration across the primary corpus; or
+- run that configuration across the primary corpus, quantify every lost certificate and changed
+  disposition, and record a deliberate decision that the default may reduce precision for users
+  of the receiver experiment.
+
+Do not infer safety from the four changed modules alone. Positive callback reachability and
+unchanged aggregate exports do not prove that a completeness certificate remains valid.
+
+### Gate 3: clean performance and resource measurements
+
+Use compact validated disposition manifests so export I/O does not dominate the solver. For each
+arm, discard one warm-up, then run five measured repetitions with alternating order and fixed CPU
+affinity. No other PANGS job may run during the set. Measure:
+
+- wall, user, system, and solver time;
+- peak RSS and phase high-water marks;
+- steps, points-to facts, copy edges, and copy-fact pairs;
+- load, store, GEP, and memcpy pairs;
+- fields and unknown fields;
+- overlap hubs, source edges, destination edges, physical overlap edges, late replay edges, index
+  roots/entries, and estimated index capacity;
+- lane admissions, maximum lanes per root, cap hits, oversize fallbacks, and maximum fallback.
+
+The required workloads are mbedx509 O1, Cairo O1, SurpriseTalk O0, SQLite O1, and regular Vim O1.
+They cover the hub-storage outlier, former fanout outliers, the SQLite neutral case, and the large
+Vim case. Add any new whole-corpus outlier with at least a 2x step/copy-work increase or a 10% RSS
+increase.
+
+Use medians and retain every sample. A stable wall-time regression of 5% or more, an RSS regression
+of 10% or more, or a new pathological work outlier blocks promotion pending explanation and a
+repeat. Small sub-second workloads need an absolute-time/noise analysis rather than a percentage
+alone. The 28% aggregate hub-fact increase is acceptable only if the per-module RSS and completion
+envelopes remain bounded.
+
+Run one clean adjacent or alternating C=0/C=1 compact OpenSSL pair asynchronously. Five OpenSSL
+repetitions are not required, but record its wall time, solver time, peak RSS, hub/work counters,
+and completion. Compare it with the already observed hub C=1 envelope of 16m29s and 18.76 GiB;
+investigate a material regression rather than averaging it into the smaller corpus.
+
+### Gate 4: rehearse the actual default
+
+On a separate candidate commit, change the API and CLI default to enabled and update the effective
+setting metadata and manifest goldens. Then prove all three configuration paths:
+
+- unset/default output is byte-identical to explicit C=1;
+- explicit environment `=0` is byte-identical to the frozen C=0 arm;
+- explicit API `false` remains honored when there is no environment override.
+
+Run `cargo test --workspace --all-targets` with no override, plus focused CLI pipeline and manifest
+validation with unset, `=0`, and `=1`. Inspect every golden change; the effective setting is the
+only metadata change expected solely from flipping the default. Repeat a small representative
+export set containing one unchanged module and all four semantic-change modules to ensure the
+default route does not differ from the explicitly enabled route.
+
+### Promotion rule and deliverables
+
+Promote only if all four gates close:
+
+- every analysis completes and validates;
+- there is no unexplained lost write, callback, target, or access identity;
+- current-candidate differential results add no failure beyond exactly reproduced and explicitly
+  waived baseline issues;
+- the receiver/certificate limitation is fixed or its measured client impact is explicitly
+  accepted;
+- controlled timing and memory remain within the stated thresholds;
+- unset defaults, explicit enablement, and explicit disablement produce the intended identical
+  pairs; and
+- the workspace, feature, interaction, trace, and manifest suites pass.
+
+Write a durable `ju_out/<date>-asymmetric-overlap-promotion/REPORT.md` containing the frozen
+protocol, hashes, completion ledger, exact semantic diffs, differential waivers, interaction and
+certificate results, all timing samples, aggregate and per-module work/RSS tables, and the final
+go/no-go decision. If promoted, update `DESIGN_lite.md` and `EXPERIMENT_HISTORY.md`, but keep and
+document `PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP=0` for at least one release cycle. Removing the
+knob is a later decision requiring soak evidence; it is not part of this evaluation.
+
+########################################
+
 ## evaluate source-closed SCC admission for globals and modref queries
 
 ########################################
@@ -308,4 +548,3 @@ A closure-aware localization proof should be able to say:
   - put an initially zeroed Scope backing object in the same context;
   - initialize the pointer to that context-owned backing object;
   - rewrite all uses of scope through the context.
-
