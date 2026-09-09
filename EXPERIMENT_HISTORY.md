@@ -871,3 +871,27 @@ scratch-space budget. Detailed evidence is in
 `ju_out/pwc_current_reevaluation_20260908/REPORT.md`,
 `ju_out/pwc_smaller_than_vim_20260908/REPORT.md`, and
 `ju_out/pwc_store_publication_fix_20260908/REPORT.md`.
+
+### Asymmetric-overlap read-fanout factoring (2026-09-08)
+
+The asymmetric-overlap solver now factors every persistent `(allocation root, read location)`
+equation through one propagation-only hub. Each directly overlapping raw source feeds the hub
+once, each destination receives from it once, and a late-created field adds one source-to-hub
+edge. The hub is content-only: it is never inserted into a points-to set as an allocation
+identity. Copy-SCC collapse remaps hubs and destinations while retaining the raw allocation root.
+
+Against the prior C=1 binary, all seven semantic output families match byte-for-byte on all 57
+primary modules. Aggregate copy edges fall 48.4%, copy-fact pairs 50.0%, overlap edges 66.1%, and
+late replay edges 82.8%; steps fall 16.2%. Hub union sets raise aggregate stored points-to facts
+28.0%, concentrated in mbedx509. Controlled five-run medians nevertheless remove the earlier
+performance blockers: mbedx509 wall/solver fall 17.0%/26.6% (RSS +5.3%), Cairo 9.2%/12.1%, and
+SurpriseTalk wall falls 9.1%. SQLite remains neutral (wall -0.6%, RSS flat). Five pinned Vim pairs
+under isolated CPU affinity but concurrent OpenSSL load give wall +2.3%, solver +0.5%, and flat
+RSS amid wide run-to-run variance; a subsequent no-PANGS-background adjacent pair gives wall
+-1.7%, solver +2.4%, and flat RSS. Treat Vim as neutral, not as a speedup.
+
+The workspace suite, the new shared-hub/late-replay regression, and targeted three-tier
+differentials for the four output-changing modules plus mbedx509, Cairo, SurpriseTalk, and SQLite
+pass. The optimization therefore clears the demonstrated copy-fanout promotion blocker without
+changing C's precision result. Full commands, hashes, counters, timing samples, and caveats are in
+`ju_out/per_read_overlap_hubs_20260908/REPORT.md`.

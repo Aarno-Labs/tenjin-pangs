@@ -489,12 +489,16 @@ Static PWC lanes are enabled by default: fixed-PAG nonzero copy/GEP cycles are r
 to affine lanes, with bounded derived lanes (256 per root by default).
 `PANGS_PAG_PWC_LANES=0` disables the rewrite for ablations.
 `PANGS_ANDERSEN_ASYMMETRIC_FIELD_OVERLAP=1` remains opt-in and replaces symmetric field bridges
-with raw-cell stores and persistent, directly overlapping memory reads. Late fields
-replay these reads; memcpy remains conservatively whole-object. Value queries remain
-raw, while boundary traversal and global exports include allocation field inventories.
+with raw-cell stores and persistent, directly overlapping memory reads. Reads of the same
+allocation root and location share a propagation-only hub: each overlapping raw cell feeds the
+hub once, each read destination receives from it once, and a late field adds one source-to-hub
+edge. This preserves the inclusion solution while replacing repeated source × destination copy
+fanout with source + destination edges. Memcpy remains conservatively whole-object. Value queries
+remain raw, while boundary traversal and global exports include allocation field inventories.
 Receiver payloads retain a separate root-local inventory; C plus receiver summaries
 conservatively disables completeness certificates until their full proof is implemented.
-See `20260907_ASYMMETRIC_OVERLAP_EVALUATION.md` and the PWC promotion record in
+See `20260907_ASYMMETRIC_OVERLAP_EVALUATION.md`,
+`ju_out/per_read_overlap_hubs_20260908/REPORT.md`, and the PWC promotion record in
 `EXPERIMENT_HISTORY.md`.
 
 C' uses the same exact/lane/unknown distinction for independently rooted GEPs. Its classes

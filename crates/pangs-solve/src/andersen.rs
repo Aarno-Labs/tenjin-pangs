@@ -2757,7 +2757,7 @@ impl<'a> Refiner<'a> {
         let activated_targets = activated.values().map(BTreeSet::len).sum();
         if andersen_profile_enabled() {
             eprintln!(
-                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} overlap_reads={} overlap_pairs={} overlap_late_replays={} overlap_index_roots={} overlap_index_entries={} overlap_index_capacity_bytes={} chained_field_derivations_exact={} chained_field_derivations_lane={} chain_collapses_missing_exact={} chain_collapses_lane_cap={} chain_collapses_unknown_input={} chain_collapses_arithmetic={} derived_lanes_admitted={} max_lanes_per_root={} roots_reaching_lane_cap={} lane_cap={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
+                "pangs andersen profile: joint solve done steps={} resume_rounds={} activated_targets={} eager_sites={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} overlap_reads={} overlap_hubs={} overlap_source_edges={} overlap_destination_edges={} overlap_pairs={} overlap_late_replays={} overlap_index_roots={} overlap_index_entries={} overlap_index_capacity_bytes={} chained_field_derivations_exact={} chained_field_derivations_lane={} chain_collapses_missing_exact={} chain_collapses_lane_cap={} chain_collapses_unknown_input={} chain_collapses_arithmetic={} derived_lanes_admitted={} max_lanes_per_root={} roots_reaching_lane_cap={} lane_cap={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={}",
                 solve.steps,
                 resume_rounds,
                 activated_targets,
@@ -2769,10 +2769,13 @@ impl<'a> Refiner<'a> {
                 solve.fields.len(),
                 solve.unknown_fields.len(),
                 solve.overlap_read_dependencies,
+                solve.overlap_read_hubs_allocated,
+                solve.overlap_read_source_edges,
+                solve.overlap_read_destination_edges,
                 solve.overlap_read_pairs,
                 solve.overlap_read_late_replays,
                 solve.overlap_reads.len(),
-                solve.overlap_reads.values().map(Vec::len).sum::<usize>(),
+                solve.overlap_read_index_entries(),
                 solve.overlap_read_index_bytes(),
                 solve.chained_exact_field_derivations,
                 solve.chained_lane_field_derivations,
@@ -5001,6 +5004,16 @@ struct MemcpyDelta {
     new_sources: Vec<Cell>,
 }
 
+/// One persistent allocation-relative read equation. The hub represents the union of every
+/// raw cell at `location`: sources feed it once and every consumer reads it once. It is a
+/// propagation-only variable and is never inserted into a points-to set as an object identity.
+#[derive(Debug, Clone)]
+struct OverlapReadHub {
+    location: FieldLocation,
+    hub: Cell,
+    destinations: Vec<Cell>,
+}
+
 fn hybrid_point_set_promotion() -> usize {
     static PROMOTION: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PROMOTION.get_or_init(|| {
@@ -5494,9 +5507,10 @@ struct Solve {
     unknown_fields: HashMap<Cell, Cell>,
     /// unknown-offset summary cell -> base object cell.
     unknown_field_base: HashMap<Cell, Cell>,
-    /// Persistent allocation-relative memory reads.  The key is deliberately the raw
-    /// allocation root: copy representatives describe contents, never locations.
-    overlap_reads: HashMap<Cell, Vec<(FieldLocation, Cell)>>,
+    /// Persistent allocation-relative memory reads, factored through one propagation-only
+    /// hub per `(allocation root, read location)`. The key is deliberately the raw allocation
+    /// root: copy representatives describe contents, never locations.
+    overlap_reads: HashMap<Cell, Vec<OverlapReadHub>>,
     /// Receiver-summary raw payload cells by their receiver allocation root. Unlike ordinary
     /// field cells these are synthetic, but aggregate export and boundary traversal must still
     /// be able to inspect them after propagation-state compaction.
@@ -5544,6 +5558,9 @@ struct Solve {
     memcpy_edge_summaries: bool,
     asymmetric_field_overlap: bool,
     overlap_read_dependencies: usize,
+    overlap_read_hubs_allocated: usize,
+    overlap_read_source_edges: usize,
+    overlap_read_destination_edges: usize,
     overlap_read_pairs: usize,
     overlap_read_late_replays: usize,
 }
@@ -5670,6 +5687,9 @@ impl Solve {
             memcpy_edge_summaries: memcpy_edge_summaries_enabled(),
             asymmetric_field_overlap,
             overlap_read_dependencies: 0,
+            overlap_read_hubs_allocated: 0,
+            overlap_read_source_edges: 0,
+            overlap_read_destination_edges: 0,
             overlap_read_pairs: 0,
             overlap_read_late_replays: 0,
         }
@@ -6174,8 +6194,9 @@ impl Solve {
         cells
     }
 
-    /// Register an allocation-relative memory read and seed it from every currently
-    /// directly-overlapping raw cell.  This is intentionally not a transitive closure.
+    /// Register an allocation-relative memory read. Every directly-overlapping raw cell feeds
+    /// one shared `(root, location)` hub, and the hub feeds each destination once. This is
+    /// intentionally not a transitive closure.
     fn read_overlap(&mut self, cell: Cell, destination: Cell) {
         if !self.asymmetric_field_overlap || self.is_external(cell) {
             self.add_copy(cell, destination);
@@ -6184,40 +6205,82 @@ impl Solve {
         let root = self.allocation_root(cell);
         let location = self.location_of(cell);
         let destination = self.canonical(destination);
-        let reads = self.overlap_reads.entry(root).or_default();
-        if reads
-            .iter()
-            .any(|&(loc, dst)| loc == location && dst == destination)
-        {
+        let existing_hub = self.overlap_reads.get(&root).and_then(|reads| {
+            reads
+                .iter()
+                .find(|read| read.location == location)
+                .map(|read| read.hub)
+        });
+        let hub = if let Some(hub) = existing_hub {
+            hub
+        } else {
+            let hub = self.allocate_cell();
+            self.overlap_reads
+                .entry(root)
+                .or_default()
+                .push(OverlapReadHub {
+                    location,
+                    hub,
+                    destinations: Vec::new(),
+                });
+            self.overlap_read_hubs_allocated = self.overlap_read_hubs_allocated.saturating_add(1);
+
+            let mut sources = vec![root];
+            if let Some(fields) = self.obj_fields.get(&root) {
+                sources.extend(fields.iter().copied());
+            }
+            for source in sources {
+                if location.may_alias(self.location_of(source)) {
+                    let before = self.copy_edges_inserted;
+                    self.add_copy(source, hub);
+                    let inserted = self.copy_edges_inserted.saturating_sub(before);
+                    self.overlap_read_source_edges =
+                        self.overlap_read_source_edges.saturating_add(inserted);
+                    self.overlap_read_pairs = self.overlap_read_pairs.saturating_add(inserted);
+                }
+            }
+            hub
+        };
+
+        let reads = self
+            .overlap_reads
+            .get_mut(&root)
+            .expect("new or existing overlap-read root must be indexed");
+        let read = reads
+            .iter_mut()
+            .find(|read| read.location == location)
+            .expect("new or existing overlap-read location must be indexed");
+        if read.destinations.contains(&destination) {
             return;
         }
-        reads.push((location, destination));
+        read.destinations.push(destination);
         self.overlap_read_dependencies = self.overlap_read_dependencies.saturating_add(1);
-        let mut sources = vec![root];
-        if let Some(fields) = self.obj_fields.get(&root) {
-            sources.extend(fields.iter().copied());
-        }
-        for source in sources {
-            if location.may_alias(self.location_of(source)) {
-                let before = self.copy_edges_inserted;
-                self.add_copy(source, destination);
-                self.overlap_read_pairs = self
-                    .overlap_read_pairs
-                    .saturating_add(self.copy_edges_inserted.saturating_sub(before));
-            }
-        }
+        let before = self.copy_edges_inserted;
+        self.add_copy(hub, destination);
+        let inserted = self.copy_edges_inserted.saturating_sub(before);
+        self.overlap_read_destination_edges =
+            self.overlap_read_destination_edges.saturating_add(inserted);
+        self.overlap_read_pairs = self.overlap_read_pairs.saturating_add(inserted);
     }
 
     fn replay_overlap_reads_for_field(&mut self, root: Cell, cell: Cell, location: FieldLocation) {
         if !self.asymmetric_field_overlap {
             return;
         }
-        let reads = self.overlap_reads.get(&root).cloned().unwrap_or_default();
-        for (read_location, destination) in reads {
+        let reads = self
+            .overlap_reads
+            .get(&root)
+            .into_iter()
+            .flatten()
+            .map(|read| (read.location, read.hub))
+            .collect::<Vec<_>>();
+        for (read_location, hub) in reads {
             if read_location.may_alias(location) {
                 let before = self.copy_edges_inserted;
-                self.add_copy(cell, destination);
+                self.add_copy(cell, hub);
                 let inserted = self.copy_edges_inserted.saturating_sub(before);
+                self.overlap_read_source_edges =
+                    self.overlap_read_source_edges.saturating_add(inserted);
                 self.overlap_read_pairs = self.overlap_read_pairs.saturating_add(inserted);
                 self.overlap_read_late_replays =
                     self.overlap_read_late_replays.saturating_add(inserted);
@@ -6463,12 +6526,17 @@ impl Solve {
         {
             fixed_generator[*destination as usize] = true;
         }
-        // A future field may feed an overlap read.  Its destination therefore has an
-        // independent generator even when no ordinary load names it.
+        // A future field may feed an overlap-read hub. Preserve both the hub equation and its
+        // destinations even when no ordinary load names them.
         for reads in self.overlap_reads.values() {
-            for &(_, destination) in reads {
-                if (destination as usize) < original_nodes {
-                    fixed_generator[destination as usize] = true;
+            for read in reads {
+                if (read.hub as usize) < original_nodes {
+                    fixed_generator[read.hub as usize] = true;
+                }
+                for &destination in &read.destinations {
+                    if (destination as usize) < original_nodes {
+                        fixed_generator[destination as usize] = true;
+                    }
                 }
             }
         }
@@ -6844,14 +6912,24 @@ impl Solve {
         }
         self.pending_geps = replay_geps;
 
-        let mut remapped_reads = HashMap::<Cell, Vec<(FieldLocation, Cell)>>::new();
-        for (root, registrations) in std::mem::take(&mut self.overlap_reads) {
+        let mut remapped_reads = HashMap::<Cell, Vec<OverlapReadHub>>::new();
+        for (root, reads) in std::mem::take(&mut self.overlap_reads) {
             let remapped = remapped_reads.entry(root).or_default();
-            for (location, destination) in registrations {
-                remapped.push((location, representatives[destination as usize]));
+            for read in reads {
+                let hub = representatives[read.hub as usize];
+                let mut destinations = read
+                    .destinations
+                    .into_iter()
+                    .map(|destination| representatives[destination as usize])
+                    .collect::<Vec<_>>();
+                destinations.sort_unstable();
+                destinations.dedup();
+                remapped.push(OverlapReadHub {
+                    location: read.location,
+                    hub,
+                    destinations,
+                });
             }
-            remapped.sort_unstable();
-            remapped.dedup();
         }
         self.overlap_reads = remapped_reads;
 
@@ -6943,19 +7021,37 @@ impl Solve {
                 .count()
     }
 
+    fn overlap_read_index_entries(&self) -> usize {
+        self.overlap_reads
+            .values()
+            .flatten()
+            .map(|read| read.destinations.len())
+            .sum()
+    }
+
     fn overlap_read_index_bytes(&self) -> usize {
         // Capacity-based lower-bound estimate for the persistent registration index; the
         // allocator/hash-table control bytes are intentionally not guessed here.
         self.overlap_reads
             .capacity()
-            .saturating_mul(std::mem::size_of::<(Cell, Vec<(FieldLocation, Cell)>)>())
+            .saturating_mul(std::mem::size_of::<(Cell, Vec<OverlapReadHub>)>())
             .saturating_add(
                 self.overlap_reads
                     .values()
                     .map(|reads| {
                         reads
                             .capacity()
-                            .saturating_mul(std::mem::size_of::<(FieldLocation, Cell)>())
+                            .saturating_mul(std::mem::size_of::<OverlapReadHub>())
+                            .saturating_add(
+                                reads
+                                    .iter()
+                                    .map(|read| {
+                                        read.destinations
+                                            .capacity()
+                                            .saturating_mul(std::mem::size_of::<Cell>())
+                                    })
+                                    .sum::<usize>(),
+                            )
                     })
                     .sum::<usize>(),
             )
@@ -6979,7 +7075,7 @@ impl Solve {
     fn maybe_report_progress(&self) {
         if self.profile && self.steps % knobs::ANDERSEN_PROFILE_STEP_INTERVAL == 0 {
             eprintln!(
-                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} overlap_reads={} overlap_pairs={} overlap_late_replays={} overlap_index_roots={} overlap_index_entries={} overlap_index_capacity_bytes={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} new_copy_edges_since_scc={}",
+                "pangs andersen profile: solve progress steps={} worklist={} queued={} pts_entries={} pts_facts={} copy_sources={} copy_edges={} fields={} unknown_fields={} overlap_reads={} overlap_hubs={} overlap_source_edges={} overlap_destination_edges={} overlap_pairs={} overlap_late_replays={} overlap_index_roots={} overlap_index_entries={} overlap_index_capacity_bytes={} memcpy_pairs_processed={} memcpy_logical_pairs_covered={} memcpy_summary_edges_inserted={} memcpy_summary_sites={} memcpy_summary_cells={} copy_fact_pairs_processed={} load_pairs_processed={} store_pairs_processed={} gep_pairs_processed={} scc_passes={} scc_nodes_collapsed={} scc_copy_edges_removed={} new_copy_edges_since_scc={}",
                 self.steps,
                 self.worklist.len(),
                 self.queued.len(),
@@ -6990,10 +7086,13 @@ impl Solve {
                 self.fields.len(),
                 self.unknown_fields.len(),
                 self.overlap_read_dependencies,
+                self.overlap_read_hubs_allocated,
+                self.overlap_read_source_edges,
+                self.overlap_read_destination_edges,
                 self.overlap_read_pairs,
                 self.overlap_read_late_replays,
                 self.overlap_reads.len(),
-                self.overlap_reads.values().map(Vec::len).sum::<usize>(),
+                self.overlap_read_index_entries(),
                 self.overlap_read_index_bytes(),
                 self.memcpy_pairs_processed,
                 self.memcpy_logical_pairs_covered,
@@ -8291,6 +8390,31 @@ mod tests {
         solve.run();
         assert!(solve.points_to(2).is_some_and(|set| set.contains(&9)));
         assert!(solve.overlap_read_late_replays > 0);
+    }
+
+    #[test]
+    fn asymmetric_overlap_factors_repeated_read_fanout_through_one_location_hub() {
+        let mut solve = Solve::new_with_pwc_and_overlap(20, false, false, true);
+        let root = 0;
+        solve.field_of(root, FieldLocation::Exact(0));
+        solve.field_of(root, FieldLocation::Exact(8));
+        let unknown = solve.unknown_field_of(root);
+
+        solve.read_overlap(unknown, 10);
+        solve.read_overlap(unknown, 11);
+        assert_eq!(solve.overlap_read_dependencies, 2);
+        assert_eq!(solve.overlap_read_hubs_allocated, 1);
+        assert_eq!(solve.overlap_read_source_edges, 4);
+        assert_eq!(solve.overlap_read_destination_edges, 2);
+        assert_eq!(solve.overlap_read_pairs, 6);
+
+        let late = solve.field_of(root, FieldLocation::Exact(16));
+        solve.add_pts(late, 19);
+        solve.run();
+        assert_eq!(solve.overlap_read_source_edges, 5);
+        assert_eq!(solve.overlap_read_late_replays, 1);
+        assert!(solve.points_to(10).is_some_and(|set| set.contains(&19)));
+        assert!(solve.points_to(11).is_some_and(|set| set.contains(&19)));
     }
 
     #[test]
