@@ -40,6 +40,10 @@ jobs:
             "https://github.com/Aarno-Labs/tenjin-build-deps/releases/download/llvmorg-14.0.6/$archive"
           tar xf "$archive"
           llvm_prefix="$PWD/${archive%.tar.xz}"
+          if [[ "${{ matrix.llvm_platform }}" == Darwin-* ]]; then
+            ln -s libLLVM.dylib "$llvm_prefix/lib/libLLVM-14.dylib"
+          fi
+          rm "$llvm_prefix/bin/as"  # it ships with a hacky wrapper around `llvm-mc`
           echo "$llvm_prefix/bin" >> "$GITHUB_PATH"
           echo "LLVM_SYS_140_PREFIX=$llvm_prefix" >> "$GITHUB_ENV"
 
