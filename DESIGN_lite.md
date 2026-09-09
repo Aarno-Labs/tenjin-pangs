@@ -59,7 +59,10 @@ No authoritative tier E. Experimental CFL query prototypes exist behind the quer
 but they do not feed analysis, disposition, or transformation artifacts. No certificate
 checks run between production phases: B2's exact answers take precedence, everything
 else reads D's solution, and FSA intersection is applied once as a final
-soundness-preserving filter on icall results. Receiver-allocation-relative payload
+soundness-preserving filter on icall results. That final filter is a no-op in practice:
+the FSA test that removes targets runs inside C', during Steensgaard binding, and the
+envelope D' activates from is already FSA-closed (`20260823_ICALL_AUDIT.md` §3.5). It is
+retained as a cheap invariant, not as a source of precision. Receiver-allocation-relative payload
 summaries and their bounded allocation-origin analysis are currently opt-in D'
 extensions (`PANGS_ANDERSEN_RECEIVER_PAYLOADS`); they are described below because their
 object domain, fallback semantics, and admission dependencies are part of the intended
@@ -112,12 +115,21 @@ otherwise function-pointer actuals and other pointer-bearing tail arguments fail
 - **B1 InitVal/stationarity (CORAL Stage Zero).** Flagship output of the mutability
   client (stationary global ⇒ no localization needed) and the settler for
   dispatch-table icalls. ~Few hundred lines of regional forward def-use tracking.
-- **B2 simple pointers (KELP).** ~⅓ of icalls resolved exactly, for free, with regional
-  SSA walks. Safe fallback discipline unchanged.
+- **B2 simple pointers (KELP).** Regional SSA walks resolving an icall operand exactly when
+  its every producer is reachable without passing through memory. Safe fallback discipline
+  unchanged. KELP reports ~⅓ of icalls resolved this way; **that yield does not reproduce
+  here.** On the 2026-08-23 corpus (`20260823_ICALL_AUDIT.md` §6) the exact pre-analyses
+  together settled **6 of 19,719** indirect callsites, all six in one module. Whether B2 is
+  correctly conservative on this corpus or defective is unresolved, and the metric cannot
+  currently distinguish them: B1's InitVal edges and B2's edges are both tagged
+  `Tier::Simple`, so the six are unattributed. Splitting that tag is a prerequisite for
+  deciding whether B2 earns its place.
 
 **Kept:** B3 confined-function subtraction falls out of B2's bookkeeping. Functions whose
 every address flow was consumed by an exact simple chain are removed from non-exact
-candidate envelopes, while an exact B2 binding to such a function remains pinned.
+candidate envelopes, while an exact B2 binding to such a function remains pinned. Since
+B3's input is B2's exact resolutions, its measured effect on that corpus is also nil:
+`confined_functions` was **0** on every module.
 
 B1 now emits more than an initializer target set. Its production certificate records the
 publication boundary, initialization subtree and writers, readers/observations, and
@@ -333,6 +345,23 @@ back to the complete Steensgaard result, while independently proven exact callsi
 answers survive. The old stateless descending construction remains only as a temporary
 differential oracle during the migration
 (`20260723_MONOTONE_OTF_CG_PLAN.md`).
+
+**Measured consequence: `unknown_callee` tracks Steensgaard's verdict, not admission.**
+Under default knobs `unknown_callee` and `fallback` agree on nearly every indirect-call row
+of the 2026-08-23 corpus census — all 19,719 pre-fix, and 12,986 of 13,022 (99.7%) after
+the constant-expression lowering fix. Both largely reduce to Steensgaard's unknown-callee
+verdict: a site whose Steensgaard class reached an external region is activated eagerly over
+its whole envelope and retains fallback provenance, and nothing in the default pipeline
+clears the bit — Andersen narrowing the target set does not narrow the Ω marker.
+`PANGS_ANDERSEN_DISABLE_EAGER_UNKNOWN=1` confirms the direction of the dependence: it
+changes `fallback` substantially (`exe-tmux-O0` 42 → 18) and leaves `unknown_callee`
+untouched at 42.
+
+So the Ω population is not primarily an admission-budget or partition-scope effect — 39
+oversize-fallback partitions were recorded corpus-wide against 12,583 Ω sites — it is
+Steensgaard's boundary verdict carried through unchanged. The closed-producer certificate
+below is the mechanism intended to clear it; see §4 for the measurement showing how little
+it currently recovers.
 
 **Finite field domain:**
 
@@ -608,15 +637,66 @@ The principal cut precision remains general tier-E context-sensitivity, which CO
 finding III says parameter-passed function pointers need. Receiver-relative payload
 summaries recover one frequent object-sensitive container pattern, but do not distinguish
 arbitrary calls, receiver state not expressible in the finite field domain, recursion,
-or receivers without a certified allocation root. Two reasons to expect a small
-remaining coverage hit *for this client*:
+or receivers without a certified allocation root.
 
-1. The canonical parameter-passed cases — qsort comparators, signal handlers,
-   pthread_create thunks — pass through **external code and are Ω-frozen regardless of
-   analysis precision.** Tier E could not have rescued them either.
-2. The icalls that shape the localization client's component structure are **dispatch
-   tables** (PHP opcode handlers, Vim command tables), and those settle at
-   B1-InitVal + array-carve-out level, which lite keeps.
+This section previously argued the remaining coverage hit would be small, on two grounds:
+that parameter-passed function pointers are Ω-frozen through external code regardless of
+analysis precision, and that dispatch-table icalls settle at B1-InitVal plus the
+array carve-out. **The 2026-08-23 corpus census
+([`20260823_ICALL_AUDIT.md`](20260823_ICALL_AUDIT.md),
+`metrics/icall_census/`) contradicts both.** Measured over the 32 `-O0` modules
+(2,027 indirect callsites), classified by how the callsite's function-pointer operand is
+produced:
+
+| operand provenance | sites | share | Ω | finite |
+|---|---:|---:|---:|---:|
+| dispatch table (load from a global) | 1183 | 58.4% | 91.7% | 8.3% |
+| receiver deref (`obj->handler`) | 362 | 17.9% | 100.0% | 0.0% |
+| unclassified memory | 323 | 15.9% | 100.0% | 0.0% |
+| parameter-passed | 118 | 5.8% | 44.9% | 55.1% |
+| materialized `&f` in frame | 19 | 0.9% | 0.0% | 100.0% |
+
+1. **Parameter-passed icalls are the best-resolved non-trivial class, not an Ω-frozen
+   one.** 55% carry a finite target set. The qsort/signal/pthread shapes are real but
+   are not what dominates this population; most parameter-passed function pointers on
+   this corpus are internal wrappers. The old claim's *premise* was wrong, so its
+   conclusion — that tier E could not have rescued them — is unsupported. The practical
+   stake is nevertheless small, because the class is only 5.8% of sites.
+2. **Dispatch tables dominate but do not settle.** They are 58% of sites and 92% of them
+   remain Ω. B1-InitVal plus the array carve-out is not, in fact, sufficient for them.
+   One observed failure mode is a `global_load` operand whose points-to set comes back
+   with *no* function pointees at all, while a structurally similar site in the same
+   function resolves — so this is a bounded, shape-dependent defect rather than a
+   categorical limit.
+3. **A third class the old text did not name: receiver deref.** `obj->handler` dispatch is
+   the second-largest population (18%) and the worst resolved (0% finite). It has no
+   dispatch table and no parameter-passed operand, so neither of the old arguments
+   covered it. It is precisely the shape the receiver-allocation-relative payload
+   summaries in §2 D′ target, which makes graduating that experiment — not tier E, and
+   not typed heap clones — the indicated response.
+
+Together the dispatch-table and receiver-deref classes are 76% of `-O0` sites and ~94% Ω
+between them. Precision work that does not address those two is not addressing the
+residue.
+
+Two calibrations keep this from being read as a bigger indictment than it is.
+
+**Not all Ω is avoidable.** A substantial share is correct conservatism that no precision
+work should remove. `lib-parson` is 60/60 Ω because it holds
+`static JSON_Malloc_Function parson_malloc = malloc;` behind an exported
+`json_set_allocation_functions()`; in library mode that hook genuinely can hold any
+caller-supplied function, so Ω is the right answer. Ω rate also varies with build mode and
+with module mix far more than with any uniform property of the analysis. Any goal phrased
+as "reduce Ω" therefore needs a denominator that first excludes justified Ω; otherwise it
+rewards making a sound answer merely look better.
+
+**The closed-producer certificate does not currently recover this.** It is the mechanism
+designed to clear the retained unknown bit, and a spot check with
+`PANGS_ANDERSEN_CLOSED_PRODUCERS=1` moved almost nothing: parson 60 Ω → 60, tree 19 → 17,
+tmux 42 → 41, libusb and fribidi unchanged. Whether that reflects a limitation of the
+prototype's bounded promotion, the aggregate-copy incompleteness rule, or the genuine
+openness of these producers is unresolved. Graduating it on the strength of the
+`unknown ≡ fallback` identity alone would be unwarranted.
 
 The genuine exposure is `DESIGN.md` §11.4's mega-component risk: if the imprecise
 residue merges load-bearing components, coverage collapses. Independent prepartitioning
@@ -666,12 +746,23 @@ Nothing in lite forecloses the full design:
 
 **Future upgrade gates:**
 - Localization coverage on Vim/PHP acceptable to the client → ship lite, stop.
+- Coverage limited by *dispatch-table icalls that do not resolve* (diagnosable: the
+  operand is a load from a global and its points-to set is empty or Ω-marked) → this is
+  the largest measured class (§4) and is a defect in existing machinery, not a missing
+  tier. Fix before considering any tier upgrade.
+- Coverage limited by *receiver-deref icalls* (diagnosable: the operand is a load through
+  an object reachable from a formal parameter) → graduate the receiver-payload summaries
+  of §2 D′; this is the second-largest measured class and the abstraction already exists.
 - Coverage limited by *heap object conflation* (diagnosable: imprecise facts trace to
   multi-type allocation sites) → add typed clones, not tier E.
 - Coverage limited by *context-insensitive icall residue merging components*
   (diagnosable: load-bearing FP edges trace to parameter-passed fn ptrs that are not
-  Ω-frozen) → first determine whether the flow matches the receiver-payload abstraction;
-  otherwise build tier E as the refinement pass, i.e., graduate to `DESIGN.md`.
+  Ω-frozen) → build tier E as the refinement pass, i.e., graduate to `DESIGN.md`.
+  **The 2026-08-23 census does not currently support this gate**: parameter-passed
+  operands are 5.8% of `-O0` sites and are already 55% resolved, so tier E is the
+  lowest-yield of the four.
 
 The provenance tags (§2F) are what make these diagnoses mechanical rather than
-forensic: every coverage-blocking edge names the phase that produced it.
+forensic: every coverage-blocking edge names the phase that produced it. The operand
+provenance census (`pangs icall-census`) is the complementary instrument: the tags say
+which phase produced an edge, the census says which *program shape* defeated it.

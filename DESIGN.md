@@ -121,6 +121,10 @@ precise as any later tier could be (singleton, ⊆ InitVal, or no-write-found). 
 unsettled queries flow downward. Expected volume, calibrated by the papers' measurements:
 B2 settles ~35% of icalls exactly (KELP), C settles ~55% of the rest (CORAL I₁), D another
 ~25% (CORAL I₂), leaving <20% for the expensive tier E — which is itself parallel.
+**These are the papers' numbers on the papers' benchmarks, and the first of them did not
+reproduce on the PANGS corpus:** the exact pre-analyses settled 6 of 19,719 indirect
+callsites (`20260823_ICALL_AUDIT.md` §6). Treat the whole cascade as a hypothesis about
+volume that each stage must re-earn by measurement, not as a calibration.
 
 ## 4. Phase details
 
@@ -204,7 +208,13 @@ B2 settles ~35% of icalls exactly (KELP), C settles ~55% of the rest (CORAL I₁
   paired Geps; object-level CastMap (built minimal in phase A); type-based `Shortcut` edges
   to skip long store/load chains soundly; FSA as a *final intersection filter* on icall
   results (they note demand answers can exceed FSA; intersecting is free soundness-preserving
-  precision). **New here:** traversals carry the partition bound from S3 — a visited-set
+  precision). **Measured caveat (2026-08-23):** in the lite pipeline the filter earns nothing
+  at this position. Every FSA rejection happens earlier, during Steensgaard binding (42.3% of
+  pointer-proposed callees corpus-wide); by the time Andersen runs, its activation envelope is
+  already FSA-closed, and Andersen-refined sites had **zero** FSA-rejected pointees across all
+  6,195 of them. A demand tier would inherit the same property unless it can propose targets
+  outside the Steensgaard envelope. See `20260823_ICALL_AUDIT.md` §3.5.
+  **New here:** traversals carry the partition bound from S3 — a visited-set
   scoped to the query's partition union, typically far smaller than the global PAG.
 - **On-the-fly call graph fixpoint (KallGraph §5.4):** start from the direct-call graph +
   tiers B–D settled icalls; iterate queries, tracking `DepiCalls[f]`/`DepFuncs[f]`; re-run
@@ -407,6 +417,7 @@ rule enforcing static-like context storage. Accepted 2026-08-19; design authorit
 2. **M2 — B1/B2/B3 + certificates.** Stationarity (immutability-after-init), simple-icall
    exact resolution, confined subtraction. This is the largest single precision jump per
    engineering hour (KELP: +33% of icalls exactly; CORAL: 55% certified at Steensgaard).
+   Neither figure has reproduced on the PANGS corpus so far; see `DESIGN_lite.md` §2 B'.
 3. **M3 — tier E queries + on-the-fly CG fixpoint.** KallGraph grammar with byte-offset
    MHS, writers()/escapes() query forms, partition-bounded traversal, parallel query pool.
 4. **M4 — tier D partition Andersen.** Slots between C and E to shrink E's load; measure
