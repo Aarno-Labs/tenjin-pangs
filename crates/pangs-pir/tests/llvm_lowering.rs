@@ -5,8 +5,6 @@ use std::process::Command;
 use pangs_pir::{GepLane, Param, Pir, ScalarTypeClass, Stmt, ValueKind, VarArgPosition};
 use tempfile::TempDir;
 
-const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
-
 fn m1_1_fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/synthetic/m1_1")
@@ -19,12 +17,11 @@ fn pir_from_llvm_sys(path: &Path) -> Pir {
 
 #[test]
 fn lowers_statement_boundary_cfg_with_insertability_and_bidirectional_edges() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let bc_path = tmp.path().join("phase-cfg.bc");
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = repo_root.join("fixtures/synthetic/disposition/phase_cfg.c");
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-O0", "-g", "-emit-llvm", "-c"])
         .arg(&source)
         .arg("-o")
@@ -86,12 +83,11 @@ fn lowers_statement_boundary_cfg_with_insertability_and_bidirectional_edges() {
 
 #[test]
 fn lowers_typedef_pointer_spelling_and_resolved_scalar_class() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let bc_path = tmp.path().join("typedef.bc");
     let c_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/synthetic/m1_8/icall_exec.c");
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .arg("-O0")
         .arg("-g")
         .arg("-emit-llvm")
@@ -113,7 +109,6 @@ fn lowers_typedef_pointer_spelling_and_resolved_scalar_class() {
 
 #[test]
 fn lowers_complete_qualified_scalar_type_evidence() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let c_path = tmp.path().join("qualified-scalars.c");
     let bc_path = tmp.path().join("qualified-scalars.bc");
@@ -135,7 +130,7 @@ int sectioned_global __attribute__((section(".pangs_test")));
 "#,
     )
     .unwrap();
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-std=c11", "-O0", "-g", "-emit-llvm", "-c"])
         .arg(&c_path)
         .arg("-o")
@@ -204,7 +199,6 @@ int sectioned_global __attribute__((section(".pangs_test")));
 
 #[test]
 fn lowers_volatile_on_direct_local_gep_and_pointer_memory_operations() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let temp = TempDir::new().unwrap();
     let source_path = temp.path().join("volatile-shapes.c");
     let bitcode_path = temp.path().join("volatile-shapes.bc");
@@ -221,7 +215,7 @@ int plain_read(int *pointer) { return *pointer; }
 "#,
     )
     .unwrap();
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-std=c11", "-O0", "-g", "-emit-llvm", "-c"])
         .arg(&source_path)
         .arg("-o")
@@ -271,12 +265,11 @@ int plain_read(int *pointer) { return *pointer; }
 
 #[test]
 fn qualified_scalar_type_walk_fails_closed_on_cycles_and_excess_depth() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let c_path = tmp.path().join("type-chain.c");
     let ll_path = tmp.path().join("type-chain.ll");
     fs::write(&c_path, "typedef int I; volatile I g;\n").unwrap();
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-std=c11", "-O0", "-g", "-S", "-emit-llvm"])
         .arg(&c_path)
         .arg("-o")
@@ -323,16 +316,11 @@ fn qualified_scalar_type_walk_fails_closed_on_cycles_and_excess_depth() {
 
 #[test]
 fn lowers_llvm14_bitcode_function_pointer_smoke() {
-    assert!(
-        Path::new(CLANG_14).exists(),
-        "LLVM-14 clang is required for the M1.1 lowering smoke test"
-    );
-
     let tmp = TempDir::new().unwrap();
     let bc_path = tmp.path().join("fp.bc");
     let c_path = m1_1_fixture("fp_smoke.c");
 
-    let status = Command::new(CLANG_14)
+    let status = Command::new("clang")
         .arg("-O0")
         .arg("-g")
         .arg("-emit-llvm")
@@ -436,16 +424,11 @@ fn lowers_llvm14_bitcode_function_pointer_smoke() {
 
 #[test]
 fn llvm_sys_lowers_llvm14_bitcode_function_pointer_smoke() {
-    assert!(
-        Path::new(CLANG_14).exists(),
-        "LLVM-14 clang is required for the M1.1 lowering smoke test"
-    );
-
     let tmp = TempDir::new().unwrap();
     let bc_path = tmp.path().join("fp.bc");
     let c_path = m1_1_fixture("fp_smoke.c");
 
-    let status = Command::new(CLANG_14)
+    let status = Command::new("clang")
         .arg("-O0")
         .arg("-g")
         .arg("-emit-llvm")
@@ -598,10 +581,9 @@ fn lowers_vararg_and_x87_signatures_from_ll() {
 
 #[test]
 fn recognizes_closed_sysv_pointer_varargs_and_rejects_va_copy() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let bc_path = tmp.path().join("positional-varargs.bc");
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-O0", "-g", "-emit-llvm", "-c"])
         .arg(m1_1_fixture("positional_varargs.c"))
         .arg("-o")
@@ -803,16 +785,11 @@ fn classifies_operand_bounded_and_symbol_referencing_inline_asm() {
 
 #[test]
 fn lowers_large_struct_byval_and_sret_from_bitcode() {
-    assert!(
-        Path::new(CLANG_14).exists(),
-        "LLVM-14 clang is required for the M1.1 lowering ABI fixture"
-    );
-
     let tmp = TempDir::new().unwrap();
     let bc_path = tmp.path().join("agg.bc");
     let c_path = m1_1_fixture("byval_sret.c");
 
-    let status = Command::new(CLANG_14)
+    let status = Command::new("clang")
         .arg("-O0")
         .arg("-g0")
         .arg("-emit-llvm")
@@ -846,16 +823,11 @@ fn lowers_large_struct_byval_and_sret_from_bitcode() {
 
 #[test]
 fn llvm_sys_lowers_large_struct_byval_and_sret_from_bitcode() {
-    assert!(
-        Path::new(CLANG_14).exists(),
-        "LLVM-14 clang is required for the M1.1 lowering ABI fixture"
-    );
-
     let tmp = TempDir::new().unwrap();
     let bc_path = tmp.path().join("agg.bc");
     let c_path = m1_1_fixture("byval_sret.c");
 
-    let status = Command::new(CLANG_14)
+    let status = Command::new("clang")
         .arg("-O0")
         .arg("-g0")
         .arg("-emit-llvm")
@@ -2305,11 +2277,6 @@ lpad:
 
 #[test]
 fn llvm_sys_lowers_clang14_asm_goto_bitcode() {
-    assert!(
-        Path::new(CLANG_14).exists(),
-        "LLVM-14 clang is required for the asm goto lowering test"
-    );
-
     let tmp = TempDir::new().unwrap();
     let c_path = tmp.path().join("asm_goto.c");
     let bc_path = tmp.path().join("asm_goto.bc");
@@ -2328,7 +2295,7 @@ hit:
     )
     .unwrap();
 
-    let status = Command::new(CLANG_14)
+    let status = Command::new("clang")
         .arg("-O0")
         .arg("-emit-llvm")
         .arg("-c")

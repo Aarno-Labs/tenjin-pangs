@@ -4433,12 +4433,11 @@ mod tests {
     }
 
     fn signal_flag_artifacts(source: &str) -> (DispositionManifest, Vec<AuditRecord>) {
-        const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
         let temp = TempDir::new().unwrap();
         let source_path = temp.path().join("signal-flag.c");
         let bitcode_path = temp.path().join("signal-flag.bc");
         fs::write(&source_path, source).unwrap();
-        assert!(Command::new(CLANG_14)
+        assert!(Command::new("clang")
             .args(["-std=c11", "-O0", "-g", "-emit-llvm", "-c"])
             .arg(&source_path)
             .arg("-o")
@@ -5206,7 +5205,6 @@ int poll_flag(void) { int value = flag; return value + poll_other(); }
 
     #[test]
     fn pointer_derived_access_site_retains_statement_volatility() {
-        const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
         let temp = TempDir::new().unwrap();
         let source_path = temp.path().join("volatile-pointer.c");
         let bitcode_path = temp.path().join("volatile-pointer.bc");
@@ -5219,7 +5217,7 @@ int call_reader(void) { return read_pointer(&target); }
 "#,
         )
         .unwrap();
-        assert!(Command::new(CLANG_14)
+        assert!(Command::new("clang")
             .args(["-std=c11", "-O0", "-g", "-emit-llvm", "-c"])
             .arg(&source_path)
             .arg("-o")

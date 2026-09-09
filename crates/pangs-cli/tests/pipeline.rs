@@ -2074,15 +2074,12 @@ fn differential_ledger_holds_on_synthetic_suite() {
     );
 }
 
-const CLANG_14: &str = "/home/brk/tenjin/_local/xj-llvm-14/bin/clang";
-
 #[test]
 fn analyze_manifest_only_emits_disposition_pair_and_metrics() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let bc = tmp.path().join("dispose.bc");
     let out = tmp.path().join("out");
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-O0", "-g", "-emit-llvm", "-c"])
         .arg(m1_1_fixture("fp_smoke.c"))
         .arg("-o")
@@ -2131,11 +2128,10 @@ fn analyze_manifest_only_emits_disposition_pair_and_metrics() {
 
 #[test]
 fn analyze_dispose_emits_policy_pair_without_indexing_it() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let bc = tmp.path().join("dispose.bc");
     let out = tmp.path().join("out");
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-O0", "-g", "-emit-llvm", "-c"])
         .arg(m1_1_fixture("fp_smoke.c"))
         .arg("-o")
@@ -2300,13 +2296,12 @@ fn sha256_text(value: &str) -> String {
 
 #[test]
 fn analyze_dispose_reports_registry_reachability_and_coupling() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let bc = tmp.path().join("registry.bc");
     let out = tmp.path().join("out");
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = repo_root.join("fixtures/synthetic/disposition/registry_and_coupling.c");
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-O0", "-g", "-emit-llvm", "-c"])
         .arg(source)
         .arg("-o")
@@ -2397,13 +2392,12 @@ fn analyze_dispose_reports_registry_reachability_and_coupling() {
 
 #[test]
 fn analyze_dispose_certifies_a_source_mapped_once_lock_candidate() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let bc = tmp.path().join("phase-once-lock.bc");
     let out = tmp.path().join("out");
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = repo_root.join("fixtures/synthetic/disposition/phase_once_lock.c");
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-O0", "-g", "-emit-llvm", "-c"])
         .arg(source)
         .arg("-o")
@@ -2454,13 +2448,12 @@ fn analyze_dispose_certifies_a_source_mapped_once_lock_candidate() {
 
 #[test]
 fn analyze_dispose_derives_common_once_lock_group_support() {
-    assert!(Path::new(CLANG_14).exists(), "LLVM-14 clang is required");
     let tmp = TempDir::new().unwrap();
     let bc = tmp.path().join("phase-once-lock-group.bc");
     let out = tmp.path().join("out");
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let source = repo_root.join("fixtures/synthetic/disposition/phase_once_lock_group.c");
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-O0", "-g", "-emit-llvm", "-c"])
         .arg(source)
         .arg("-o")
@@ -2549,10 +2542,6 @@ fn workspace_path(rel: &str) -> PathBuf {
 /// every observed (caller, idx, target) pair is in the andersen edge set.
 #[test]
 fn dynamic_icall_trace_validates_against_andersen() {
-    assert!(
-        Path::new(CLANG_14).exists(),
-        "LLVM-14 clang is required for the M1.8 dynamic trace test"
-    );
     let tmp = TempDir::new().unwrap();
     let src = workspace_path("fixtures/synthetic/m1_8/icall_exec.c");
     let runtime = workspace_path("scripts/pangs_trace_runtime.c");
@@ -2563,7 +2552,7 @@ fn dynamic_icall_trace_validates_against_andersen() {
     let trace = tmp.path().join("trace.txt");
 
     // 1. compile to bitcode
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args([
             "-O0",
             "-g",
@@ -2601,7 +2590,7 @@ fn dynamic_icall_trace_validates_against_andersen() {
         .success());
 
     // 4. link instrumented module + trace runtime
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-O0"])
         .arg(&inst)
         .arg(&runtime)
@@ -2640,10 +2629,6 @@ fn dynamic_icall_trace_validates_against_andersen() {
 /// resolved `beta` trace pair would make `check-traces` exit 3.
 #[test]
 fn dynamic_multi_icall_trace_validates_both_sites() {
-    assert!(
-        Path::new(CLANG_14).exists(),
-        "LLVM-14 clang is required for the M1.8 dynamic trace test"
-    );
     let tmp = TempDir::new().unwrap();
     let src = workspace_path("fixtures/synthetic/m1_8/two_icall_exec.c");
     let runtime = workspace_path("scripts/pangs_trace_runtime.c");
@@ -2653,7 +2638,7 @@ fn dynamic_multi_icall_trace_validates_both_sites() {
     let out = tmp.path().join("out");
     let trace = tmp.path().join("trace.txt");
 
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args([
             "-O0",
             "-g",
@@ -2694,7 +2679,7 @@ fn dynamic_multi_icall_trace_validates_both_sites() {
         .status()
         .unwrap()
         .success());
-    assert!(Command::new(CLANG_14)
+    assert!(Command::new("clang")
         .args(["-O0"])
         .arg(&inst)
         .arg(&runtime)
