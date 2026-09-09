@@ -118,6 +118,28 @@ enum Command {
         #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
         partition_budget: u64,
     },
+    /// Emit the diagnostic indirect-call provenance + FSA-intersection census as JSONL.
+    ///
+    /// One row per indirect callsite: how its function-pointer operand is produced, the size
+    /// of its FSA signature envelope, and how the pointer answer relates to that envelope.
+    /// Purely observational — no analysis fact depends on it.
+    IcallCensus {
+        module: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Also write a module-level summary JSON (row counts plus the analysis metrics that
+        /// bear on this census), so a corpus sweep needs only this one run per module.
+        #[arg(long)]
+        summary: Option<PathBuf>,
+        #[arg(long, default_value = knobs::DEFAULT_ANALYSIS_STAGE)]
+        stage: StageArg,
+        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
+        build_mode: BuildModeArg,
+        #[arg(long)]
+        exports: Option<PathBuf>,
+        #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
+        partition_budget: u64,
+    },
     /// Run the M2.7 pre-analysis ablation: M1 baseline, B2 only, B1 only, and both.
     M2Ablation {
         module: PathBuf,
@@ -604,6 +626,117 @@ fn run() -> Result<()> {
                 );
             }
         },
+        Command::IcallCensus {
+            module,
+            out,
+            summary,
+            stage,
+            build_mode,
+            exports,
+            partition_budget,
+        } => {
+            let pir = Pir::from_path(&module)?;
+            let opts = Opts {
+                stage: stage.into(),
+                build_mode: build_mode.into(),
+                exports: read_exports(exports)?,
+                partition_budget,
+                ..Opts::default()
+            };
+            let provenance = pangs_api::icall_census::classify_icalls(&pir);
+            let analysis = Analysis::run(&pir, &opts)?;
+
+            // Rows join positionally with the indirect entries of the callsite table; both
+            // are built in module-function order then body order. Verify rather than trust:
+            // a mismatch means one of the two walks changed and every row after it is
+            // attributed to the wrong callsite.
+            let indirect: Vec<_> = analysis
+                .callsites()
+                .iter()
+                .enumerate()
+                .filter(|(_, cs)| cs.kind == pangs_api::CallKind::Indirect)
+                .collect();
+            anyhow::ensure!(
+                indirect.len() == provenance.len(),
+                "icall census: {} classified operands vs {} indirect callsites — the PIR walk \
+                 and the callsite table have diverged",
+                provenance.len(),
+                indirect.len()
+            );
+
+            let census = analysis.icall_fsa_census();
+            let mut lines = Vec::new();
+            for ((index, callsite), row) in indirect.iter().zip(&provenance) {
+                let caller = &analysis.functions()[callsite.caller].key;
+                anyhow::ensure!(
+                    caller == &row.caller,
+                    "icall census: callsite {} is in {caller} but the classified operand is in \
+                     {} — positional join is invalid",
+                    callsite.key,
+                    row.caller
+                );
+                let fsa = census
+                    .get(&pangs_api::CallsiteId(*index as u32))
+                    .copied()
+                    .unwrap_or_default();
+                lines.push(serde_json::json!({
+                    "module": module.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+                    "callsite": callsite.key,
+                    "caller": row.caller,
+                    "bucket": row.bucket,
+                    "labels": row.labels.iter().map(|l| l.name()).collect::<Vec<_>>(),
+                    "truncated": row.truncated,
+                    "fsa_envelope": row.fsa_envelope,
+                    "pointer_targets_prefsa": fsa.prefsa_targets,
+                    "fsa_rejected_targets": fsa.fsa_rejected_targets,
+                    "targets": fsa.kept_targets,
+                    "unknown_callee": fsa.unknown_callee,
+                    "fallback": fsa.fallback,
+                }));
+            }
+            // Newline-terminated JSONL, and genuinely empty for a module with no indirect
+            // calls — a lone "\n" would be an unparseable record, not an empty file.
+            let body = lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>();
+            match out {
+                Some(path) => {
+                    fs::write(&path, &body)
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    eprintln!("icall census: {} rows -> {}", lines.len(), path.display());
+                }
+                None => print!("{body}"),
+            }
+            if let Some(path) = summary {
+                let metrics = analysis.metrics();
+                let report = serde_json::json!({
+                    "module": module.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+                    "stage": format!("{:?}", opts.stage),
+                    "build_mode": format!("{:?}", opts.build_mode),
+                    "functions": analysis.functions().len(),
+                    "callsites": analysis.callsites().len(),
+                    "indirect_callsites": lines.len(),
+                    "address_taken": analysis
+                        .functions()
+                        .iter()
+                        .filter(|func| func.address_taken)
+                        .count(),
+                    "icalls_simple": metrics.icalls_simple,
+                    "icalls_andersen": metrics.icalls_andersen,
+                    "icalls_steens": metrics.icalls_steens,
+                    "icalls_fsa": metrics.icalls_fsa,
+                    "icalls_unknown": metrics.icalls_unknown,
+                    "confined_functions": metrics.confined_functions,
+                    "steens_fsa_compatible_pairs": metrics.steens_fsa_compatible_pairs,
+                    "steens_fsa_rejected_pairs": metrics.steens_fsa_rejected_pairs,
+                    "oversize_fallbacks": metrics.oversize_fallbacks,
+                    "analysis_wall_us": metrics.analysis_wall_us,
+                });
+                fs::write(&path, format!("{report}\n"))
+                    .with_context(|| format!("writing {}", path.display()))?;
+            }
+        }
         Command::Differential {
             module,
             build_mode,

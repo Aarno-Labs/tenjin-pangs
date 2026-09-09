@@ -24,6 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 mod differential;
+pub mod icall_census;
 mod initval;
 pub mod knobs;
 mod simple;
@@ -843,6 +844,24 @@ pub struct Analysis {
     registry_entries: BTreeMap<CallsiteId, RegistryEntryResolution>,
     #[serde(skip)]
     registry_apis: Vec<RegistryApi>,
+    /// Diagnostic-only per-indirect-callsite FSA census (`icall_census`). Empty for
+    /// `Stage::Conservative`, which has no pointer solution to compare against.
+    #[serde(skip)]
+    icall_fsa_census: BTreeMap<CallsiteId, IcallFsaCensus>,
+}
+
+/// How one indirect callsite's pointer answer relates to its FSA signature envelope.
+///
+/// Diagnostic only: nothing in the pipeline reads these counters, and they are deliberately
+/// excluded from every soundness guard. `fsa_rejected_targets` is the per-site count of
+/// callees the pointer solution proposed and only the type envelope excluded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcallFsaCensus {
+    pub prefsa_targets: usize,
+    pub fsa_rejected_targets: usize,
+    pub kept_targets: usize,
+    pub unknown_callee: bool,
+    pub fallback: bool,
 }
 
 impl Analysis {
@@ -971,6 +990,7 @@ impl Analysis {
         let mut simple_icall_queries = Vec::new();
         let mut solver_metrics = None;
         let mut registry_entries = BTreeMap::new();
+        let mut icall_fsa_census = BTreeMap::<CallsiteId, IcallFsaCensus>::new();
         let mut pag_build_us = 0;
         let mut solve_us = 0;
         let address_taken: Vec<_> = module
@@ -1498,6 +1518,16 @@ impl Analysis {
                         continue;
                     };
                     let caller = callsites[cs.0 as usize].caller;
+                    icall_fsa_census.insert(
+                        cs,
+                        IcallFsaCensus {
+                            prefsa_targets: solved_site.prefsa_targets,
+                            fsa_rejected_targets: solved_site.fsa_rejected_targets,
+                            kept_targets: solved_site.targets.len(),
+                            unknown_callee: solved_site.unknown_callee,
+                            fallback: solved_site.fallback,
+                        },
+                    );
                     if let Some(simple) = simple_icalls.get(&cs) {
                         if let Some(query) = simple_queries.get(&cs) {
                             emit_simple_call_edges(
@@ -1998,7 +2028,13 @@ impl Analysis {
             global_lookup,
             registry_entries,
             registry_apis,
+            icall_fsa_census,
         })
+    }
+
+    /// Diagnostic-only FSA census per indirect callsite; empty under `Stage::Conservative`.
+    pub fn icall_fsa_census(&self) -> &BTreeMap<CallsiteId, IcallFsaCensus> {
+        &self.icall_fsa_census
     }
 
     pub fn functions(&self) -> &Table<FuncId, FuncInfo> {

@@ -3962,11 +3962,39 @@ impl<'a> Refiner<'a> {
                         certified
                     );
                 }
+                // Diagnostic-only census of the pre-FSA pointer answer at this site: the
+                // address-taken function objects Andersen actually materialized in the
+                // operand's points-to set, and how many of them the signature envelope
+                // would reject. Neither counter feeds `targets`.
+                let mut prefsa_targets = 0usize;
+                let mut fsa_rejected_targets = 0usize;
+                for function in cs
+                    .operand
+                    .and_then(|operand| pts.points_to(operand.0))
+                    .into_iter()
+                    .flat_map(|points_to| points_to.iter())
+                    .filter_map(|cell| {
+                        let root = pts.field_base.get(&cell).copied().unwrap_or(cell);
+                        self.fn_cell_to_index.get(&root).copied()
+                    })
+                    .collect::<BTreeSet<_>>()
+                {
+                    let meta = &self.pir.functions[function];
+                    if !meta.address_taken {
+                        continue;
+                    }
+                    prefsa_targets += 1;
+                    if !pangs_pir::fsa_compatible(&cs.sig, &meta.sig) {
+                        fsa_rejected_targets += 1;
+                    }
+                }
                 out.push(IndirectCallResolution {
                     callsite_key: cs.key.clone(),
                     targets,
                     unknown_callee,
                     fallback,
+                    prefsa_targets,
+                    fsa_rejected_targets,
                 });
             } else if let Some(steens) = steens {
                 // Uninteresting or oversize partition: keep Steensgaard, tag as fallback.

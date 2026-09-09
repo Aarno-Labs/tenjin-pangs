@@ -184,6 +184,16 @@ pub struct IndirectCallResolution {
     /// `--stage andersen`.
     #[serde(default)]
     pub fallback: bool,
+    /// Diagnostic only: how many address-taken function objects the pointer solution placed
+    /// in this operand's pointee set, before the FSA signature filter ran. `targets` remains
+    /// the authoritative post-filter answer; nothing reads either counter for soundness.
+    #[serde(default)]
+    pub prefsa_targets: usize,
+    /// Diagnostic only: how many of `prefsa_targets` the FSA signature envelope rejected —
+    /// the per-site count of callees the pointer solution proposed and only the type
+    /// envelope excluded (Clash's `escape_number` in `~/tmp/clash`).
+    #[serde(default)]
+    pub fsa_rejected_targets: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1796,6 +1806,18 @@ impl<'a> Solver<'a> {
             let operand = self.class_of(operand);
             let pointee = self.pointee_of(operand);
             let root = self.find(pointee);
+            let mut prefsa_targets = 0usize;
+            let mut fsa_rejected_targets = 0usize;
+            for &func_index in &self.classes[root].fn_objs {
+                let meta = &self.function_meta[func_index];
+                if !meta.address_taken {
+                    continue;
+                }
+                prefsa_targets += 1;
+                if !fsa_compatible(&callsite.sig, &meta.sig) {
+                    fsa_rejected_targets += 1;
+                }
+            }
             let mut targets = self.classes[root]
                 .fn_objs
                 .iter()
@@ -1816,6 +1838,8 @@ impl<'a> Solver<'a> {
                 targets,
                 unknown_callee: self.classes[root].ext,
                 fallback: false,
+                prefsa_targets,
+                fsa_rejected_targets,
             });
         }
 
