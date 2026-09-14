@@ -426,10 +426,6 @@ pub struct Global {
     pub is_definition: bool,
     #[serde(default)]
     pub linkage: SymbolLinkage,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub section: Option<String>,
-    #[serde(default)]
-    pub thread_local: bool,
     #[serde(default)]
     pub type_spelling: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -467,8 +463,6 @@ impl Default for Global {
             exported: false,
             is_definition: true,
             linkage: SymbolLinkage::External,
-            section: None,
-            thread_local: false,
             type_spelling: None,
             scalar_type_evidence: None,
             size_bits: None,
@@ -592,8 +586,6 @@ pub enum Stmt {
     Load {
         dest: String,
         address: String,
-        #[serde(default, skip_serializing_if = "is_false")]
-        volatile: bool,
         /// ABI width of the loaded LLVM value. This is obtained from the load instruction's
         /// result type, never by inspecting the address pointer's element type.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -604,8 +596,6 @@ pub enum Stmt {
     Store {
         address: String,
         value: String,
-        #[serde(default, skip_serializing_if = "is_false")]
-        volatile: bool,
         /// ABI width of the stored LLVM value. This is obtained from the stored operand's type,
         /// never by inspecting the address pointer's element type.
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -187,73 +187,6 @@
     "certificate_slot": {
       "oneOf": [{ "type": "null" }, { "$ref": "#/definitions/certificate" }]
     },
-    "atomic_recipe": {
-      "oneOf": [
-        {
-          "type": "object",
-          "required": ["mode", "declaration", "accesses", "cross_tu", "ordering"],
-          "properties": {
-            "mode": { "const": "ordinary" },
-            "ordering": { "const": "relaxed" },
-            "declaration": { "type": "object" },
-            "accesses": { "type": "array" },
-            "cross_tu": { "type": "object" }
-          },
-          "additionalProperties": true
-        },
-        {
-          "type": "object",
-          "required": ["mode", "declaration", "accesses", "cross_tu", "ordering"],
-          "properties": {
-            "mode": { "const": "signal-flag-v1" },
-            "ordering": { "const": "seq_cst" },
-            "declaration": {
-              "type": "object",
-              "required": ["size_bits", "align_bits", "scalar_class", "signed", "linkage"],
-              "properties": {
-                "size_bits": { "const": 32 },
-                "align_bits": { "const": 32 },
-                "scalar_class": { "const": "integer" },
-                "signed": { "const": true },
-                "linkage": { "const": "internal" }
-              },
-              "additionalProperties": true
-            },
-            "accesses": { "type": "array" },
-            "cross_tu": { "type": "object" }
-          },
-          "additionalProperties": true
-        }
-      ]
-    },
-    "atomic_certificate": {
-      "allOf": [
-        { "$ref": "#/definitions/certificate" },
-        {
-          "if": {
-            "properties": { "status": { "const": "certified" } },
-            "required": ["status"]
-          },
-          "then": {
-            "properties": {
-              "certificate": {
-                "type": "object",
-                "required": ["recipe", "source_materialization"],
-                "properties": {
-                  "recipe": { "$ref": "#/definitions/atomic_recipe" },
-                  "source_materialization": { "type": "object" }
-                },
-                "not": { "required": ["signal_lock_free"] },
-                "additionalProperties": true
-              }
-            }
-          }
-        }
-      ]
-    },
-    "atomic_certificate_slot": {
-      "oneOf": [{ "type": "null" }, { "$ref": "#/definitions/atomic_certificate" }]
-    },
     "localization": {
       "oneOf": [
         { "type": "null" },
@@ -298,7 +231,7 @@
         "access_set_complete": { "$ref": "#/definitions/evidenced_bool_false" },
         "word_sized_scalar": { "$ref": "#/definitions/word_sized_scalar" },
         "phase_stationarity": { "$ref": "#/definitions/certificate_slot" },
-        "atomic_eligibility": { "$ref": "#/definitions/atomic_certificate_slot" },
+        "atomic_eligibility": { "$ref": "#/definitions/certificate_slot" },
         "mutex_eligibility": { "$ref": "#/definitions/certificate_slot" },
         "coupling_group": { "type": ["string", "null"] },
         "localization": { "$ref": "#/definitions/localization" },

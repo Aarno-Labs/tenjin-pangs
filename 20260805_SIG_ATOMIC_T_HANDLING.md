@@ -2,7 +2,7 @@
 
 ## Status
 
-Design proposal with Phases 1 and 2 implemented. Phase 3 remains future work.
+Design proposal with Phase 1 implemented. Phases 2 and 3 remain future work.
 This is deliberately the smallest useful v1: it recognizes one common
 signal-flag representation on `x86_64`. It gives up coverage whenever the
 functions that access the flag are not equally simple and records the two
@@ -485,8 +485,6 @@ is an intentional soundness repair and the only permitted Phase-1 coverage loss.
 
 ### Phase 2: signal-flag-v1 eligibility
 
-Implemented 2026-08-07.
-
 1. Land the exact-version guard for manifest-preserving stages.
 2. Bump the manifest to v5; add recipe `mode` and `seq_cst`; remove
    `signal_lock_free`.
@@ -596,17 +594,10 @@ lose coverage, and a newly recovered `DW_TAG_atomic_type` must not increase
 atomic coverage.
 
 After Phase 2, the expected new atomic dispositions are bore's
-`g_interrupted`, OpenSSL's `intr_signal`, and libusb's `do_exit` when each exact
-artifact retains the required debug-type evidence. OpenSSL must remain admitted
-despite its module-wide counts (`A = 3`, `V = 223`) because its two access
-functions contain no other volatile operation (`U = 0`).
-
-The currently available `lib-openssl-4.1.0-O1.bc` has the three measured
-volatile operations but no `DIGlobalVariable` metadata attached to
-`intr_signal`; consequently it cannot prove the `sig_atomic_t` intent spelling
-and correctly remains ineligible. The corpus acceptance test must rebuild and
-freeze a debug-bearing OpenSSL artifact before asserting that disposition. The
-same exact-artifact requirement already applies to libusb. Any additional
+`g_interrupted`, OpenSSL's `intr_signal`, and libusb's `do_exit` in the exact
+example module selected and frozen by the corpus test. OpenSSL must remain
+admitted despite its module-wide counts (`A = 3`, `V = 223`) because its two
+access functions contain no other volatile operation (`U = 0`). Any additional
 candidate is a census finding; any candidate rejected by function-local closure
 is a measured coverage cost, not grounds for silently weakening the rule.
 

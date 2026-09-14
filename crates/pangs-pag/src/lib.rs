@@ -1190,8 +1190,6 @@ pub struct Edge {
     /// legacy hand-written load/store that predates `access_bytes`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub access_extent_unknown: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub volatile: bool,
     /// The memory effect is a summary of a non-capturing external call, rather than a source
     /// load/store expression. Consumers must retain the effect for ModRef while treating its
     /// address use as indirect for source-materialization purposes.
@@ -2044,7 +2042,6 @@ impl<'a> Builder<'a> {
             Stmt::Load {
                 dest,
                 address,
-                volatile,
                 access_bytes,
                 loc,
             } => {
@@ -2057,14 +2054,12 @@ impl<'a> Builder<'a> {
                     owner,
                     *access_bytes,
                     false,
-                    *volatile,
                     loc.clone(),
                 );
             }
             Stmt::Store {
                 address,
                 value,
-                volatile,
                 access_bytes,
                 loc,
             } => {
@@ -2077,7 +2072,6 @@ impl<'a> Builder<'a> {
                     owner,
                     *access_bytes,
                     false,
-                    *volatile,
                     loc.clone(),
                 );
             }
@@ -2344,7 +2338,6 @@ impl<'a> Builder<'a> {
                     owner,
                     *bytes,
                     bytes.is_none(),
-                    false,
                     loc.clone(),
                 );
             }
@@ -2982,7 +2975,6 @@ impl<'a> Builder<'a> {
             owner,
             access_bytes: None,
             access_extent_unknown: false,
-            volatile: false,
             modeled_external_write: false,
             loc,
         });
@@ -2997,13 +2989,11 @@ impl<'a> Builder<'a> {
         owner: Owner,
         access_bytes: Option<u64>,
         access_extent_unknown: bool,
-        volatile: bool,
         loc: Option<Loc>,
     ) -> EdgeId {
         let id = self.add_edge(kind, src, dst, owner, loc);
         self.edges[id.0 as usize].access_bytes = access_bytes;
         self.edges[id.0 as usize].access_extent_unknown = access_extent_unknown;
-        self.edges[id.0 as usize].volatile = volatile;
         id
     }
 

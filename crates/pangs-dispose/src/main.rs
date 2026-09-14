@@ -42,7 +42,7 @@ fn main() {
                 2
             } else if matches!(
                 error,
-                DisposeError::Manifest(ManifestError::UnsupportedSchema { .. })
+                DisposeError::Manifest(ManifestError::NewerSchema { .. })
             ) {
                 3
             } else {

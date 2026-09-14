@@ -176,21 +176,6 @@ fn exit_codes_distinguish_override_problems_and_newer_schema() {
             .code(),
         Some(3)
     );
-
-    manifest.schema_version = SCHEMA_VERSION - 1;
-    fs::write(
-        temp.path().join("pangs-manifest.json"),
-        to_canonical_json(&manifest).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        command(temp.path())
-            .arg("--no-overrides")
-            .status()
-            .unwrap()
-            .code(),
-        Some(3)
-    );
 }
 
 #[test]

@@ -365,7 +365,7 @@ pub fn assemble_disposition_artifacts(
     let coupling_started = Instant::now();
     let mut coupling_groups = assemble_coupling_groups(analysis, &mut globals);
     let atomic_started = Instant::now();
-    let signal_flag_globals = assemble_atomic_eligibility(analysis, module, target, &mut globals);
+    assemble_atomic_eligibility(analysis, target, &mut globals);
     if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
         eprintln!(
             "pangs disposition timing atomic-eligibility={}ms certified={}",
@@ -575,29 +575,6 @@ pub fn assemble_disposition_artifacts(
         failures: None,
         extra: Extra::new(),
     }];
-    if !signal_flag_globals.is_empty() {
-        ledger.push(AuditRecord {
-            id: String::new(),
-            kind: "signal-flag-assumptions".into(),
-            scope: AuditScope::Run {
-                extra: Extra::new(),
-            },
-            source: AuditSource::Analysis,
-            text: "Certified volatile sig_atomic_t globals are treated as notification flags and lowered to x86-64 i32 SeqCst atomics. The transformation assumes access count is not semantically load-bearing, that the flag is not part of a cross-object volatile protocol split across functions, and that the tested Rust backend emits inline operations without unbounded loop elision.".into(),
-            witness: None,
-            failures: None,
-            extra: BTreeMap::from([(
-                "context".into(),
-                serde_json::json!({
-                    "arch": "x86_64",
-                    "width": 32,
-                    "ordering": "seq_cst",
-                    "globals": signal_flag_globals.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                    "regression": "tests/codegen/signal_flag_x86_64_i32",
-                }),
-            )]),
-        });
-    }
     canonicalize_audit(&mut ledger)?;
     Ok((manifest, ledger))
 }
@@ -1224,10 +1201,9 @@ fn assemble_coupling_groups(
 
 fn assemble_atomic_eligibility(
     analysis: &Analysis,
-    module: &pangs_pir::Pir,
     target: &pangs_pir::TargetInfo,
     globals: &mut [DispositionGlobal],
-) -> Vec<Key> {
+) {
     let mut access_site_counts = vec![0_usize; analysis.globals().len()];
     for site in analysis.access_sites() {
         for global in site.globals() {
@@ -1260,44 +1236,6 @@ fn assemble_atomic_eligibility(
             }
         }
     }
-    let mut signal_plans = BTreeMap::<GlobalId, Result<SignalFlagPlan, Witness>>::new();
-    for global in globals.iter() {
-        let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) else {
-            continue;
-        };
-        if let Some(plan) = provisional_signal_flag_plan(
-            analysis,
-            module,
-            target,
-            global,
-            gid,
-            &access_by_global[gid.0 as usize],
-        ) {
-            signal_plans.insert(gid, Ok(plan));
-        }
-    }
-    let candidate_count = signal_plans.len();
-    if candidate_count != 1 {
-        for (&gid, outcome) in &mut signal_plans {
-            let mut witness = atomic_witness(
-                "signal-flag-access-functions-not-closed",
-                Some(analysis.globals()[gid].key.clone()),
-                None,
-                Some(format!(
-                    "signal-flag-v1 requires exactly one provisional candidate; found {candidate_count}"
-                )),
-            );
-            witness
-                .extra
-                .insert("candidate_count".into(), candidate_count.into());
-            *outcome = Err(witness);
-        }
-    } else if let Some((&gid, Ok(plan))) = signal_plans.iter().next() {
-        if let Err(witness) = signal_flag_function_closure(analysis, module, plan) {
-            signal_plans.insert(gid, Err(witness));
-        }
-    }
-    let mut certified_signal_flags = Vec::new();
     for global in globals {
         let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) else {
             global.facts.atomic_eligibility = Some(Certificate::Failed {
@@ -1417,86 +1355,6 @@ fn assemble_atomic_eligibility(
         }
 
         let sites = &access_by_global[gid.0 as usize];
-        if let Some(outcome) = signal_plans.get(&gid) {
-            match outcome {
-                Ok(plan) => {
-                    let recipe = serde_json::json!({
-                        "mode": "signal-flag-v1",
-                        "declaration": atomic_declaration(analysis, global, gid),
-                        "accesses": plan.accesses,
-                        "cross_tu": {
-                            "required": false,
-                            "scope": "linked-module",
-                        },
-                        "ordering": "seq_cst",
-                    });
-                    global.facts.atomic_eligibility = Some(Certificate::Certified {
-                        certificate: serde_json::json!({
-                            "recipe": recipe,
-                            "source_materialization": atomic_source_materialization(global),
-                        }),
-                        extra: Extra::new(),
-                    });
-                    certified_signal_flags.push(global.key.clone());
-                }
-                Err(witness) => {
-                    global.facts.atomic_eligibility = Some(Certificate::Failed {
-                        codes: vec!["signal-flag-access-functions-not-closed".into()],
-                        witnesses: vec![witness.clone()],
-                        recipe: None,
-                        diagnostics: Some(serde_json::json!({
-                            "mode": "signal-flag-v1",
-                            "candidate_count": candidate_count,
-                            "access_sites_observed": sites.len(),
-                        })),
-                        extra: Extra::new(),
-                    });
-                }
-            }
-            continue;
-        }
-        if let Some(evidence) = analysis.globals()[gid]
-            .scalar_type_evidence
-            .as_ref()
-            .filter(|evidence| {
-                evidence.qualifiers.is_volatile
-                    && evidence
-                        .typedef_chain
-                        .iter()
-                        .any(|name| name == "sig_atomic_t")
-            })
-        {
-            let (code, kind, note) = if evidence.qualifiers.is_atomic {
-                (
-                    "source-atomic-unsupported",
-                    "source-atomic-unsupported",
-                    "source _Atomic ordering is not preserved by the current PIR",
-                )
-            } else {
-                (
-                    "volatile-access",
-                    "atomic-volatile-access",
-                    "volatile sig_atomic_t does not satisfy every signal-flag-v1 admission gate",
-                )
-            };
-            global.facts.atomic_eligibility = Some(Certificate::Failed {
-                codes: vec![code.into()],
-                witnesses: vec![atomic_witness(
-                    kind,
-                    Some(global.key.to_string()),
-                    None,
-                    Some(note.into()),
-                )],
-                recipe: None,
-                diagnostics: Some(serde_json::json!({
-                    "mode": "signal-flag-v1",
-                    "status": "provisional-candidate-rejected",
-                    "access_sites_observed": sites.len(),
-                })),
-                extra: Extra::new(),
-            });
-            continue;
-        }
         let (access_recipe, access_failures) = atomic_access_recipe(
             analysis,
             sites,
@@ -1513,8 +1371,19 @@ fn assemble_atomic_eligibility(
         let recipe_ready = access_recipe.is_some();
         let recipe = recipe_ready.then(|| {
             serde_json::json!({
-                "mode": "ordinary",
-                "declaration": atomic_declaration(analysis, global, gid),
+                "declaration": {
+                    "key": global.key,
+                    "llvm_name": global.meta.llvm_name,
+                    "file": global.meta.file,
+                    "line": global.meta.line,
+                    "type_spelling": global.meta.type_spelling,
+                    "size_bits": global.facts.word_sized_scalar.size_bits,
+                    "align_bits": global.meta.align_bits,
+                    "scalar_class": global.facts.word_sized_scalar.class,
+                    "signed": global.facts.word_sized_scalar.signed,
+                    "initializer_ir": analysis.globals()[gid].initializer_ir,
+                    "linkage": global.meta.linkage,
+                },
                 "accesses": access_recipe.unwrap_or_default(),
                 "cross_tu": {
                     "required": global.meta.linkage == Linkage::External,
@@ -1529,6 +1398,11 @@ fn assemble_atomic_eligibility(
                 certificate: serde_json::json!({
                     "recipe": recipe.expect("a certified atomic must have a complete recipe"),
                     "source_materialization": atomic_source_materialization(global),
+                    "signal_lock_free": {
+                        "required": global.facts.signal_context_access.value,
+                        "width": width,
+                        "target_guaranteed": signal_lock_free,
+                    },
                 }),
                 extra: Extra::new(),
             }
@@ -1544,231 +1418,6 @@ fn assemble_atomic_eligibility(
             }
         });
     }
-    certified_signal_flags.sort();
-    certified_signal_flags
-}
-
-fn atomic_declaration(analysis: &Analysis, global: &DispositionGlobal, gid: GlobalId) -> Value {
-    serde_json::json!({
-        "key": global.key,
-        "llvm_name": global.meta.llvm_name,
-        "file": global.meta.file,
-        "line": global.meta.line,
-        "type_spelling": global.meta.type_spelling,
-        "size_bits": global.facts.word_sized_scalar.size_bits,
-        "align_bits": global.meta.align_bits,
-        "scalar_class": global.facts.word_sized_scalar.class,
-        "signed": global.facts.word_sized_scalar.signed,
-        "initializer_ir": analysis.globals()[gid].initializer_ir,
-        "linkage": global.meta.linkage,
-    })
-}
-
-#[derive(Clone)]
-struct SignalFlagPlan {
-    accesses: Vec<Value>,
-    access_functions: BTreeSet<FuncId>,
-    operation_statements: BTreeSet<(FuncId, u32)>,
-}
-
-fn provisional_signal_flag_plan(
-    analysis: &Analysis,
-    module: &pangs_pir::Pir,
-    target: &pangs_pir::TargetInfo,
-    global: &DispositionGlobal,
-    gid: GlobalId,
-    sites: &[&pangs_api::AccessSite],
-) -> Option<SignalFlagPlan> {
-    let info = &analysis.globals()[gid];
-    let evidence = info.scalar_type_evidence.as_ref()?;
-    let qualifiers = &evidence.qualifiers;
-    let target_arch = target.triple.split('-').next();
-    if !info.is_definition
-        || !info.mutable
-        || info.initializer_ir.is_none()
-        || info.linkage != pangs_pir::SymbolLinkage::Internal
-        || info.section.is_some()
-        || info.thread_local
-        || !evidence
-            .typedef_chain
-            .iter()
-            .any(|name| name == "sig_atomic_t")
-        || !qualifiers.is_volatile
-        || qualifiers.is_const
-        || qualifiers.is_atomic
-        || evidence.class != Some(pangs_pir::ScalarTypeClass::Integer)
-        || evidence.signed != Some(true)
-        || target_arch != Some("x86_64")
-        || info.size_bits != Some(32)
-        || info.align_bits != Some(32)
-        || !global.facts.access_set_complete.value
-        || !global.facts.word_sized_scalar.value
-        || global.facts.violation_taint.value
-        || !global.storage_members.is_empty()
-        || info.address_escaped
-        || module.globals.iter().any(|candidate| {
-            candidate
-                .init_refs
-                .iter()
-                .any(|referenced| same_llvm_global(referenced, &info.key))
-        })
-        || sites.is_empty()
-    {
-        return None;
-    }
-
-    let mut ordered = sites.to_vec();
-    ordered.sort_by_key(|site| (site.func, site.statement_index, site.access, site.via));
-    let mut accesses = Vec::with_capacity(ordered.len());
-    let mut access_functions = BTreeSet::new();
-    let mut operation_statements = BTreeSet::new();
-    for site in ordered {
-        if site.via != pangs_api::Via::Direct
-            || !site.volatile
-            || site.atomic_rmw.is_some()
-            || site.loc.is_none()
-            || site.globals().ne(std::iter::once(gid))
-        {
-            return None;
-        }
-        let reference_index = site.statement_index? as usize;
-        let function_key = &analysis.functions()[site.func].key;
-        let function = module
-            .functions
-            .iter()
-            .find(|function| &function.key == function_key)?;
-        let operation_index = reference_index.checked_sub(1)?;
-        let global_ref_matches = matches!(
-            function.body.get(reference_index),
-            Some(pangs_pir::Stmt::GlobalRef { global: referenced, access, volatile: true, .. })
-                if same_llvm_global(referenced, &info.key) && *access == site.access
-        );
-        if !global_ref_matches {
-            return None;
-        }
-        let operation_matches = match (site.access, function.body.get(operation_index)) {
-            (
-                pangs_pir::Access::Ref,
-                Some(pangs_pir::Stmt::Load {
-                    address,
-                    volatile: true,
-                    access_bytes: Some(4),
-                    ..
-                }),
-            ) => same_llvm_global(address, &info.key),
-            (
-                pangs_pir::Access::Mod,
-                Some(pangs_pir::Stmt::Store {
-                    address,
-                    volatile: true,
-                    access_bytes: Some(4),
-                    ..
-                }),
-            ) => same_llvm_global(address, &info.key),
-            _ => false,
-        };
-        if !operation_matches {
-            return None;
-        }
-        access_functions.insert(site.func);
-        operation_statements.insert((site.func, operation_index as u32));
-        accesses.push(serde_json::json!({
-            "operation": if site.access == pangs_pir::Access::Ref { "load" } else { "store" },
-            "function": function_key,
-            "site": atomic_access_site(analysis, site),
-            "statement_index": site.statement_index,
-        }));
-    }
-    Some(SignalFlagPlan {
-        accesses,
-        access_functions,
-        operation_statements,
-    })
-}
-
-fn signal_flag_function_closure(
-    analysis: &Analysis,
-    module: &pangs_pir::Pir,
-    plan: &SignalFlagPlan,
-) -> Result<(), Witness> {
-    for &func_id in &plan.access_functions {
-        let function_key = &analysis.functions()[func_id].key;
-        let Some(function) = module
-            .functions
-            .iter()
-            .find(|function| &function.key == function_key)
-        else {
-            let mut witness = atomic_witness(
-                "signal-flag-access-functions-not-closed",
-                Some(function_key.clone()),
-                None,
-                Some("candidate access function is absent from PIR".into()),
-            );
-            witness
-                .extra
-                .insert("function".into(), function_key.clone().into());
-            return Err(witness);
-        };
-        for (statement_index, statement) in function.body.iter().enumerate() {
-            let (operation, address, loc) = match statement {
-                pangs_pir::Stmt::Load {
-                    address,
-                    volatile: true,
-                    loc,
-                    ..
-                } => ("load", address, loc),
-                pangs_pir::Stmt::Store {
-                    address,
-                    volatile: true,
-                    loc,
-                    ..
-                } => ("store", address, loc),
-                _ => continue,
-            };
-            if plan
-                .operation_statements
-                .contains(&(func_id, statement_index as u32))
-            {
-                continue;
-            }
-            let site = loc.as_ref().map(|loc| Site {
-                file: loc.file.clone(),
-                line: loc.line,
-                col: Some(loc.col),
-                function: Some(function_key.clone()),
-                extra: Extra::new(),
-            });
-            let mut witness = atomic_witness(
-                "signal-flag-access-functions-not-closed",
-                Some(function_key.clone()),
-                site,
-                Some(format!(
-                    "unrelated volatile {operation} at statement {statement_index} through {address}"
-                )),
-            );
-            witness
-                .extra
-                .insert("function".into(), function_key.clone().into());
-            witness
-                .extra
-                .insert("statement_index".into(), statement_index.into());
-            witness.extra.insert("operation".into(), operation.into());
-            witness
-                .extra
-                .insert("address_operand".into(), address.clone().into());
-            if let Some(global) = address.strip_prefix('@') {
-                witness
-                    .extra
-                    .insert("attributable_global".into(), global.into());
-            }
-            return Err(witness);
-        }
-    }
-    Ok(())
-}
-
-fn same_llvm_global(operand: &str, global: &str) -> bool {
-    operand.strip_prefix('@').unwrap_or(operand) == global.strip_prefix('@').unwrap_or(global)
 }
 
 fn atomic_source_materialization(global: &DispositionGlobal) -> serde_json::Value {
@@ -4366,16 +4015,12 @@ fn sha256_file(path: &Path) -> Result<String> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::process::Command;
 
     use std::time::Instant;
 
     use jsonschema::JSONSchema;
-    use pangs_api::{Analysis, BuildMode, GlobalId, Opts, Stage};
-    use pangs_manifest::{
-        AuditRecord, Certificate, Extra, GlobalRecord as DispositionGlobal, Key, Localization,
-        LocalizationBlocker, LocalizationVerdict, Manifest as DispositionManifest, Site, Witness,
-    };
+    use pangs_api::{Analysis, BuildMode, GlobalId, Opts};
+    use pangs_manifest::{Certificate, Extra, Key, LocalizationVerdict, Site};
     use pangs_pir::Pir;
     use serde_json::json;
     use tempfile::TempDir;
@@ -4427,48 +4072,6 @@ mod tests {
             function: Some("main".into()),
             extra: Extra::new(),
         }
-    }
-
-    fn signal_flag_artifacts(source: &str) -> (DispositionManifest, Vec<AuditRecord>) {
-        let temp = TempDir::new().unwrap();
-        let source_path = temp.path().join("signal-flag.c");
-        let bitcode_path = temp.path().join("signal-flag.bc");
-        fs::write(&source_path, source).unwrap();
-        assert!(Command::new("clang")
-            .args(["-std=c11", "-O0", "-g", "-emit-llvm", "-c"])
-            .arg(&source_path)
-            .arg("-o")
-            .arg(&bitcode_path)
-            .status()
-            .unwrap()
-            .success());
-        let pir = Pir::from_path(&bitcode_path).unwrap();
-        let target = pir.target.clone().unwrap();
-        let opts = Opts {
-            build_mode: BuildMode::Executable,
-            ..Opts::default()
-        };
-        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
-        assemble_disposition_artifacts(
-            &analysis,
-            &pir,
-            &opts,
-            &bitcode_path,
-            &workspace_root(),
-            &target,
-        )
-        .unwrap()
-    }
-
-    fn manifest_global_by_llvm_name<'a>(
-        manifest: &'a DispositionManifest,
-        llvm_name: &str,
-    ) -> &'a DispositionGlobal {
-        manifest
-            .globals
-            .iter()
-            .find(|global| global.meta.llvm_name == llvm_name)
-            .unwrap()
     }
 
     fn external_result_after_escape_artifacts(stage: Stage) -> (Analysis, DispositionManifest) {
@@ -4624,7 +4227,6 @@ mod tests {
                 pangs_pir::Stmt::Load {
                     dest: "%old".into(),
                     address: "@g_counter".into(),
-                    volatile: false,
                     access_bytes: Some(4),
                     loc: loc.clone(),
                 },
@@ -4644,7 +4246,6 @@ mod tests {
                 pangs_pir::Stmt::Store {
                     address: "@g_counter".into(),
                     value: "%new".into(),
-                    volatile: false,
                     access_bytes: Some(4),
                     loc: loc.clone(),
                 },
@@ -5019,227 +4620,6 @@ mod tests {
         assert_eq!(codes, &["source-atomic-unsupported"]);
         assert_eq!(witnesses[0].kind, "source-atomic-unsupported");
         assert!(recipe.is_none());
-    }
-
-    #[test]
-    fn signal_flag_v1_certifies_one_closed_internal_candidate() {
-        let (manifest, ledger) = signal_flag_artifacts(
-            r#"
-#include <signal.h>
-static volatile sig_atomic_t flag;
-int poll_flag(void) { return flag; }
-void set_flag(void) { flag = 1; }
-"#,
-        );
-        let flag = manifest_global_by_llvm_name(&manifest, "flag");
-        let Some(Certificate::Certified { certificate, .. }) = &flag.facts.atomic_eligibility
-        else {
-            panic!("closed internal volatile sig_atomic_t should certify")
-        };
-        assert_eq!(certificate["recipe"]["mode"], "signal-flag-v1");
-        assert_eq!(certificate["recipe"]["ordering"], "seq_cst");
-        assert_eq!(
-            certificate["recipe"]["accesses"].as_array().unwrap().len(),
-            2
-        );
-        assert!(certificate.get("signal_lock_free").is_none());
-        assert!(ledger
-            .iter()
-            .any(|record| record.kind == "signal-flag-assumptions"));
-        manifest.validate().unwrap();
-
-        let schema_value: serde_json::Value = serde_json::from_slice(
-            &fs::read(workspace_root().join("schemas/disposition-manifest.schema.json")).unwrap(),
-        )
-        .unwrap();
-        let schema_value = Box::leak(Box::new(schema_value));
-        let schema = JSONSchema::compile(schema_value).unwrap();
-        let manifest_value = serde_json::to_value(&manifest).unwrap();
-        assert!(schema.validate(&manifest_value).is_ok());
-
-        let mut bad_ordering = manifest.clone();
-        let Certificate::Certified { certificate, .. } = bad_ordering.globals[0]
-            .facts
-            .atomic_eligibility
-            .as_mut()
-            .unwrap()
-        else {
-            unreachable!()
-        };
-        certificate["recipe"]["ordering"] = json!("relaxed");
-        assert!(bad_ordering.validate().is_err());
-        assert!(schema
-            .validate(&serde_json::to_value(&bad_ordering).unwrap())
-            .is_err());
-    }
-
-    #[test]
-    fn signal_flag_v1_rejects_two_candidates_and_function_local_nonclosure() {
-        let (two, _) = signal_flag_artifacts(
-            r#"
-#include <signal.h>
-static volatile sig_atomic_t first;
-static volatile sig_atomic_t second;
-int poll_flags(void) { return first || second; }
-"#,
-        );
-        for name in ["first", "second"] {
-            let global = manifest_global_by_llvm_name(&two, name);
-            let Some(Certificate::Failed {
-                codes,
-                witnesses,
-                recipe,
-                ..
-            }) = &global.facts.atomic_eligibility
-            else {
-                panic!("multiple provisional candidates must fail")
-            };
-            assert_eq!(codes, &["signal-flag-access-functions-not-closed"]);
-            assert_eq!(witnesses[0].extra["candidate_count"], 2);
-            assert!(recipe.is_none());
-        }
-
-        let (not_closed, _) = signal_flag_artifacts(
-            r#"
-#include <signal.h>
-static volatile sig_atomic_t flag;
-static volatile int other;
-int poll_flag(void) { return flag + other; }
-"#,
-        );
-        let flag = manifest_global_by_llvm_name(&not_closed, "flag");
-        let Some(Certificate::Failed {
-            codes,
-            witnesses,
-            recipe,
-            ..
-        }) = &flag.facts.atomic_eligibility
-        else {
-            panic!("an unrelated volatile in an access function must fail")
-        };
-        assert_eq!(codes, &["signal-flag-access-functions-not-closed"]);
-        assert_eq!(witnesses[0].extra["function"], "poll_flag");
-        assert_eq!(witnesses[0].extra["operation"], "load");
-        assert!(witnesses[0].extra["statement_index"].is_u64());
-        assert!(recipe.is_none());
-    }
-
-    #[test]
-    fn signal_flag_v1_ignores_unrelated_volatile_in_other_function() {
-        let (manifest, _) = signal_flag_artifacts(
-            r#"
-#include <signal.h>
-static volatile sig_atomic_t flag;
-static volatile int other;
-int poll_other(void) { return other; }
-int poll_flag(void) { int value = flag; return value + poll_other(); }
-"#,
-        );
-        let flag = manifest_global_by_llvm_name(&manifest, "flag");
-        assert!(matches!(
-            flag.facts.atomic_eligibility,
-            Some(Certificate::Certified { .. })
-        ));
-    }
-
-    #[test]
-    fn signal_flag_v1_rejects_storage_linkage_machine_and_access_exclusions() {
-        let cases = [
-            (
-                "external",
-                "#include <signal.h>\nvolatile sig_atomic_t flag; int read_flag(void) { return flag; }\n",
-            ),
-            (
-                "thread-local",
-                "#include <signal.h>\nstatic _Thread_local volatile sig_atomic_t flag; int read_flag(void) { return flag; }\n",
-            ),
-            (
-                "section",
-                "#include <signal.h>\nstatic volatile sig_atomic_t flag __attribute__((section(\".flags\"))); int read_flag(void) { return flag; }\n",
-            ),
-            (
-                "unsigned",
-                "typedef unsigned int sig_atomic_t; static volatile sig_atomic_t flag; int read_flag(void) { return flag; }\n",
-            ),
-            (
-                "wide",
-                "typedef long sig_atomic_t; static volatile sig_atomic_t flag; long read_flag(void) { return flag; }\n",
-            ),
-            (
-                "over-aligned",
-                "typedef int sig_atomic_t; static volatile sig_atomic_t flag __attribute__((aligned(8))); int read_flag(void) { return flag; }\n",
-            ),
-            (
-                "rmw",
-                "#include <signal.h>\nstatic volatile sig_atomic_t flag; void increment_flag(void) { flag++; }\n",
-            ),
-            (
-                "address-escape",
-                "#include <signal.h>\nstatic volatile sig_atomic_t flag; static volatile sig_atomic_t *pointer = &flag; int read_flag(void) { return *pointer; }\n",
-            ),
-        ];
-        for (label, source) in cases {
-            let (manifest, ledger) = signal_flag_artifacts(source);
-            let flag = manifest_global_by_llvm_name(&manifest, "flag");
-            assert!(
-                !matches!(
-                    flag.facts.atomic_eligibility,
-                    Some(Certificate::Certified { .. })
-                ),
-                "{label} unexpectedly certified"
-            );
-            if let Some(Certificate::Failed { recipe, .. }) = &flag.facts.atomic_eligibility {
-                assert!(recipe.is_none(), "{label} retained a partial recipe");
-            }
-            assert!(
-                ledger
-                    .iter()
-                    .all(|record| record.kind != "signal-flag-assumptions"),
-                "{label} emitted assumptions without certification"
-            );
-        }
-    }
-
-    #[test]
-    fn pointer_derived_access_site_retains_statement_volatility() {
-        let temp = TempDir::new().unwrap();
-        let source_path = temp.path().join("volatile-pointer.c");
-        let bitcode_path = temp.path().join("volatile-pointer.bc");
-        fs::write(
-            &source_path,
-            r#"
-static volatile int target;
-static int read_pointer(volatile int *pointer) { return *pointer; }
-int call_reader(void) { return read_pointer(&target); }
-"#,
-        )
-        .unwrap();
-        assert!(Command::new("clang")
-            .args(["-std=c11", "-O0", "-g", "-emit-llvm", "-c"])
-            .arg(&source_path)
-            .arg("-o")
-            .arg(&bitcode_path)
-            .status()
-            .unwrap()
-            .success());
-        let pir = Pir::from_path(&bitcode_path).unwrap();
-        let analysis = Analysis::run_with_disposition(
-            &pir,
-            &Opts {
-                stage: Stage::Andersen,
-                ..Opts::default()
-            },
-        )
-        .unwrap();
-        let target = analysis.lookup_global("target").unwrap();
-        let read_pointer = analysis.lookup_func("read_pointer").unwrap();
-        let site = analysis
-            .access_sites()
-            .iter()
-            .find(|site| site.func == read_pointer && site.affects(target))
-            .expect("pointer load should resolve to the internal global");
-        assert_ne!(site.via, pangs_api::Via::Direct);
-        assert!(site.volatile);
     }
 
     #[test]

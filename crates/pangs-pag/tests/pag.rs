@@ -216,7 +216,6 @@ fn fresh_allocator_result_is_a_bounded_heap_object() {
                     Stmt::Load {
                         dest: "%value".into(),
                         address: "%heap".into(),
-                        volatile: false,
                         access_bytes: Some(8),
                         loc: None,
                     },

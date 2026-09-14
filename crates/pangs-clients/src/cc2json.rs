@@ -1973,7 +1973,6 @@ mod tests {
             body.push(Stmt::Store {
                 address: "%slot".to_string(),
                 value: format!("@G{idx:02}"),
-                volatile: false,
                 access_bytes: None,
                 loc: None,
             });
@@ -1981,21 +1980,18 @@ mod tests {
         body.push(Stmt::Store {
             address: "%slot".to_string(),
             value: "@.str.collapse".to_string(),
-            volatile: false,
             access_bytes: None,
             loc: None,
         });
         body.push(Stmt::Load {
             dest: "%p".to_string(),
             address: "%slot".to_string(),
-            volatile: false,
             access_bytes: None,
             loc: None,
         });
         body.push(Stmt::Store {
             address: "%p".to_string(),
             value: "%x".to_string(),
-            volatile: false,
             access_bytes: None,
             loc: None,
         });
@@ -2077,7 +2073,6 @@ mod tests {
                     body: vec![Stmt::Store {
                         address: "@Dispatch".to_string(),
                         value: "@Target".to_string(),
-                        volatile: false,
                         access_bytes: None,
                         loc: None,
                     }],

@@ -9,17 +9,6 @@ use serde_json::json;
 
 fn contract_manifest() -> Manifest {
     let global = |key: &str, llvm_name: &str, chosen: &str, group: Option<&str>| {
-        let atomic_eligibility = (chosen == "atomic").then(|| {
-            json!({
-                "status": "certified",
-                "certificate": {
-                    "recipe": {
-                        "mode": "ordinary",
-                        "ordering": "relaxed"
-                    }
-                }
-            })
-        });
         json!({
             "key": key,
             "meta": {
@@ -32,10 +21,7 @@ fn contract_manifest() -> Manifest {
                 "line": 1
             },
             "facts": {
-                "written": {
-                    "value": true,
-                    "witness": { "kind": "fixture-write" }
-                },
+                "written": { "value": true },
                 "omega_escaped_address": { "value": false },
                 "violation_taint": { "value": false },
                 "thread_visible": { "value": false },
@@ -44,7 +30,7 @@ fn contract_manifest() -> Manifest {
                 "word_sized_scalar": { "value": true, "type_spelling": "int",
                     "size_bits": 32, "class": "integer", "signed": true },
                 "phase_stationarity": null,
-                "atomic_eligibility": atomic_eligibility,
+                "atomic_eligibility": null,
                 "mutex_eligibility": null,
                 "coupling_group": group,
                 "localization": null

@@ -20,8 +20,8 @@ pub type Extra = BTreeMap<String, Value>;
 pub enum Error {
     #[error("invalid symbol key: {0}")]
     InvalidKey(String),
-    #[error("unsupported disposition manifest schema version {found} (expected exactly {supported}); rerun analysis")]
-    UnsupportedSchema { found: u32, supported: u32 },
+    #[error("unsupported disposition manifest schema version {found} (maximum {supported})")]
+    NewerSchema { found: u32, supported: u32 },
     #[error("marker collision for {marker}: {first} and {second}")]
     MarkerCollision {
         marker: String,
@@ -473,9 +473,6 @@ impl Facts {
                     )));
                 }
             }
-        }
-        if let Some(certificate) = &self.atomic_eligibility {
-            validate_atomic_certificate(certificate)?;
         }
         if let Some(localization) = &self.localization {
             let blockers_expected = localization.verdict == LocalizationVerdict::Blocked;
@@ -975,8 +972,8 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn validate(&self) -> Result<(), Error> {
-        if self.schema_version != SCHEMA_VERSION {
-            return Err(Error::UnsupportedSchema {
+        if self.schema_version > SCHEMA_VERSION {
+            return Err(Error::NewerSchema {
                 found: self.schema_version,
                 supported: SCHEMA_VERSION,
             });
@@ -1166,56 +1163,6 @@ impl Manifest {
     }
 }
 
-fn validate_atomic_certificate(certificate: &Certificate) -> Result<(), Error> {
-    let Certificate::Certified { certificate, .. } = certificate else {
-        return Ok(());
-    };
-    let recipe = certificate
-        .get("recipe")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            Error::InvalidInvariant("certified atomic is missing recipe object".into())
-        })?;
-    if certificate.get("signal_lock_free").is_some() {
-        return Err(Error::InvalidInvariant(
-            "atomic certificate contains obsolete signal_lock_free member".into(),
-        ));
-    }
-    let mode = recipe.get("mode").and_then(Value::as_str);
-    let ordering = recipe.get("ordering").and_then(Value::as_str);
-    match mode {
-        Some("ordinary") if ordering == Some("relaxed") => Ok(()),
-        Some("signal-flag-v1") if ordering == Some("seq_cst") => {
-            let declaration = recipe
-                .get("declaration")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    Error::InvalidInvariant(
-                        "signal-flag-v1 atomic is missing declaration object".into(),
-                    )
-                })?;
-            let valid = declaration.get("size_bits").and_then(Value::as_u64) == Some(32)
-                && declaration.get("align_bits").and_then(Value::as_u64) == Some(32)
-                && declaration.get("scalar_class").and_then(Value::as_str) == Some("integer")
-                && declaration.get("signed").and_then(Value::as_bool) == Some(true)
-                && declaration.get("linkage").and_then(Value::as_str) == Some("internal");
-            if valid {
-                Ok(())
-            } else {
-                Err(Error::InvalidInvariant(
-                    "signal-flag-v1 atomic requires internal signed aligned i32 declaration".into(),
-                ))
-            }
-        }
-        Some("ordinary" | "signal-flag-v1") => Err(Error::InvalidInvariant(
-            "atomic recipe ordering does not match mode".into(),
-        )),
-        _ => Err(Error::InvalidInvariant(
-            "atomic recipe mode is missing or unsupported".into(),
-        )),
-    }
-}
-
 fn canonicalize_facts(facts: &mut Facts) {
     for certificate in [
         &mut facts.phase_stationarity,
@@ -1341,7 +1288,6 @@ pub struct ExpectedMarker {
 }
 
 pub fn expected_markers(manifest: &Manifest) -> Result<Vec<ExpectedMarker>, Error> {
-    manifest.validate()?;
     let mut expected = Vec::new();
     for global in &manifest.globals {
         let Some(disposition) = &global.disposition else {

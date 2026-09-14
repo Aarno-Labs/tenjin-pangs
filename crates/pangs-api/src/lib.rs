@@ -157,10 +157,6 @@ pub struct GlobalInfo {
     pub exported: bool,
     pub is_definition: bool,
     pub linkage: SymbolLinkage,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub section: Option<String>,
-    #[serde(default)]
-    pub thread_local: bool,
     pub type_spelling: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scalar_type_evidence: Option<ScalarTypeEvidence>,
@@ -1026,8 +1022,6 @@ impl Analysis {
                 exported,
                 is_definition: global.is_definition,
                 linkage: global.linkage,
-                section: global.section.clone(),
-                thread_local: global.thread_local,
                 type_spelling: global.type_spelling.clone(),
                 scalar_type_evidence: global.scalar_type_evidence.clone(),
                 size_bits: global.size_bits,
@@ -4039,7 +4033,6 @@ struct IndexedAccessLocation {
     func: FuncId,
     access: Access,
     via: Via,
-    volatile: bool,
     loc: Option<LocInfo>,
 }
 
@@ -4141,7 +4134,6 @@ impl AccessSiteBuilder {
                 func: key.func,
                 access: key.access,
                 via: key.via,
-                volatile: key.volatile,
                 loc: key.loc.clone(),
             };
             let exact = indexed
@@ -4160,7 +4152,6 @@ impl AccessSiteBuilder {
                     func: key.func,
                     access: key.access,
                     via: key.via,
-                    volatile: key.volatile,
                     loc: key.loc.clone(),
                 };
                 if let Some(exact) = indexed.get(&location) {
@@ -4896,7 +4887,6 @@ fn option_str(value: &Option<String>) -> &str {
 
 struct PointerAccess {
     access: Access,
-    volatile: bool,
     address_node: pangs_pag::NodeId,
     unknown_reason: &'static str,
     detail: &'static str,
@@ -5931,7 +5921,7 @@ fn push_pointer_modrefs_from_pag(
                             func,
                             access: pointer_access.access,
                             via: Via::Aliased,
-                            volatile: pointer_access.volatile,
+                            volatile: false,
                             atomic_rmw: None,
                             loc: site_loc.clone(),
                             statement_index: None,
@@ -6407,7 +6397,6 @@ fn edge_accesses(
             func,
             vec![PointerAccess {
                 access: Access::Ref,
-                volatile: edge.volatile,
                 address_node: edge.src,
                 unknown_reason: "omega_load",
                 detail: "edge:load",
@@ -6419,7 +6408,6 @@ fn edge_accesses(
             func,
             vec![PointerAccess {
                 access: Access::Mod,
-                volatile: edge.volatile,
                 address_node: edge.dst,
                 unknown_reason: "omega_store",
                 detail: if edge.modeled_external_write {
@@ -6436,7 +6424,6 @@ fn edge_accesses(
             vec![
                 PointerAccess {
                     access: Access::Ref,
-                    volatile: false,
                     address_node: edge.src,
                     unknown_reason: "omega_load",
                     detail: "edge:memcpy_src",
@@ -6444,7 +6431,6 @@ fn edge_accesses(
                 },
                 PointerAccess {
                     access: Access::Mod,
-                    volatile: false,
                     address_node: edge.dst,
                     unknown_reason: "omega_store",
                     detail: "edge:memcpy_dst",
@@ -7913,8 +7899,6 @@ mod component_tests {
             exported: false,
             is_definition: true,
             linkage: SymbolLinkage::Internal,
-            section: None,
-            thread_local: false,
             type_spelling: None,
             scalar_type_evidence: None,
             size_bits: None,
@@ -8110,7 +8094,6 @@ mod component_tests {
                     body: vec![Stmt::Load {
                         dest: "%value".into(),
                         address: "%map".into(),
-                        volatile: false,
                         access_bytes: None,
                         loc: None,
                     }],
@@ -8323,7 +8306,6 @@ mod component_tests {
                 Stmt::Store {
                     address: "@interior_pointer".into(),
                     value: "@__global_init::0".into(),
-                    volatile: false,
                     access_bytes: None,
                     loc: None,
                 },
