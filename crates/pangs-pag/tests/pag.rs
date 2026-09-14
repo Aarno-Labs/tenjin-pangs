@@ -325,14 +325,12 @@ fn direct_internal_vararg_boundary_requires_visible_vararg_consumption() {
                     Stmt::Load {
                         dest: "%read_only_sink::tail".to_string(),
                         address: "%read_only_sink::decay".to_string(),
-                        volatile: false,
                         access_bytes: Some(8),
                         loc: None,
                     },
                     Stmt::Load {
                         dest: "%read_only_sink::byte".to_string(),
                         address: "%read_only_sink::tail".to_string(),
-                        volatile: false,
                         access_bytes: Some(1),
                         loc: None,
                     },

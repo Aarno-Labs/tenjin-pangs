@@ -11,9 +11,7 @@ use pangs_pag::{
     BuildMode as PagBuildMode, Edge, EdgeKind, Owner, Pag, PagOpts, StorageRoot, StorageRootState,
     StorageRoots, VarargCallProof,
 };
-use pangs_pir::{
-    fsa_compatible, Access, LoweringStats, Pir, ScalarOp, ScalarTypeClass, Stmt, SymbolLinkage,
-};
+use pangs_pir::{fsa_compatible, Access, LoweringStats, Pir, ScalarTypeClass, Stmt, SymbolLinkage};
 use pangs_solve::{
     debug_assert_narrows, solve_andersen_with_overrides,
     solve_andersen_with_overrides_and_target_points_to, solve_steensgaard,
@@ -157,6 +155,8 @@ pub struct GlobalInfo {
     pub is_definition: bool,
     pub linkage: SymbolLinkage,
     pub type_spelling: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source_atomic: bool,
     pub size_bits: Option<u64>,
     pub align_bits: Option<u64>,
     pub path_error: Option<String>,
@@ -288,8 +288,6 @@ pub struct AccessSite {
     pub func: FuncId,
     pub access: Access,
     pub via: Via,
-    pub volatile: bool,
-    pub atomic_rmw: Option<AtomicRmwAccess>,
     pub loc: Option<LocInfo>,
     pub statement_index: Option<u32>,
     targets: Rc<[u64]>,
@@ -340,14 +338,6 @@ impl Iterator for SetBits {
             bit
         })
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct AtomicRmwAccess {
-    pub op: ScalarOp,
-    pub operand: String,
-    pub reference_statement_index: u32,
-    pub operation_statement_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1020,6 +1010,7 @@ impl Analysis {
                 is_definition: global.is_definition,
                 linkage: global.linkage,
                 type_spelling: global.type_spelling.clone(),
+                source_atomic: global.source_atomic,
                 size_bits: global.size_bits,
                 align_bits: global.align_bits,
                 path_error: global.path_error.clone(),
@@ -1261,8 +1252,8 @@ impl Analysis {
                     Stmt::GlobalRef {
                         global,
                         access,
-                        volatile,
                         loc,
+                        ..
                     } => {
                         if let Some(&gid) = global_lookup.get(global) {
                             access_sites.push_one(
@@ -1270,17 +1261,6 @@ impl Analysis {
                                     func: caller,
                                     access: *access,
                                     via: Via::Direct,
-                                    volatile: *volatile,
-                                    atomic_rmw: (*access == Access::Mod)
-                                        .then(|| {
-                                            direct_atomic_rmw(
-                                                &func.body,
-                                                stmt_idx,
-                                                global,
-                                                &module.lowering.scalar_phi_rmw,
-                                            )
-                                        })
-                                        .flatten(),
                                     loc: loc.as_ref().map(loc_info),
                                     statement_index: Some(stmt_idx as u32),
                                 },
@@ -3058,219 +3038,6 @@ fn signature_text(sig: &pangs_pir::Signature) -> String {
     format!("{:?}({:?})", sig.ret, sig.params)
 }
 
-fn direct_atomic_rmw(
-    body: &[Stmt],
-    mod_ref_index: usize,
-    global: &str,
-    scalar_phi_rmw: &BTreeMap<String, pangs_pir::ScalarPhiRmwEvidence>,
-) -> Option<AtomicRmwAccess> {
-    let store_index = mod_ref_index.checked_sub(1)?;
-    let Stmt::Store {
-        address,
-        value,
-        loc: store_loc,
-        ..
-    } = &body[store_index]
-    else {
-        return None;
-    };
-    if !same_global_address(address, global) {
-        return None;
-    }
-    let operation_index = store_index.checked_sub(1)?;
-    let Stmt::ScalarOp {
-        dest,
-        op,
-        lhs,
-        rhs,
-        loc: operation_loc,
-    } = &body[operation_index]
-    else {
-        return None;
-    };
-    if dest != value || operation_loc != store_loc {
-        return None;
-    }
-
-    let (loaded, operand) = match op {
-        ScalarOp::Sub => (lhs, rhs),
-        ScalarOp::Add | ScalarOp::And | ScalarOp::Or | ScalarOp::Xor => {
-            if scalar_value_is_current_global(
-                body,
-                operation_index,
-                lhs,
-                global,
-                store_loc,
-                scalar_phi_rmw,
-            ) {
-                (lhs, rhs)
-            } else {
-                (rhs, lhs)
-            }
-        }
-    };
-    let reference_index = current_global_reference(
-        body,
-        operation_index,
-        loaded,
-        global,
-        store_loc,
-        scalar_phi_rmw,
-    )?;
-    Some(AtomicRmwAccess {
-        op: *op,
-        operand: operand.clone(),
-        reference_statement_index: reference_index as u32,
-        operation_statement_index: operation_index as u32,
-    })
-}
-
-fn scalar_value_is_current_global(
-    body: &[Stmt],
-    before: usize,
-    value: &str,
-    global: &str,
-    loc: &Option<pangs_pir::Loc>,
-    scalar_phi_rmw: &BTreeMap<String, pangs_pir::ScalarPhiRmwEvidence>,
-) -> bool {
-    current_global_reference(body, before, value, global, loc, scalar_phi_rmw).is_some()
-}
-
-fn current_global_reference(
-    body: &[Stmt],
-    before: usize,
-    value: &str,
-    global: &str,
-    loc: &Option<pangs_pir::Loc>,
-    scalar_phi_rmw: &BTreeMap<String, pangs_pir::ScalarPhiRmwEvidence>,
-) -> Option<usize> {
-    direct_global_load_reference(body, before, value, global, loc).or_else(|| {
-        let evidence = scalar_phi_rmw.get(value)?;
-        same_global_address(&evidence.global, global)
-            .then(|| direct_global_load_reference(body, before, &evidence.reference, global, loc))?
-    })
-}
-
-fn direct_global_load_reference(
-    body: &[Stmt],
-    before: usize,
-    value: &str,
-    global: &str,
-    loc: &Option<pangs_pir::Loc>,
-) -> Option<usize> {
-    let load_index = (0..before).rev().find(|&index| {
-        matches!(
-            &body[index],
-            Stmt::Load {
-                dest,
-                address,
-                loc: load_loc,
-                ..
-            }
-                if dest == value && same_global_address(address, global) && load_loc == loc
-        )
-    })?;
-    let reference_index = (load_index + 1..before).find(|&index| {
-        matches!(
-            &body[index],
-            Stmt::GlobalRef {
-                global: reference_global,
-                access: Access::Ref,
-                loc: reference_loc,
-                ..
-            } if reference_global == global && reference_loc == loc
-        )
-    })?;
-    Some(reference_index)
-}
-
-fn same_global_address(address: &str, global: &str) -> bool {
-    address.strip_prefix('@').unwrap_or(address) == global.strip_prefix('@').unwrap_or(global)
-}
-
-#[cfg(test)]
-mod scalar_phi_rmw_tests {
-    use super::*;
-
-    fn loc() -> Option<pangs_pir::Loc> {
-        Some(pangs_pir::Loc {
-            file: "scalar-phi-rmw.c".into(),
-            line: 10,
-            col: 3,
-            dir: None,
-            filename: None,
-        })
-    }
-
-    fn body() -> Vec<Stmt> {
-        vec![
-            Stmt::Load {
-                dest: "%pre".into(),
-                address: "@g".into(),
-                volatile: false,
-                access_bytes: Some(4),
-                loc: loc(),
-            },
-            Stmt::GlobalRef {
-                global: "g".into(),
-                access: Access::Ref,
-                volatile: false,
-                loc: loc(),
-            },
-            Stmt::ScalarOp {
-                dest: "%next".into(),
-                op: ScalarOp::Add,
-                lhs: "%current".into(),
-                rhs: "1".into(),
-                loc: loc(),
-            },
-            Stmt::Store {
-                address: "@g".into(),
-                value: "%next".into(),
-                volatile: false,
-                access_bytes: Some(4),
-                loc: loc(),
-            },
-            Stmt::GlobalRef {
-                global: "g".into(),
-                access: Access::Mod,
-                volatile: false,
-                loc: loc(),
-            },
-        ]
-    }
-
-    #[test]
-    fn trusted_scalar_phi_evidence_supplies_the_reference_half_of_an_rmw() {
-        let evidence = BTreeMap::from([(
-            "%current".into(),
-            pangs_pir::ScalarPhiRmwEvidence {
-                global: "g".into(),
-                reference: "%pre".into(),
-            },
-        )]);
-
-        let rmw = direct_atomic_rmw(&body(), 4, "g", &evidence).unwrap();
-        assert_eq!(rmw.op, ScalarOp::Add);
-        assert_eq!(rmw.operand, "1");
-        assert_eq!(rmw.reference_statement_index, 1);
-        assert_eq!(rmw.operation_statement_index, 2);
-    }
-
-    #[test]
-    fn scalar_phi_evidence_for_another_global_fails_closed() {
-        let evidence = BTreeMap::from([(
-            "%current".into(),
-            pangs_pir::ScalarPhiRmwEvidence {
-                global: "other".into(),
-                reference: "%pre".into(),
-            },
-        )]);
-
-        assert!(direct_atomic_rmw(&body(), 4, "g", &evidence).is_none());
-    }
-}
-
 fn loc_info(loc: &pangs_pir::Loc) -> LocInfo {
     LocInfo {
         file: loc.file.clone(),
@@ -4020,8 +3787,6 @@ struct AccessSiteKey {
     loc: Option<LocInfo>,
     access: Access,
     via: Via,
-    volatile: bool,
-    atomic_rmw: Option<AtomicRmwAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -4171,8 +3936,6 @@ impl AccessSiteBuilder {
                 func: key.func,
                 access: key.access,
                 via: key.via,
-                volatile: key.volatile,
-                atomic_rmw: key.atomic_rmw,
                 loc: key.loc,
                 statement_index: key.statement_index,
                 targets,
@@ -5917,8 +5680,6 @@ fn push_pointer_modrefs_from_pag(
                             func,
                             access: pointer_access.access,
                             via: Via::Aliased,
-                            volatile: false,
-                            atomic_rmw: None,
                             loc: site_loc.clone(),
                             statement_index: None,
                         },
@@ -5942,8 +5703,6 @@ fn push_pointer_modrefs_from_pag(
                 } else {
                     Via::Aliased
                 },
-                volatile: pointer_access.volatile,
-                atomic_rmw: None,
                 loc: site_loc.clone(),
                 statement_index: None,
             };
@@ -6058,8 +5817,6 @@ fn push_pointer_memcpy_constexpr_modrefs_from_pir(
                         func: func_id,
                         access,
                         via: Via::Aliased,
-                        volatile: false,
-                        atomic_rmw: None,
                         loc: loc.as_ref().map(loc_info),
                         statement_index: Some(statement_index as u32),
                     },
@@ -6106,8 +5863,6 @@ fn push_pointer_memset_modrefs_from_pir(
                         func: func_id,
                         access: Access::Mod,
                         via: Via::Aliased,
-                        volatile: false,
-                        atomic_rmw: None,
                         loc: loc.as_ref().map(loc_info),
                         statement_index: Some(statement_index as u32),
                     },
@@ -6130,8 +5885,6 @@ fn push_pointer_memset_modrefs_from_pir(
                         func: func_id,
                         access: Access::Mod,
                         via: Via::Aliased,
-                        volatile: false,
-                        atomic_rmw: None,
                         loc: loc.as_ref().map(loc_info),
                         statement_index: Some(statement_index as u32),
                     },
@@ -6171,8 +5924,6 @@ fn push_pointer_memset_modrefs_from_pir(
                 } else {
                     Via::Aliased
                 },
-                volatile: false,
-                atomic_rmw: None,
                 loc: loc.as_ref().map(loc_info),
                 statement_index: Some(statement_index as u32),
             };
@@ -7666,8 +7417,6 @@ mod access_site_tests {
             func: FuncId(func),
             access: Access::Ref,
             via: Via::Aliased,
-            volatile: false,
-            atomic_rmw: None,
             loc: Some(LocInfo {
                 file: "site.c".into(),
                 line: 7,
@@ -7783,7 +7532,6 @@ mod storage_root_identity_tests {
                 body: vec![Stmt::Load {
                     dest: "x".into(),
                     address: "g".into(),
-                    volatile: false,
                     access_bytes: None,
                     loc: None,
                 }],
@@ -7896,6 +7644,7 @@ mod component_tests {
             is_definition: true,
             linkage: SymbolLinkage::Internal,
             type_spelling: None,
+            source_atomic: false,
             size_bits: None,
             align_bits: None,
             path_error: None,

@@ -5611,14 +5611,12 @@ mod tests {
                 pangs_pir::Stmt::Load {
                     dest: "x".into(),
                     address: "elt".into(),
-                    volatile: false,
                     access_bytes: None,
                     loc: None,
                 },
                 pangs_pir::Stmt::Store {
                     address: "elt".into(),
                     value: "x".into(),
-                    volatile: false,
                     access_bytes: None,
                     loc: None,
                 },

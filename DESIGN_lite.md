@@ -623,11 +623,15 @@ With an exhaustive materialized solution, every client is a scan, not a query en
   automatic cascade, while their facts, certificates, coupling-group support, and explicit
   cascade configuration remain available. Overrides, accepted-risk records,
   source-materialization recipes, and the marker inventory are emitted in the shared
-  manifest. `access_set_complete` gates every certificate or verdict
-  that would rewrite accesses: phase stationarity, atomic, mutex, and localization all fail
+  manifest. Atomic disposition is not inferred from the analysis: an upstream source-to-source
+  transform has already rewritten atomic declarations and accesses, and PANGS merely reflects
+  recovered `DW_TAG_atomic_type` metadata as `atomic_declaration`. `access_set_complete` gates
+  every remaining certificate or verdict that would rewrite accesses: phase stationarity,
+  mutex, and localization all fail
   closed when a module-wide row, address escape, or library name boundary leaves possible
-  accessors unenumerated. Violation taint gates the four access-property
-  strategies. Localization may ignore hard `fnptr_varargs_internal_unmodeled`
+  accessors unenumerated. Violation taint gates the three analysis-derived access-property
+  strategies (`immutable`, `once-lock`, and `mutex`), but not source-declared atomicity.
+  Localization may ignore hard `fnptr_varargs_internal_unmodeled`
   diagnostics when no other hard finding remains and its independent verdict is OK,
   under the supported-program contract in
   `20260818_LOCALIZATION_VIOLATION_TAINT_v3.md`. Localization consumes only globals

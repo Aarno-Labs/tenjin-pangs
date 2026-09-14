@@ -1511,7 +1511,6 @@ mod tests {
             Stmt::Store {
                 address: "%slot".into(),
                 value: "cb".into(),
-                volatile: false,
                 access_bytes: None,
                 loc: None,
             },

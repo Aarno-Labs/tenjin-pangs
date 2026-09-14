@@ -13,7 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 pub type Extra = BTreeMap<String, Value>;
 
 #[derive(Debug, Error)]
@@ -322,30 +322,6 @@ impl EvidencedBool {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WordSizedScalar {
-    pub value: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub type_spelling: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size_bits: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub class: Option<ScalarClass>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signed: Option<bool>,
-    #[serde(flatten)]
-    pub extra: Extra,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScalarClass {
-    Integer,
-    Boolean,
-    Enum,
-    Pointer,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Certificate {
     Certified {
@@ -411,9 +387,8 @@ pub struct Facts {
     pub thread_visible: EvidencedBool,
     pub signal_context_access: EvidencedBool,
     pub access_set_complete: EvidencedBool,
-    pub word_sized_scalar: WordSizedScalar,
+    pub atomic_declaration: EvidencedBool,
     pub phase_stationarity: Option<Certificate>,
-    pub atomic_eligibility: Option<Certificate>,
     pub mutex_eligibility: Option<Certificate>,
     pub coupling_group: Option<String>,
     pub localization: Option<Localization>,
@@ -444,23 +419,10 @@ impl Facts {
             .validate("signal_context_access", true)?;
         self.access_set_complete
             .validate("access_set_complete", false)?;
-        let scalar_detail_present = self.word_sized_scalar.type_spelling.is_some()
-            || self.word_sized_scalar.size_bits.is_some()
-            || self.word_sized_scalar.class.is_some()
-            || self.word_sized_scalar.signed.is_some();
-        if self.word_sized_scalar.value
-            != (self.word_sized_scalar.type_spelling.is_some()
-                && self.word_sized_scalar.size_bits.is_some()
-                && self.word_sized_scalar.class.is_some())
-            || (!self.word_sized_scalar.value && scalar_detail_present)
-        {
-            return Err(Error::InvalidInvariant(
-                "word_sized_scalar detail presence does not match value".into(),
-            ));
-        }
+        self.atomic_declaration
+            .validate("atomic_declaration", true)?;
         for (name, slot) in [
             ("phase_stationarity", &self.phase_stationarity),
-            ("atomic_eligibility", &self.atomic_eligibility),
             ("mutex_eligibility", &self.mutex_eligibility),
         ] {
             if let Some(Certificate::Failed {
@@ -1164,13 +1126,9 @@ impl Manifest {
 }
 
 fn canonicalize_facts(facts: &mut Facts) {
-    for certificate in [
-        &mut facts.phase_stationarity,
-        &mut facts.atomic_eligibility,
-        &mut facts.mutex_eligibility,
-    ]
-    .into_iter()
-    .filter_map(Option::as_mut)
+    for certificate in [&mut facts.phase_stationarity, &mut facts.mutex_eligibility]
+        .into_iter()
+        .filter_map(Option::as_mut)
     {
         if let Certificate::Failed {
             codes, witnesses, ..

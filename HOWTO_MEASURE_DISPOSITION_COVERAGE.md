@@ -268,24 +268,24 @@ jq --arg key "$KEY" '.globals[] | select(.key == $key)' "$MANIFEST"
 Always use the manifest `key` for identity. `meta.llvm_name` is a this-run join key,
 not the cross-tool identity.
 
-## 7. Summarize eligibility and certificates
+## 7. Summarize declarations and certificates
 
-The free and final D3/D4 funnels are:
+Atomic declaration counts and the remaining D4 funnel are:
 
 ```bash
-jq '.run.dispose.measurement_report.would_be_eligibility' "$MANIFEST"
+jq '.run.dispose.measurement_report
+    | {atomic_declarations, mutex:.would_be_eligibility.mutex}' "$MANIFEST"
 ```
 
-Summarize atomic and mutex certificate states independently of final cascade choice:
+Summarize source-declared atomics and analysis-owned certificate states independently
+of final cascade choice:
 
 ```bash
 jq '
   def state($slot):
     if $slot == null then "not-computed" else $slot.status end;
   {
-    atomic:
-      ([.globals[] | state(.facts.atomic_eligibility)]
-       | group_by(.) | map({key:.[0],value:length}) | from_entries),
+    atomic_declared: [.globals[] | select(.facts.atomic_declaration.value) | .key],
     mutex:
       ([.globals[] | state(.facts.mutex_eligibility)]
        | group_by(.) | map({key:.[0],value:length}) | from_entries),
@@ -300,7 +300,7 @@ Count pass-owned failure codes. These counts may overlap because a failed certif
 can carry multiple codes:
 
 ```bash
-for SLOT in atomic_eligibility mutex_eligibility phase_stationarity; do
+for SLOT in mutex_eligibility phase_stationarity; do
   jq -r --arg slot "$SLOT" '
     [.globals[].facts[$slot]
      | select(.status == "failed")
@@ -320,14 +320,21 @@ List certified globals even when an earlier cascade strategy won:
 ```bash
 jq -r '
   .globals[] as $global
-  | ["atomic", "atomic_eligibility"],
-    ["mutex", "mutex_eligibility"],
+  | ["mutex", "mutex_eligibility"],
     ["once-lock", "phase_stationarity"]
   | . as [$strategy, $slot]
   | select($global.facts[$slot].status == "certified")
   | [$strategy, $global.key, $global.disposition.chosen]
   | @tsv
 ' "$MANIFEST" | sort
+```
+
+List source-declared atomics in the same shape:
+
+```bash
+jq -r '.globals[]
+  | select(.facts.atomic_declaration.value)
+  | ["atomic", .key, .disposition.chosen] | @tsv' "$MANIFEST" | sort
 ```
 
 This distinction matters: a global can have a valid mutex certificate but finish as
@@ -355,21 +362,20 @@ Inspect localization/context-struct pressure:
 jq '.run.dispose.measurement_report.context_struct_pressure' "$MANIFEST"
 ```
 
-For final atomic and mutex selections, report whether their static certificate is
-immediately source-materializable:
+For final mutex selections, report whether their static certificate is immediately
+source-materializable. Atomic selections were already materialized by the upstream
+source transform and have no PANGS recipe:
 
 ```bash
 jq -r '
   .globals[]
-  | select(.disposition.chosen == "atomic" or .disposition.chosen == "mutex")
+  | select(.disposition.chosen == "mutex")
   | . as $global
-  | (if .disposition.chosen == "atomic"
-     then .facts.atomic_eligibility
-     else .facts.mutex_eligibility end) as $slot
+  | .facts.mutex_eligibility as $slot
   | (if $slot.status == "certified"
      then $slot.certificate
      else $slot.recipe end) as $recipe
-  | [$global.disposition.chosen,
+  | ["mutex",
      $global.key,
      ($recipe.source_materialization.status // "unknown"),
      ($recipe.source_materialization.code // "-")]
@@ -448,10 +454,10 @@ Summarize:
 
 - dominant cascade guard failures, without adding overlapping counts;
 - fact-not-computed counts;
-- D3/D4 free-gate and certified counts;
+- source atomic declaration counts and D4 free-gate/certified counts;
 - certificate failure-code concentrations;
 - coupling-group and context-struct pressure;
-- source-ready versus source-blocked final atomic/mutex selections;
+- source-ready versus source-blocked final mutex selections;
 - override outcomes and accepted risks.
 
 ### Audit highlights

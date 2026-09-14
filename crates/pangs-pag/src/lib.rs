@@ -2216,7 +2216,6 @@ impl<'a> Builder<'a> {
                     owner.clone(),
                     None,
                     true,
-                    false,
                     loc.clone(),
                 );
                 self.edges[edge.0 as usize].modeled_external_write = true;
@@ -2228,7 +2227,6 @@ impl<'a> Builder<'a> {
                         owner.clone(),
                         None,
                         true,
-                        false,
                         loc.clone(),
                     );
                 }
@@ -2270,7 +2268,6 @@ impl<'a> Builder<'a> {
                     owner.clone(),
                     None,
                     true,
-                    false,
                     loc.clone(),
                 );
                 let edge = self.add_memory_edge(
@@ -2280,7 +2277,6 @@ impl<'a> Builder<'a> {
                     owner.clone(),
                     None,
                     true,
-                    false,
                     loc.clone(),
                 );
                 self.edges[edge.0 as usize].modeled_external_write = true;
@@ -2514,7 +2510,6 @@ impl<'a> Builder<'a> {
                                 owner.clone(),
                                 None,
                                 true,
-                                false,
                                 loc.clone(),
                             );
                             self.edges[edge.0 as usize].modeled_external_write = true;
@@ -2530,7 +2525,6 @@ impl<'a> Builder<'a> {
                                 owner.clone(),
                                 None,
                                 true,
-                                false,
                                 loc.clone(),
                             );
                             self.edges[edge.0 as usize].modeled_external_write = true;
@@ -2543,7 +2537,6 @@ impl<'a> Builder<'a> {
                                 owner.clone(),
                                 None,
                                 true,
-                                false,
                                 loc.clone(),
                             );
                         }
@@ -2625,7 +2618,6 @@ impl<'a> Builder<'a> {
                                     owner.clone(),
                                     None,
                                     true,
-                                    false,
                                     loc.clone(),
                                 );
                             }
@@ -2638,7 +2630,6 @@ impl<'a> Builder<'a> {
                                     owner.clone(),
                                     None,
                                     true,
-                                    false,
                                     loc.clone(),
                                 );
                                 self.edges[edge.0 as usize].modeled_external_write = true;
@@ -2806,7 +2797,6 @@ impl<'a> Builder<'a> {
                                     owner.clone(),
                                     None,
                                     true,
-                                    false,
                                     loc.clone(),
                                 );
                             }
@@ -4711,7 +4701,6 @@ mod tests {
                 owner: Owner::Module,
                 access_bytes: None,
                 access_extent_unknown: false,
-                volatile: false,
                 modeled_external_write: false,
                 loc: None,
             })
@@ -4786,7 +4775,6 @@ mod tests {
             owner: Owner::Module,
             access_bytes: None,
             access_extent_unknown: false,
-            volatile: false,
             modeled_external_write: false,
             loc: None,
         });
@@ -4810,7 +4798,6 @@ mod tests {
             owner: Owner::Module,
             access_bytes: None,
             access_extent_unknown: false,
-            volatile: false,
             modeled_external_write: false,
             loc: None,
         });
@@ -4825,7 +4812,6 @@ mod tests {
             owner: Owner::Module,
             access_bytes: None,
             access_extent_unknown: false,
-            volatile: false,
             modeled_external_write: false,
             loc: None,
         });
@@ -6545,7 +6531,6 @@ mod tests {
                 with_use.functions[0].body.push(Stmt::Load {
                     dest: "x".into(),
                     address: "g".into(),
-                    volatile: false,
                     access_bytes: None,
                     loc: None,
                 });
@@ -6582,7 +6567,6 @@ mod tests {
                 owner: Owner::Function("f".into()),
                 access_bytes: None,
                 access_extent_unknown: false,
-                volatile: false,
                 modeled_external_write: false,
                 loc: None,
             });

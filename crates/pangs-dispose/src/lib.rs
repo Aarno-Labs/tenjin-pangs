@@ -303,11 +303,7 @@ fn emit_measurement_report(manifest: &mut Manifest) {
             )
         })
         .collect::<BTreeMap<String, (u64, BTreeMap<String, u64>, BTreeMap<String, u64>)>>();
-    let mut atomic_candidates = 0_u64;
-    let mut atomic_word_sized = 0_u64;
-    let mut atomic_access_complete = 0_u64;
-    let mut atomic_free_gate_eligible = 0_u64;
-    let mut atomic_certified = 0_u64;
+    let mut atomic_declared = 0_u64;
     let mut mutex_candidates = 0_u64;
     let mut mutex_access_complete = 0_u64;
     let mut mutex_signal_safe = 0_u64;
@@ -342,28 +338,12 @@ fn emit_measurement_report(manifest: &mut Manifest) {
             }
         }
 
-        let gate_candidate = matches!(
-            disposition.chosen,
-            Strategy::Atomic | Strategy::Localize | Strategy::Unhandled
-        );
+        if global.facts.atomic_declaration.value {
+            atomic_declared += 1;
+        }
+        let gate_candidate = !global.facts.atomic_declaration.value
+            && matches!(disposition.chosen, Strategy::Localize | Strategy::Unhandled);
         if gate_candidate {
-            atomic_candidates += 1;
-            if global.facts.word_sized_scalar.value {
-                atomic_word_sized += 1;
-                if global.facts.access_set_complete.value {
-                    atomic_access_complete += 1;
-                    atomic_free_gate_eligible += 1;
-                }
-            }
-            if global
-                .facts
-                .atomic_eligibility
-                .as_ref()
-                .is_some_and(Certificate::is_certified)
-            {
-                atomic_certified += 1;
-            }
-
             mutex_candidates += 1;
             if global.facts.access_set_complete.value {
                 mutex_access_complete += 1;
@@ -436,15 +416,11 @@ fn emit_measurement_report(manifest: &mut Manifest) {
     let report = serde_json::json!({
         "disposition_distribution": distribution,
         "cascade_skip_histogram": skip_histogram,
+        "atomic_declarations": {
+            "declared": atomic_declared,
+            "not_declared": manifest.globals.len() as u64 - atomic_declared,
+        },
         "would_be_eligibility": {
-            "atomic": {
-                "candidate_disposition": atomic_candidates,
-                "word_sized_scalar": atomic_word_sized,
-                "access_set_complete": atomic_access_complete,
-                "free_gate_eligible": atomic_free_gate_eligible,
-                "certificate_eligible": atomic_certified,
-                "eligible": atomic_certified,
-            },
             "mutex": {
                 "candidate_disposition": mutex_candidates,
                 "access_set_complete": mutex_access_complete,
@@ -964,9 +940,16 @@ fn missing_group_failure(member: &Key, guard: &str) -> GuardFailure {
 }
 
 fn unavailable_outcome(strategy: Strategy, facts: &Facts) -> Option<OverrideOutcome> {
+    if facts.atomic_declaration.value && !matches!(strategy, Strategy::Atomic | Strategy::Unhandled)
+    {
+        return Some(OverrideOutcome::RejectedStrategyUnavailable);
+    }
+    if strategy == Strategy::Atomic {
+        return (!facts.atomic_declaration.value)
+            .then_some(OverrideOutcome::RejectedStrategyUnavailable);
+    }
     let slot = match strategy {
         Strategy::OnceLock => Some(&facts.phase_stationarity),
-        Strategy::Atomic => Some(&facts.atomic_eligibility),
         Strategy::Mutex => Some(&facts.mutex_eligibility),
         Strategy::Localize if facts.localization.is_none() => {
             return Some(OverrideOutcome::RejectedStrategyUnavailable)
@@ -1053,6 +1036,7 @@ fn witness_for_guard(facts: &Facts, guard: &str) -> Witness {
         "written" => facts.written.witness.as_ref(),
         "omega_escaped_address" => facts.omega_escaped_address.witness.as_ref(),
         "violation_taint" => facts.violation_taint.witness.as_ref(),
+        "atomic_declaration" => facts.atomic_declaration.witness.as_ref(),
         _ => None,
     };
     if let Some(witness) = evidenced {
@@ -1060,7 +1044,6 @@ fn witness_for_guard(facts: &Facts, guard: &str) -> Witness {
     }
     let certificate = match guard {
         "phase_stationarity" => facts.phase_stationarity.as_ref(),
-        "atomic_eligibility" => facts.atomic_eligibility.as_ref(),
         "mutex_eligibility" => facts.mutex_eligibility.as_ref(),
         _ => None,
     };
@@ -1153,6 +1136,9 @@ enum GuardResult {
 const LOCALIZE_EXEMPT_VIOLATION_KIND: &str = "fnptr_varargs_internal_unmodeled";
 
 fn violation_taint_blocks(strategy: Strategy, facts: &Facts) -> bool {
+    if strategy == Strategy::Atomic {
+        return false;
+    }
     if strategy != Strategy::Localize {
         return facts.violation_taint.value;
     }
@@ -1174,6 +1160,16 @@ fn violation_taint_blocks(strategy: Strategy, facts: &Facts) -> bool {
 }
 
 fn evaluate(strategy: Strategy, facts: &Facts) -> GuardResult {
+    if strategy == Strategy::Atomic {
+        return if facts.atomic_declaration.value {
+            GuardResult::Applicable
+        } else {
+            GuardResult::Failed(vec!["atomic_declaration".to_owned()])
+        };
+    }
+    if facts.atomic_declaration.value {
+        return GuardResult::Failed(vec!["atomic_declaration".to_owned()]);
+    }
     if violation_taint_blocks(strategy, facts) {
         let mut failed = vec!["violation_taint".to_owned()];
         match strategy {
@@ -1190,11 +1186,7 @@ fn evaluate(strategy: Strategy, facts: &Facts) -> GuardResult {
                 "phase_stationarity",
                 facts.phase_stationarity.as_ref(),
             ),
-            Strategy::Atomic => push_failed_certificate(
-                &mut failed,
-                "atomic_eligibility",
-                facts.atomic_eligibility.as_ref(),
-            ),
+            Strategy::Atomic => unreachable!("atomic was handled before violation taint"),
             Strategy::Mutex => push_failed_certificate(
                 &mut failed,
                 "mutex_eligibility",
@@ -1226,7 +1218,7 @@ fn evaluate(strategy: Strategy, facts: &Facts) -> GuardResult {
             failed_result(failed)
         }
         Strategy::OnceLock => certificate_guard("phase_stationarity", &facts.phase_stationarity),
-        Strategy::Atomic => certificate_guard("atomic_eligibility", &facts.atomic_eligibility),
+        Strategy::Atomic => unreachable!("atomic was handled before analysis-derived guards"),
         Strategy::Mutex => certificate_guard("mutex_eligibility", &facts.mutex_eligibility),
         Strategy::Localize => match &facts.localization {
             None => GuardResult::NotComputed("localization"),
@@ -1264,7 +1256,7 @@ mod tests {
     use pangs_manifest::{
         AnalysisRun, AuditRecord, CouplingGroup, EvidencedBool, GlobalRecord, GroupStrategySupport,
         Linkage, Localization, LocalizationBlocker, Manifest, Meta, RunHeader, UnkeyedGlobal,
-        ViolationRelevance, ViolationRelevanceDiagnostic, WordSizedScalar,
+        ViolationRelevance, ViolationRelevanceDiagnostic,
     };
     use serde_json::json;
 
@@ -1286,20 +1278,26 @@ mod tests {
             thread_visible: bool_fact(false),
             signal_context_access: bool_fact(false),
             access_set_complete: bool_fact(true),
-            word_sized_scalar: WordSizedScalar {
-                value: false,
-                type_spelling: None,
-                size_bits: None,
-                class: None,
-                signed: None,
-                extra: Extra::new(),
-            },
+            atomic_declaration: bool_fact(false),
             phase_stationarity: None,
-            atomic_eligibility: None,
             mutex_eligibility: None,
             coupling_group: None,
             localization: None,
             violation_relevance: Vec::new(),
+            extra: Extra::new(),
+        }
+    }
+
+    fn declared_atomic() -> EvidencedBool {
+        EvidencedBool {
+            value: true,
+            witness: Some(Witness {
+                kind: "source-atomic-declaration".into(),
+                site: None,
+                symbol: Some("src/a.c::g".into()),
+                note: Some("atomic_int".into()),
+                extra: Extra::new(),
+            }),
             extra: Extra::new(),
         }
     }
@@ -1343,7 +1341,7 @@ mod tests {
         let mut facts = base_facts();
         facts.written.value = true;
         facts.phase_stationarity = Some(certified());
-        facts.atomic_eligibility = Some(certified());
+        facts.atomic_declaration = declared_atomic();
         let config = CascadeConfig::default_for(DisposeMode::Application);
         let (chosen, trace) = cascade(&facts, &config).unwrap();
         assert_eq!(chosen, Strategy::Atomic);
@@ -1364,44 +1362,52 @@ mod tests {
     }
 
     #[test]
-    fn null_and_failed_certificate_are_distinct() {
+    fn atomic_requires_an_existing_source_declaration() {
         let mut facts = base_facts();
         facts.written.value = true;
         let config = CascadeConfig {
             mode: DisposeMode::Library,
             order: vec![Strategy::Atomic],
         };
-        let (_, trace) = cascade(&facts, &config).unwrap();
-        assert!(matches!(
-            trace[0].reason,
-            SkipReason::FactNotComputed { .. }
-        ));
+        let (chosen, trace) = cascade(&facts, &config).unwrap();
+        assert_eq!(chosen, Strategy::Unhandled);
+        assert!(
+            matches!(&trace[0].reason, SkipReason::GuardFailed { failed, .. } if failed == &["atomic_declaration"])
+        );
 
-        facts.atomic_eligibility = Some(Certificate::Failed {
-            codes: vec!["bad-access".into()],
-            witnesses: Vec::new(),
-            recipe: None,
-            diagnostics: None,
-            extra: Extra::new(),
-        });
-        let (_, trace) = cascade(&facts, &config).unwrap();
-        assert!(matches!(trace[0].reason, SkipReason::GuardFailed { .. }));
+        facts.atomic_declaration = declared_atomic();
+        let (chosen, trace) = cascade(&facts, &config).unwrap();
+        assert_eq!(chosen, Strategy::Atomic);
+        assert!(trace.is_empty());
     }
 
     #[test]
-    fn violation_taint_forces_every_strategy_to_guard_failed() {
+    fn disabling_atomic_leaves_a_source_atomic_unhandled() {
         let mut facts = base_facts();
-        facts.violation_taint.value = true;
-        let config = CascadeConfig::default_for(DisposeMode::Application);
+        facts.atomic_declaration = declared_atomic();
+        facts.localization = Some(ok_localization());
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Localize],
+        };
+
         let (chosen, trace) = cascade(&facts, &config).unwrap();
         assert_eq!(chosen, Strategy::Unhandled);
-        assert_eq!(trace.len(), config.order.len());
-        for skip in trace {
-            let SkipReason::GuardFailed { failed, .. } = skip.reason else {
-                panic!("taint must dominate null slots");
-            };
-            assert_eq!(failed.first().map(String::as_str), Some("violation_taint"));
-        }
+        assert!(
+            matches!(&trace[0].reason, SkipReason::GuardFailed { failed, .. } if failed == &["atomic_declaration"])
+        );
+    }
+
+    #[test]
+    fn violation_taint_does_not_override_source_atomic_declaration() {
+        let mut facts = base_facts();
+        facts.violation_taint.value = true;
+        facts.atomic_declaration = declared_atomic();
+        let config = CascadeConfig::default_for(DisposeMode::Application);
+        let (chosen, trace) = cascade(&facts, &config).unwrap();
+        assert_eq!(chosen, Strategy::Atomic);
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].strategy, Strategy::Immutable);
     }
 
     #[test]
@@ -1685,23 +1691,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_certificate_needs_recipe_then_accept_risk() {
-        let witness = Witness {
-            kind: "bad-access".into(),
-            site: None,
-            symbol: None,
-            note: None,
-            extra: Extra::new(),
-        };
-        let mut facts = base_facts();
-        facts.atomic_eligibility = Some(Certificate::Failed {
-            codes: vec!["bad-access".into()],
-            witnesses: vec![witness],
-            recipe: Some(json!({"sites": []})),
-            diagnostics: None,
-            extra: Extra::new(),
-        });
-        let mut manifest = manifest_with(facts);
+    fn accepted_risk_cannot_invent_an_atomic_declaration() {
+        let mut manifest = manifest_with(base_facts());
         let mut ledger = Vec::<AuditRecord>::new();
         let config = CascadeConfig {
             mode: DisposeMode::Application,
@@ -1717,15 +1708,49 @@ mod tests {
             Some("hash".into()),
         )
         .unwrap();
-        assert!(!outcome.override_problems);
+        assert!(outcome.override_problems);
         let disposition = manifest.globals[0].disposition.as_ref().unwrap();
-        assert_eq!(disposition.chosen, Strategy::Atomic);
+        assert_eq!(disposition.chosen, Strategy::Unhandled);
+        assert_eq!(disposition.provenance, DispositionProvenance::Cascade);
+        assert!(ledger.is_empty());
         assert_eq!(
-            disposition.provenance,
-            DispositionProvenance::OverrideAcceptedRisk
+            manifest.override_report.as_ref().unwrap().entries[0].outcome,
+            OverrideOutcome::RejectedStrategyUnavailable
         );
-        assert_eq!(ledger.len(), 1);
-        assert!(ledger[0].id.starts_with("ar-"));
+    }
+
+    #[test]
+    fn accepted_risk_cannot_relabel_an_atomic_declaration() {
+        let mut facts = base_facts();
+        facts.atomic_declaration = declared_atomic();
+        facts.localization = Some(ok_localization());
+        let mut manifest = manifest_with(facts);
+        let mut ledger = Vec::<AuditRecord>::new();
+        let config = CascadeConfig {
+            mode: DisposeMode::Application,
+            order: vec![Strategy::Atomic, Strategy::Localize],
+        };
+        let overrides = global_override(Strategy::Localize, true);
+        let outcome = apply_policy(
+            &mut manifest,
+            &mut ledger,
+            &config,
+            Some(&overrides),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(outcome.override_problems);
+        assert_eq!(
+            manifest.globals[0].disposition.as_ref().unwrap().chosen,
+            Strategy::Atomic
+        );
+        assert_eq!(
+            manifest.override_report.as_ref().unwrap().entries[0].outcome,
+            OverrideOutcome::RejectedStrategyUnavailable
+        );
+        assert!(ledger.is_empty());
     }
 
     #[test]
@@ -1873,7 +1898,7 @@ mod tests {
     fn per_global_atomic_results_do_not_create_a_group_disposition() {
         let mut facts = base_facts();
         facts.written.value = true;
-        facts.atomic_eligibility = Some(certified());
+        facts.atomic_declaration = declared_atomic();
         let mut manifest = manifest_with(facts);
         add_two_member_group(&mut manifest);
         let mut ledger = Vec::new();
@@ -2008,10 +2033,10 @@ mod tests {
     fn per_global_strategy_is_rejected_at_group_override_scope() {
         let mut facts = base_facts();
         facts.written.value = true;
-        facts.atomic_eligibility = Some(certified());
+        facts.atomic_declaration = declared_atomic();
         let mut manifest = manifest_with(facts);
         add_two_member_group(&mut manifest);
-        manifest.globals[1].facts.atomic_eligibility = None;
+        manifest.globals[1].facts.atomic_declaration = bool_fact(false);
         let mut overrides = Overrides::default();
         overrides.groups.insert(
             "grp-test".into(),
@@ -2053,10 +2078,10 @@ mod tests {
     fn group_does_not_demote_an_individually_eligible_atomic() {
         let mut facts = base_facts();
         facts.written.value = true;
-        facts.atomic_eligibility = Some(certified());
+        facts.atomic_declaration = declared_atomic();
         let mut manifest = manifest_with(facts);
         add_two_member_group(&mut manifest);
-        manifest.globals[1].facts.atomic_eligibility = None;
+        manifest.globals[1].facts.atomic_declaration = bool_fact(false);
         let mut ledger = Vec::new();
         let config = CascadeConfig {
             mode: DisposeMode::Application,
@@ -2089,17 +2114,9 @@ mod tests {
     }
 
     #[test]
-    fn policy_emits_free_d3_d4_gate_measurements() {
+    fn policy_reports_atomic_declarations_and_mutex_gates() {
         let mut facts = base_facts();
         facts.written.value = true;
-        facts.word_sized_scalar = WordSizedScalar {
-            value: true,
-            type_spelling: Some("int".into()),
-            size_bits: Some(32),
-            class: Some(pangs_manifest::ScalarClass::Integer),
-            signed: Some(true),
-            extra: Extra::new(),
-        };
         facts.localization = Some(Localization {
             component: "component-main".into(),
             verdict: LocalizationVerdict::Ok,
@@ -2121,18 +2138,11 @@ mod tests {
             1
         );
         assert_eq!(
-            report["cascade_skip_histogram"]["atomic"]["fact_not_computed"]["atomic_eligibility"],
+            report["cascade_skip_histogram"]["atomic"]["guard_failed"]["atomic_declaration"],
             1
         );
-        assert_eq!(
-            report["would_be_eligibility"]["atomic"]["free_gate_eligible"],
-            1
-        );
-        assert_eq!(
-            report["would_be_eligibility"]["atomic"]["certificate_eligible"],
-            0
-        );
-        assert_eq!(report["would_be_eligibility"]["atomic"]["eligible"], 0);
+        assert_eq!(report["atomic_declarations"]["declared"], 0);
+        assert_eq!(report["atomic_declarations"]["not_declared"], 1);
         assert_eq!(report["would_be_eligibility"]["mutex"]["eligible"], 1);
         assert_eq!(report["context_struct_pressure"]["known_size_bits"], 32);
         assert_eq!(

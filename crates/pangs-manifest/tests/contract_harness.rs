@@ -9,6 +9,14 @@ use serde_json::json;
 
 fn contract_manifest() -> Manifest {
     let global = |key: &str, llvm_name: &str, chosen: &str, group: Option<&str>| {
+        let atomic_declaration = if chosen == "atomic" {
+            json!({
+                "value": true,
+                "witness": { "kind": "source-atomic-declaration", "symbol": llvm_name }
+            })
+        } else {
+            json!({ "value": false })
+        };
         json!({
             "key": key,
             "meta": {
@@ -21,16 +29,17 @@ fn contract_manifest() -> Manifest {
                 "line": 1
             },
             "facts": {
-                "written": { "value": true },
+                "written": {
+                    "value": true,
+                    "witness": { "kind": "fixture-write" }
+                },
                 "omega_escaped_address": { "value": false },
                 "violation_taint": { "value": false },
                 "thread_visible": { "value": false },
                 "signal_context_access": { "value": false },
                 "access_set_complete": { "value": true },
-                "word_sized_scalar": { "value": true, "type_spelling": "int",
-                    "size_bits": 32, "class": "integer", "signed": true },
+                "atomic_declaration": atomic_declaration,
                 "phase_stationarity": null,
-                "atomic_eligibility": null,
                 "mutex_eligibility": null,
                 "coupling_group": group,
                 "localization": null
@@ -45,7 +54,7 @@ fn contract_manifest() -> Manifest {
         })
     };
     serde_json::from_value(json!({
-        "schema_version": 6,
+        "schema_version": 7,
         "run": {
             "analysis": {
                 "pangs_git": "test",

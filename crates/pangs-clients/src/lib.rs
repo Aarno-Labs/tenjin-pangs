@@ -22,10 +22,9 @@ use pangs_manifest::{
     Certificate, CommonInterval, CouplingGroup, EvidenceEdge, EvidenceKind, EvidenceStrength,
     EvidencedBool, Extra, Facts, GlobalRecord as DispositionGlobal, GroupStrategySupport, Key,
     Linkage, Localization, LocalizationBlocker, LocalizationVerdict,
-    Manifest as DispositionManifest, Meta, OnceLockGroupSupport, RunHeader, ScalarClass, Site,
-    StorageMember, SyntheticGlobal, UnkeyedGlobal,
-    ViolationRelevance as ManifestViolationRelevance, ViolationRelevanceDiagnostic, Witness,
-    WordSizedScalar, SCHEMA_VERSION,
+    Manifest as DispositionManifest, Meta, OnceLockGroupSupport, RunHeader, Site, StorageMember,
+    SyntheticGlobal, UnkeyedGlobal, ViolationRelevance as ManifestViolationRelevance,
+    ViolationRelevanceDiagnostic, Witness, SCHEMA_VERSION,
 };
 use pangs_pag::PagOpts;
 use serde::Serialize;
@@ -284,9 +283,8 @@ pub fn assemble_disposition_artifacts(
                     registry_facts.signal_context_access.get(&gid).cloned(),
                 ),
                 access_set_complete: evidenced(access_failure.is_none(), false, access_failure),
-                word_sized_scalar: word_sized_scalar(info, target),
+                atomic_declaration: atomic_declaration_fact(info),
                 phase_stationarity: phase_slots.get(&gid).cloned(),
-                atomic_eligibility: None,
                 mutex_eligibility: None,
                 coupling_group: None,
                 localization,
@@ -364,22 +362,6 @@ pub fn assemble_disposition_artifacts(
 
     let coupling_started = Instant::now();
     let mut coupling_groups = assemble_coupling_groups(analysis, &mut globals);
-    let atomic_started = Instant::now();
-    assemble_atomic_eligibility(analysis, target, &mut globals);
-    if std::env::var_os(knobs::ENV_DISPOSITION_TIMINGS).is_some() {
-        eprintln!(
-            "pangs disposition timing atomic-eligibility={}ms certified={}",
-            atomic_started.elapsed().as_millis(),
-            globals
-                .iter()
-                .filter(|global| global
-                    .facts
-                    .atomic_eligibility
-                    .as_ref()
-                    .is_some_and(Certificate::is_certified))
-                .count()
-        );
-    }
     let mutex_started = Instant::now();
     let needs_mutex_reachability =
         globals.iter().any(mutex_coarse_eligible) || !coupling_groups.is_empty();
@@ -488,13 +470,10 @@ pub fn assemble_disposition_artifacts(
             }),
         );
         report.insert(
-            "atomic_eligibility".into(),
+            "atomic_declarations".into(),
             serde_json::json!({
-                "certified": globals.iter().filter(|global| global.facts.atomic_eligibility.as_ref().is_some_and(Certificate::is_certified)).count(),
-                "failed": globals.iter().filter(|global| matches!(global.facts.atomic_eligibility, Some(Certificate::Failed { .. }))).count(),
-                "not_word_sized": globals.iter().filter(|global| !global.facts.word_sized_scalar.value).count(),
-                "access_incomplete": globals.iter().filter(|global| !global.facts.access_set_complete.value).count(),
-                "violation_tainted": globals.iter().filter(|global| global.facts.violation_taint.value).count(),
+                "declared": globals.iter().filter(|global| global.facts.atomic_declaration.value).count(),
+                "not_declared": globals.iter().filter(|global| !global.facts.atomic_declaration.value).count(),
             }),
         );
         report.insert(
@@ -590,6 +569,31 @@ fn disposition_key(info: &pangs_api::GlobalInfo) -> Option<Key> {
         .map_or_else(|| Key::unqualified(symbol), |file| Key::new(file, symbol))
         .or_else(|_| Key::unqualified(symbol))
         .ok()
+}
+
+/// Reflects the source declaration produced by the upstream atomic-marking transform.
+/// This intentionally consults only source type metadata; pointer-analysis results and
+/// access-shape facts have no bearing on whether a declaration is already atomic.
+fn atomic_declaration_fact(info: &pangs_api::GlobalInfo) -> EvidencedBool {
+    let declared = info.source_atomic;
+    let witness = declared.then(|| Witness {
+        kind: "source-atomic-declaration".into(),
+        site: info
+            .file
+            .as_ref()
+            .zip(info.line.filter(|line| *line > 0))
+            .map(|(file, line)| Site {
+                file: file.clone(),
+                line,
+                col: None,
+                function: None,
+                extra: Extra::new(),
+            }),
+        symbol: Some(info.key.clone()),
+        note: info.type_spelling.clone(),
+        extra: Extra::new(),
+    });
+    evidenced(declared, true, witness)
 }
 
 /// Finds source-level globals that uniquely own compiler-generated compound-literal storage.
@@ -1199,236 +1203,6 @@ fn assemble_coupling_groups(
     groups
 }
 
-fn assemble_atomic_eligibility(
-    analysis: &Analysis,
-    target: &pangs_pir::TargetInfo,
-    globals: &mut [DispositionGlobal],
-) {
-    let mut access_site_counts = vec![0_usize; analysis.globals().len()];
-    for site in analysis.access_sites() {
-        for global in site.globals() {
-            access_site_counts[global.0 as usize] += 1;
-        }
-    }
-    // Do not build the detailed access index unless at least one global has passed every coarse
-    // per-global gate.
-    let mut detailed_globals = vec![false; analysis.globals().len()];
-    for global in globals.iter() {
-        let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) else {
-            continue;
-        };
-        let width = global.facts.word_sized_scalar.size_bits;
-        let signal_lock_free = !global.facts.signal_context_access.value
-            || width.is_some_and(|width| target.supported_atomic_widths.contains(&width));
-        detailed_globals[gid.0 as usize] = global.facts.word_sized_scalar.value
-            && global.storage_members.is_empty()
-            && global.facts.access_set_complete.value
-            && !global.facts.violation_taint.value
-            && signal_lock_free;
-    }
-    let mut access_by_global = vec![Vec::new(); analysis.globals().len()];
-    if detailed_globals.iter().any(|&needed| needed) {
-        for site in analysis.access_sites() {
-            for global in site.globals() {
-                if detailed_globals[global.0 as usize] {
-                    access_by_global[global.0 as usize].push(site);
-                }
-            }
-        }
-    }
-    for global in globals {
-        let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) else {
-            global.facts.atomic_eligibility = Some(Certificate::Failed {
-                codes: vec!["global-not-in-analysis".into()],
-                witnesses: vec![atomic_witness(
-                    "global-not-in-analysis",
-                    Some(global.key.to_string()),
-                    None,
-                    None,
-                )],
-                recipe: None,
-                diagnostics: None,
-                extra: Extra::new(),
-            });
-            continue;
-        };
-
-        let mut codes = Vec::new();
-        let mut witnesses = Vec::new();
-        let mut fail = |code: &str, witness: Witness| {
-            codes.push(code.to_owned());
-            witnesses.push(witness);
-        };
-
-        if !global.storage_members.is_empty() {
-            fail(
-                "nontrivial-storage-closure",
-                atomic_witness(
-                    "atomic-nontrivial-storage-closure",
-                    Some(global.key.to_string()),
-                    None,
-                    Some(
-                        "one atomic declaration cannot materialize compiler-generated backing storage"
-                            .into(),
-                    ),
-                ),
-            );
-        }
-        if !global.facts.word_sized_scalar.value {
-            fail(
-                "word-sized-scalar",
-                atomic_witness(
-                    "atomic-word-sized-scalar-failed",
-                    Some(global.key.to_string()),
-                    None,
-                    global.meta.type_spelling.clone(),
-                ),
-            );
-        }
-        if !global.facts.access_set_complete.value {
-            fail(
-                "access-set-complete",
-                global
-                    .facts
-                    .access_set_complete
-                    .witness
-                    .clone()
-                    .unwrap_or_else(|| {
-                        atomic_witness(
-                            "atomic-access-set-incomplete",
-                            Some(global.key.to_string()),
-                            None,
-                            None,
-                        )
-                    }),
-            );
-        }
-        if global.facts.violation_taint.value {
-            fail(
-                "violation-taint",
-                global
-                    .facts
-                    .violation_taint
-                    .witness
-                    .clone()
-                    .unwrap_or_else(|| {
-                        atomic_witness(
-                            "atomic-violation-taint",
-                            Some(global.key.to_string()),
-                            None,
-                            None,
-                        )
-                    }),
-            );
-        }
-        let width = global.facts.word_sized_scalar.size_bits;
-        let signal_lock_free = !global.facts.signal_context_access.value
-            || width.is_some_and(|width| target.supported_atomic_widths.contains(&width));
-        if !signal_lock_free {
-            fail(
-                "signal-atomic-not-lock-free",
-                atomic_witness(
-                    "signal-atomic-not-lock-free",
-                    Some(global.key.to_string()),
-                    None,
-                    width.map(|width| format!("{width}-bit atomic is not target-guaranteed")),
-                ),
-            );
-        }
-
-        drop(fail);
-        if !codes.is_empty() {
-            global.facts.atomic_eligibility = Some(Certificate::Failed {
-                codes,
-                witnesses,
-                recipe: None,
-                diagnostics: Some(serde_json::json!({
-                    "access_lowering": {
-                        "status": "skipped",
-                        "reason": "coarse-eligibility-failed",
-                    },
-                    "access_sites_observed": access_site_counts[gid.0 as usize],
-                })),
-                extra: Extra::new(),
-            });
-            continue;
-        }
-
-        let sites = &access_by_global[gid.0 as usize];
-        let (access_recipe, access_failures) = atomic_access_recipe(analysis, sites);
-        let mut fail = |code: &str, witness: Witness| {
-            codes.push(code.to_owned());
-            witnesses.push(witness);
-        };
-        for (code, witness) in access_failures {
-            fail(&code, witness);
-        }
-        let recipe_ready = access_recipe.is_some();
-        let recipe = recipe_ready.then(|| {
-            serde_json::json!({
-                "declaration": {
-                    "key": global.key,
-                    "llvm_name": global.meta.llvm_name,
-                    "file": global.meta.file,
-                    "line": global.meta.line,
-                    "type_spelling": global.meta.type_spelling,
-                    "size_bits": global.facts.word_sized_scalar.size_bits,
-                    "align_bits": global.meta.align_bits,
-                    "scalar_class": global.facts.word_sized_scalar.class,
-                    "signed": global.facts.word_sized_scalar.signed,
-                    "initializer_ir": analysis.globals()[gid].initializer_ir,
-                    "linkage": global.meta.linkage,
-                },
-                "accesses": access_recipe.unwrap_or_default(),
-                "cross_tu": {
-                    "required": global.meta.linkage == Linkage::External,
-                    "scope": "linked-module",
-                },
-                "ordering": "relaxed",
-            })
-        });
-
-        global.facts.atomic_eligibility = Some(if codes.is_empty() {
-            Certificate::Certified {
-                certificate: serde_json::json!({
-                    "recipe": recipe.expect("a certified atomic must have a complete recipe"),
-                    "source_materialization": atomic_source_materialization(global),
-                    "signal_lock_free": {
-                        "required": global.facts.signal_context_access.value,
-                        "width": width,
-                        "target_guaranteed": signal_lock_free,
-                    },
-                }),
-                extra: Extra::new(),
-            }
-        } else {
-            Certificate::Failed {
-                codes,
-                witnesses,
-                recipe,
-                diagnostics: Some(serde_json::json!({
-                    "access_sites_observed": sites.len(),
-                })),
-                extra: Extra::new(),
-            }
-        });
-    }
-}
-
-fn atomic_source_materialization(global: &DispositionGlobal) -> serde_json::Value {
-    if global.meta.file.is_some() && global.meta.line.is_some() {
-        serde_json::json!({
-            "status": "source-mapped",
-        })
-    } else {
-        serde_json::json!({
-            "status": "blocked",
-            "code": "declaration-source-unmapped",
-            "detail": "static eligibility is certified, but the C declaration requires symbol-based source recovery",
-        })
-    }
-}
-
 #[derive(Clone, Copy)]
 struct MutexCallStep {
     callee: FuncId,
@@ -1575,6 +1349,12 @@ fn assemble_mutex_eligibility(
     });
 
     for global in globals {
+        if global.facts.atomic_declaration.value {
+            // The upstream transform has already fixed this representation. Do not spend
+            // call-graph effort constructing an inapplicable alternative rewrite.
+            global.facts.mutex_eligibility = None;
+            continue;
+        }
         let Some(gid) = analysis.lookup_global(&global.meta.llvm_name) else {
             global.facts.mutex_eligibility = Some(Certificate::Failed {
                 codes: vec!["global-not-in-analysis".into()],
@@ -1733,7 +1513,8 @@ fn assemble_mutex_eligibility(
 }
 
 fn mutex_coarse_eligible(global: &DispositionGlobal) -> bool {
-    global.facts.access_set_complete.value
+    !global.facts.atomic_declaration.value
+        && global.facts.access_set_complete.value
         && !global.facts.signal_context_access.value
         && !global.facts.violation_taint.value
 }
@@ -1990,180 +1771,6 @@ fn mutex_unknown_callee_witness(
                 .into(),
         ),
         extra: BTreeMap::from([("call_path".into(), serde_json::json!(call_path))]),
-    }
-}
-
-fn atomic_access_recipe(
-    analysis: &Analysis,
-    sites: &[&pangs_api::AccessSite],
-) -> (Option<Vec<Value>>, Vec<(String, Witness)>) {
-    let mut ordered = sites.to_vec();
-    ordered.sort_by_key(|site| (site.func, site.statement_index, site.access, site.via));
-    let mut failures = Vec::new();
-    let mut entries = Vec::new();
-    let mut consumed = vec![false; ordered.len()];
-
-    for index in 0..ordered.len() {
-        if consumed[index] {
-            continue;
-        }
-        let site = ordered[index];
-        let function = &analysis.functions()[site.func];
-        let manifest_site = atomic_access_site(analysis, site);
-        if site.volatile {
-            failures.push((
-                "volatile-access".into(),
-                atomic_witness(
-                    "atomic-volatile-access",
-                    Some(function.key.clone()),
-                    manifest_site,
-                    Some("volatile C access cannot be replaced by an ordinary Rust atomic".into()),
-                ),
-            ));
-            continue;
-        }
-        if site.via != pangs_api::Via::Direct {
-            failures.push((
-                "address-access-not-lowerable".into(),
-                atomic_witness(
-                    "atomic-address-access-not-lowerable",
-                    Some(function.key.clone()),
-                    manifest_site,
-                    Some(format!("{:?} access", site.via)),
-                ),
-            ));
-            continue;
-        }
-        if site.loc.is_none() || site.statement_index.is_none() {
-            failures.push((
-                "access-site-unmapped".into(),
-                atomic_witness(
-                    "atomic-access-site-unmapped",
-                    Some(function.key.clone()),
-                    manifest_site,
-                    site.statement_index
-                        .map(|value| format!("statement {value}")),
-                ),
-            ));
-            continue;
-        }
-
-        if site.access == pangs_pir::Access::Ref {
-            let pair = ((index + 1)..ordered.len()).find(|&other| {
-                let candidate = ordered[other];
-                !consumed[other]
-                    && candidate.func == site.func
-                    && candidate.access == pangs_pir::Access::Mod
-                    && candidate.via == pangs_api::Via::Direct
-                    && candidate.atomic_rmw.as_ref().is_some_and(|rmw| {
-                        Some(rmw.reference_statement_index) == site.statement_index
-                    })
-            });
-            if let Some(other) = pair {
-                consumed[other] = true;
-                let rmw = ordered[other]
-                    .atomic_rmw
-                    .as_ref()
-                    .expect("an exact RMW pair carries operation evidence");
-                entries.push(serde_json::json!({
-                    "operation": atomic_rmw_operation(rmw.op),
-                    "operand": rmw.operand,
-                    "function": function.key,
-                    "site": manifest_site,
-                    "statement_indices": [
-                        site.statement_index,
-                        rmw.operation_statement_index,
-                        ordered[other].statement_index
-                    ],
-                }));
-                continue;
-            }
-        }
-
-        if site.atomic_rmw.is_some() {
-            failures.push((
-                "rmw-shape-unresolved".into(),
-                atomic_witness(
-                    "atomic-rmw-shape-unresolved",
-                    Some(function.key.clone()),
-                    manifest_site,
-                    Some("recognized scalar update has no matching direct global load".into()),
-                ),
-            ));
-            continue;
-        }
-
-        let shares_source_expression_with_opposite_access = ordered.iter().any(|candidate| {
-            candidate.func == site.func
-                && candidate.loc == site.loc
-                && candidate.access != site.access
-                && candidate.atomic_rmw.is_none()
-        });
-        if shares_source_expression_with_opposite_access {
-            failures.push((
-                "rmw-shape-unclassified".into(),
-                atomic_witness(
-                    "atomic-rmw-shape-unclassified",
-                    Some(function.key.clone()),
-                    manifest_site,
-                    Some(
-                        "same-expression load/store lacks a proven supported scalar operation"
-                            .into(),
-                    ),
-                ),
-            ));
-            continue;
-        }
-
-        entries.push(serde_json::json!({
-            "operation": if site.access == pangs_pir::Access::Ref { "load" } else { "store" },
-            "function": function.key,
-            "site": manifest_site,
-            "statement_index": site.statement_index,
-        }));
-    }
-
-    if failures.is_empty() {
-        (Some(entries), failures)
-    } else {
-        (None, failures)
-    }
-}
-
-fn atomic_rmw_operation(op: pangs_pir::ScalarOp) -> &'static str {
-    match op {
-        pangs_pir::ScalarOp::Add => "fetch_add",
-        pangs_pir::ScalarOp::Sub => "fetch_sub",
-        pangs_pir::ScalarOp::And => "fetch_and",
-        pangs_pir::ScalarOp::Or => "fetch_or",
-        pangs_pir::ScalarOp::Xor => "fetch_xor",
-    }
-}
-
-fn atomic_access_site(analysis: &Analysis, access: &pangs_api::AccessSite) -> Option<Site> {
-    let loc = access.loc.as_ref()?;
-    let function = &analysis.functions()[access.func];
-    Some(Site {
-        file: loc.file.clone(),
-        line: loc.line,
-        col: Some(loc.col),
-        function: Some(function.key.clone()),
-        extra: Extra::new(),
-    })
-}
-
-fn atomic_witness(
-    kind: &str,
-    symbol: Option<String>,
-    site: Option<Site>,
-    note: Option<String>,
-) -> Witness {
-    Witness {
-        kind: kind.into(),
-        site,
-        symbol,
-        note,
-        extra: Extra::new(),
     }
 }
 
@@ -2449,36 +2056,6 @@ fn evidenced(value: bool, polarity: bool, witness: Option<Witness>) -> Evidenced
     EvidencedBool {
         value,
         witness,
-        extra: Extra::new(),
-    }
-}
-
-fn word_sized_scalar(
-    info: &pangs_api::GlobalInfo,
-    target: &pangs_pir::TargetInfo,
-) -> WordSizedScalar {
-    let class = info.scalar_class.map(|class| match class {
-        pangs_pir::ScalarTypeClass::Integer => ScalarClass::Integer,
-        pangs_pir::ScalarTypeClass::Boolean => ScalarClass::Boolean,
-        pangs_pir::ScalarTypeClass::Enum => ScalarClass::Enum,
-        pangs_pir::ScalarTypeClass::Pointer => ScalarClass::Pointer,
-    });
-    let signedness_known =
-        !matches!(class, Some(ScalarClass::Integer | ScalarClass::Enum)) || info.signed.is_some();
-    let value = info.type_spelling.is_some()
-        && info
-            .size_bits
-            .is_some_and(|width| width != 0 && target.supported_atomic_widths.contains(&width))
-        && info.align_bits == info.size_bits
-        && class.is_some()
-        && signedness_known;
-
-    WordSizedScalar {
-        value,
-        type_spelling: value.then(|| info.type_spelling.clone()).flatten(),
-        size_bits: value.then_some(info.size_bits).flatten(),
-        class: value.then_some(class).flatten(),
-        signed: value.then_some(info.signed).flatten(),
         extra: Extra::new(),
     }
 }
@@ -3998,18 +3575,21 @@ mod tests {
     use std::time::Instant;
 
     use jsonschema::JSONSchema;
-    use pangs_api::{Analysis, BuildMode, GlobalId, Opts};
-    use pangs_manifest::{Certificate, Extra, Key, LocalizationVerdict, Site};
+    use pangs_api::{Analysis, BuildMode, GlobalId, Opts, Stage};
+    use pangs_manifest::{
+        Certificate, Extra, GlobalRecord as DispositionGlobal, Key, Localization,
+        LocalizationBlocker, LocalizationVerdict, Manifest as DispositionManifest, Site, Witness,
+    };
     use pangs_pir::Pir;
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
-        assemble_disposition_artifacts, atomic_access_recipe, check_traces,
-        classify_violation_relevance, coupling_group_id, export_analysis, load_schema_for_artifact,
-        localization_index, merge_localization_blockers, once_lock_pair_evidence, report,
-        validate_export_dir, validate_value_against_schema, violation_relevance_witness,
-        CertifiedGroupEvidence, ComponentsRecord, DispositionFactRows, ViolationRelevance,
+        assemble_disposition_artifacts, check_traces, classify_violation_relevance,
+        coupling_group_id, export_analysis, load_schema_for_artifact, localization_index,
+        merge_localization_blockers, once_lock_pair_evidence, report, validate_export_dir,
+        validate_value_against_schema, violation_relevance_witness, CertifiedGroupEvidence,
+        ComponentsRecord, DispositionFactRows, ViolationRelevance,
     };
 
     #[test]
@@ -4053,14 +3633,22 @@ mod tests {
         }
     }
 
+    fn manifest_global_by_llvm_name<'a>(
+        manifest: &'a DispositionManifest,
+        llvm_name: &str,
+    ) -> &'a DispositionGlobal {
+        manifest
+            .globals
+            .iter()
+            .find(|global| global.meta.llvm_name == llvm_name)
+            .unwrap()
+    }
+
     fn external_result_after_escape_artifacts(stage: Stage) -> (Analysis, DispositionManifest) {
         disposition_fixture_artifacts("external_result_after_escape.ll", stage)
     }
 
-    fn disposition_fixture_artifacts(
-        name: &str,
-        stage: Stage,
-    ) -> (Analysis, DispositionManifest) {
+    fn disposition_fixture_artifacts(name: &str, stage: Stage) -> (Analysis, DispositionManifest) {
         let fixture = workspace_root().join(format!("fixtures/synthetic/disposition/{name}"));
         let pir = Pir::from_path(&fixture).unwrap();
         let target = pir.target.clone().unwrap();
@@ -4258,32 +3846,12 @@ mod tests {
         assert_eq!(manifest.globals[0].meta.file, None);
         assert!(manifest.unkeyed_globals.is_empty());
         assert!(ledger[0].text.contains("globally unique"));
-        let Some(Certificate::Certified { certificate, .. }) =
-            &manifest.globals[0].facts.atomic_eligibility
-        else {
-            panic!("direct source-mapped scalar accesses should certify atomic eligibility")
-        };
-        assert_eq!(
-            certificate["recipe"]["accesses"][0]["operation"],
-            "fetch_add"
-        );
-        assert_eq!(certificate["recipe"]["accesses"][0]["operand"], "1");
-        assert!(certificate["recipe"]["declaration"]["file"].is_null());
-        assert_eq!(
-            certificate["recipe"]["declaration"]["initializer_ir"],
-            "i32 0"
-        );
-        assert_eq!(certificate["recipe"]["declaration"]["align_bits"], 32);
-        assert_eq!(
-            certificate["recipe"]["declaration"]["scalar_class"],
-            "integer"
-        );
-        assert_eq!(certificate["recipe"]["declaration"]["signed"], true);
-        assert_eq!(certificate["source_materialization"]["status"], "blocked");
-        assert_eq!(
-            certificate["source_materialization"]["code"],
-            "declaration-source-unmapped"
-        );
+        assert!(!manifest.globals[0].facts.atomic_declaration.value);
+        assert!(manifest.globals[0]
+            .facts
+            .atomic_declaration
+            .witness
+            .is_none());
     }
 
     #[test]
@@ -4315,7 +3883,6 @@ mod tests {
             pangs_pir::Stmt::Store {
                 address: "@g_counter".into(),
                 value: "0".into(),
-                volatile: false,
                 access_bytes: Some(4),
                 loc: None,
             },
@@ -4495,59 +4062,6 @@ mod tests {
         assert!(localization_index(&analysis)[global.0 as usize].is_some());
     }
 
-    #[test]
-    fn volatile_global_access_blocks_atomic_eligibility() {
-        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
-        let mut pir = Pir::from_path(&fixture).unwrap();
-        pir.globals[0].type_spelling = Some("int".into());
-        pir.globals[0].size_bits = Some(32);
-        pir.globals[0].align_bits = Some(32);
-        pir.globals[0].scalar_class = Some(pangs_pir::ScalarTypeClass::Integer);
-        pir.globals[0].signed = Some(true);
-        pir.globals[0].initializer_ir = Some("i32 0".into());
-        pir.functions[0].body.insert(
-            0,
-            pangs_pir::Stmt::GlobalRef {
-                global: "g_counter".into(),
-                access: pangs_pir::Access::Ref,
-                volatile: true,
-                loc: Some(pangs_pir::Loc {
-                    file: "fixtures/synthetic/trivial/trivial.c".into(),
-                    line: 4,
-                    col: 3,
-                    dir: None,
-                    filename: None,
-                }),
-            },
-        );
-        let opts = Opts::default();
-        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
-        let target = pangs_pir::TargetInfo {
-            triple: "x86_64-unknown-linux-gnu".into(),
-            data_layout: String::new(),
-            supported_atomic_widths: vec![8, 16, 32, 64],
-        };
-        let (manifest, _) = assemble_disposition_artifacts(
-            &analysis,
-            &pir,
-            &opts,
-            &fixture,
-            &workspace_root(),
-            &target,
-        )
-        .unwrap();
-
-        let Some(Certificate::Failed {
-            codes, witnesses, ..
-        }) = &manifest.globals[0].facts.atomic_eligibility
-        else {
-            panic!("volatile access must fail atomic eligibility")
-        };
-        assert!(codes.iter().any(|code| code == "volatile-access"));
-        assert!(witnesses
-            .iter()
-            .any(|witness| witness.kind == "atomic-volatile-access"));
-    }
 
     #[test]
     fn mutex_eligibility_rejects_call_paths_between_accessors() {
@@ -4849,73 +4363,6 @@ mod tests {
     }
 
     #[test]
-    fn nearby_load_store_without_scalar_dataflow_is_not_an_rmw() {
-        let fixture = workspace_root().join("fixtures/synthetic/trivial/module.pir.json");
-        let mut pir = Pir::from_path(&fixture).unwrap();
-        pir.globals[0].type_spelling = Some("int".into());
-        pir.globals[0].size_bits = Some(32);
-        pir.globals[0].align_bits = Some(32);
-        pir.globals[0].scalar_class = Some(pangs_pir::ScalarTypeClass::Integer);
-        pir.globals[0].signed = Some(true);
-        pir.globals[0].initializer_ir = Some("i32 0".into());
-        pir.functions[0].body.insert(
-            0,
-            pangs_pir::Stmt::GlobalRef {
-                global: "g_counter".into(),
-                access: pangs_pir::Access::Ref,
-                volatile: false,
-                loc: Some(pangs_pir::Loc {
-                    file: "fixtures/synthetic/trivial/trivial.c".into(),
-                    line: 4,
-                    col: 3,
-                    dir: None,
-                    filename: None,
-                }),
-            },
-        );
-        let opts = Opts::default();
-        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
-        let target = pangs_pir::TargetInfo {
-            triple: "x86_64-unknown-linux-gnu".into(),
-            data_layout: String::new(),
-            supported_atomic_widths: vec![8, 16, 32, 64],
-        };
-        let (manifest, _) = assemble_disposition_artifacts(
-            &analysis,
-            &pir,
-            &opts,
-            &fixture,
-            &workspace_root(),
-            &target,
-        )
-        .unwrap();
-
-        let Some(Certificate::Failed { codes, .. }) = &manifest.globals[0].facts.atomic_eligibility
-        else {
-            panic!("proximity alone must not certify an RMW")
-        };
-        assert!(codes.iter().any(|code| code == "rmw-shape-unclassified"));
-    }
-
-    #[test]
-    fn scalar_phi_current_global_proof_recovers_the_source_rmw_recipe() {
-        let fixture = workspace_root().join("fixtures/synthetic/disposition/scalar_phi_rmw.ll");
-        let pir = Pir::from_path(&fixture).unwrap();
-        let opts = Opts::default();
-        let analysis = Analysis::run_with_disposition(&pir, &opts).unwrap();
-        let global = analysis.lookup_global("g").unwrap();
-        let sites = analysis.access_sites_for_global(global).collect::<Vec<_>>();
-
-        let (recipe, failures) = atomic_access_recipe(&analysis, &sites, None, "g");
-        assert!(failures.is_empty(), "{failures:#?}");
-        let recipe = recipe.unwrap();
-        assert_eq!(recipe.len(), 2);
-        assert!(recipe.iter().all(|entry| entry["operation"] == "fetch_add"));
-        assert!(recipe.iter().all(|entry| entry["operand"] == "1"));
-        assert!(recipe.iter().any(|entry| entry["site"]["line"] == 10));
-    }
-
-    #[test]
     fn collapsed_finite_modref_does_not_poison_an_outside_global() {
         let fixture = workspace_root().join("fixtures/synthetic/m1_6/high_fanout_modref.pir.json");
         let pir = Pir::from_path(&fixture).unwrap();
@@ -4970,18 +4417,7 @@ mod tests {
             .find(|global| global.meta.llvm_name == "@G00")
             .unwrap();
         assert!(touched.facts.access_set_complete.value);
-        let Some(Certificate::Failed {
-            codes, diagnostics, ..
-        }) = &touched.facts.atomic_eligibility
-        else {
-            panic!("coarse atomic gates must produce a failed D3 certificate")
-        };
-        assert!(codes.iter().any(|code| code == "word-sized-scalar"));
-        let diagnostics = diagnostics.as_ref().unwrap();
-        assert_eq!(
-            diagnostics["access_lowering"]["status"], "skipped",
-            "a decisive coarse gate must bound access-lowering diagnostics"
-        );
+        assert!(!touched.facts.atomic_declaration.value);
         assert_eq!(
             manifest.run.analysis.extra["phase_stationarity_report"]["bounded_indirect_accesses"]
                 ["globals"],
@@ -5018,7 +4454,7 @@ mod tests {
     }
 
     #[test]
-    fn external_result_store_stays_finite_and_escape_blocks_atomic_and_mutex() {
+    fn external_result_store_stays_finite_and_escape_blocks_mutex() {
         for stage in [Stage::Steens, Stage::Andersen] {
             let (analysis, manifest) = external_result_after_escape_artifacts(stage);
             let gid = analysis.lookup_global("g").unwrap();
@@ -5044,19 +4480,14 @@ mod tests {
             assert!(global.facts.written.value, "{stage:?}");
             assert!(global.facts.omega_escaped_address.value, "{stage:?}");
             assert!(!global.facts.access_set_complete.value, "{stage:?}");
-            assert!(global.facts.word_sized_scalar.value, "{stage:?}");
-            for (name, certificate) in [
-                ("atomic", &global.facts.atomic_eligibility),
-                ("mutex", &global.facts.mutex_eligibility),
-            ] {
-                let Some(Certificate::Failed { codes, .. }) = certificate else {
-                    panic!("{name} must fail closed at {stage:?}: {certificate:?}")
-                };
-                assert!(
-                    codes.iter().any(|code| code == "access-set-complete"),
-                    "{name} omitted the escape blocker at {stage:?}: {codes:?}"
-                );
-            }
+            assert!(!global.facts.atomic_declaration.value, "{stage:?}");
+            let Some(Certificate::Failed { codes, .. }) = &global.facts.mutex_eligibility else {
+                panic!("mutex must fail closed at {stage:?}")
+            };
+            assert!(
+                codes.iter().any(|code| code == "access-set-complete"),
+                "mutex omitted the escape blocker at {stage:?}: {codes:?}"
+            );
         }
     }
 
@@ -5074,14 +4505,7 @@ mod tests {
                 "phase stationarity omitted the access-set gate at {stage:?}: {codes:?}"
             );
 
-            assert!(
-                !global
-                    .facts
-                    .atomic_eligibility
-                    .as_ref()
-                    .is_some_and(Certificate::is_certified),
-                "atomic eligibility certified escaped storage at {stage:?}"
-            );
+            assert!(!global.facts.atomic_declaration.value, "{stage:?}");
             assert!(
                 !global
                     .facts

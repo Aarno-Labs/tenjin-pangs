@@ -4,7 +4,7 @@ use std::process::Command;
 use pangs_manifest::{
     canonicalize_audit, to_canonical_json, AnalysisRun, AuditRecord, AuditScope, AuditSource,
     EvidencedBool, Extra, Facts, GlobalRecord, Key, Linkage, Manifest, Meta, RunHeader,
-    WordSizedScalar, SCHEMA_VERSION,
+    SCHEMA_VERSION,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -57,16 +57,8 @@ fn fixture() -> (Manifest, Vec<AuditRecord>) {
                 thread_visible: bool_fact(false),
                 signal_context_access: bool_fact(false),
                 access_set_complete: bool_fact(true),
-                word_sized_scalar: WordSizedScalar {
-                    value: false,
-                    type_spelling: None,
-                    size_bits: None,
-                    class: None,
-                    signed: None,
-                    extra: Extra::new(),
-                },
+                atomic_declaration: bool_fact(false),
                 phase_stationarity: None,
-                atomic_eligibility: None,
                 mutex_eligibility: None,
                 coupling_group: None,
                 localization: None,

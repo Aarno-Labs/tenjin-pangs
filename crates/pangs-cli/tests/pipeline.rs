@@ -2159,16 +2159,14 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
     );
     let disposition: Value =
         serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
-    assert_eq!(disposition["schema_version"], 6);
+    assert_eq!(disposition["schema_version"], 7);
     let counter = disposition["globals"]
         .as_array()
         .unwrap()
         .iter()
         .find(|global| global["key"] == "fixtures/synthetic/m1_1/fp_smoke.c::g_counter")
         .expect("g_counter disposition record");
-    assert_eq!(counter["facts"]["word_sized_scalar"]["value"], true);
-    assert_eq!(counter["facts"]["word_sized_scalar"]["class"], "integer");
-    assert_eq!(counter["facts"]["word_sized_scalar"]["signed"], true);
+    assert_eq!(counter["facts"]["atomic_declaration"]["value"], false);
     let phase_report = &disposition["run"]["analysis"]["phase_stationarity_report"];
     assert!(phase_report["coverage"]["client_relevant_mutable_globals"]
         .as_u64()
@@ -2189,7 +2187,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         disposition["globals"].as_array().unwrap().len() as u64
     );
     assert!(measurements["cascade_skip_histogram"].is_object());
-    assert!(measurements["would_be_eligibility"]["atomic"]["eligible"].is_u64());
+    assert!(measurements["atomic_declarations"]["declared"].is_u64());
     assert!(measurements["would_be_eligibility"]["mutex"]["eligible"].is_u64());
     assert!(measurements["context_struct_pressure"]["components"].is_object());
     assert_eq!(measurements["override_usage"]["honored"], 0);
@@ -2243,7 +2241,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "adbfb16dccf08a0c6e8c376d5aaa506a3165cc1aaa6a39738df453a41ba38a50"
+        "fbf4cbe5340a8da48180d3babc2badd710b4e3aa955e8065298779728922fcd2"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(
@@ -2395,6 +2393,64 @@ fn analyze_dispose_reports_registry_reachability_and_coupling() {
 }
 
 #[test]
+fn analyze_dispose_reflects_a_source_atomic_declaration() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source-atomic.c");
+    let bc = tmp.path().join("source-atomic.bc");
+    let out = tmp.path().join("out");
+    fs::write(
+        &source,
+        "_Atomic int counter; int read_counter(void) { return counter; }\n",
+    )
+    .unwrap();
+    assert!(Command::new("clang")
+        .args(["-std=c11", "-O0", "-g", "-emit-llvm", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&bc)
+        .status()
+        .unwrap()
+        .success());
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(&bc)
+        .arg("--out")
+        .arg(&out)
+        .arg("--build-mode")
+        .arg("executable")
+        .arg("--dispose")
+        .arg("--repo-root")
+        .arg(&repo_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
+    let counter = manifest["globals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|global| global["meta"]["llvm_name"] == "counter")
+        .unwrap();
+    assert_eq!(counter["facts"]["atomic_declaration"]["value"], true);
+    assert_eq!(
+        counter["facts"]["atomic_declaration"]["witness"]["kind"],
+        "source-atomic-declaration"
+    );
+    assert_eq!(counter["disposition"]["chosen"], "atomic");
+    assert_eq!(
+        counter["disposition"]["cascade_trace"][0]["reason"]["failed"],
+        serde_json::json!(["atomic_declaration"])
+    );
+}
+
+#[test]
 fn analyze_dispose_retains_once_lock_evidence_while_strategy_is_disabled() {
     let tmp = TempDir::new().unwrap();
     let bc = tmp.path().join("phase-once-lock.bc");
@@ -2443,7 +2499,7 @@ fn analyze_dispose_retains_once_lock_evidence_while_strategy_is_disabled() {
     assert_eq!(certificate["publication"]["publication_function"], "main");
     assert_eq!(certificate["writers"][0]["function"], "initialize");
     assert_eq!(certificate["init_subtree"][0]["function"], "initialize");
-    assert_eq!(configured["disposition"]["chosen"], "atomic");
+    assert_eq!(configured["disposition"]["chosen"], "localize");
     assert_eq!(
         manifest["run"]["dispose"]["cascade"],
         serde_json::json!(["immutable", "atomic", "localize"])
@@ -2526,12 +2582,12 @@ fn analyze_dispose_retains_common_once_lock_group_support_while_strategy_is_disa
         .as_array()
         .unwrap()
         .iter()
-        .all(|global| global["disposition"]["chosen"] == "atomic"));
+        .all(|global| global["disposition"]["chosen"] == "localize"));
     assert!(manifest["globals"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|global| global["facts"]["atomic_eligibility"]["status"] == "certified"));
+        .all(|global| global["facts"]["atomic_declaration"]["value"] == false));
     let report = &manifest["run"]["analysis"]["phase_stationarity_report"]["coupling_groups"];
     assert_eq!(report["count"], 1);
     assert_eq!(report["once_lock_supported"], 1);

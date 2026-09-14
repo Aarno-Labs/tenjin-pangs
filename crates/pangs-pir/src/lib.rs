@@ -428,6 +428,9 @@ pub struct Global {
     pub linkage: SymbolLinkage,
     #[serde(default)]
     pub type_spelling: Option<String>,
+    /// True only when source debug metadata marks this declaration with `DW_TAG_atomic_type`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub source_atomic: bool,
     #[serde(default)]
     pub size_bits: Option<u64>,
     #[serde(default)]
@@ -462,6 +465,7 @@ impl Default for Global {
             is_definition: true,
             linkage: SymbolLinkage::External,
             type_spelling: None,
+            source_atomic: false,
             size_bits: None,
             align_bits: None,
             path_error: None,
@@ -777,11 +781,6 @@ pub struct LoweringStats {
     /// operands from `Func::body`.
     #[serde(default, skip_serializing)]
     pub rewrite_global_refs: BTreeMap<String, Vec<String>>,
-    /// Trusted, in-process evidence for a narrow scalar-PHI RMW shape recognized while the LLVM
-    /// CFG and SSA edge identities are still available.  Serialized and hand-written PIR must
-    /// fail closed rather than asserting this proof.
-    #[serde(default, skip)]
-    pub scalar_phi_rmw: BTreeMap<String, ScalarPhiRmwEvidence>,
     #[serde(default)]
     pub functions: u64,
     #[serde(default)]
@@ -811,14 +810,6 @@ pub struct LoweringStats {
     /// PIR fixtures may still deserialize this field.
     #[serde(default, skip_serializing)]
     pub statement_cfgs: BTreeMap<String, StatementCfg>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScalarPhiRmwEvidence {
-    /// The direct global whose current value reaches every incoming edge of the scalar PHI.
-    pub global: String,
-    /// A source-mapped direct load on one PHI arm, used as the Ref half of the source RMW recipe.
-    pub reference: String,
 }
 
 /// Source-oriented CFG for one defined function. Each node is the boundary immediately before

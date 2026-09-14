@@ -895,3 +895,20 @@ differentials for the four output-changing modules plus mbedx509, Cairo, Surpris
 pass. The optimization therefore clears the demonstrated copy-fanout promotion blocker without
 changing C's precision result. Full commands, hashes, counters, timing samples, and caveats are in
 `ju_out/per_read_overlap_hubs_20260908/REPORT.md`.
+
+### Atomic disposition becomes source-declaration reflection (2026-09-14)
+
+Atomic selection no longer attempts to discover ordinary scalar globals that could be
+rewritten as atomics. A separate upstream source-to-source transform now owns that
+decision and rewrites declarations and accesses before PANGS runs. PANGS reads only the
+recovered source atomic qualifier (`DW_TAG_atomic_type`) and emits the evidenced
+`atomic_declaration` fact; it does not infer atomicity from IR instructions or consult
+PIR/PAG access semantics, width, escape, access completeness, or violation taint.
+
+Manifest schema v7 removes `atomic_eligibility`, its ordinary/signal recipes, and the
+atomic-only `word_sized_scalar` fact. The old D3 access/RMW and signal-flag machinery and
+assumptions ledger entry are removed, along with the now-unused API `atomic_rmw` field
+and LLVM scalar-PHI RMW recognizer. Source atomics cannot be relabeled by another
+strategy or fabricated by an accepted-risk override; if `atomic` is omitted from the
+cascade they remain `unhandled`. Atomic measurements now count declared/non-declared
+source types, while the existing D4 mutex funnel remains under `would_be_eligibility`.

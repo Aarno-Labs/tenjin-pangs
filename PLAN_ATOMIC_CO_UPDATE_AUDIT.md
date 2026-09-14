@@ -1,6 +1,6 @@
 # Atomic Co-Update Runtime Audit Plan
 
-Status: retired 2026-07-17.
+Status: retired 2026-07-17; atomic eligibility analysis removed 2026-09-14.
 
 The proposed co-update audit is not part of atomic eligibility or production
 materialization. PANGS preserves defined C behavior; it does not promise to preserve
@@ -21,10 +21,9 @@ report imposed an additional race-hardening policy rather than defined-behavior
 preservation. Its complexity and false negatives are not justified by the project
 contract.
 
-D3 remains fail-closed on per-global representation requirements: complete and
-classifiable accesses, compatible scalar width and alignment, no incompatible
-address use or external ABI access, relevant violation checks, supported RMW
-lowering, and target-lock-free signal access where required.
+The later upstream atomic source transform made even those D3 representation checks
+obsolete in PANGS. Current atomic disposition reflects an existing source atomic
+declaration and performs no IR/PIR/PAG semantic eligibility analysis.
 
 Coupling remains relevant only when a strategy creates a joint runtime object or
 changes joint publication, such as `OnceLock<Struct>` or `Mutex<Struct>`.

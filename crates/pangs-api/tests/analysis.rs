@@ -2250,7 +2250,6 @@ fn direct_constant_gep_global_write_survives_solver_fact_merge() {
                     address: "i8* getelementptr inbounds ([2 x i8], [2 x i8]* @G, i64 0, i64 1)"
                         .to_string(),
                     value: "0".to_string(),
-                    volatile: false,
                     access_bytes: Some(1),
                     loc: None,
                 },
@@ -2904,14 +2903,12 @@ fn vararg_audit_taxonomy_splits_callsite_shape_without_changing_taint() {
                     Stmt::Load {
                         dest: "%read_only_sink::tail".to_string(),
                         address: "%read_only_sink::decay".to_string(),
-                        volatile: false,
                         access_bytes: Some(8),
                         loc: None,
                     },
                     Stmt::Load {
                         dest: "%read_only_sink::byte".to_string(),
                         address: "%read_only_sink::tail".to_string(),
-                        volatile: false,
                         access_bytes: Some(1),
                         loc: None,
                     },
@@ -3938,7 +3935,6 @@ fn canonical_null_store_retains_modref_rows_in_pointer_stages() {
                 Stmt::Store {
                     address: "%cell".into(),
                     value: "null".into(),
-                    volatile: false,
                     access_bytes: Some(8),
                     loc: Some(pangs_pir::Loc {
                         file: "null-store.c".into(),

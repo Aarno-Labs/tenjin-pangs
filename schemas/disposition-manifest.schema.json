@@ -4,7 +4,7 @@
   "type": "object",
   "required": ["schema_version", "run", "globals", "synthetic_globals", "unkeyed_globals", "coupling_groups"],
   "properties": {
-    "schema_version": { "const": 6 },
+    "schema_version": { "const": 7 },
     "run": { "$ref": "#/definitions/run" },
     "globals": {
       "type": "array",
@@ -136,34 +136,6 @@
         }
       ]
     },
-    "word_sized_scalar": {
-      "oneOf": [
-        {
-          "type": "object",
-          "required": ["value"],
-          "properties": { "value": { "const": false } },
-          "not": {
-            "anyOf": [
-              { "required": ["type_spelling"] }, { "required": ["size_bits"] },
-              { "required": ["class"] }, { "required": ["signed"] }
-            ]
-          },
-          "additionalProperties": true
-        },
-        {
-          "type": "object",
-          "required": ["value", "type_spelling", "size_bits", "class"],
-          "properties": {
-            "value": { "const": true },
-            "type_spelling": { "type": "string" },
-            "size_bits": { "type": "integer", "minimum": 1 },
-            "class": { "enum": ["integer", "boolean", "enum", "pointer"] },
-            "signed": { "type": "boolean" }
-          },
-          "additionalProperties": true
-        }
-      ]
-    },
     "certificate": {
       "oneOf": [
         {
@@ -218,8 +190,8 @@
       "type": "object",
       "required": [
         "written", "omega_escaped_address", "violation_taint", "thread_visible",
-        "signal_context_access", "access_set_complete", "word_sized_scalar",
-        "phase_stationarity", "atomic_eligibility", "mutex_eligibility",
+        "signal_context_access", "access_set_complete", "atomic_declaration",
+        "phase_stationarity", "mutex_eligibility",
         "coupling_group", "localization"
       ],
       "properties": {
@@ -229,9 +201,8 @@
         "thread_visible": { "$ref": "#/definitions/evidenced_bool_true" },
         "signal_context_access": { "$ref": "#/definitions/evidenced_bool_true" },
         "access_set_complete": { "$ref": "#/definitions/evidenced_bool_false" },
-        "word_sized_scalar": { "$ref": "#/definitions/word_sized_scalar" },
+        "atomic_declaration": { "$ref": "#/definitions/evidenced_bool_true" },
         "phase_stationarity": { "$ref": "#/definitions/certificate_slot" },
-        "atomic_eligibility": { "$ref": "#/definitions/certificate_slot" },
         "mutex_eligibility": { "$ref": "#/definitions/certificate_slot" },
         "coupling_group": { "type": ["string", "null"] },
         "localization": { "$ref": "#/definitions/localization" },

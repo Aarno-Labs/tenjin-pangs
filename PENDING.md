@@ -315,7 +315,8 @@ knob is a later decision requiring soak evidence; it is not part of this evaluat
   For the other strategies, DISPOSITION.md:60 requires more:
 
   - once-lock needs writer/read information and publication reasoning.
-  - atomic needs complete access sites and valid lowering recipes.
+  - atomic no longer depends on this proof: it reflects an atomic declaration created by
+    the upstream source-to-source transform.
   - mutex additionally needs call-graph reentrancy checks.
   - localize still needs sound rewrite-boundary and call-graph information.
 

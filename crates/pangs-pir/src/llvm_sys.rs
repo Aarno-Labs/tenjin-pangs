@@ -21,9 +21,8 @@ use llvm_sys::{
 use crate::knobs::{CONSTANT_EXPR_RECURSION_LIMIT, DEBUG_TYPE_RECURSION_LIMIT};
 use crate::{
     AbiClass, Access, Func, GepLane, Global, IntToPtrProvenanceTrace, Loc, LoweringStats, Param,
-    Pir, PirError, ScalarPhiRmwEvidence, ScalarTypeClass, ScalarTypeEvidence, Signature,
-    StatementBoundary, StatementCfg, Stmt, SymbolLinkage, TargetInfo, TypeQualifiers, ValueKind,
-    VarArgPosition,
+    Pir, PirError, ScalarTypeClass, Signature, StatementBoundary, StatementCfg, Stmt,
+    SymbolLinkage, TargetInfo, ValueKind, VarArgPosition,
 };
 
 mod ptrint;
@@ -256,8 +255,7 @@ impl FunctionCtx {
                 return key;
             }
             // LLVMConstIntGetSExtValue aborts for values whose significant bits do not
-            // fit in i64. Wide integers cannot be D3 atomics on current targets, but
-            // scalar lowering must still retain them without crashing.
+            // fit in i64, but scalar lowering must still retain them without crashing.
             let key = value_string(value);
             self.note_kind(&key, ValueKind::NonPointer);
             return key;
@@ -381,6 +379,7 @@ unsafe fn lower_module(module: LLVMModuleRef, repo_roots: Option<&RepoRoots>) ->
                 is_definition: LLVMIsDeclaration(*global) == 0,
                 linkage: symbol_linkage(LLVMGetLinkage(*global)),
                 type_spelling: debug.as_ref().and_then(|debug| debug.type_spelling.clone()),
+                source_atomic: debug.as_ref().is_some_and(|debug| debug.source_atomic),
                 size_bits: Some(LLVMABISizeOfType(ctx.data_layout, ty).saturating_mul(8)),
                 align_bits: Some(
                     u64::from(LLVMABIAlignmentOfType(ctx.data_layout, ty)).saturating_mul(8),
@@ -443,6 +442,7 @@ struct GlobalDebugInfo {
     file: Option<String>,
     line: Option<u32>,
     type_spelling: Option<String>,
+    source_atomic: bool,
     path_error: Option<String>,
     scalar_class: Option<ScalarTypeClass>,
     signed: Option<bool>,
@@ -484,13 +484,24 @@ unsafe fn global_debug_info(
         };
         let path_error = (file.is_none() && repo_roots.is_some()).then(|| raw_file.clone());
         let line = LLVMDIVariableGetLine(variable);
-        let (type_spelling, scalar_class, signed) = metadata_operand(context, variable, 3)
-            .map(|ty| di_type_details(context, ty))
-            .unwrap_or((None, None, None));
+        let source_type =
+            metadata_operand(context, variable, 3).and_then(|ty| source_type_details(context, ty));
+        let (type_spelling, scalar_class, signed, source_atomic) = source_type
+            .as_ref()
+            .map(|details| {
+                (
+                    details.type_spelling.clone(),
+                    details.class,
+                    details.signed,
+                    details.atomic,
+                )
+            })
+            .unwrap_or((None, None, None, false));
         result = Some(GlobalDebugInfo {
             file,
             line: (line != 0).then_some(line),
             type_spelling,
+            source_atomic,
             path_error,
             scalar_class,
             signed,
@@ -535,51 +546,101 @@ unsafe fn di_type_name(metadata: LLVMMetadataRef) -> Option<String> {
     })
 }
 
-unsafe fn di_type_details(
-    context: LLVMContextRef,
-    metadata: LLVMMetadataRef,
-) -> (Option<String>, Option<ScalarTypeClass>, Option<bool>) {
-    let name = di_type_name(metadata);
-    let (class, signed) = di_type_class(context, metadata, 0);
-    (name, class, signed)
+struct SourceTypeDetails {
+    type_spelling: Option<String>,
+    class: Option<ScalarTypeClass>,
+    signed: Option<bool>,
+    atomic: bool,
 }
 
-unsafe fn di_type_class(
+unsafe fn source_type_details(
+    context: LLVMContextRef,
+    metadata: LLVMMetadataRef,
+) -> Option<SourceTypeDetails> {
+    let mut first_typedef = None;
+    let mut atomic = false;
+    let mut visited = BTreeSet::new();
+    let (terminal_name, class, signed) = walk_scalar_type(
+        context,
+        metadata,
+        0,
+        &mut visited,
+        &mut first_typedef,
+        &mut atomic,
+    )?;
+    Some(SourceTypeDetails {
+        type_spelling: first_typedef.or(terminal_name),
+        class,
+        signed,
+        atomic,
+    })
+}
+
+unsafe fn walk_scalar_type(
     context: LLVMContextRef,
     metadata: LLVMMetadataRef,
     depth: usize,
-) -> (Option<ScalarTypeClass>, Option<bool>) {
-    if depth >= DEBUG_TYPE_RECURSION_LIMIT {
-        return (None, None);
+    visited: &mut BTreeSet<usize>,
+    first_typedef: &mut Option<String>,
+    atomic: &mut bool,
+) -> Option<(Option<String>, Option<ScalarTypeClass>, Option<bool>)> {
+    if depth >= DEBUG_TYPE_RECURSION_LIMIT || !visited.insert(metadata as usize) {
+        return None;
     }
     let printed = value_string(LLVMMetadataAsValue(context, metadata));
-    match LLVMGetMetadataKind(metadata) {
+    let result = match LLVMGetMetadataKind(metadata) {
         LLVMMetadataKind::LLVMDIBasicTypeMetadataKind if printed.contains("DW_ATE_boolean") => {
-            (Some(ScalarTypeClass::Boolean), None)
+            Some((di_type_name(metadata), Some(ScalarTypeClass::Boolean), None))
         }
         LLVMMetadataKind::LLVMDIBasicTypeMetadataKind if printed.contains("DW_ATE_unsigned") => {
-            (Some(ScalarTypeClass::Integer), Some(false))
+            Some((
+                di_type_name(metadata),
+                Some(ScalarTypeClass::Integer),
+                Some(false),
+            ))
         }
         LLVMMetadataKind::LLVMDIBasicTypeMetadataKind if printed.contains("DW_ATE_signed") => {
-            (Some(ScalarTypeClass::Integer), Some(true))
+            Some((
+                di_type_name(metadata),
+                Some(ScalarTypeClass::Integer),
+                Some(true),
+            ))
         }
+        LLVMMetadataKind::LLVMDIBasicTypeMetadataKind => Some((di_type_name(metadata), None, None)),
         LLVMMetadataKind::LLVMDICompositeTypeMetadataKind
             if printed.contains("DW_TAG_enumeration_type") =>
         {
             let signed = metadata_operand(context, metadata, 3)
-                .and_then(|base| di_type_class(context, base, depth + 1).1);
-            (Some(ScalarTypeClass::Enum), signed)
+                .and_then(|base| {
+                    walk_scalar_type(context, base, depth + 1, visited, first_typedef, atomic)
+                })
+                .and_then(|(_, _, signed)| signed);
+            Some((di_type_name(metadata), Some(ScalarTypeClass::Enum), signed))
         }
         LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind
             if printed.contains("DW_TAG_pointer_type") =>
         {
-            (Some(ScalarTypeClass::Pointer), None)
+            Some((di_type_name(metadata), Some(ScalarTypeClass::Pointer), None))
         }
-        LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind => metadata_operand(context, metadata, 3)
-            .map(|base| di_type_class(context, base, depth + 1))
-            .unwrap_or((None, None)),
-        _ => (None, None),
-    }
+        LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind => {
+            if printed.contains("DW_TAG_typedef") {
+                if first_typedef.is_none() {
+                    *first_typedef = di_type_name(metadata);
+                }
+            } else if printed.contains("DW_TAG_atomic_type") {
+                *atomic = true;
+            }
+            metadata_operand(context, metadata, 3).and_then(|base| {
+                walk_scalar_type(context, base, depth + 1, visited, first_typedef, atomic)
+            })
+        }
+        LLVMMetadataKind::LLVMDICompositeTypeMetadataKind => {
+            Some((di_type_name(metadata), None, None))
+        }
+        _ => None,
+    };
+    visited.remove(&(metadata as usize));
+    result
 }
 
 unsafe fn di_file_path(file: LLVMMetadataRef) -> Option<String> {
@@ -1967,7 +2028,7 @@ unsafe fn lower_instruction(
         LLVMOpcode::LLVMCall => lower_call(ctx, fctx, inst, body, lowering),
         LLVMOpcode::LLVMInvoke => lower_invoke(ctx, fctx, inst, body, lowering),
         LLVMOpcode::LLVMCallBr => lower_callbr(ctx, fctx, inst, body, lowering),
-        LLVMOpcode::LLVMPHI => lower_phi(ctx, fctx, inst, body, lowering),
+        LLVMOpcode::LLVMPHI => lower_phi(fctx, inst, body, lowering),
         LLVMOpcode::LLVMSelect => lower_select(fctx, inst, body, lowering),
         LLVMOpcode::LLVMFreeze => lower_freeze(fctx, inst, body, lowering),
         LLVMOpcode::LLVMExtractElement => lower_extract_element(fctx, inst, body, lowering),
@@ -2171,7 +2232,6 @@ unsafe fn lower_ifunc_call(
 }
 
 unsafe fn lower_phi(
-    ctx: &ModuleCtx,
     fctx: &mut FunctionCtx,
     inst: LLVMValueRef,
     body: &mut Vec<Stmt>,
@@ -2192,13 +2252,6 @@ unsafe fn lower_phi(
     {
         lowering.bump_tainted("phi_pointer_operand_non_pointer_result");
     } else {
-        if let Some((global, reference)) = recognize_scalar_phi_rmw(ctx, inst) {
-            let dest = fctx.local_key(inst);
-            let reference = fctx.operand_key(reference);
-            lowering
-                .scalar_phi_rmw
-                .insert(dest, ScalarPhiRmwEvidence { global, reference });
-        }
         lowering.bump_skipped("phi_non_pointer");
     }
     bump_missing_loc(lowering, "phi", inst);
@@ -2214,304 +2267,6 @@ unsafe fn lower_phi(
 /// This proof deliberately stays in LLVM lowering, where PHI incoming blocks and verified SSA
 /// dominance are available.  Only the representative direct load is retained for the later PIR
 /// access-recipe recognizer; arbitrary scalar PHIs remain unsupported.
-unsafe fn recognize_scalar_phi_rmw(
-    ctx: &ModuleCtx,
-    phi: LLVMValueRef,
-) -> Option<(String, LLVMValueRef)> {
-    if LLVMCountIncoming(phi) != 2 {
-        return None;
-    }
-
-    let mut candidates = Vec::new();
-    let mut phi_use = LLVMGetFirstUse(phi);
-    while !phi_use.is_null() {
-        let operation = LLVMGetUser(phi_use);
-        if !scalar_operation_uses_current_value(operation, phi) {
-            phi_use = LLVMGetNextUse(phi_use);
-            continue;
-        }
-
-        let mut operation_use = LLVMGetFirstUse(operation);
-        while !operation_use.is_null() {
-            let store = LLVMGetUser(operation_use);
-            if !LLVMIsAInstruction(store).is_null()
-                && LLVMGetInstructionOpcode(store) == LLVMOpcode::LLVMStore
-                && LLVMGetOperand(store, 0) == operation
-            {
-                let address = LLVMGetOperand(store, 1);
-                if let Some(global) = direct_global_operand_name(ctx, address) {
-                    let phi_block = LLVMGetInstructionParent(phi);
-                    if LLVMGetInstructionParent(operation) != phi_block
-                        || LLVMGetInstructionParent(store) != phi_block
-                        || !block_range_preserves_global(
-                            ctx,
-                            LLVMGetNextInstruction(phi),
-                            operation,
-                            &global,
-                        )
-                        || !block_range_preserves_global(
-                            ctx,
-                            LLVMGetNextInstruction(operation),
-                            store,
-                            &global,
-                        )
-                    {
-                        operation_use = LLVMGetNextUse(operation_use);
-                        continue;
-                    }
-                    if let Some(reference) =
-                        scalar_phi_current_global_reference(ctx, phi, store, &global)
-                    {
-                        candidates.push((global, reference));
-                    }
-                }
-            }
-            operation_use = LLVMGetNextUse(operation_use);
-        }
-        phi_use = LLVMGetNextUse(phi_use);
-    }
-
-    candidates.sort_by_key(|(global, reference)| (global.clone(), *reference as usize));
-    candidates.dedup_by_key(|(global, reference)| (global.clone(), *reference as usize));
-    (candidates.len() == 1).then(|| candidates.pop().unwrap())
-}
-
-unsafe fn scalar_operation_uses_current_value(
-    operation: LLVMValueRef,
-    current: LLVMValueRef,
-) -> bool {
-    if LLVMIsAInstruction(operation).is_null() {
-        return false;
-    }
-    match LLVMGetInstructionOpcode(operation) {
-        LLVMOpcode::LLVMSub => LLVMGetOperand(operation, 0) == current,
-        LLVMOpcode::LLVMAdd | LLVMOpcode::LLVMAnd | LLVMOpcode::LLVMOr | LLVMOpcode::LLVMXor => {
-            LLVMGetOperand(operation, 0) == current || LLVMGetOperand(operation, 1) == current
-        }
-        _ => false,
-    }
-}
-
-unsafe fn scalar_phi_current_global_reference(
-    ctx: &ModuleCtx,
-    phi: LLVMValueRef,
-    final_store: LLVMValueRef,
-    global: &str,
-) -> Option<LLVMValueRef> {
-    let mut direct_reference = None;
-    let mut stored_arm = false;
-
-    for index in 0..LLVMCountIncoming(phi) {
-        let value = LLVMGetIncomingValue(phi, index);
-        let incoming_block = LLVMGetIncomingBlock(phi, index);
-        if scalar_phi_direct_load_arm(ctx, value, incoming_block, final_store, global) {
-            if direct_reference.replace(value).is_some() {
-                return None;
-            }
-        } else if scalar_phi_stored_rmw_arm(ctx, value, incoming_block, global) {
-            if stored_arm {
-                return None;
-            }
-            stored_arm = true;
-        } else {
-            return None;
-        }
-    }
-
-    if stored_arm {
-        direct_reference
-    } else {
-        None
-    }
-}
-
-unsafe fn scalar_phi_direct_load_arm(
-    ctx: &ModuleCtx,
-    value: LLVMValueRef,
-    incoming_block: LLVMBasicBlockRef,
-    final_store: LLVMValueRef,
-    global: &str,
-) -> bool {
-    !LLVMIsAInstruction(value).is_null()
-        && LLVMGetInstructionOpcode(value) == LLVMOpcode::LLVMLoad
-        && LLVMGetInstructionParent(value) == incoming_block
-        && direct_global_operand_name(ctx, LLVMGetOperand(value, 0)).as_deref() == Some(global)
-        && loc(value).is_some()
-        && loc(value) == loc(final_store)
-        && block_tail_preserves_global(ctx, LLVMGetNextInstruction(value), global)
-}
-
-unsafe fn scalar_phi_stored_rmw_arm(
-    ctx: &ModuleCtx,
-    value: LLVMValueRef,
-    incoming_block: LLVMBasicBlockRef,
-    global: &str,
-) -> bool {
-    if LLVMIsAInstruction(value).is_null() {
-        return false;
-    }
-    let loaded = match LLVMGetInstructionOpcode(value) {
-        LLVMOpcode::LLVMSub => scalar_direct_global_load(ctx, LLVMGetOperand(value, 0), global),
-        LLVMOpcode::LLVMAdd | LLVMOpcode::LLVMAnd | LLVMOpcode::LLVMOr | LLVMOpcode::LLVMXor => {
-            scalar_direct_global_load(ctx, LLVMGetOperand(value, 0), global)
-                .or_else(|| scalar_direct_global_load(ctx, LLVMGetOperand(value, 1), global))
-        }
-        _ => None,
-    };
-    let Some(loaded) = loaded else {
-        return false;
-    };
-    let value_block = LLVMGetInstructionParent(value);
-    if LLVMGetInstructionParent(loaded) != value_block
-        || !block_range_preserves_global(ctx, LLVMGetNextInstruction(loaded), value, global)
-    {
-        return false;
-    }
-
-    let store = next_non_debug_instruction(LLVMGetNextInstruction(value));
-    if store.is_null()
-        || LLVMGetInstructionOpcode(store) != LLVMOpcode::LLVMStore
-        || LLVMGetOperand(store, 0) != value
-        || direct_global_operand_name(ctx, LLVMGetOperand(store, 1)).as_deref() != Some(global)
-        || loc(value) != loc(store)
-    {
-        return false;
-    }
-
-    unique_predecessor_path_preserves_global(ctx, store, incoming_block, global)
-}
-
-unsafe fn scalar_direct_global_load(
-    ctx: &ModuleCtx,
-    value: LLVMValueRef,
-    global: &str,
-) -> Option<LLVMValueRef> {
-    (!LLVMIsAInstruction(value).is_null()
-        && LLVMGetInstructionOpcode(value) == LLVMOpcode::LLVMLoad
-        && direct_global_operand_name(ctx, LLVMGetOperand(value, 0)).as_deref() == Some(global))
-    .then_some(value)
-}
-
-unsafe fn direct_global_operand_name(ctx: &ModuleCtx, value: LLVMValueRef) -> Option<String> {
-    if LLVMIsAGlobalVariable(value).is_null() {
-        return None;
-    }
-    resolve_global_name(ctx, &value_name(value))
-}
-
-unsafe fn unique_predecessor_path_preserves_global(
-    ctx: &ModuleCtx,
-    store: LLVMValueRef,
-    incoming_block: LLVMBasicBlockRef,
-    global: &str,
-) -> bool {
-    let store_block = LLVMGetInstructionParent(store);
-    if !block_tail_preserves_global(ctx, LLVMGetNextInstruction(store), global) {
-        return false;
-    }
-
-    let function = LLVMGetBasicBlockParent(store_block);
-    let mut path = Vec::new();
-    let mut current = incoming_block;
-    let mut seen = BTreeSet::new();
-    while current != store_block {
-        if current.is_null() || !seen.insert(current as usize) {
-            return false;
-        }
-        path.push(current);
-        let predecessors = basic_block_predecessors(function, current);
-        if predecessors.len() != 1 {
-            return false;
-        }
-        current = predecessors[0];
-    }
-
-    path.into_iter()
-        .all(|block| block_tail_preserves_global(ctx, LLVMGetFirstInstruction(block), global))
-}
-
-unsafe fn basic_block_predecessors(
-    function: LLVMValueRef,
-    target: LLVMBasicBlockRef,
-) -> Vec<LLVMBasicBlockRef> {
-    let mut out = Vec::new();
-    let mut block = LLVMGetFirstBasicBlock(function);
-    while !block.is_null() {
-        let terminator = LLVMGetBasicBlockTerminator(block);
-        if !terminator.is_null()
-            && (0..LLVMGetNumSuccessors(terminator))
-                .any(|index| LLVMGetSuccessor(terminator, index) == target)
-        {
-            out.push(block);
-        }
-        block = LLVMGetNextBasicBlock(block);
-    }
-    out
-}
-
-unsafe fn block_range_preserves_global(
-    ctx: &ModuleCtx,
-    mut instruction: LLVMValueRef,
-    end: LLVMValueRef,
-    global: &str,
-) -> bool {
-    while !instruction.is_null() && instruction != end {
-        if instruction_may_write_global(ctx, instruction, global) {
-            return false;
-        }
-        instruction = LLVMGetNextInstruction(instruction);
-    }
-    instruction == end
-}
-
-unsafe fn block_tail_preserves_global(
-    ctx: &ModuleCtx,
-    mut instruction: LLVMValueRef,
-    global: &str,
-) -> bool {
-    while !instruction.is_null() {
-        if instruction_may_write_global(ctx, instruction, global) {
-            return false;
-        }
-        instruction = LLVMGetNextInstruction(instruction);
-    }
-    true
-}
-
-unsafe fn instruction_may_write_global(
-    ctx: &ModuleCtx,
-    instruction: LLVMValueRef,
-    global: &str,
-) -> bool {
-    match LLVMGetInstructionOpcode(instruction) {
-        LLVMOpcode::LLVMStore => direct_global_operand_name(ctx, LLVMGetOperand(instruction, 1))
-            .as_deref()
-            .is_none_or(|written| written == global),
-        LLVMOpcode::LLVMAtomicRMW | LLVMOpcode::LLVMAtomicCmpXchg => {
-            direct_global_operand_name(ctx, LLVMGetOperand(instruction, 0))
-                .as_deref()
-                .is_none_or(|written| written == global)
-        }
-        LLVMOpcode::LLVMCall | LLVMOpcode::LLVMInvoke | LLVMOpcode::LLVMCallBr => {
-            !direct_symbol_name(LLVMGetCalledValue(instruction))
-                .is_some_and(|callee| callee.starts_with("llvm.dbg."))
-        }
-        LLVMOpcode::LLVMVAArg => true,
-        _ => false,
-    }
-}
-
-unsafe fn next_non_debug_instruction(mut instruction: LLVMValueRef) -> LLVMValueRef {
-    while !instruction.is_null()
-        && LLVMGetInstructionOpcode(instruction) == LLVMOpcode::LLVMCall
-        && direct_symbol_name(LLVMGetCalledValue(instruction))
-            .is_some_and(|callee| callee.starts_with("llvm.dbg."))
-    {
-        instruction = LLVMGetNextInstruction(instruction);
-    }
-    instruction
-}
-
 unsafe fn lower_select(
     fctx: &mut FunctionCtx,
     inst: LLVMValueRef,
