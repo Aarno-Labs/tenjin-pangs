@@ -10,23 +10,16 @@ It also enumerates the required amendments to the other documents (§8).*
 
 ## 0. Thesis: facts are computed, dispositions are chosen
 
-The original architecture had one client (localization of all mutable globals, as a C→C
-refactoring) and one carve-out (`ONCELOCK.md`, consumed subtractively as an exemption
-list). The purview is now:
-
 | Disposition | Rust shape | Consumed by |
 |---|---|---|
 | `immutable` | `static G: T` | Rust-side rewriter |
-| `once-lock` | `static G: OnceLock<T>` (`ONCELOCK.md`) | Rust-side rewriter |
-| `atomic` | pre-existing source atomic type, preserved as `AtomicI32` etc. | Rust-side rewriter |
+| `once-lock` | `static G: OnceLock<T>` (`ONCELOCK.md`) | Rust-side rewriter (future) |
+| `atomic` | pre-existing source atomic type, preserved as `AtomicI32` etc. | nobody; for debugging |
 | `mutex` | `static G: Mutex<T>` | Rust-side rewriter (future) |
 | `localize` | field of the threaded context struct | C→C localization tool |
 | `unhandled` | left as-is (`static mut` + unsafe, or manual) | nobody; reported |
 
-Exemption-chaining does not scale to this set: an atomic declaration can also have mutex
-facts; an override can contradict a certificate; `localize` applies only to applications
-while `atomic`/`mutex` also serve libraries. The structural fix is a
-strict two-layer split:
+Our design maintains a strict two-layer split:
 
 - **Facts** — objective, per-global, produced by analysis post-passes, never mention
   dispositions. "Phase-stationary with certificate C", "access set complete",
@@ -36,20 +29,6 @@ strict two-layer split:
   vector through a preference cascade (§1), applies user overrides (§4), resolves
   coupling-group constraints (§6), and records the final disposition *with provenance*
   in the manifest.
-
-Consequences worth making explicit:
-
-1. Clients consume **the disposition assignment**, never each other's exemption lists.
-   The localization tool no longer knows or cares *why* a global is exempt.
-2. Failure codes stop being terminal. `ONCELOCK.md`'s `never-quiescent` is routing input
-   for later analysis-backed strategies rather than an immediate localization verdict.
-3. Adding an analysis-backed strategy means adding a fact-producing post-pass, a cascade
-   entry, and a rewriter. Atomic is the deliberate exception: its upstream source transform
-   has already made the decision, so PANGS only reflects the resulting declaration.
-
-The analysis core (A′–D′, Ω, the materialized solution) is untouched by all of this.
-Analysis-derived facts are phase-F scans over the materialized result; atomic declaration
-is the explicit source-metadata exception described next.
 
 ### 0.1 Upstream atomic contract
 
@@ -74,9 +53,7 @@ The policy stage assigns each client-relevant global the **first applicable** en
 ```
 
 `atomic_declaration: true` also makes every representation-changing strategy
-inapplicable. Thus a configured cascade that omits `atomic` leaves an existing source
-atomic `unhandled`; it never converts or relabels it as immutable, once-lock, mutex, or
-localized storage.
+inapplicable. 
 
 `once-lock` and `mutex` are temporarily omitted from this automatic default. Their analysis
 passes, facts, certificates, group support, schema variants, and override machinery remain in
@@ -101,14 +78,13 @@ Rationale for the full order when all strategies are explicitly enabled: **prefe
 applicable strategy that encodes the strongest verified property in the Rust type system.**
 `immutable` makes illegal writes
 unrepresentable; `once-lock` makes re-initialization a loud panic and needs no
-per-access synchronization reasoning; `atomic` preserves a representation already selected
-by the upstream transform; `mutex` is the general fallback with runtime cost
+per-access synchronization reasoning; `mutex` is the general fallback with runtime cost
 and deadlock surface; `localize` is the most invasive rewrite.
 
 The order is a **preference list over independent applicability predicates**, not a
 proof lattice. A certificate for one strategy never implies support for a later
-strategy: for example, phase-stationarity does not prove mutex reentrancy safety, and
-neither property determines whether the input declaration is atomic. "First applicable" is sound because every
+strategy: for example, phase-stationarity does not prove mutex reentrancy safety.
+"First applicable" is sound because every
 entry evaluates its own guard; order affects preference only.
 
 Violation taint gates the three analysis-derived access-property strategies: every
@@ -150,8 +126,7 @@ manifest header so a run is reproducible from its output.
 `DESIGN.md` §4F's lattice (`never-written → stationary → thread-confined → shared`) was
 a single client's verdict. The new strategies key off **orthogonal** combinations —
 phase-stationarity is independent of thread-visibility (a phase-stationary global read
-by threads is precisely the OnceLock case); the atomic declaration fact is source-owned
-and independent of both.
+by threads is precisely the OnceLock case).
 The internal representation becomes a vector of independent facts; the lattice survives
 only as a derived reporting summary.
 
@@ -161,7 +136,7 @@ Per-global facts, with producers:
 |---|---|---|---|
 | `written` | evidenced bool, *may-runtime-written* semantics; static initializer stores are excluded (witness when true: a runtime write site, or the external escape that prevents ruling writes out — `DISPOSITION_PLAN.md` §1.9) | F runtime `writers(o)` scan | implemented |
 | `omega_escaped_address` | evidenced bool (witness when true: the escape site) | Ω machinery | implemented |
-| `violation_taint` | evidenced bool (witness when true: an address-relevant, access-shape-relevant, or unresolved violation finding) — gates `immutable`, `once-lock`, and `mutex`; `atomic` is source-owned; `localize` filters the complete `violation_relevance` list by the single exempt kind in §1; value-only/unrelated findings remain diagnostics | A′ relevance routing | implemented |
+| `violation_taint` | evidenced bool (witness when true: an address-relevant, access-shape-relevant, or unresolved violation finding) — gates `immutable`, `once-lock`, and `mutex`; `localize` filters the complete `violation_relevance` list by the single exempt kind in §1; value-only/unrelated findings remain diagnostics | A′ relevance routing | implemented |
 | `thread_visible` | evidenced bool (true iff reachable from any spawn-entry's TransRef/TransMod; witness when true: the spawn site) — **reporting fact, not a guard**: thread visibility alone defeats no strategy (thread readers are a primary OnceLock use case; the thread-*writer* kill rule lives inside the phase-stationarity certificate) | F scan over spawn sites | implemented |
 | `signal_context_access` | evidenced bool (true iff accessed under a registered signal handler; witness when true: registration site + accessing function) | F scan over Ω escape sites of handlers | implemented |
 | `access_set_complete` | evidenced bool (true iff analysis bounds every possible accessor; **witness when false**: module-wide Ω, an address escape not closed by the shared external-call contract, or library name reachability) | F scan | implemented; gates phase stationarity, D4, and localization; bounded indirect/rewrite compatibility is diagnosed separately for D4 |
@@ -173,17 +148,6 @@ Per-global facts, with producers:
 
 Rule of construction: every fact is either source metadata or derivable from the
 materialized solution in one scan. Nothing here re-enters the solver.
-
-The concrete JSON/Rust encodings of these types — the evidenced-bool object and its
-per-fact evidenced polarity, witness records, the certificate-slot union, the
-localization verdict, and cascade skip reasons — are fixed in `DISPOSITION_PLAN.md`
-§1.5 and are part of what D1a's golden test freezes. Schema v3 made unknown mod/ref
-candidate scope explicit so an abbreviated finite set could not be mistaken for
-module-wide Ω; schema v4 adds owner storage closures and the auxiliary synthetic-global
-inventory. Schema v7 removes the old atomic eligibility/recipe contract and its
-`word_sized_scalar` support fact, replacing both with the source-owned
-`atomic_declaration` fact. Exact-version matching remains required at
-manifest-preserving boundaries.
 
 ## 3. The manifest
 
@@ -522,7 +486,7 @@ pangs_disposition_atomic__src_state_c__g_stats__ab12cd34();
 Cardinality and linkage rules (validated by the `pangs-manifest` inventory helper, D5):
 
 - Marker kinds are exactly two: `publish` (once-lock publication point) and
-  `disposition_<strategy>` (definition site, for `immutable`/`atomic`/`mutex`).
+  `disposition_<strategy>` (definition site, for `once-lock` and `mutex`).
 - A `once-lock` global gets **exactly one publication marker and no definition
   marker**: the ONCELOCK certificate names a single publication point P — multiple
   publication points are unsupported in v1 (that program shape fails certification as
@@ -532,9 +496,6 @@ Cardinality and linkage rules (validated by the `pangs-manifest` inventory helpe
   (e.g. `pangs_publish__grp_cmd__<hash8>`; the group id occupies the mangled-key slot
   of the `DISPOSITION_PLAN.md` §1.2 grammar). The inventory maps *every member key* to
   that one symbol via the `group` field.
-- `immutable`/`atomic`/`mutex` globals get exactly one definition-site marker whose
-  embedded strategy must match the manifest disposition; `localize`/`unhandled`
-  globals get no markers. No global carries more than one marker.
 - Inventory validation: one `publish` row per once-lock global (shared symbol across a
   group's rows); strategy match on every `disposition_*` row; no rows for
   `localize`/`unhandled`; no marker symbol under two keys except group-shared
@@ -556,7 +517,8 @@ Cardinality and linkage rules (validated by the `pangs-manifest` inventory helpe
 |---|---|
 | `localize` | full localization rewrite (unchanged from `DESIGN.md` §7) |
 | `once-lock` | exemption from localization + publication marker at P (no restructuring — `ONCELOCK.md` §7.5's exemption-only lean is adopted, plus the marker) |
-| `immutable`, `atomic`, `mutex` | exemption + definition-site marker |
+| `mutex` | exemption + definition-site marker |
+| `immutable`, `atomic` | nothing |
 | `unhandled` | exemption + report entry (visible manual-work list) |
 
 The C→C tool never makes a disposition decision; it executes the manifest. If it cannot
@@ -590,7 +552,7 @@ consumes it differently:
 Coupling detection lives in a shared F-layer post-pass. Overlapping compatible
 publication intervals are hard evidence and are unioned into policy-bearing
 `coupling_groups`. Same-function co-writes are not collected: correlation alone does
-not justify a joint representation or constrain atomic declarations. Group IDs use the
+not justify a joint representation. Group IDs use the
 `grp-` namespace. The manifest's `coupling_candidates` field is retained empty for
 schema compatibility.
 
@@ -662,75 +624,6 @@ Atomic disposition is a per-global reflection of the source declaration and requ
 co-update audit. Accepted-risk overrides (§4.2) add per-global
 rows to this matrix in the soundness inventory.
 
-## 8. Amendments required to the other documents
-
-1. **`ONCELOCK.md`** — trim to pure fact production (applied):
-   - §2's standalone schema (v1) is superseded; the pass emits the shared
-     certificate-slot shape (`DISPOSITION_PLAN.md` §1.5) directly as
-     `facts.phase_stationarity` — certified payload
-     `{ publication, writers, init_subtree, readers, observations }`, failed variant
-     `codes`/`witnesses`/`diagnostics`. Failure reason codes keep their §2.2 meanings
-     but are re-described as routing input, not terminal verdicts.
-   - §4.4's "consumption is purely subtractive" paragraph is superseded by §5.3 here
-     (exemption **plus publication marker**).
-   - §2.3 co-quiescence detection moves to the shared coupling component (§6 here);
-     the ONCELOCK pass stays per-global while D2b derives the group common-P
-     certificate (`strategy_support.once_lock`) from its per-global output. Work item
-     O6 shrinks accordingly.
-   - The spawn-reachability bit consumed internally is additionally surfaced as the
-     first-class reporting fact `thread_visible` (§2 here; not a cascade guard — the
-     kill rule is thread-*writer*, inside the certificate).
-2. **`DESIGN_lite.md` §2F** — the client list gains the disposition stage as a named
-   post-pass, and the sentence "Globals localization: unchanged from `DESIGN.md` §7"
-   gains "…consuming the disposition manifest (see `DISPOSITION.md`)". The two
-   provenance tags on icall edges are unaffected by disposition. The later B1/B2 provenance
-   split is likewise analysis-owned and does not alter disposition policy.
-3. **`DESIGN.md` §4F** — the mutability lattice is re-labeled a *reporting summary*
-   derived from the fact vector (§2 here); no analysis change.
-4. **`DESIGN.md` §7 / §8** — the localization client's input becomes "globals disposed
-   `localize`"; the soundness inventory gains the accepted-risk override ledger and the
-   per-strategy audit matrix (§7 here).
-
-None of these amendments change A′–D′ or any solver semantics.
-
-## 9. Implementation plan
-
-Work items (D-prefix; O-items are `ONCELOCK.md` §3.2):
-
-- **D1 — manifest + policy stage (implemented).** Fact-vector assembly from existing
-  scans; cascade evaluation with trace; schema v6 emission; run-header reproducibility
-  fields. No new analysis.
-- **D2 — override machinery (implemented).** TOML parsing, §4.2 validation, override
-  report, soundness-inventory append for accepted risks, CI exit-code discipline.
-- **D2b — shared coupling post-pass (implemented).** Extracted from O6's clustering;
-  derives hard common-publication groups, group evidence records, and group disposition
-  resolution for joint strategies.
-- **D3 — source atomic reflection (implemented).** Reads only the recovered source type
-  qualifier and emits `atomic_declaration`. The former scalar-width, bounded-access,
-  violation, signal-flag, and load/store/RMW eligibility pass has been removed; those
-  decisions and rewrites belong to the upstream source transform.
-- **D4 — mutex eligibility pass (implemented).** Reuses access-set completeness and
-  violation relevance, rejects signal-context access, and checks final-call-graph
-  reachability between accessor functions. Under the whole-accessor-function recipe it
-  also fails closed when an accessor can reach an unresolved callee, since that callee
-  may call back into an accessor while the lock is held. It emits deterministic
-  call-path witnesses, declaration metadata and source-materialization status,
-  per-global lock recipes, and shared-lock support certificates for coupling groups.
-  Static certification remains distinct from source readiness: an unmapped declaration
-  or an empty runtime accessor set carries a blocked materialization status.
-- **D5 — marker contract (implemented analysis-side).** Shared marker name mangling +
-  collision check, `pangs_markers.h`/`.c` artifact emission, inventory schema and
-  validation, plus a mock-materializer / fixture-rewriter round-trip harness. The
-  insertion itself remains production C→C-tool work, and consumption remains
-  production Rust-rewriter work, but the name scheme and inventory format are owned
-  here so all three agree. The harness validates the repository boundary; it does not
-  claim survival through the unavailable production C-to-Rust translator.
-
-Order: D1 → D2 → D2b (v1, alongside O-items; D1 is a prerequisite for consuming
-ONCELOCK output at all under the new interface), then D3's declaration reflection and D5.
-D4 populates its certificate slot; D3 populates a source fact. D5's analysis-side contract
-is complete, and the production materializers remain boundary work.
-
 ### Testing
 
 - Golden-file the full manifest on the small-program corpus (lite idiom).
@@ -775,11 +668,6 @@ to stderr only; it does not alter either canonical artifact.
 
 ## 11. Open questions
 
-1. **Atomic metadata survivability.** The upstream transform's `_Atomic` qualifier must
-   survive compilation as `DW_TAG_atomic_type`. A production integration test should
-   compile transformed source, verify `atomic_declaration: true`, and confirm the marker
-   survives the C-to-Rust boundary. PANGS deliberately does not fall back to recognizing
-   atomic LLVM instructions because that would reintroduce IR-semantic inference.
 2. **Group support-set intersection** (§6) can discard a strategy supported by only
    some members. A future alternative is to split the group when the evidence shows
    the coupling is write-side only (no reader assumes cross-member consistency).
