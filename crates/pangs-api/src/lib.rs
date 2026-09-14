@@ -12,8 +12,7 @@ use pangs_pag::{
     StorageRoots, VarargCallProof,
 };
 use pangs_pir::{
-    fsa_compatible, Access, LoweringStats, Pir, ScalarOp, ScalarTypeClass, ScalarTypeEvidence,
-    Stmt, SymbolLinkage,
+    fsa_compatible, Access, LoweringStats, Pir, ScalarOp, ScalarTypeClass, Stmt, SymbolLinkage,
 };
 use pangs_solve::{
     debug_assert_narrows, solve_andersen_with_overrides,
@@ -158,8 +157,6 @@ pub struct GlobalInfo {
     pub is_definition: bool,
     pub linkage: SymbolLinkage,
     pub type_spelling: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scalar_type_evidence: Option<ScalarTypeEvidence>,
     pub size_bits: Option<u64>,
     pub align_bits: Option<u64>,
     pub path_error: Option<String>,
@@ -1023,7 +1020,6 @@ impl Analysis {
                 is_definition: global.is_definition,
                 linkage: global.linkage,
                 type_spelling: global.type_spelling.clone(),
-                scalar_type_evidence: global.scalar_type_evidence.clone(),
                 size_bits: global.size_bits,
                 align_bits: global.align_bits,
                 path_error: global.path_error.clone(),
@@ -7900,7 +7896,6 @@ mod component_tests {
             is_definition: true,
             linkage: SymbolLinkage::Internal,
             type_spelling: None,
-            scalar_type_evidence: None,
             size_bits: None,
             align_bits: None,
             path_error: None,

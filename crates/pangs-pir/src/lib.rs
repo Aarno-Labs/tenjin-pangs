@@ -428,8 +428,6 @@ pub struct Global {
     pub linkage: SymbolLinkage,
     #[serde(default)]
     pub type_spelling: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scalar_type_evidence: Option<ScalarTypeEvidence>,
     #[serde(default)]
     pub size_bits: Option<u64>,
     #[serde(default)]
@@ -464,7 +462,6 @@ impl Default for Global {
             is_definition: true,
             linkage: SymbolLinkage::External,
             type_spelling: None,
-            scalar_type_evidence: None,
             size_bits: None,
             align_bits: None,
             path_error: None,
@@ -491,27 +488,6 @@ pub enum ScalarTypeClass {
     Boolean,
     Enum,
     Pointer,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TypeQualifiers {
-    #[serde(default)]
-    pub is_const: bool,
-    #[serde(default)]
-    pub is_volatile: bool,
-    #[serde(default)]
-    pub is_atomic: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScalarTypeEvidence {
-    pub type_spelling: Option<String>,
-    #[serde(default)]
-    pub typedef_chain: Vec<String>,
-    #[serde(default)]
-    pub qualifiers: TypeQualifiers,
-    pub class: Option<ScalarTypeClass>,
-    pub signed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

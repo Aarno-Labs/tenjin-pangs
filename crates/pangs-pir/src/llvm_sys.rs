@@ -381,9 +381,6 @@ unsafe fn lower_module(module: LLVMModuleRef, repo_roots: Option<&RepoRoots>) ->
                 is_definition: LLVMIsDeclaration(*global) == 0,
                 linkage: symbol_linkage(LLVMGetLinkage(*global)),
                 type_spelling: debug.as_ref().and_then(|debug| debug.type_spelling.clone()),
-                scalar_type_evidence: debug
-                    .as_ref()
-                    .and_then(|debug| debug.scalar_type_evidence.clone()),
                 size_bits: Some(LLVMABISizeOfType(ctx.data_layout, ty).saturating_mul(8)),
                 align_bits: Some(
                     u64::from(LLVMABIAlignmentOfType(ctx.data_layout, ty)).saturating_mul(8),
@@ -446,7 +443,6 @@ struct GlobalDebugInfo {
     file: Option<String>,
     line: Option<u32>,
     type_spelling: Option<String>,
-    scalar_type_evidence: Option<ScalarTypeEvidence>,
     path_error: Option<String>,
     scalar_class: Option<ScalarTypeClass>,
     signed: Option<bool>,
@@ -488,23 +484,13 @@ unsafe fn global_debug_info(
         };
         let path_error = (file.is_none() && repo_roots.is_some()).then(|| raw_file.clone());
         let line = LLVMDIVariableGetLine(variable);
-        let scalar_type_evidence =
-            metadata_operand(context, variable, 3).and_then(|ty| scalar_type_evidence(context, ty));
-        let (type_spelling, scalar_class, signed) = scalar_type_evidence
-            .as_ref()
-            .map(|evidence| {
-                (
-                    evidence.type_spelling.clone(),
-                    evidence.class,
-                    evidence.signed,
-                )
-            })
+        let (type_spelling, scalar_class, signed) = metadata_operand(context, variable, 3)
+            .map(|ty| di_type_details(context, ty))
             .unwrap_or((None, None, None));
         result = Some(GlobalDebugInfo {
             file,
             line: (line != 0).then_some(line),
             type_spelling,
-            scalar_type_evidence,
             path_error,
             scalar_class,
             signed,
@@ -549,99 +535,51 @@ unsafe fn di_type_name(metadata: LLVMMetadataRef) -> Option<String> {
     })
 }
 
-unsafe fn scalar_type_evidence(
+unsafe fn di_type_details(
     context: LLVMContextRef,
     metadata: LLVMMetadataRef,
-) -> Option<ScalarTypeEvidence> {
-    let mut typedef_chain = Vec::new();
-    let mut qualifiers = TypeQualifiers::default();
-    let mut visited = BTreeSet::new();
-    let (terminal_name, class, signed) = walk_scalar_type(
-        context,
-        metadata,
-        0,
-        &mut visited,
-        &mut typedef_chain,
-        &mut qualifiers,
-    )?;
-    Some(ScalarTypeEvidence {
-        type_spelling: typedef_chain.first().cloned().or(terminal_name),
-        typedef_chain,
-        qualifiers,
-        class,
-        signed,
-    })
+) -> (Option<String>, Option<ScalarTypeClass>, Option<bool>) {
+    let name = di_type_name(metadata);
+    let (class, signed) = di_type_class(context, metadata, 0);
+    (name, class, signed)
 }
 
-unsafe fn walk_scalar_type(
+unsafe fn di_type_class(
     context: LLVMContextRef,
     metadata: LLVMMetadataRef,
     depth: usize,
-    visited: &mut BTreeSet<usize>,
-    typedef_chain: &mut Vec<String>,
-    qualifiers: &mut TypeQualifiers,
-) -> Option<(Option<String>, Option<ScalarTypeClass>, Option<bool>)> {
-    if depth >= DEBUG_TYPE_RECURSION_LIMIT || !visited.insert(metadata as usize) {
-        return None;
+) -> (Option<ScalarTypeClass>, Option<bool>) {
+    if depth >= DEBUG_TYPE_RECURSION_LIMIT {
+        return (None, None);
     }
     let printed = value_string(LLVMMetadataAsValue(context, metadata));
-    let result = match LLVMGetMetadataKind(metadata) {
+    match LLVMGetMetadataKind(metadata) {
         LLVMMetadataKind::LLVMDIBasicTypeMetadataKind if printed.contains("DW_ATE_boolean") => {
-            Some((di_type_name(metadata), Some(ScalarTypeClass::Boolean), None))
+            (Some(ScalarTypeClass::Boolean), None)
         }
         LLVMMetadataKind::LLVMDIBasicTypeMetadataKind if printed.contains("DW_ATE_unsigned") => {
-            Some((
-                di_type_name(metadata),
-                Some(ScalarTypeClass::Integer),
-                Some(false),
-            ))
+            (Some(ScalarTypeClass::Integer), Some(false))
         }
         LLVMMetadataKind::LLVMDIBasicTypeMetadataKind if printed.contains("DW_ATE_signed") => {
-            Some((
-                di_type_name(metadata),
-                Some(ScalarTypeClass::Integer),
-                Some(true),
-            ))
+            (Some(ScalarTypeClass::Integer), Some(true))
         }
-        LLVMMetadataKind::LLVMDIBasicTypeMetadataKind => Some((di_type_name(metadata), None, None)),
         LLVMMetadataKind::LLVMDICompositeTypeMetadataKind
             if printed.contains("DW_TAG_enumeration_type") =>
         {
             let signed = metadata_operand(context, metadata, 3)
-                .and_then(|base| {
-                    walk_scalar_type(context, base, depth + 1, visited, typedef_chain, qualifiers)
-                })
-                .and_then(|(_, _, signed)| signed);
-            Some((di_type_name(metadata), Some(ScalarTypeClass::Enum), signed))
+                .and_then(|base| di_type_class(context, base, depth + 1).1);
+            (Some(ScalarTypeClass::Enum), signed)
         }
         LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind
             if printed.contains("DW_TAG_pointer_type") =>
         {
-            Some((di_type_name(metadata), Some(ScalarTypeClass::Pointer), None))
+            (Some(ScalarTypeClass::Pointer), None)
         }
-        LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind => {
-            if printed.contains("DW_TAG_typedef") {
-                if let Some(name) = di_type_name(metadata) {
-                    typedef_chain.push(name);
-                }
-            } else if printed.contains("DW_TAG_const_type") {
-                qualifiers.is_const = true;
-            } else if printed.contains("DW_TAG_volatile_type") {
-                qualifiers.is_volatile = true;
-            } else if printed.contains("DW_TAG_atomic_type") {
-                qualifiers.is_atomic = true;
-            }
-            metadata_operand(context, metadata, 3).and_then(|base| {
-                walk_scalar_type(context, base, depth + 1, visited, typedef_chain, qualifiers)
-            })
-        }
-        LLVMMetadataKind::LLVMDICompositeTypeMetadataKind => {
-            Some((di_type_name(metadata), None, None))
-        }
-        _ => None,
-    };
-    visited.remove(&(metadata as usize));
-    result
+        LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind => metadata_operand(context, metadata, 3)
+            .map(|base| di_type_class(context, base, depth + 1))
+            .unwrap_or((None, None)),
+        _ => (None, None),
+    }
 }
 
 unsafe fn di_file_path(file: LLVMMetadataRef) -> Option<String> {
