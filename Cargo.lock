@@ -928,7 +928,6 @@ dependencies = [
  "pangs-manifest",
  "pangs-pag",
  "pangs-pir",
- "pangs-solve",
  "serde",
  "serde_json",
  "sha2",

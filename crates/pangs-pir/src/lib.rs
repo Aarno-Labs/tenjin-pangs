@@ -447,8 +447,8 @@ pub struct Global {
     pub initializer_ir: Option<String>,
     /// Names of other global values (functions and global variables) referenced by this
     /// global's constant initializer, walked recursively through struct/array/expr
-    /// constants. Mirrors cclyzer's `global_initializer_references` (constant-init.dl) and
-    /// feeds the `cc2json` client. Names are bare (no leading `@`).
+    /// constants. This feeds disposition's aggregate-initializer localization blocker.
+    /// Names are bare (no leading `@`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub init_refs: Vec<String>,
 }

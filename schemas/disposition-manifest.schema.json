@@ -2,9 +2,9 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "PANGS disposition manifest",
   "type": "object",
-  "required": ["schema_version", "run", "globals", "synthetic_globals", "unkeyed_globals", "coupling_groups"],
+  "required": ["schema_version", "run", "globals", "synthetic_globals", "unkeyed_globals", "coupling_groups", "context_rewrite"],
   "properties": {
-    "schema_version": { "const": 7 },
+    "schema_version": { "const": 8 },
     "run": { "$ref": "#/definitions/run" },
     "globals": {
       "type": "array",
@@ -40,6 +40,7 @@
       "type": "array",
       "items": { "$ref": "#/definitions/coupling_group" }
     },
+    "context_rewrite": { "$ref": "#/definitions/context_rewrite" },
     "coupling_candidates": {
       "type": "array",
       "items": { "$ref": "#/definitions/coupling_candidate" }
@@ -64,6 +65,72 @@
         "line": { "type": "integer", "minimum": 1 },
         "col": { "type": "integer", "minimum": 1 },
         "function": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "context_rewrite_callsite": {
+      "type": "object",
+      "required": ["key", "caller", "callees", "unresolved"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "caller": { "type": "string", "minLength": 1 },
+        "callees": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "unresolved": { "type": "boolean" },
+        "site": { "$ref": "#/definitions/site" }
+      },
+      "additionalProperties": true
+    },
+    "context_rewrite_blocker": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "function": { "type": "string", "minLength": 1 },
+        "callsite": { "type": "string", "minLength": 1 },
+        "initializer": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "context_rewrite_field": {
+      "type": "object",
+      "required": ["global", "llvm_name", "accessors", "functions", "rewrite_callsites", "blockers"],
+      "properties": {
+        "global": { "$ref": "#/definitions/key" },
+        "llvm_name": { "type": "string", "minLength": 1 },
+        "accessors": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "functions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "rewrite_callsites": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/context_rewrite_callsite" }
+        },
+        "blockers": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/context_rewrite_blocker" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "selected_context_rewrite": {
+      "type": "object",
+      "required": ["fields", "accessors", "functions", "rewrite_callsites"],
+      "properties": {
+        "fields": { "type": "array", "items": { "$ref": "#/definitions/context_rewrite_field" } },
+        "accessors": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "functions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "rewrite_callsites": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/context_rewrite_callsite" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "context_rewrite": {
+      "type": "object",
+      "required": ["id", "fields"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "fields": { "type": "array", "items": { "$ref": "#/definitions/context_rewrite_field" } },
+        "selected": { "$ref": "#/definitions/selected_context_rewrite" }
       },
       "additionalProperties": true
     },

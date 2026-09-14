@@ -370,9 +370,9 @@ pub struct ComponentInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextFieldPlan {
     pub global: GlobalId,
-    /// Functions containing runtime references that the source rewriter must redirect. The
-    /// schema name is retained for compatibility; pointer-taking callees that merely dereference
-    /// an already-redirected argument are not included.
+    /// Functions containing runtime references that the source rewriter must redirect.
+    /// Pointer-taking callees that merely dereference an already-redirected argument are not
+    /// included.
     pub accessors: Vec<FuncId>,
     pub functions: Vec<FuncId>,
     pub rewrite_callsites: Vec<CallsiteId>,
@@ -6192,7 +6192,7 @@ fn edge_accesses(
 fn compute_context_rewrite_plan(
     funcs: &[FuncInfo],
     globals: &[GlobalInfo],
-    _callsites: &[CallsiteInfo],
+    callsites: &[CallsiteInfo],
     edges: &[CallEdge],
     rewrite_roots: &[BTreeSet<FuncId>],
     initializer_address_users: &BTreeMap<String, BTreeSet<String>>,
@@ -6274,6 +6274,19 @@ fn compute_context_rewrite_plan(
             }
         }
         for site in &rewrite_callsites {
+            let callsite = &callsites[site.0 as usize];
+            if callsite
+                .loc
+                .as_ref()
+                .is_none_or(|loc| loc.file.is_empty() || loc.line == 0 || loc.col == 0)
+            {
+                blockers.push(ContextRewriteBlocker {
+                    kind: "unlocatable-callsite".into(),
+                    function: Some(callsite.caller),
+                    callsite: Some(*site),
+                    initializer: None,
+                });
+            }
             // A callsite with a context-taking internal target and an unresolved alternative
             // cannot be rewritten to one ABI without a wrapper plan.
             if unknown_by_callsite.contains(site)
@@ -6283,7 +6296,7 @@ fn compute_context_rewrite_plan(
             {
                 blockers.push(ContextRewriteBlocker {
                     kind: "unknown-callee-taint".into(),
-                    function: Some(_callsites[site.0 as usize].caller),
+                    function: Some(callsites[site.0 as usize].caller),
                     callsite: Some(*site),
                     initializer: None,
                 });
@@ -6435,8 +6448,8 @@ fn aggregate_initializer_address_users(module: &Pir) -> BTreeMap<String, BTreeSe
         }
     }
 
-    // `init_refs` intentionally mirrors the legacy cc2json relation and therefore does not
-    // recurse through constant expressions. The lowered global-init body does: recover bases of
+    // `init_refs` does not recurse through constant expressions. The lowered global-init body
+    // does: recover bases of
     // GEP/cast/select chains here so an interior address retained by an initializer also blocks
     // localization. A leading GlobalRef(Mod) identifies the initializer that owns the following
     // statements; this is the ordering contract of `lower_global_initializers`.
@@ -7654,6 +7667,20 @@ mod component_tests {
         }
     }
 
+    fn callsite(key: &str, caller: u32) -> CallsiteInfo {
+        CallsiteInfo {
+            key: key.into(),
+            caller: FuncId(caller),
+            kind: CallKind::Direct,
+            loc: Some(LocInfo {
+                file: "source.c".into(),
+                line: 7,
+                col: 3,
+            }),
+            synthetic: false,
+        }
+    }
+
     #[test]
     fn components_do_not_connect_internal_callers_through_external_declarations() {
         let funcs = vec![
@@ -7704,22 +7731,7 @@ mod component_tests {
         let mut main_to_printf = edge(0, 2);
         main_to_printf.callsite = Some(CallsiteId(1));
         let rewrite_roots = vec![BTreeSet::from([FuncId(1)])];
-        let callsites = vec![
-            CallsiteInfo {
-                key: "main@uses#0".into(),
-                caller: FuncId(0),
-                kind: CallKind::Direct,
-                loc: None,
-                synthetic: false,
-            },
-            CallsiteInfo {
-                key: "main@printf#1".into(),
-                caller: FuncId(0),
-                kind: CallKind::Direct,
-                loc: None,
-                synthetic: false,
-            },
-        ];
+        let callsites = vec![callsite("main@uses#0", 0), callsite("main@printf#1", 0)];
         let plan = compute_context_rewrite_plan(
             &funcs,
             &[global("g")],
@@ -7959,13 +7971,7 @@ mod component_tests {
         let mut main_to_uses = edge(0, 1);
         main_to_uses.callsite = Some(CallsiteId(0));
         let rewrite_roots = vec![BTreeSet::from([FuncId(1)])];
-        let callsites = vec![CallsiteInfo {
-            key: "main@uses#0".into(),
-            caller: FuncId(0),
-            kind: CallKind::Direct,
-            loc: None,
-            synthetic: false,
-        }];
+        let callsites = vec![callsite("main@uses#0", 0)];
         let unknown_incoming = CallEdge {
             caller: Caller::Unknown("callback".into()),
             callsite: None,
@@ -7986,6 +7992,30 @@ mod component_tests {
         assert_eq!(plan.fields[0].blockers.len(), 1);
         assert_eq!(plan.fields[0].blockers[0].kind, "unknown-caller-taint");
         assert_eq!(plan.fields[0].blockers[0].function, Some(FuncId(1)));
+    }
+
+    #[test]
+    fn context_rewrite_blocks_a_callsite_without_an_exact_source_location() {
+        let funcs = vec![func("main", false), func("uses_global", false)];
+        let mut main_to_uses = edge(0, 1);
+        main_to_uses.callsite = Some(CallsiteId(0));
+        let rewrite_roots = vec![BTreeSet::from([FuncId(1)])];
+        let mut callsite = callsite("main@uses#0", 0);
+        callsite.loc = None;
+
+        let plan = compute_context_rewrite_plan(
+            &funcs,
+            &[global("g")],
+            &[callsite],
+            &[main_to_uses],
+            &rewrite_roots,
+            &BTreeMap::new(),
+            BuildMode::Executable,
+        );
+
+        assert_eq!(plan.fields[0].blockers.len(), 1);
+        assert_eq!(plan.fields[0].blockers[0].kind, "unlocatable-callsite");
+        assert_eq!(plan.fields[0].blockers[0].callsite, Some(CallsiteId(0)));
     }
 
     #[test]

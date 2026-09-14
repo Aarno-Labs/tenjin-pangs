@@ -635,8 +635,11 @@ With an exhaustive materialized solution, every client is a scan, not a query en
   diagnostics when no other hard finding remains and its independent verdict is OK,
   under the supported-program contract in
   `20260818_LOCALIZATION_VIOLATION_TAINT_v3.md`. Localization consumes only globals
-  assigned `localize`; the older mutability lattice is a reporting summary, not the
-  strategy decision procedure.
+  assigned `localize`. Manifest schema v8 carries every analysis-owned per-global rewrite
+  recipe and a dispose-owned `selected` projection whose fields exactly match those final
+  dispositions; source materializers consume that projection rather than reconstructing a
+  tissue from mutated or escaped globals. The older mutability lattice is a reporting summary,
+  not the strategy decision procedure.
 
 Post-passes over one materialized result are also far easier to test than interleaved
 demand queries: golden-file the whole solution on small inputs, diff across changes.

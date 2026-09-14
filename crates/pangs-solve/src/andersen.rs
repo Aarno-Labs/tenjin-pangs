@@ -134,10 +134,9 @@ pub fn solve_andersen_with_overrides_and_target_points_to(
 
 /// Solve Andersen and materialize allocation-level points-to for *global memory objects*
 /// (`SolveResult::node_points_to`, keyed `obj:global:<name>`), refining the partitions below the
-/// budget and falling back to the Steensgaard global points-to for the rest. This is the cc2json
-/// escape client's solve: it sharpens which allocations a global's memory reaches (so escape need
-/// not over-approximate every within-budget partition) while keeping the Steensgaard answer for
-/// uninteresting/oversize partitions.
+/// budget and falling back to the Steensgaard global points-to for the rest. This diagnostic view
+/// sharpens which allocations a global's memory reaches while keeping the Steensgaard answer for
+/// uninteresting or oversize partitions.
 pub fn solve_andersen_with_global_points_to(
     pir: &Pir,
     pag: &Pag,
@@ -4536,9 +4535,9 @@ impl<'a> Refiner<'a> {
 
     /// Refined `ptr_points_to` for every in-scope global memory object: the named allocations
     /// (function + global keys) reachable from the object cell *and all its materialized field
-    /// cells*. Unioning the fields keeps this object-granular — the same shape cc2json's escape
-    /// fixpoint consumes from the Steensgaard fallback — while still benefiting from Andersen's
-    /// reduced cross-object over-merge. Ω is not a named allocation, so it is dropped.
+    /// cells*. Unioning the fields keeps this diagnostic object-granular while still benefiting
+    /// from Andersen's reduced cross-object over-merge. Ω is not a named allocation, so it is
+    /// dropped.
     fn emit_global_points_to(&self, pts: &Solve) -> Vec<(String, BTreeSet<String>)> {
         let mut out = Vec::new();
         for node in &self.pag.nodes {

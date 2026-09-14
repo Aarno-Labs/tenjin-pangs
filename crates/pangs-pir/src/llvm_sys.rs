@@ -3407,7 +3407,7 @@ unsafe fn collect_constant_func_refs(
 /// through `ConstantExpr` operands. So a direct element `@f` or `bitcast(@f)` is captured, but
 /// a `getelementptr(@g, …)` element is not (the GEP expr is not itself a global-value
 /// constant). Names preserve initializer (element) order, deduped; the owning global is
-/// excluded. The `cc2json` client filters `.`-prefixed (string-constant) names downstream.
+/// excluded. String-constant references remain available for disposition to classify.
 unsafe fn collect_global_init_refs(global: LLVMValueRef) -> Vec<String> {
     let initializer = LLVMGetInitializer(global);
     if initializer.is_null() {

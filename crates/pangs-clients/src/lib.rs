@@ -7,10 +7,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use jsonschema::JSONSchema;
 
-mod cc2json;
 mod knobs;
 mod phase_stationarity;
-pub use cc2json::{run_cc2json, Cc2jsonOpts};
 
 use pangs_api::{
     AffectedGlobals, Analysis, BuildMode, CallEdge, Callee, Caller, ComponentInfo, FuncId,
@@ -19,9 +17,12 @@ use pangs_api::{
 };
 use pangs_manifest::{
     canonicalize_audit, AlwaysFalse, AlwaysTrue, AnalysisRun, AuditRecord, AuditScope, AuditSource,
-    Certificate, CommonInterval, CouplingGroup, EvidenceEdge, EvidenceKind, EvidenceStrength,
-    EvidencedBool, Extra, Facts, GlobalRecord as DispositionGlobal, GroupStrategySupport, Key,
-    Linkage, Localization, LocalizationBlocker, LocalizationVerdict,
+    Certificate, CommonInterval, ContextRewriteBlocker as ManifestContextRewriteBlocker,
+    ContextRewriteCallsite as ManifestContextRewriteCallsite,
+    ContextRewriteField as ManifestContextRewriteField,
+    ContextRewritePlan as ManifestContextRewritePlan, CouplingGroup, EvidenceEdge, EvidenceKind,
+    EvidenceStrength, EvidencedBool, Extra, Facts, GlobalRecord as DispositionGlobal,
+    GroupStrategySupport, Key, Linkage, Localization, LocalizationBlocker, LocalizationVerdict,
     Manifest as DispositionManifest, Meta, OnceLockGroupSupport, RunHeader, Site, StorageMember,
     SyntheticGlobal, UnkeyedGlobal, ViolationRelevance as ManifestViolationRelevance,
     ViolationRelevanceDiagnostic, Witness, SCHEMA_VERSION,
@@ -487,6 +488,8 @@ pub fn assemble_disposition_artifacts(
             }),
         );
     }
+    let context_rewrite =
+        disposition_context_rewrite_plan(analysis, &globals, &compound_literal_owners);
     let mut manifest = DispositionManifest {
         schema_version: SCHEMA_VERSION,
         run: RunHeader {
@@ -535,6 +538,7 @@ pub fn assemble_disposition_artifacts(
         synthetic_globals,
         unkeyed_globals,
         coupling_groups,
+        context_rewrite,
         coupling_candidates: Vec::new(),
         override_report: None,
         materialization: None,
@@ -556,6 +560,125 @@ pub fn assemble_disposition_artifacts(
     }];
     canonicalize_audit(&mut ledger)?;
     Ok((manifest, ledger))
+}
+
+fn disposition_context_rewrite_plan(
+    analysis: &Analysis,
+    globals: &[DispositionGlobal],
+    synthetic_owners: &BTreeMap<String, Option<Key>>,
+) -> ManifestContextRewritePlan {
+    let global_llvm_names = globals
+        .iter()
+        .map(|global| (global.key.clone(), global.meta.llvm_name.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut callees_by_site = BTreeMap::<pangs_api::CallsiteId, BTreeSet<String>>::new();
+    let mut unresolved_sites = BTreeSet::<pangs_api::CallsiteId>::new();
+    for edge in analysis.call_edges() {
+        let Some(site) = edge.callsite else { continue };
+        match edge.callee {
+            Callee::Func(callee) => {
+                callees_by_site
+                    .entry(site)
+                    .or_default()
+                    .insert(analysis.functions()[callee].key.clone());
+            }
+            Callee::Unknown(_) => {
+                unresolved_sites.insert(site);
+            }
+        }
+    }
+
+    let callsite_recipe = |site: pangs_api::CallsiteId| {
+        let info = &analysis.callsites()[site];
+        let caller = analysis.functions()[info.caller].key.clone();
+        ManifestContextRewriteCallsite {
+            key: info.key.clone(),
+            caller: caller.clone(),
+            callees: callees_by_site
+                .get(&site)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+            unresolved: unresolved_sites.contains(&site),
+            site: info.loc.as_ref().and_then(|loc| {
+                (loc.line > 0).then(|| Site {
+                    file: loc.file.clone(),
+                    line: loc.line,
+                    col: (loc.col > 0).then_some(loc.col),
+                    function: Some(caller),
+                    extra: Extra::new(),
+                })
+            }),
+            extra: Extra::new(),
+        }
+    };
+
+    let final_key = |global: GlobalId| {
+        let info = &analysis.globals()[global];
+        if is_unnamed_compound_literal(info) {
+            synthetic_owners.get(&info.key).cloned().flatten()
+        } else {
+            disposition_key(info)
+        }
+    };
+
+    let mut fields = BTreeMap::<Key, ManifestContextRewriteField>::new();
+    for field in &analysis.context_rewrite_plan().fields {
+        let Some(global) = final_key(field.global) else {
+            continue;
+        };
+        let Some(llvm_name) = global_llvm_names.get(&global) else {
+            continue;
+        };
+        let entry = fields
+            .entry(global.clone())
+            .or_insert_with(|| ManifestContextRewriteField {
+                global,
+                llvm_name: llvm_name.clone(),
+                accessors: Vec::new(),
+                functions: Vec::new(),
+                rewrite_callsites: Vec::new(),
+                blockers: Vec::new(),
+                extra: Extra::new(),
+            });
+        entry.accessors.extend(
+            field
+                .accessors
+                .iter()
+                .map(|function| analysis.functions()[*function].key.clone()),
+        );
+        entry.functions.extend(
+            field
+                .functions
+                .iter()
+                .map(|function| analysis.functions()[*function].key.clone()),
+        );
+        entry
+            .rewrite_callsites
+            .extend(field.rewrite_callsites.iter().copied().map(callsite_recipe));
+        entry.blockers.extend(field.blockers.iter().map(|blocker| {
+            ManifestContextRewriteBlocker {
+                kind: blocker.kind.clone(),
+                function: blocker
+                    .function
+                    .map(|function| analysis.functions()[function].key.clone()),
+                callsite: blocker
+                    .callsite
+                    .map(|site| analysis.callsites()[site].key.clone()),
+                initializer: blocker.initializer.clone(),
+                extra: Extra::new(),
+            }
+        }));
+    }
+
+    ManifestContextRewritePlan {
+        id: analysis.context_rewrite_plan().id.clone(),
+        fields: fields.into_values().collect(),
+        selected: None,
+        extra: Extra::new(),
+    }
 }
 
 fn is_unnamed_compound_literal(info: &pangs_api::GlobalInfo) -> bool {
@@ -4061,7 +4184,6 @@ mod tests {
         assert!(analysis.globals()[global].initval_stable);
         assert!(localization_index(&analysis)[global.0 as usize].is_some());
     }
-
 
     #[test]
     fn mutex_eligibility_rejects_call_paths_between_accessors() {

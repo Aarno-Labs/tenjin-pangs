@@ -71,6 +71,12 @@ fn fixture() -> (Manifest, Vec<AuditRecord>) {
         synthetic_globals: Vec::new(),
         unkeyed_globals: Vec::new(),
         coupling_groups: Vec::new(),
+        context_rewrite: pangs_manifest::ContextRewritePlan {
+            id: "ctx0001".into(),
+            fields: Vec::new(),
+            selected: None,
+            extra: Extra::new(),
+        },
         coupling_candidates: Vec::new(),
         override_report: None,
         materialization: None,
@@ -139,7 +145,7 @@ fn no_override_run_is_byte_idempotent() {
 }
 
 #[test]
-fn exit_codes_distinguish_override_problems_and_newer_schema() {
+fn exit_codes_distinguish_override_problems_and_unsupported_schema() {
     let temp = tempdir().unwrap();
     write_fixture(temp.path());
     fs::write(
@@ -155,6 +161,21 @@ fn exit_codes_distinguish_override_problems_and_newer_schema() {
 
     let (mut manifest, _) = fixture();
     manifest.schema_version = SCHEMA_VERSION + 1;
+    fs::write(
+        temp.path().join("pangs-manifest.json"),
+        to_canonical_json(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        command(temp.path())
+            .arg("--no-overrides")
+            .status()
+            .unwrap()
+            .code(),
+        Some(3)
+    );
+
+    manifest.schema_version = SCHEMA_VERSION - 1;
     fs::write(
         temp.path().join("pangs-manifest.json"),
         to_canonical_json(&manifest).unwrap(),

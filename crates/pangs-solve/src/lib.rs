@@ -159,9 +159,8 @@ pub struct SolveResult {
     #[serde(default)]
     pub nodes: BTreeMap<String, NodeResolution>,
     /// Allocation-level points-to: PAG node label → the named allocations (global and function
-    /// keys) the node's class points to. Populated only by `solve_steensgaard_with_points_to`
-    /// (the cc2json client); empty otherwise. This is cclyzer's `operand_points_to` /
-    /// `var_points_to` over named allocations, and — for object nodes — `ptr_points_to`.
+    /// keys) the node's class points to. Populated only by explicit diagnostic/materialization
+    /// entry points; empty in the normal analysis pipeline.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub node_points_to: BTreeMap<String, BTreeSet<String>>,
     /// Named allocations reachable by loading from memory designated by a targeted node:
@@ -420,8 +419,7 @@ pub fn solve_steensgaard_with_points_to(
 }
 
 /// Like [`solve_steensgaard_with_points_to`] but only materializes object-node points-to for
-/// globals. This is enough for cc2json's escape fixpoint (`ptr_points_to` from global memory
-/// objects) without building allocation-level points-to sets for every SSA/PAG node.
+/// globals, without building allocation-level points-to sets for every SSA/PAG node.
 pub fn solve_steensgaard_with_global_points_to(
     pir: &Pir,
     pag: &Pag,

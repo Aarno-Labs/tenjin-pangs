@@ -174,25 +174,6 @@ enum Command {
         dir: PathBuf,
         trace: PathBuf,
     },
-    /// Emit a `cc2json`-compatible JSON summary (mutated/escaped globals, bipartite call-graph
-    /// components, mutable-global tissue, global initializer references) for a bitcode module.
-    Cc2json {
-        module: PathBuf,
-        #[arg(long)]
-        json_out: PathBuf,
-        #[arg(long, default_value = knobs::DEFAULT_ANALYSIS_STAGE)]
-        stage: StageArg,
-        /// pangs reachability mode: `library` (all functions reachable) or `executable`
-        /// (reachable from `main`). Mirrors cc2json's `--entrypoints`.
-        #[arg(long, default_value = knobs::DEFAULT_BUILD_MODE)]
-        entrypoints: BuildModeArg,
-        /// Treat all globals as module-internal for escape analysis (cclyzer's
-        /// `--internalize-globals`). Off by default, matching how the goldens were produced.
-        #[arg(long)]
-        internalize_globals: bool,
-        #[arg(long, default_value_t = knobs::DEFAULT_PARTITION_BUDGET, hide = true)]
-        partition_budget: u64,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -402,6 +383,7 @@ fn run() -> Result<()> {
                     overrides_path.map(|path| path.display().to_string()),
                     overrides_sha256,
                 )?;
+                disposition_manifest.validate()?;
                 write_artifact_pair(&out, &disposition_manifest, &ledger)?;
                 if manifest_only {
                     write_canonical_json(&out.join("metrics.json"), analysis.metrics())?;
@@ -865,25 +847,6 @@ fn run() -> Result<()> {
                 std::process::exit(3);
             }
             eprintln!("check-traces: ok (all observed pairs in analysis edge set)");
-        }
-        Command::Cc2json {
-            module,
-            json_out,
-            stage,
-            entrypoints,
-            internalize_globals,
-            partition_budget,
-        } => {
-            let pir = Pir::from_path(&module)?;
-            let opts = pangs_clients::Cc2jsonOpts {
-                stage: stage.into(),
-                build_mode: entrypoints.into(),
-                internalize_globals,
-                partition_budget,
-            };
-            let json = pangs_clients::run_cc2json(&pir, &module, &opts)?;
-            fs::write(&json_out, &json).with_context(|| format!("write {}", json_out.display()))?;
-            eprintln!("cc2json: wrote {}", json_out.display());
         }
     }
     Ok(())

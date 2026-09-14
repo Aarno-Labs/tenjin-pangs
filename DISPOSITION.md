@@ -152,7 +152,7 @@ materialized solution in one scan. Nothing here re-enters the solver.
 ## 3. The manifest
 
 One versioned JSON document per analyzed program — **`pangs-manifest.json`,
-`schema_version: 7`** — superseding and subsuming `ONCELOCK.md` §2's standalone schema
+`schema_version: 8`** — superseding and subsuming `ONCELOCK.md` §2's standalone schema
 (which becomes the `facts.phase_stationarity` sub-object; see §8). It is the single
 artifact consumed by *both* toolchain stages and referenced by override files.
 
@@ -216,7 +216,7 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
 
 ```jsonc
 {
-  "schema_version": 7,
+  "schema_version": 8,
   "run": {
     "analysis": {                        // analysis-owned (§3.3): provenance fields
       "entry_spine": { ... },            //   (pangs git, input hash, opts) +
@@ -288,6 +288,18 @@ key = [<translation_unit>::]<name>      e.g.  "src/commands.c::cmd_table" or "cm
                          "override": null } ],           // echo of an applied GROUP pin —
                                                          //   the only place it is echoed
   "coupling_candidates": [],             // deprecated compatibility field
+  "context_rewrite": {                   // candidate recipes are analysis-owned
+    "id": "ctx0001",
+    "fields": [ { "global": "src/commands.c::cmd_table",
+                    "llvm_name": "cmd_table",
+                    "accessors": [...], "functions": [...],
+                    "rewrite_callsites": [...], "blockers": [...] } ],
+    "selected": {                        // dispose-owned projection
+      "fields": [...],                   // exactly chosen == "localize"
+      "accessors": [...], "functions": [...],
+      "rewrite_callsites": [...]
+    }
+  },
   "override_report": { ... },            // §4.3; dispose-owned
   "materialization": { ... }             // §5: C→C-tool-owned — marker inventory (§5.2)
                                          //   and demotion records (§5.3); absent until
@@ -308,8 +320,8 @@ The manifest flows strictly forward through three stages, each owning named sect
 
 | Stage | Owns |
 |---|---|
-| analysis | `run.analysis`; `globals[].key`, `.meta`, `.facts`; `unkeyed_globals`; `coupling_groups[].{id, members, evidence, strategy_support}` |
-| `pangs-dispose` | `run.dispose`; `globals[].disposition`; `coupling_groups[].group_disposition`; `override_report` |
+| analysis | `run.analysis`; `globals[].key`, `.meta`, `.facts`; `unkeyed_globals`; `coupling_groups[].{id, members, evidence, strategy_support}`; `context_rewrite.{id, fields}` |
+| `pangs-dispose` | `run.dispose`; `globals[].disposition`; `coupling_groups[].group_disposition`; `override_report`; `context_rewrite.selected` |
 | C→C tool | `materialization` (marker inventory §5.2, demotion records §5.3) |
 
 **Re-running a stage regenerates its own sections and deletes every later stage's

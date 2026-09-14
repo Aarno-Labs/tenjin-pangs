@@ -42,7 +42,7 @@ fn main() {
                 2
             } else if matches!(
                 error,
-                DisposeError::Manifest(ManifestError::NewerSchema { .. })
+                DisposeError::Manifest(ManifestError::UnsupportedSchema { .. })
             ) {
                 3
             } else {
@@ -122,6 +122,7 @@ fn run(cli: Cli) -> Result<(), DisposeError> {
         overrides_path.map(|path| path.display().to_string()),
         overrides_sha256,
     )?;
+    manifest.validate()?;
     if let Some(output_dir) = cli.out.as_deref() {
         write_artifact_pair(output_dir, &manifest, &ledger)?;
     } else {

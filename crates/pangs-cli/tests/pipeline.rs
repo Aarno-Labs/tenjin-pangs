@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -2159,7 +2160,22 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
     );
     let disposition: Value =
         serde_json::from_slice(&fs::read(out.join("pangs-manifest.json")).unwrap()).unwrap();
-    assert_eq!(disposition["schema_version"], 7);
+    assert_eq!(disposition["schema_version"], 8);
+    let selected = &disposition["context_rewrite"]["selected"];
+    let selected_keys = selected["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field["global"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    let localized_keys = disposition["globals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|global| global["disposition"]["chosen"] == "localize")
+        .map(|global| global["key"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(selected_keys, localized_keys);
     let counter = disposition["globals"]
         .as_array()
         .unwrap()
@@ -2241,7 +2257,7 @@ fn analyze_dispose_emits_policy_pair_without_indexing_it() {
         );
     assert_eq!(
         sha256_text(&normalized),
-        "fbf4cbe5340a8da48180d3babc2badd710b4e3aa955e8065298779728922fcd2"
+        "1a416e506bce795e7b632983ad8488e935b1969c99c308d67c7304bd587c340b"
     );
     let audit = fs::read_to_string(out.join("pangs-audit.json")).unwrap();
     assert_eq!(

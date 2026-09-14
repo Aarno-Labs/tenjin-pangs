@@ -13,15 +13,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 pub type Extra = BTreeMap<String, Value>;
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("invalid symbol key: {0}")]
     InvalidKey(String),
-    #[error("unsupported disposition manifest schema version {found} (maximum {supported})")]
-    NewerSchema { found: u32, supported: u32 },
+    #[error("unsupported disposition manifest schema version {found} (required {supported})")]
+    UnsupportedSchema { found: u32, supported: u32 },
     #[error("marker collision for {marker}: {first} and {second}")]
     MarkerCollision {
         marker: String,
@@ -912,6 +912,65 @@ pub struct MaterializationDemotion {
     pub extra: Extra,
 }
 
+/// Analysis-owned source rewrite recipe for one candidate context field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextRewriteField {
+    pub global: Key,
+    pub llvm_name: String,
+    pub accessors: Vec<String>,
+    pub functions: Vec<String>,
+    pub rewrite_callsites: Vec<ContextRewriteCallsite>,
+    pub blockers: Vec<ContextRewriteBlocker>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextRewriteCallsite {
+    pub key: String,
+    pub caller: String,
+    pub callees: Vec<String>,
+    pub unresolved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<Site>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextRewriteBlocker {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callsite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initializer: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// Policy-owned projection of the candidate recipes whose final disposition is `localize`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectedContextRewrite {
+    pub fields: Vec<ContextRewriteField>,
+    pub accessors: Vec<String>,
+    pub functions: Vec<String>,
+    pub rewrite_callsites: Vec<ContextRewriteCallsite>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextRewritePlan {
+    pub id: String,
+    pub fields: Vec<ContextRewriteField>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<SelectedContextRewrite>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -922,6 +981,7 @@ pub struct Manifest {
     pub synthetic_globals: Vec<SyntheticGlobal>,
     pub unkeyed_globals: Vec<UnkeyedGlobal>,
     pub coupling_groups: Vec<CouplingGroup>,
+    pub context_rewrite: ContextRewritePlan,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coupling_candidates: Vec<CouplingCandidate>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -934,8 +994,8 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn validate(&self) -> Result<(), Error> {
-        if self.schema_version > SCHEMA_VERSION {
-            return Err(Error::NewerSchema {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(Error::UnsupportedSchema {
                 found: self.schema_version,
                 supported: SCHEMA_VERSION,
             });
@@ -961,6 +1021,16 @@ impl Manifest {
                 }
             }
             global.facts.validate()?;
+        }
+        let disposition_count = self
+            .globals
+            .iter()
+            .filter(|global| global.disposition.is_some())
+            .count();
+        if disposition_count != 0 && disposition_count != self.globals.len() {
+            return Err(Error::InvalidInvariant(
+                "dispositions must be absent or finalized for every global".into(),
+            ));
         }
         let mut synthetic_names = BTreeSet::new();
         for synthetic in &self.synthetic_globals {
@@ -1053,6 +1123,57 @@ impl Manifest {
                 )));
             }
         }
+        let mut rewrite_globals = BTreeSet::new();
+        for field in &self.context_rewrite.fields {
+            if !global_keys.contains(&field.global) {
+                return Err(Error::InvalidInvariant(format!(
+                    "context rewrite names absent global {}",
+                    field.global
+                )));
+            }
+            if !rewrite_globals.insert(field.global.clone()) {
+                return Err(Error::InvalidInvariant(format!(
+                    "duplicate context rewrite field {}",
+                    field.global
+                )));
+            }
+        }
+        if let Some(selected) = &self.context_rewrite.selected {
+            let selected_globals = selected
+                .fields
+                .iter()
+                .map(|field| field.global.clone())
+                .collect::<BTreeSet<_>>();
+            let chosen_globals = self
+                .globals
+                .iter()
+                .filter(|global| {
+                    global
+                        .disposition
+                        .as_ref()
+                        .is_some_and(|disposition| disposition.chosen == Strategy::Localize)
+                })
+                .map(|global| global.key.clone())
+                .collect::<BTreeSet<_>>();
+            if selected_globals != chosen_globals {
+                return Err(Error::InvalidInvariant(
+                    "selected context rewrite fields must exactly match localize dispositions"
+                        .into(),
+                ));
+            }
+            if selected_globals
+                .iter()
+                .any(|global| !rewrite_globals.contains(global))
+            {
+                return Err(Error::InvalidInvariant(
+                    "selected context rewrite field has no analysis recipe".into(),
+                ));
+            }
+        } else if self.run.dispose.is_some() {
+            return Err(Error::InvalidInvariant(
+                "finalized dispositions require a selected context rewrite".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1097,6 +1218,7 @@ impl Manifest {
                 ak.cmp(&bk)
             });
         }
+        canonicalize_context_rewrite(&mut self.context_rewrite);
         if let Some(report) = &mut self.override_report {
             for entry in &mut report.entries {
                 if let Some(failures) = &mut entry.failures {
@@ -1123,6 +1245,65 @@ impl Manifest {
             materialization.demotions.sort_by(|a, b| a.key.cmp(&b.key));
         }
     }
+}
+
+fn canonicalize_context_rewrite(plan: &mut ContextRewritePlan) {
+    canonicalize_context_fields(&mut plan.fields);
+    if let Some(selected) = &mut plan.selected {
+        canonicalize_context_fields(&mut selected.fields);
+        selected.accessors.sort();
+        selected.accessors.dedup();
+        selected.functions.sort();
+        selected.functions.dedup();
+        canonicalize_context_callsites(&mut selected.rewrite_callsites);
+    }
+}
+
+fn canonicalize_context_fields(fields: &mut Vec<ContextRewriteField>) {
+    for field in fields.iter_mut() {
+        field.accessors.sort();
+        field.accessors.dedup();
+        field.functions.sort();
+        field.functions.dedup();
+        canonicalize_context_callsites(&mut field.rewrite_callsites);
+        field.blockers.sort_by(|left, right| {
+            (
+                &left.kind,
+                &left.function,
+                &left.callsite,
+                &left.initializer,
+            )
+                .cmp(&(
+                    &right.kind,
+                    &right.function,
+                    &right.callsite,
+                    &right.initializer,
+                ))
+        });
+        field.blockers.dedup_by(|left, right| {
+            (
+                &left.kind,
+                &left.function,
+                &left.callsite,
+                &left.initializer,
+            ) == (
+                &right.kind,
+                &right.function,
+                &right.callsite,
+                &right.initializer,
+            )
+        });
+    }
+    fields.sort_by(|left, right| left.global.cmp(&right.global));
+}
+
+fn canonicalize_context_callsites(callsites: &mut Vec<ContextRewriteCallsite>) {
+    for callsite in callsites.iter_mut() {
+        callsite.callees.sort();
+        callsite.callees.dedup();
+    }
+    callsites.sort_by(|left, right| left.key.cmp(&right.key));
+    callsites.dedup_by(|left, right| left.key == right.key);
 }
 
 fn canonicalize_facts(facts: &mut Facts) {

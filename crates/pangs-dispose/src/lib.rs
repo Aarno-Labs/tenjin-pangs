@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 
 use pangs_manifest::{
     canonicalize_audit, to_canonical_json, AuditRecord, AuditScope, AuditSource, CascadeSkip,
-    Certificate, DisposeMode, DisposeRun, Disposition, DispositionProvenance, Extra, Facts,
-    GroupProvenance, GuardFailure, Key, LocalizationVerdict, Manifest, OnceLockGroupSupport,
-    OverrideCounts, OverrideEcho, OverrideOutcome, OverrideReport, OverrideReportEntry,
-    OverrideRequested, OverrideScope, SharedGuardFailures, SkipReason, Strategy, Witness,
+    Certificate, ContextRewriteCallsite, DisposeMode, DisposeRun, Disposition,
+    DispositionProvenance, Extra, Facts, GroupProvenance, GuardFailure, Key, LocalizationVerdict,
+    Manifest, OnceLockGroupSupport, OverrideCounts, OverrideEcho, OverrideOutcome, OverrideReport,
+    OverrideReportEntry, OverrideRequested, OverrideScope, SelectedContextRewrite,
+    SharedGuardFailures, SkipReason, Strategy, Witness,
 };
 use serde::Deserialize;
 use tempfile::NamedTempFile;
@@ -160,6 +161,7 @@ pub fn apply_independent_cascade(
     if manifest.materialization.take().is_some() {
         eprintln!("warning: dropping stale disposition materialization section");
     }
+    manifest.context_rewrite.selected = None;
     for global in &mut manifest.globals {
         let (chosen, cascade_trace) = cascade(&global.facts, config)?;
         global.disposition = Some(Disposition {
@@ -271,10 +273,58 @@ pub fn apply_policy(
         counts,
         extra: Extra::new(),
     });
+    select_context_rewrite(manifest)?;
     emit_measurement_report(manifest);
     canonicalize_audit(ledger)?;
     manifest.canonicalize();
     Ok(PolicyOutcome { override_problems })
+}
+
+fn select_context_rewrite(manifest: &mut Manifest) -> Result<(), DisposeError> {
+    let chosen = manifest
+        .globals
+        .iter()
+        .filter(|global| {
+            global
+                .disposition
+                .as_ref()
+                .is_some_and(|disposition| disposition.chosen == Strategy::Localize)
+        })
+        .map(|global| global.key.clone())
+        .collect::<BTreeSet<_>>();
+    let candidates = manifest
+        .context_rewrite
+        .fields
+        .iter()
+        .map(|field| (field.global.clone(), field))
+        .collect::<BTreeMap<_, _>>();
+    let mut fields = Vec::new();
+    let mut accessors = BTreeSet::new();
+    let mut functions = BTreeSet::new();
+    let mut rewrite_callsites = BTreeMap::<String, ContextRewriteCallsite>::new();
+    for global in chosen {
+        let field = candidates.get(&global).ok_or_else(|| {
+            pangs_manifest::Error::InvalidInvariant(format!(
+                "localize disposition for {global} has no context rewrite recipe"
+            ))
+        })?;
+        accessors.extend(field.accessors.iter().cloned());
+        functions.extend(field.functions.iter().cloned());
+        for callsite in &field.rewrite_callsites {
+            rewrite_callsites
+                .entry(callsite.key.clone())
+                .or_insert_with(|| callsite.clone());
+        }
+        fields.push((*field).clone());
+    }
+    manifest.context_rewrite.selected = Some(SelectedContextRewrite {
+        fields,
+        accessors: accessors.into_iter().collect(),
+        functions: functions.into_iter().collect(),
+        rewrite_callsites: rewrite_callsites.into_values().collect(),
+        extra: Extra::new(),
+    });
+    Ok(())
 }
 
 /// Emit the inexpensive M3 gate measurements from facts and finalized policy output. These are
@@ -1585,6 +1635,21 @@ mod tests {
     }
 
     fn manifest_with(facts: Facts) -> Manifest {
+        let key = Key::parse("src/a.c::g").unwrap();
+        let context_fields = facts
+            .localization
+            .is_some()
+            .then(|| pangs_manifest::ContextRewriteField {
+                global: key.clone(),
+                llvm_name: "g".into(),
+                accessors: vec!["use_g".into()],
+                functions: vec!["use_g".into()],
+                rewrite_callsites: Vec::new(),
+                blockers: Vec::new(),
+                extra: Extra::new(),
+            })
+            .into_iter()
+            .collect();
         Manifest {
             schema_version: pangs_manifest::SCHEMA_VERSION,
             run: RunHeader {
@@ -1605,7 +1670,7 @@ mod tests {
                 extra: Extra::new(),
             },
             globals: vec![GlobalRecord {
-                key: Key::parse("src/a.c::g").unwrap(),
+                key,
                 meta: Meta {
                     linkage: Linkage::Internal,
                     type_spelling: None,
@@ -1624,6 +1689,12 @@ mod tests {
             synthetic_globals: Vec::new(),
             unkeyed_globals: Vec::<UnkeyedGlobal>::new(),
             coupling_groups: Vec::new(),
+            context_rewrite: pangs_manifest::ContextRewritePlan {
+                id: "ctx0001".into(),
+                fields: context_fields,
+                selected: None,
+                extra: Extra::new(),
+            },
             coupling_candidates: Vec::new(),
             override_report: None,
             materialization: None,

@@ -54,7 +54,7 @@ fn contract_manifest() -> Manifest {
         })
     };
     serde_json::from_value(json!({
-        "schema_version": 7,
+        "schema_version": 8,
         "run": {
             "analysis": {
                 "pangs_git": "test",
@@ -94,7 +94,17 @@ fn contract_manifest() -> Manifest {
                 "evidence": [],
                 "strategy_support": { "once_lock": null, "mutex": null }
             }
-        ]
+        ],
+        "context_rewrite": {
+            "id": "ctx0001",
+            "fields": [],
+            "selected": {
+                "fields": [],
+                "accessors": [],
+                "functions": [],
+                "rewrite_callsites": []
+            }
+        }
     }))
     .unwrap()
 }

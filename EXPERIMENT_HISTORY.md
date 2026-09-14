@@ -912,3 +912,14 @@ and LLVM scalar-PHI RMW recognizer. Source atomics cannot be relabeled by anothe
 strategy or fabricated by an accepted-risk override; if `atomic` is omitted from the
 cascade they remain `unhandled`. Atomic measurements now count declared/non-declared
 source types, while the existing D4 mutex funnel remains under `would_be_eligibility`.
+
+### Disposition-selected context rewriting replaces cc2json tissue (2026-09-14)
+
+Manifest schema v8 makes localization planning a two-owner artifact. Analysis records a
+per-global context-rewrite recipe containing accessors, transitive functions, exact callsites,
+callee alternatives, and blockers. After overrides and group resolution, disposition emits a
+`context_rewrite.selected` projection containing exactly the globals whose final choice is
+`localize` and the union of only their rewrite slices. The legacy `pangs cc2json` client and its
+independently inferred `mutated_globals`, `escaped_globals`, `call_graph_components`, and
+`mutable_global_tissue` output were removed. Tenjin now runs `pangs analyze --dispose` in
+executable mode and consumes the finalized selection directly.
