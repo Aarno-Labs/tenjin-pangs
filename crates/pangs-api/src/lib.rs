@@ -6198,8 +6198,9 @@ fn compute_context_rewrite_plan(
     initializer_address_users: &BTreeMap<String, BTreeSet<String>>,
     build_mode: BuildMode,
 ) -> ContextRewritePlan {
-    // Reverse internal call edges are the only paths over which the context must be threaded.
-    // External calls keep their ABI; they are not context recipients and cannot connect callers.
+    // Internal function/callsite edges are the only paths over which the context must be
+    // threaded. External calls keep their ABI; they are not context recipients and cannot
+    // connect callers.
     let mut callers = vec![Vec::<(FuncId, Option<CallsiteId>)>::new(); funcs.len()];
     let mut unknown_callers = vec![false; funcs.len()];
     let mut unknown_by_callsite = BTreeSet::<CallsiteId>::new();
@@ -6250,7 +6251,20 @@ fn compute_context_rewrite_plan(
         while let Some(callee) = work.pop() {
             for (caller, callsite) in &callers[callee.0 as usize] {
                 if let Some(site) = callsite {
-                    rewrite_callsites.insert(*site);
+                    // Rewriting one target's signature also rewrites the callsite.  Every
+                    // other internal target of that callsite must therefore acquire the same
+                    // signature, even if it does not access this field itself.  Feeding those
+                    // targets back into `work` computes the fixed-point closure in both
+                    // directions of the function/callsite relation.
+                    if rewrite_callsites.insert(*site) {
+                        if let Some(targets) = internal_targets_by_callsite.get(site) {
+                            for target in targets {
+                                if functions.insert(*target) {
+                                    work.push(*target);
+                                }
+                            }
+                        }
+                    }
                 }
                 if functions.insert(*caller) {
                     work.push(*caller);
