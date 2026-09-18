@@ -7748,6 +7748,45 @@ mod component_tests {
     }
 
     #[test]
+    fn context_rewrite_closes_over_every_target_of_a_rewritten_indirect_callsite() {
+        // Model a field-insensitive function-pointer table: the analysis reports both a
+        // context-taking function and an ordinary function as targets of the same callsite.
+        let funcs = vec![
+            func("caller", false),
+            func("uses_global", false),
+            func("does_not_use_global", false),
+        ];
+        let mut to_context_target = edge(0, 1);
+        to_context_target.callsite = Some(CallsiteId(0));
+        to_context_target.kind = CallKind::Indirect;
+        to_context_target.tier = Tier::Andersen;
+        let mut to_ordinary_target = edge(0, 2);
+        to_ordinary_target.callsite = Some(CallsiteId(0));
+        to_ordinary_target.kind = CallKind::Indirect;
+        to_ordinary_target.tier = Tier::Andersen;
+        let rewrite_roots = vec![BTreeSet::from([FuncId(1)])];
+        let mut mixed_callsite = callsite("caller@callback#0", 0);
+        mixed_callsite.kind = CallKind::Indirect;
+
+        let plan = compute_context_rewrite_plan(
+            &funcs,
+            &[global("g")],
+            &[mixed_callsite],
+            &[to_context_target, to_ordinary_target],
+            &rewrite_roots,
+            &BTreeMap::new(),
+            BuildMode::Executable,
+        );
+
+        assert_eq!(plan.fields[0].rewrite_callsites, vec![CallsiteId(0)]);
+        assert_eq!(
+            plan.fields[0].functions,
+            vec![FuncId(0), FuncId(1), FuncId(2)],
+            "every possible target must share the rewritten callsite's context-taking ABI"
+        );
+    }
+
+    #[test]
     fn context_rewrite_candidates_ignore_initval_stability_but_require_defined_mutable_roots() {
         let funcs = vec![func("main", false), func("helper", false)];
         let mut main_to_helper = edge(0, 1);
