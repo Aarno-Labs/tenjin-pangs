@@ -27,6 +27,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate rewritten source, including cross-TU declaration consistency.
+    ValidateSource {
+        #[arg(long)]
+        source_compdb: PathBuf,
+        #[arg(long)]
+        removed_global: Vec<String>,
+    },
+    /// Apply materialization demotions and regenerate only the selected plan.
+    Reproject {
+        manifest: PathBuf,
+        #[arg(long)]
+        failures: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     Analyze {
         module: PathBuf,
         #[arg(short, long)]
@@ -53,6 +68,9 @@ enum Command {
         /// Emit only the disposition manifest, audit ledger, and analysis metrics.
         #[arg(long, requires = "dispose")]
         manifest_only: bool,
+        /// Exact preprocessed source commands used to build this module.
+        #[arg(long, requires = "dispose")]
+        source_compdb: Option<PathBuf>,
         #[arg(long, requires = "dispose")]
         repo_root: Option<PathBuf>,
         #[arg(long, requires = "dispose")]
@@ -280,6 +298,25 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Command::ValidateSource {
+            source_compdb,
+            removed_global,
+        } => {
+            pangs_source::validate_sources(&source_compdb, &removed_global)?;
+        }
+        Command::Reproject {
+            manifest,
+            failures,
+            out,
+        } => {
+            let mut manifest: pangs_manifest::Manifest =
+                serde_json::from_slice(&fs::read(manifest)?)?;
+            manifest.validate()?;
+            let failures: BTreeMap<pangs_manifest::Key, pangs_manifest::Witness> =
+                serde_json::from_slice(&fs::read(failures)?)?;
+            pangs_dispose::demote_and_reproject(&mut manifest, &failures)?;
+            write_canonical_json(&out, &manifest)?;
+        }
         Command::Analyze {
             module,
             out,
@@ -291,6 +328,7 @@ fn run() -> Result<()> {
             validate,
             dispose,
             manifest_only,
+            source_compdb,
             repo_root,
             mode,
             overrides,
@@ -344,6 +382,14 @@ fn run() -> Result<()> {
                     pangs_clients::assemble_disposition_artifacts(
                         &analysis, &pir, &opts, &module, repo_root, target,
                     )?;
+                if let Some(database) = source_compdb {
+                    pangs_source::augment_manifest(
+                        &mut disposition_manifest,
+                        &analysis,
+                        &database,
+                        repo_root,
+                    )?;
+                }
                 let analysis_mode = match opts.build_mode {
                     BuildMode::Executable => DisposeMode::Application,
                     BuildMode::Library => DisposeMode::Library,

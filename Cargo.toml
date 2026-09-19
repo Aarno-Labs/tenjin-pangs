@@ -9,6 +9,7 @@ members = [
     "crates/pangs-testutil",
     "crates/pangs-manifest",
     "crates/pangs-dispose",
+    "crates/pangs-source",
 ]
 resolver = "2"
 

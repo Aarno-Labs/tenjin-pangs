@@ -1,0 +1,19 @@
+[package]
+name = "pangs-source"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+pangs-api = { path = "../pangs-api" }
+pangs-manifest = { path = "../pangs-manifest" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tempfile.workspace = true

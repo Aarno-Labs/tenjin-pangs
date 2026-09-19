@@ -913,6 +913,7 @@ dependencies = [
  "pangs-pag",
  "pangs-pir",
  "pangs-solve",
+ "pangs-source",
  "serde_json",
  "sha2",
  "tempfile",
@@ -990,6 +991,20 @@ dependencies = [
  "pangs-pir",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pangs-source"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "pangs-api",
+ "pangs-manifest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

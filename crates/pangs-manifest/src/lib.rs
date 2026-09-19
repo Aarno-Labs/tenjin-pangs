@@ -14,6 +14,49 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const SCHEMA_VERSION: u32 = 8;
+
+/// Independently versioned source/materializer contract. A v8 manifest without
+/// this contract remains a valid IR-only manifest, not a source certificate.
+pub const SOURCE_PLAN_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SourceEdit {
+    pub file: String,
+    pub start: usize,
+    pub end: usize,
+    pub expected: String,
+    pub replacement: String,
+    pub kind: String,
+}
+
+/// Shared identical obligations are applied once. Incompatible or overlapping
+/// edits are never resolved by insertion order.
+pub fn compose_source_edits(fields: &[ContextRewriteField]) -> Result<Vec<SourceEdit>, Error> {
+    let mut edits = BTreeSet::new();
+    for field in fields {
+        if let Some(value) = field.extra.get("source_edits") {
+            let field_edits: Vec<SourceEdit> = serde_json::from_value(value.clone())
+                .map_err(|e| Error::InvalidInvariant(format!("invalid source edits: {e}")))?;
+            edits.extend(field_edits);
+        }
+    }
+    let edits = edits.into_iter().collect::<Vec<_>>();
+    for edit in &edits {
+        if edit.end < edit.start || edit.end - edit.start != edit.expected.len() {
+            return Err(Error::InvalidInvariant("invalid source edit range".into()));
+        }
+    }
+    for pair in edits.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if a.file == b.file && (b.start < a.end || a.start == b.start) {
+            return Err(Error::InvalidInvariant(format!(
+                "conflicting source edits at {}:{}",
+                a.file, b.start
+            )));
+        }
+    }
+    Ok(edits)
+}
 pub type Extra = BTreeMap<String, Value>;
 
 #[derive(Debug, Error)]
@@ -1139,6 +1182,34 @@ impl Manifest {
             }
         }
         if let Some(selected) = &self.context_rewrite.selected {
+            if let Some(source) = self.context_rewrite.extra.get("source") {
+                if source.get("version").and_then(Value::as_u64) != Some(SOURCE_PLAN_VERSION as u64)
+                    || source.get("complete").and_then(Value::as_bool) != Some(true)
+                {
+                    return Err(Error::InvalidInvariant(
+                        "unsupported or incomplete source plan".into(),
+                    ));
+                }
+                for field in &selected.fields {
+                    if !field.blockers.is_empty() || !field.extra.contains_key("source_edits") {
+                        return Err(Error::InvalidInvariant(
+                            "selected source recipe is blocked or absent".into(),
+                        ));
+                    }
+                    if !self.context_rewrite.fields.contains(field) {
+                        return Err(Error::InvalidInvariant(
+                            "selected source recipe differs from analysis".into(),
+                        ));
+                    }
+                }
+                let edits = compose_source_edits(&selected.fields)?;
+                if selected.extra.get("source_edits") != Some(&serde_json::to_value(edits).unwrap())
+                {
+                    return Err(Error::InvalidInvariant(
+                        "selected source edits differ from recipe union".into(),
+                    ));
+                }
+            }
             let selected_globals = selected
                 .fields
                 .iter()
@@ -1272,12 +1343,14 @@ fn canonicalize_context_fields(fields: &mut Vec<ContextRewriteField>) {
                 &left.function,
                 &left.callsite,
                 &left.initializer,
+                left.extra.get("source_node").and_then(Value::as_str),
             )
                 .cmp(&(
                     &right.kind,
                     &right.function,
                     &right.callsite,
                     &right.initializer,
+                    right.extra.get("source_node").and_then(Value::as_str),
                 ))
         });
         field.blockers.dedup_by(|left, right| {
@@ -1286,11 +1359,13 @@ fn canonicalize_context_fields(fields: &mut Vec<ContextRewriteField>) {
                 &left.function,
                 &left.callsite,
                 &left.initializer,
+                left.extra.get("source_node").and_then(Value::as_str),
             ) == (
                 &right.kind,
                 &right.function,
                 &right.callsite,
                 &right.initializer,
+                right.extra.get("source_node").and_then(Value::as_str),
             )
         });
     }

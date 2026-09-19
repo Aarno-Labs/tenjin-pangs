@@ -280,7 +280,9 @@ pub fn apply_policy(
     Ok(PolicyOutcome { override_problems })
 }
 
-fn select_context_rewrite(manifest: &mut Manifest) -> Result<(), DisposeError> {
+/// Reproject surviving choices after materialization demotions, without running
+/// the cascade, promoting choices, or modifying analysis/cascade history.
+pub fn select_context_rewrite(manifest: &mut Manifest) -> Result<(), DisposeError> {
     let chosen = manifest
         .globals
         .iter()
@@ -317,13 +319,113 @@ fn select_context_rewrite(manifest: &mut Manifest) -> Result<(), DisposeError> {
         }
         fields.push((*field).clone());
     }
+    let mut extra = Extra::new();
+    if manifest.context_rewrite.extra.contains_key("source") {
+        let edits = pangs_manifest::compose_source_edits(&fields)?;
+        extra.insert(
+            "source_edits".into(),
+            serde_json::to_value(edits).expect("source edits"),
+        );
+    }
     manifest.context_rewrite.selected = Some(SelectedContextRewrite {
         fields,
         accessors: accessors.into_iter().collect(),
         functions: functions.into_iter().collect(),
         rewrite_callsites: rewrite_callsites.into_values().collect(),
-        extra: Extra::new(),
+        extra,
     });
+    Ok(())
+}
+
+/// Apply witnessed materializer failures and reproject from the unchanged
+/// analysis recipes. Joint once-lock/mutex representations demote as a group.
+pub fn demote_and_reproject(
+    manifest: &mut Manifest,
+    failures: &BTreeMap<Key, Witness>,
+) -> Result<(), DisposeError> {
+    use pangs_manifest::{Demotion, Materialization, MaterializationDemotion, ToolInfo};
+    let mut expanded = failures.clone();
+    for (key, witness) in failures {
+        let global = manifest
+            .globals
+            .iter()
+            .find(|g| &g.key == key)
+            .ok_or_else(|| {
+                pangs_manifest::Error::InvalidInvariant(format!("unknown demotion subject {key}"))
+            })?;
+        let choice = global
+            .disposition
+            .as_ref()
+            .ok_or_else(|| {
+                pangs_manifest::Error::InvalidInvariant(
+                    "demotion requires finalized choices".into(),
+                )
+            })?
+            .chosen;
+        if matches!(choice, Strategy::OnceLock | Strategy::Mutex) {
+            if let Some(group) = manifest.coupling_groups.iter().find(|g| {
+                global.facts.coupling_group.as_ref() == Some(&g.id)
+                    && g.group_disposition == Some(choice)
+            }) {
+                for member in &group.members {
+                    expanded.insert(member.clone(), witness.clone());
+                }
+            }
+        }
+    }
+    let materialization = manifest
+        .materialization
+        .get_or_insert_with(|| Materialization {
+            tool: ToolInfo {
+                name: "tenjin".into(),
+                version: "source-plan-1".into(),
+                extra: Extra::new(),
+            },
+            marker_inventory: Vec::new(),
+            demotions: Vec::new(),
+            extra: Extra::new(),
+        });
+    // A new projection invalidates concrete edits/markers from an earlier attempt.
+    materialization.marker_inventory.clear();
+    materialization.extra.clear();
+    for global in &mut manifest.globals {
+        let Some(witness) = expanded.get(&global.key) else {
+            continue;
+        };
+        let disposition = global.disposition.as_mut().expect("finalized choices");
+        if disposition.chosen == Strategy::Unhandled {
+            continue;
+        }
+        let from = disposition.chosen;
+        disposition.chosen = Strategy::Unhandled;
+        disposition.provenance = DispositionProvenance::Demoted;
+        disposition.demotion = Some(Demotion {
+            from,
+            witness: witness.clone(),
+            extra: Extra::new(),
+        });
+        materialization.demotions.push(MaterializationDemotion {
+            key: global.key.clone(),
+            from,
+            witness: witness.clone(),
+            extra: Extra::new(),
+        });
+    }
+    for group in &mut manifest.coupling_groups {
+        if group.members.iter().all(|key| {
+            manifest.globals.iter().any(|g| {
+                &g.key == key
+                    && g.disposition
+                        .as_ref()
+                        .is_some_and(|d| d.chosen == Strategy::Unhandled)
+            })
+        }) {
+            group.group_disposition = Some(Strategy::Unhandled);
+        }
+    }
+    select_context_rewrite(manifest)?;
+    manifest.canonicalize();
+    manifest.validate()?;
     Ok(())
 }
 
@@ -2042,6 +2144,13 @@ mod tests {
     fn unanimous_mutex_selection_uses_the_joint_group_representation() {
         let mut facts = base_facts();
         facts.written.value = true;
+        facts.written.witness = Some(Witness {
+            kind: "store".into(),
+            site: None,
+            symbol: Some("g".into()),
+            note: None,
+            extra: Extra::new(),
+        });
         facts.mutex_eligibility = Some(certified());
         let mut manifest = manifest_with(facts);
         add_two_member_group(&mut manifest);
@@ -2062,6 +2171,36 @@ mod tests {
             .globals
             .iter()
             .all(|global| { global.disposition.as_ref().unwrap().chosen == Strategy::Mutex }));
+
+        let original = manifest.clone();
+        let witness = Witness {
+            kind: "unsupported-materialization".into(),
+            site: None,
+            symbol: Some("g".into()),
+            note: None,
+            extra: Extra::new(),
+        };
+        demote_and_reproject(
+            &mut manifest,
+            &BTreeMap::from([(Key::parse("src/a.c::g").unwrap(), witness)]),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.coupling_groups[0].group_disposition,
+            Some(Strategy::Unhandled)
+        );
+        assert_eq!(
+            manifest.materialization.as_ref().unwrap().demotions.len(),
+            2
+        );
+        for (before, after) in original.globals.iter().zip(&manifest.globals) {
+            assert_eq!(before.facts, after.facts);
+            let before = before.disposition.as_ref().unwrap();
+            let after = after.disposition.as_ref().unwrap();
+            assert_eq!(after.chosen, Strategy::Unhandled);
+            assert_eq!(before.cascade_chosen, after.cascade_chosen);
+            assert_eq!(before.cascade_trace, after.cascade_trace);
+        }
     }
 
     #[test]

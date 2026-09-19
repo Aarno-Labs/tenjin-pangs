@@ -68,6 +68,42 @@
       },
       "additionalProperties": true
     },
+    "source_edit": {
+      "type": "object",
+      "required": ["file", "start", "end", "expected", "replacement", "kind"],
+      "properties": {
+        "file": { "type": "string", "minLength": 1 },
+        "start": { "type": "integer", "minimum": 0 },
+        "end": { "type": "integer", "minimum": 0 },
+        "expected": { "type": "string" },
+        "replacement": { "type": "string" },
+        "kind": { "enum": ["signature", "call", "typedef-clone", "typedef-use"] }
+      },
+      "additionalProperties": false
+    },
+    "source_plan": {
+      "type": "object",
+      "required": ["version", "complete", "compiler", "module_sha256", "compdb_sha256", "files", "construction"],
+      "properties": {
+        "version": { "const": 1 },
+        "complete": { "const": true },
+        "compiler": { "type": "string", "minLength": 1 },
+        "module_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "compdb_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "construction": { "const": "automatic-context-in-main" },
+        "files": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "required": ["path", "sha256", "command"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "command": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
     "context_rewrite_callsite": {
       "type": "object",
       "required": ["key", "caller", "callees", "unresolved"],
@@ -95,6 +131,7 @@
       "type": "object",
       "required": ["global", "llvm_name", "accessors", "functions", "rewrite_callsites", "blockers"],
       "properties": {
+        "source_edits": { "type": "array", "items": { "$ref": "#/definitions/source_edit" } },
         "global": { "$ref": "#/definitions/key" },
         "llvm_name": { "type": "string", "minLength": 1 },
         "accessors": { "type": "array", "items": { "type": "string", "minLength": 1 } },
@@ -114,6 +151,7 @@
       "type": "object",
       "required": ["fields", "accessors", "functions", "rewrite_callsites"],
       "properties": {
+        "source_edits": { "type": "array", "items": { "$ref": "#/definitions/source_edit" } },
         "fields": { "type": "array", "items": { "$ref": "#/definitions/context_rewrite_field" } },
         "accessors": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "functions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
@@ -128,6 +166,7 @@
       "type": "object",
       "required": ["id", "fields"],
       "properties": {
+        "source": { "$ref": "#/definitions/source_plan" },
         "id": { "type": "string", "minLength": 1 },
         "fields": { "type": "array", "items": { "$ref": "#/definitions/context_rewrite_field" } },
         "selected": { "$ref": "#/definitions/selected_context_rewrite" }
