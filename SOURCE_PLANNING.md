@@ -1,4 +1,4 @@
-# Source-aware localization contract (version 1)
+# Source-aware localization contract (version 2)
 
 `pangs analyze module.bc --dispose --repo-root ROOT --source-compdb COMMANDS ...`
 augments the analysis-owned localization candidates before disposition. The
@@ -16,7 +16,7 @@ driver's cc1 job preserves `.i` input mode (ClangTool 14 itself rejects these
 jobs). This is not a separate extractor executable or interchange service.
 
 The existing manifest schema remains 8; the independent required **source
-plan version is 1**. IR-only schema-8 manifests remain readable but do not
+plan version is 2**. IR-only schema-8 manifests remain readable but do not
 satisfy Tenjin's localization contract. `context_rewrite.source` records source
 hashes and normalized paths, compilation commands and their hash, expanded
 cc1 options, compiler version, linked-module hash, construction recipe, and
@@ -30,6 +30,21 @@ from the manifest is never an immutability proof. Source-only functions can
 enter a recipe, but source-only globals are not silently added as disposition
 subjects. Safety gates are rechecked for newly reached functions.
 
+Source obligations follow C2Rust's per-TU declaration dependency closure with
+`--preserve-unused-functions` disabled. Roots are externally visible function
+and variable definitions (including the compiler's inline visibility rules)
+and declarations marked `used`. Dependencies include source references in
+constant-false branches, initializers, types and cleanup attributes. This is
+not LLVM reachability. Discarded declaration bodies do not contribute effects
+or callback-flow blockers. The manifest records the retention policy, retained
+function definitions and discarded declarations; Tenjin checks the policy.
+
+Localization recipes include anchored `prune-declaration` edits for discarded
+declarations, so their old references cannot invalidate intermediate C after
+global removal or signature rewriting. They are applied only with a selected
+localization recipe. A declaration group that cannot be pruned independently
+blocks localization explicitly; the consumer never guesses a repair.
+
 Supported source constraints include direct calls, global references,
 indirect calls through fields/variables/arrays, initializers, assignments,
 conditional producers, direct argument/parameter flow, and pointer comparison
@@ -38,7 +53,7 @@ Single-level callback typedefs are cloned per affected use; equal signatures
 and shared typedef names do not themselves create value flow. Declaration
 occurrences and shared fields are checked across TUs. `main` retains its ABI.
 
-Version 1 deliberately blocks, with scoped witnesses, unsupported callable
+Version 2 deliberately blocks, with scoped witnesses, unsupported callable
 returns/nested higher-order values, typedef alias chains, pointer-to-pointer
 callable storage, union callable storage, aggregate copies, opaque/cast or
 variadic transfers, external callbacks/producers/storage, external-inline

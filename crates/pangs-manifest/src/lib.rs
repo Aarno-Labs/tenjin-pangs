@@ -17,7 +17,7 @@ pub const SCHEMA_VERSION: u32 = 8;
 
 /// Independently versioned source/materializer contract. A v8 manifest without
 /// this contract remains a valid IR-only manifest, not a source certificate.
-pub const SOURCE_PLAN_VERSION: u32 = 1;
+pub const SOURCE_PLAN_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SourceEdit {

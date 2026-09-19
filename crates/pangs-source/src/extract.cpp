@@ -25,6 +25,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <vector>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -40,15 +41,72 @@ struct Node {
 };
 struct Facts {
   std::map<std::string, Node> nodes;
-  Array edges, calls, uses, functions, records, variables, invocations;
+  Array edges, calls, uses, functions, records, variables, invocations, pruned_declarations;
+  Array pruning_edits;
+  bool pruning_complete = true;
   std::set<std::string> globals, mutable_storage, identifiers, no_initializer, initialized;
   std::map<std::string, std::set<std::string>> clone_users;
+};
+
+// Match C2Rust's TypedAstContext::prune_unwanted_items(false), per TU.
+// This is declaration dependency closure, NOT executable/LLVM reachability:
+// references in if(0), sizeof, initializers and cleanup attributes still count.
+class Retention : public RecursiveASTVisitor<Retention> {
+  std::set<const Decl *> retained;
+  std::vector<Decl *> pending;
+  std::set<const Decl *> visited;
+public:
+  void keep(const Decl *d) {
+    if (!d || !retained.insert(d->getCanonicalDecl()).second) return;
+    if (auto *f = dyn_cast<FunctionDecl>(d)) {
+      for (auto *r : f->redecls()) pending.push_back(r);
+    } else if (auto *v = dyn_cast<VarDecl>(d)) {
+      for (auto *r : v->redecls()) pending.push_back(r);
+    } else if (auto *t = dyn_cast<TagDecl>(d)) {
+      for (auto *r : t->redecls()) pending.push_back(r);
+    } else pending.push_back(const_cast<Decl *>(d));
+  }
+  bool contains(const Decl *d) const {
+    return retained.count(d->getCanonicalDecl());
+  }
+  bool VisitDecl(Decl *d) { keep(d); return true; }
+  bool VisitDeclRefExpr(DeclRefExpr *e) {
+    keep(e->getDecl());
+    if (isa<EnumConstantDecl>(e->getDecl()))
+      keep(cast<Decl>(e->getDecl()->getDeclContext()));
+    return true;
+  }
+  bool VisitMemberExpr(MemberExpr *e) { keep(e->getMemberDecl()); return true; }
+  bool VisitTagType(TagType *t) { keep(t->getDecl()); return true; }
+  bool VisitTypedefType(TypedefType *t) { keep(t->getDecl()); return true; }
+  bool VisitVarDecl(VarDecl *v) {
+    if (auto *cleanup = v->getAttr<CleanupAttr>()) keep(cleanup->getFunctionDecl());
+    return true;
+  }
+  explicit Retention(ASTContext &ctx) {
+    for (auto *d : ctx.getTranslationUnitDecl()->decls()) {
+      if (auto *f = dyn_cast<FunctionDecl>(d)) {
+        auto *def = f->getDefinition();
+        if ((def && f->isGlobal() &&
+             (!def->isInlineSpecified() || def->isInlineDefinitionExternallyVisible())) ||
+            f->hasAttr<UsedAttr>()) keep(f);
+      } else if (auto *v = dyn_cast<VarDecl>(d)) {
+        if ((v->isThisDeclarationADefinition() && v->isExternallyVisible()) ||
+            v->hasAttr<UsedAttr>()) keep(v);
+      }
+    }
+    while (!pending.empty()) {
+      auto *d = pending.back(); pending.pop_back();
+      if (visited.insert(d).second) TraverseDecl(d);
+    }
+  }
 };
 
 class Extract : public RecursiveASTVisitor<Extract> {
   ASTContext &ctx;
   SourceManager &sm;
   Facts &out;
+  const Retention &retention;
   std::string function, initializer;
   std::set<const Decl *> typed;
   unsigned unknown_count = 0;
@@ -360,7 +418,59 @@ class Extract : public RecursiveASTVisitor<Extract> {
   }
 
 public:
-  Extract(ASTContext &ctx, Facts &out) : ctx(ctx), sm(ctx.getSourceManager()), out(out) {}
+  Extract(ASTContext &ctx, Facts &out, const Retention &retention)
+      : ctx(ctx), sm(ctx.getSourceManager()), out(out), retention(retention) {}
+  bool TraverseDecl(Decl *d) {
+    if (!d) return true;
+    // Names remain reserved in the unmodified C snapshot, even when C2Rust
+    // would omit their declarations. Extraction itself never changes source.
+    if (auto *n = dyn_cast<NamedDecl>(d)) out.identifiers.insert(n->getNameAsString());
+    if (!isa<TranslationUnitDecl>(d) && !retention.contains(d)) return true;
+    return RecursiveASTVisitor::TraverseDecl(d);
+  }
+  void recordPruning() {
+    // Discarded bodies/initializers must not leave invalid C behind when a
+    // selected recipe removes a global or changes a function's signature.
+    // Emit anchored deletions, applied only when localization is materialized.
+    std::map<unsigned, std::vector<Decl *>> groups;
+    for (auto *d : ctx.getTranslationUnitDecl()->decls()) {
+      if (d->isImplicit() || !editable(d->getBeginLoc())) continue;
+      if (isa<FunctionDecl>(d) || isa<VarDecl>(d) || isa<TagDecl>(d) || isa<TypedefNameDecl>(d))
+        groups[offset(d->getBeginLoc())].push_back(d);
+    }
+    for (auto &entry : groups) {
+      bool kept = false, discarded = false;
+      for (auto *d : entry.second) {
+        kept |= retention.contains(d);
+        discarded |= !retention.contains(d);
+      }
+      if (!discarded) continue;
+      if (kept) { out.pruning_complete = false; continue; }
+      SourceLocation begin, end;
+      bool complete = true;
+      for (auto *d : entry.second) {
+        auto after = Lexer::getLocForEndOfToken(d->getEndLoc(), 0, sm, ctx.getLangOpts());
+        if (auto *f = dyn_cast<FunctionDecl>(d); !f || !f->doesThisDeclarationHaveABody()) {
+          auto semi = Lexer::findNextToken(d->getEndLoc(), sm, ctx.getLangOpts());
+          // A tag can share its declaration with a variable/typedef. The
+          // outer declarator supplies that group's terminating semicolon.
+          if (semi && semi->is(tok::semi)) after = semi->getLocation().getLocWithOffset(1);
+          else if (!isa<TagDecl>(d)) { complete = false; continue; }
+        }
+        if (begin.isInvalid()) begin = d->getBeginLoc();
+        if (end.isInvalid() || offset(after) > offset(end)) end = after;
+        if (!retention.contains(d)) {
+          auto *named = dyn_cast<NamedDecl>(d);
+          out.pruned_declarations.push_back(Object{{"name", named ? named->getNameAsString() : ""},
+              {"file", file(d->getLocation())}, {"offset", offset(d->getLocation())},
+              {"kind", d->getDeclKindName()}});
+        }
+      }
+      out.pruning_complete &= complete;
+      if (complete && begin.isValid() && end.isValid())
+        out.pruning_edits.push_back(edit(begin, end, "", "prune-declaration"));
+    }
+  }
   bool TraverseFunctionDecl(FunctionDecl *d) {
     auto saved = function;
     function = d->getNameAsString();
@@ -560,7 +670,10 @@ class Consumer : public ASTConsumer {
 public:
   explicit Consumer(Facts &facts) : facts(facts) {}
   void HandleTranslationUnit(ASTContext &ctx) override {
-    Extract(ctx, facts).TraverseDecl(ctx.getTranslationUnitDecl());
+    Retention retention(ctx);
+    Extract extractor(ctx, facts, retention);
+    extractor.recordPruning();
+    extractor.TraverseDecl(ctx.getTranslationUnitDecl());
   }
 };
 class Action : public ASTFrontendAction {
@@ -664,6 +777,9 @@ extern "C" char *pangs_source_extract(const char *database) {
         {"calls", std::move(facts.calls)}, {"uses", std::move(facts.uses)},
         {"functions", std::move(facts.functions)}, {"records", std::move(facts.records)},
         {"variables", std::move(facts.variables)}, {"invocations", std::move(facts.invocations)},
+        {"pruning_edits", std::move(facts.pruning_edits)},
+        {"pruned_declarations", std::move(facts.pruned_declarations)},
+        {"pruning_complete", facts.pruning_complete},
         {"globals", std::move(globals)},
         {"mutable_storage", std::move(mutable_storage)}, {"no_initializer", std::move(no_initializer)},
         {"compiler", getClangFullVersion()}};

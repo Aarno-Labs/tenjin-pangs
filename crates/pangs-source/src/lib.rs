@@ -66,6 +66,9 @@ struct Facts {
     records: Vec<Value>,
     variables: Vec<Value>,
     invocations: Vec<Value>,
+    pruning_edits: Vec<SourceEdit>,
+    pruned_declarations: Vec<Value>,
+    pruning_complete: bool,
     globals: BTreeSet<String>,
     mutable_storage: BTreeSet<String>,
     no_initializer: BTreeSet<String>,
@@ -458,6 +461,11 @@ pub fn augment_manifest(
                 .blockers
                 .push(blocker("source-owned-storage-recipe-required", name));
         }
+        if !facts.pruning_complete {
+            field
+                .blockers
+                .push(blocker("source-unprunable-declaration", name));
+        }
         if !global.facts.access_set_complete.value {
             field.blockers.push(blocker("access-set-complete", name));
         }
@@ -489,7 +497,7 @@ pub fn augment_manifest(
                 }
             }
         }
-        let mut edits = BTreeSet::new();
+        let mut edits = facts.pruning_edits.iter().cloned().collect::<BTreeSet<_>>();
         let mut functions = BTreeSet::new();
         for node in &reached {
             if let Some(n) = facts.nodes.get(node) {
@@ -599,6 +607,11 @@ pub fn augment_manifest(
         "construction": "automatic-context-in-main", "parse_and_plan_ms": started.elapsed().as_millis(),
         "node_count": facts.nodes.len(), "call_count": facts.calls.len(),
         "globals_without_initializers": facts.no_initializer,
+        "retention": {"policy": "c2rust-declaration-dependencies", "version": 1,
+                      "preserve_unused_functions": false},
+        "pruned_declarations": facts.pruned_declarations,
+        "retained_functions": facts.functions.iter().filter(|f| f.defined)
+            .map(|f| f.name.clone()).collect::<BTreeSet<_>>(),
     }));
     manifest.canonicalize();
     manifest.validate()?;

@@ -78,7 +78,7 @@ fn source_only_indirect_chain_closes_all_producers_and_compiles() {
     let f = field(&m);
     assert_eq!(f["blockers"], json!([]), "{f:#}");
     assert_eq!(f["functions"], json!(["dead", "main", "needs", "ordinary"]));
-    assert_eq!(m["context_rewrite"]["source"]["version"], 1);
+    assert_eq!(m["context_rewrite"]["source"]["version"], 2);
     let mut edits: Vec<pangs_manifest::SourceEdit> =
         serde_json::from_value(f["source_edits"].clone()).unwrap();
     edits.sort_by_key(|e| std::cmp::Reverse(e.start));
@@ -109,9 +109,9 @@ fn source_only_indirect_chain_closes_all_producers_and_compiles() {
 #[test]
 fn source_boundaries_and_initializers_block_even_when_ir_elides_them() {
     for (extra, expected) in [
-        ("extern int atexit(void (*)(void)); static void cb(void){if(0)++g;} static void unused(void){atexit(cb);}", "source-external-callback:atexit"),
-        ("static int *p=&g; static int unused(void){return *p;}", "source-static-initializer-dependency"),
-        ("static void cb(void){if(0)++g;} static void unused(void){((void (*)(int))cb)(1);}", "source-callable-cast"),
+        ("extern int atexit(void (*)(void)); static void cb(void){if(0)++g;} void retained(void){atexit(cb);}", "source-external-callback:atexit"),
+        ("static int *p=&g; int retained(void){return *p;}", "source-static-initializer-dependency"),
+        ("static void cb(void){if(0)++g;} void retained(void){((void (*)(int))cb)(1);}", "source-callable-cast"),
     ] {
         let (_, m) = analyze(&format!("static int g; {extra} int main(void){{return ++g;}}"));
         let f = field(&m);
@@ -132,7 +132,7 @@ fn identical_slot_signatures_do_not_establish_flow() {
 #[test]
 fn dead_write_is_representation_evidence_not_runtime_write() {
     let (_, m) =
-        analyze("static int g=7; static void dead(void){if(0)++g;} int main(void){return g;}");
+        analyze("static int g=7; void retained(void){if(0)++g;} int main(void){return g;}");
     let g = m["globals"]
         .as_array()
         .unwrap()
@@ -149,10 +149,10 @@ fn dead_write_is_representation_evidence_not_runtime_write() {
 #[test]
 fn retained_function_static_initializer_and_lifecycle_entry_are_blockers() {
     for (body, expected) in [
-        ("static void dead(void){static int *p=&g; (void)p;}", "source-static-initializer-dependency"),
-        ("__attribute__((constructor)) static void startup(void){if(0)++g;}", "source-lifecycle-or-opaque-entry"),
-        ("static int xjg;", "source-context-name-collision"),
-        ("static int f(void){return ++g;} static int (*choose(void))(void){return f;} static int dead(void){return choose()();}", "source-callable-return-type"),
+        ("void retained(void){static int *p=&g; (void)p;}", "source-static-initializer-dependency"),
+        ("__attribute__((constructor,used)) static void startup(void){if(0)++g;}", "source-lifecycle-or-opaque-entry"),
+        ("int xjg;", "source-context-name-collision"),
+        ("static int f(void){return ++g;} static int (*choose(void))(void){return f;} int retained(void){return choose()();}", "source-callable-return-type"),
     ] {
         let (_, m) = analyze(&format!("static int g; {body} int main(void){{return ++g;}}"));
         assert!(field(&m)["blockers"].as_array().unwrap().iter().any(|b| b["kind"] == expected), "{}", field(&m));
@@ -227,6 +227,7 @@ fn aggregate_copy_and_opaque_storage_are_explicitly_blocked() {
             "source-external-callable-storage",
         ),
     ] {
+        let body = body.replace("static void dead", "void retained").replace("static int dead", "int retained");
         let (_, m) = analyze(&format!(
             "static int g; static int f(void){{return ++g;}} {body} int main(void){{return f();}}"
         ));
@@ -281,7 +282,7 @@ fn cross_tu_and_parse_failures_are_fatal_without_an_accepted_plan() {
 
 #[test]
 fn cross_tu_anonymous_records_and_incomplete_arrays() {
-    let declaration = "struct S { union {int a; struct {int x;} aa;}; union {int b; struct {int y;} bb;}; }; extern const int table[];";
+    let declaration = "struct S { union {int a; struct {int x;} aa;}; union {int b; struct {int y;} bb;}; }; extern const int table[]; extern struct S object; int retain(void){return object.a + table[0];}";
     for (other, succeeds) in [
         (format!("{declaration} const int table[4]={{0}};"), true),
         (declaration.replace("int y", "long y"), false),
@@ -324,4 +325,94 @@ fn external_inline_header_definition_is_not_a_local_callback_boundary() {
         .unwrap()
         .iter()
         .any(|b| b["kind"] == "source-external-callback:run"));
+}
+
+#[test]
+fn source_retention_uses_declaration_dependencies_not_llvm_reachability() {
+    let (_, m) = analyze(
+        r#"
+static int g = 7;
+static void discarded_write(void){ ++g; }
+static void discarded_root(void){ discarded_write(); }
+static int never_called(void){ return ++g; }
+static void cleanup(int *p){ if(0) ++g; }
+static int callback(void){ return g; }
+int (*exported_callback)(void) = callback;
+__attribute__((used)) static int pinned(void){ return g; }
+static inline int unused_inline(void){ return ++g; }
+int exported(void){ return g; }
+int main(void){ int x __attribute__((cleanup(cleanup))) = 0;
+    if(0) return never_called(); return g; }
+"#,
+    );
+    assert_eq!(
+        m["context_rewrite"]["source"]["retained_functions"],
+        json!([
+            "callback",
+            "cleanup",
+            "exported",
+            "main",
+            "never_called",
+            "pinned"
+        ])
+    );
+    let pruned = m["context_rewrite"]["source"]["pruned_declarations"]
+        .as_array()
+        .unwrap();
+    for name in ["discarded_root", "discarded_write", "unused_inline"] {
+        assert!(pruned.iter().any(|d| d["name"] == name), "{pruned:#?}");
+    }
+}
+
+#[test]
+fn discarded_source_writers_do_not_constrain_immutable_storage() {
+    let (_, m) = analyze("static int g=7; static void add(void){++g;} static void unused(void){add();} int main(void){return g;}");
+    let g = m["globals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["meta"]["llvm_name"] == "g")
+        .unwrap();
+    assert_eq!(g["facts"]["written"]["value"], false);
+    assert_eq!(
+        g["facts"]["source_representation"]["requires_mutable_storage"],
+        false
+    );
+    assert_eq!(g["disposition"]["chosen"], "immutable");
+}
+
+#[test]
+fn localization_recipes_prune_unused_declaration_dependencies() {
+    let code = "static int g; static int f(void){return ++g;} static int (*unused_slot)(void)=f; static int unused(void){return unused_slot();} int main(void){return f();}";
+    let (dir, m) = analyze(code);
+    let f = field(&m);
+    assert_eq!(f["blockers"], json!([]), "{f:#}");
+    assert_eq!(f["functions"], json!(["f", "main"]));
+    let mut edits: Vec<pangs_manifest::SourceEdit> =
+        serde_json::from_value(f["source_edits"].clone()).unwrap();
+    assert!(edits.iter().any(|e| e.kind == "prune-declaration"));
+    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
+    let mut rewritten = code.to_owned();
+    for edit in edits {
+        rewritten.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    rewritten.insert_str(0, "struct XjGlobals;\n");
+    assert!(!rewritten.contains("unused"), "{rewritten}");
+    let source = dir.path().join("pruned.i");
+    fs::write(&source, rewritten).unwrap();
+    let check = Command::new(clang())
+        .args([
+            "-x",
+            "c",
+            "-fsyntax-only",
+            "-Werror=incompatible-function-pointer-types",
+        ])
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
 }
