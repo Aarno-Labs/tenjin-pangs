@@ -10,8 +10,8 @@ use anyhow::{bail, ensure, Context, Result};
 use pangs_api::{Analysis, Callee, Caller};
 use pangs_manifest::{
     ContextRewriteBlocker, ContextRewriteCallsite, ContextRewriteField, Extra, Localization,
-    LocalizationBlocker, LocalizationVerdict, Manifest, Site, SourceEdit, Witness,
-    SOURCE_PLAN_VERSION,
+    LocalizationBlocker, LocalizationVerdict, Manifest, Site, SourceEdit, SourceObligations,
+    SourceObservation, Witness, SOURCE_EMITTER, SOURCE_PLAN_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -45,6 +45,7 @@ struct Use {
     initializer: String,
     file: String,
     offset: usize,
+    observations: Vec<SourceObservation>,
 }
 #[derive(Debug, Deserialize)]
 struct Function {
@@ -69,8 +70,8 @@ struct Facts {
     pruning_edits: Vec<SourceEdit>,
     pruned_declarations: Vec<Value>,
     pruning_complete: bool,
+    unprunable_declarations: Vec<Value>,
     globals: BTreeSet<String>,
-    mutable_storage: BTreeSet<String>,
     no_initializer: BTreeSet<String>,
     compiler: String,
 }
@@ -411,10 +412,57 @@ pub fn augment_manifest(
             .iter()
             .filter(|u| u.global == name)
             .collect::<Vec<_>>();
-        global.facts.extra.insert("source_representation".into(), json!({
-            "mapped": facts.globals.contains(name),
-            "requires_mutable_storage": !facts.globals.contains(name) || facts.mutable_storage.contains(name),
-        }));
+        let declarations = facts
+            .variables
+            .iter()
+            .filter(|v| v["name"] == name && v["defined"] == true)
+            .collect::<Vec<_>>();
+        let mut observations = uses
+            .iter()
+            .flat_map(|u| u.observations.iter().cloned())
+            .collect::<Vec<_>>();
+        let relative_site = |site: &mut Site| -> Result<()> {
+            site.file = Path::new(&site.file)
+                .strip_prefix(&root)
+                .context("source observation outside snapshot")?
+                .to_string_lossy()
+                .into_owned();
+            Ok(())
+        };
+        for observation in &mut observations {
+            relative_site(&mut observation.site)?;
+        }
+        let mut declaration_site = declarations
+            .first()
+            .map(|v| serde_json::from_value::<Site>(v["site"].clone()))
+            .transpose()?;
+        if let Some(site) = &mut declaration_site {
+            relative_site(site)?;
+        }
+        let source = SourceObligations {
+            emitter: SOURCE_EMITTER.into(),
+            declaration: declarations
+                .first()
+                .and_then(|v| v["declaration"].as_str())
+                .map(str::to_owned),
+            declaration_site,
+            contains_object_pointer: declarations
+                .iter()
+                .any(|v| v["contains_object_pointer"] == true),
+            initializer_features: declarations
+                .iter()
+                .flat_map(|v| v["initializer_features"].as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            observations,
+        };
+        global
+            .facts
+            .extra
+            .insert("source_obligations".into(), serde_json::to_value(source)?);
         let old = old_fields.get(&global.key);
         if old.is_none() && uses.is_empty() {
             continue;
@@ -609,7 +657,9 @@ pub fn augment_manifest(
         "globals_without_initializers": facts.no_initializer,
         "retention": {"policy": "c2rust-declaration-dependencies", "version": 1,
                       "preserve_unused_functions": false},
+        "emitter": SOURCE_EMITTER,
         "pruned_declarations": facts.pruned_declarations,
+        "unprunable_declarations": facts.unprunable_declarations,
         "retained_functions": facts.functions.iter().filter(|f| f.defined)
             .map(|f| f.name.clone()).collect::<BTreeSet<_>>(),
     }));

@@ -1,4 +1,4 @@
-# Source-aware localization contract (version 2)
+# Source obligations and localization contract (version 2)
 
 `pangs analyze module.bc --dispose --repo-root ROOT --source-compdb COMMANDS ...`
 augments the analysis-owned localization candidates before disposition. The
@@ -24,9 +24,12 @@ extraction/closure measurements. Each field carries `source_edits` and reason
 edges. The selected projection carries the deduplicated, conflict-checked edit
 union. Edits have byte ranges, expected original text, replacement, and kind.
 
-Runtime written/escape/points-to/call-graph facts are unchanged. Source writes
-and address uses are recorded under `facts.source_representation`; absence
-from the manifest is never an immutability proof. Source-only functions can
+Runtime written/escape/points-to/call-graph facts are unchanged. Concrete source
+observations are recorded under `facts.source_obligations`: assignments,
+increments/decrements, reads, pointer reads, address-taking, array decay and
+unevaluated operands, each with a source location and containing function.
+Unknown uses are explicit. The old `requires_mutable_storage` conclusion is
+not emitted. Absence from the manifest is never an immutability proof. Source-only functions can
 enter a recipe, but source-only globals are not silently added as disposition
 subjects. Safety gates are rechecked for newly reached functions.
 
@@ -39,11 +42,62 @@ not LLVM reachability. Discarded declaration bodies do not contribute effects
 or callback-flow blockers. The manifest records the retention policy, retained
 function definitions and discarded declarations; Tenjin checks the policy.
 
+Retention also follows the AST that C2Rust actually exports, not every child
+visited by Clang's default visitor. `_Generic` retains only its selected
+expression. `typeof` operands, constant array bounds, enum values, bitfield
+widths, alignment operands and type-compatibility predicates contribute their
+exported type/value rather than references in the folded-away syntax. Ordinary
+`sizeof` expression dependencies and variable-length array bounds remain
+distinct from these folded forms.
+
 Localization recipes include anchored `prune-declaration` edits for discarded
 declarations, so their old references cannot invalidate intermediate C after
 global removal or signature rewriting. They are applied only with a selected
-localization recipe. A declaration group that cannot be pruned independently
-blocks localization explicitly; the consumer never guesses a repair.
+localization recipe. Logical C2Rust pruning does not require physically deleting
+plain unused header declarations: PANGS preserves harmless type/prototype
+spellings to avoid unnecessary header expansion in Tenjin's refolder. Discarded
+bodies, storage and declarations with value references (including transitively
+through types) still receive physical pruning edits. Anchored `prune-expression` edits similarly remove
+exporter-discarded syntax, while preserving the selected `_Generic` expression's
+offsets for nested signature/call edits. Unprintable or callable `typeof`
+rewrites and declaration groups that cannot be pruned independently block
+localization explicitly; the consumer never guesses a repair.
+
+## Emitter profile and disposition
+
+Source-enabled analysis currently targets the fixed `tenjin-c2rust-default-v1`
+profile, recorded in both source metadata and per-global obligations. This is
+the actual Tenjin C2Rust configuration without `--preserve-unused-functions`,
+not an arbitrary Clang frontend's notion of liveness. No separate PANGS
+preservation flag or generalized capability negotiation is needed. Tenjin
+rejects a mismatched profile. Custom user type/mutability guidance remains an
+explicit override outside the default-representation guarantee.
+
+The profile is tied to these emitter implementations and tested by translating
+the same fixtures through C2Rust:
+
+| Emitter behavior | Planning constraint |
+| --- | --- |
+| `TypedAstContext::prune_unwanted_items(false)` | Declaration-dependency retention, not LLVM reachability |
+| `static_decl_rust_mutability` / `type_contains_unguided_raw_pointer` | Default immutable static must not contain object raw pointers; function pointers are allowed |
+| `static_initializer_is_uncompilable` | Initializer forms moved to runtime assignments cannot use immutable storage |
+| `static_storage_root` / `convert_address_of_common` | Read-only address-taking and array decay support const-address lowering |
+| Tenjin context materializer | Joined variable declarations, unprunable groups and unsupported context recipes are blocked before selection |
+| Tenjin recipe consumers | Immutable, native atomic and localize are implemented; OnceLock/Mutex materialization is not |
+
+PANGS records initializer syntax features (for example unsigned arithmetic,
+pointer-to-integer casts and bitfield initializers) separately from runtime
+facts. Disposition checks the proposed strategy against the profile. A retained
+direct assignment rejects immutable storage even when LLVM proves
+`written=false`; a discarded writer adds no obligation. Address-taking alone
+does not reject immutable storage. Pointer-containing palette arrays reject
+the *default immutable representation*, not semantic immutability. Each failed
+guard has a source witness, and the ordinary cascade considers its remaining
+strategies, including localization. LLVM evidence and certificates are preserved.
+
+Declaration bindings include C2Rust's function scope (`function:local_static`).
+Tenjin forwards the exact binding for a finalized immutable selection, without
+rediscovering declarations or stripping the function name.
 
 Supported source constraints include direct calls, global references,
 indirect calls through fields/variables/arrays, initializers, assignments,
@@ -66,34 +120,32 @@ recipe with regressions before removing their blockers.
 
 `pangs validate-source --source-compdb COMMANDS [--removed-global NAME ...]`
 checks rewritten C and cross-TU function/global/record consistency without
-running the solver or repairing source. `pangs reproject MANIFEST --failures
-FAILURES --out OUTPUT` accepts a JSON map of global keys to witnesses, applies
-only demotions, preserves analysis and cascade history, respects joint
-once-lock/mutex groups, and reprojects the surviving recipes without rerunning
-the cascade. Concrete markers/validation from a previous attempt are invalidated.
+running the solver or repairing source. The older `pangs reproject` command
+remains available for explicit artifact demotion, but it is not part of the
+Tenjin pipeline and is not a substitute for disposition's feasibility guards.
 
 Tenjin supplies the effective database from its bitcode builder, verifies the
 source contract and anchors, applies signature edits on a private copy, and
 performs its existing context-storage materialization. It validates C with
 both provided compilers and calls `validate-source` before publication. Stale
-inputs or unexplained C errors abort without publishing partial edits. Known
-materializer limitations (including joined global declarations) demote only
-their dependent fields and restart from the unchanged snapshot through
-`reproject`; failed edits are never reused. The
-existing downstream Rust compilation gates still apply. Representation
-demotions use `reproject` and retain the semantic analysis evidence.
+inputs or unexplained C errors abort without publishing partial edits.
+Materialization gets one private attempt. Any unexpected failure reports a
+source-plan contract violation, preserves the original source and manifest,
+and does not demote, retry or run policy. Known limitations belong in the
+planner. The existing downstream Rust compilation gates still apply.
 
 For development across the two repositories, set `XJ_PANGS_EXE` in Tenjin to
 the newly built `pangs` binary; otherwise its provisioned release is used.
 Cross-repository tests in `tests/test_pangs_source.py` use this override.
 
-The libtommath regression snapshot has 163 translation units and 5,882 source
-calls. Source planning currently rejects its localization candidates that
+The original source-plan-v1 libtommath survey snapshot had 163 translation units and 5,882 source
+calls. That survey rejected its localization candidates that
 reach the retained `pthread_create`/`CreateThread` callback paths, even when
 LLVM eliminates those paths. Supporting these cases requires a separately
 justified recipe; successful analysis does not imply localization coverage.
 An end-to-end run with `XJ_EXTRA_PREPARATION_PASSES=0` (skipping the lengthy
 preprocessor-refolding pass) compiles the translated Rust and matches the C
 test program's exit status and summary. Its final zero-unsafe-functions
-assertion still fails: 247 unsafe functions remain. This is a coverage limit,
-not a passing result for the full slow test; that assertion is unchanged.
+assertion failed: 247 unsafe functions remained. Those are historical baseline
+measurements; the retention-aware corpus comparison is recorded in Tenjin's
+survey report. The unsafe-count assertion is not relaxed by this contract.

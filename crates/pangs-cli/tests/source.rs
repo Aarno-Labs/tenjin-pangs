@@ -140,10 +140,15 @@ fn dead_write_is_representation_evidence_not_runtime_write() {
         .find(|g| g["meta"]["llvm_name"] == "g")
         .unwrap();
     assert_eq!(g["facts"]["written"]["value"], false);
-    assert_eq!(
-        g["facts"]["source_representation"]["requires_mutable_storage"],
-        true
-    );
+    assert!(g["facts"]["source_obligations"]["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o["kind"] == "update" && o["site"]["function"] == "retained"));
+    assert_eq!(g["disposition"]["chosen"], "localize", "{g:#}");
+    assert!(g["disposition"]["cascade_trace"]
+        .to_string()
+        .contains("source-retained-assignment"));
 }
 
 #[test]
@@ -189,10 +194,7 @@ fn read_only_array_selection_does_not_require_mutable_rust_storage() {
         .iter()
         .find(|g| g["meta"]["llvm_name"] == "g")
         .unwrap();
-    assert_eq!(
-        g["facts"]["source_representation"]["requires_mutable_storage"],
-        false
-    );
+    assert_eq!(g["disposition"]["chosen"], "immutable", "{g:#}");
 }
 
 #[test]
@@ -374,16 +376,85 @@ fn discarded_source_writers_do_not_constrain_immutable_storage() {
         .find(|g| g["meta"]["llvm_name"] == "g")
         .unwrap();
     assert_eq!(g["facts"]["written"]["value"], false);
-    assert_eq!(
-        g["facts"]["source_representation"]["requires_mutable_storage"],
-        false
-    );
+    assert!(g["facts"]["source_obligations"]["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|o| o["kind"] == "read"));
     assert_eq!(g["disposition"]["chosen"], "immutable");
 }
 
 #[test]
+fn emitter_folded_syntax_does_not_retain_writers_or_leave_dangling_c_references() {
+    let original = r#"
+static int g=7;
+static int discarded(void){return ++g;}
+int main(void){
+    __typeof__(discarded()) x=0;
+    int a[sizeof(discarded())];
+    enum { N=sizeof(discarded()) };
+    struct Width { unsigned n:sizeof(discarded()); };
+    int y __attribute__((aligned(sizeof(discarded()))))=0;
+    return _Generic(g++, int: g, default: discarded()) + x + y + sizeof(a) + N
+        + __builtin_types_compatible_p(__typeof__(discarded()), int);
+}
+"#;
+    for retained_write in [false, true] {
+        let code = if retained_write {
+            original.replace("return _Generic", "if(0) g=9; return _Generic")
+        } else {
+            original.to_owned()
+        };
+        let (dir, m) = analyze(&code);
+        assert_eq!(
+            m["context_rewrite"]["source"]["retained_functions"],
+            json!(["main"])
+        );
+        let g = m["globals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["meta"]["llvm_name"] == "g")
+            .unwrap();
+        assert_eq!(g["facts"]["written"]["value"], false);
+        assert_eq!(
+            g["disposition"]["chosen"],
+            if retained_write {
+                "localize"
+            } else {
+                "immutable"
+            },
+            "{g:#}"
+        );
+        let f = field(&m);
+        assert_eq!(f["blockers"], json!([]), "{f:#}");
+        let mut edits: Vec<pangs_manifest::SourceEdit> =
+            serde_json::from_value(f["source_edits"].clone()).unwrap();
+        edits.sort_by_key(|e| std::cmp::Reverse(e.start));
+        let mut rewritten = code;
+        for edit in edits {
+            rewritten.replace_range(edit.start..edit.end, &edit.replacement);
+        }
+        assert!(!rewritten.contains("discarded"), "{rewritten}");
+        assert!(!rewritten.contains("_Generic"), "{rewritten}");
+        let source = dir.path().join("normalized.i");
+        fs::write(&source, rewritten).unwrap();
+        let check = Command::new(clang())
+            .args(["-x", "c", "-fsyntax-only"])
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+}
+
+#[test]
 fn localization_recipes_prune_unused_declaration_dependencies() {
-    let code = "static int g; static int f(void){return ++g;} static int (*unused_slot)(void)=f; static int unused(void){return unused_slot();} int main(void){return f();}";
+    let code = "typedef unsigned long HeaderSize; struct HeaderRecord { HeaderSize size; }; extern void header_function(struct HeaderRecord *); static int g; typedef __typeof__(g) UnusedType; extern UnusedType unused_prototype(void); static int f(void){return ++g;} static int (*unused_slot)(void)=f; static int unused(void){return unused_slot();} int main(void){return f();}";
     let (dir, m) = analyze(code);
     let f = field(&m);
     assert_eq!(f["blockers"], json!([]), "{f:#}");
@@ -398,6 +469,10 @@ fn localization_recipes_prune_unused_declaration_dependencies() {
     }
     rewritten.insert_str(0, "struct XjGlobals;\n");
     assert!(!rewritten.contains("unused"), "{rewritten}");
+    assert!(!rewritten.contains("UnusedType"), "{rewritten}");
+    assert!(rewritten.contains("typedef unsigned long HeaderSize;"));
+    assert!(rewritten.contains("struct HeaderRecord { HeaderSize size; };"));
+    assert!(rewritten.contains("extern void header_function(struct HeaderRecord *);"));
     let source = dir.path().join("pruned.i");
     fs::write(&source, rewritten).unwrap();
     let check = Command::new(clang())
@@ -407,6 +482,95 @@ fn localization_recipes_prune_unused_declaration_dependencies() {
             "-fsyntax-only",
             "-Werror=incompatible-function-pointer-types",
         ])
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn source_representation_guards_cover_pointer_reads_writes_and_initializers() {
+    for (code, chosen, guard) in [
+        (
+            "static int g=7; int main(void){int *p=&g; return *p;}",
+            "immutable",
+            None,
+        ),
+        (
+            "static int g=7; int main(void){return g+sizeof(++g);}",
+            "immutable",
+            None,
+        ),
+        (
+            "static int g=7; int main(void){if(0) g=9; return g;}",
+            "localize",
+            Some("source-retained-assignment"),
+        ),
+        (
+            "static int g=7; int main(void){if(0) (void)sizeof(int[++g]); return g;}",
+            "localize",
+            Some("source-retained-assignment"),
+        ),
+        (
+            "static char *g[2]={\"a\",\"b\"}; int main(int n,char **v){return g[n&1][0];}",
+            "localize",
+            Some("source-default-type-not-sync"),
+        ),
+        (
+            "static unsigned g=1u+2u; int main(void){return g;}",
+            "localize",
+            Some("source-section-initializer"),
+        ),
+        (
+            "static int g=7,h=8; int main(void){if(0)g=9; return g+h;}",
+            "unhandled",
+            Some("source-retained-assignment"),
+        ),
+    ] {
+        let (_, m) = analyze(code);
+        let g = m["globals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["meta"]["llvm_name"] == "g")
+            .unwrap();
+        assert_eq!(g["facts"]["written"]["value"], false, "{code}: {g:#}");
+        assert_eq!(g["disposition"]["chosen"], chosen, "{code}: {g:#}");
+        if let Some(guard) = guard {
+            assert!(
+                g["disposition"]["cascade_trace"]
+                    .to_string()
+                    .contains(guard),
+                "{g:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pruning_embedded_tags_has_nonoverlapping_edits_and_preserves_retained_tags() {
+    let code = "static int g; typedef __typeof__(g) register_t __attribute__((__mode__(__word__))); typedef struct { int unused:sizeof(g); } Unused; typedef struct Retained { int x; } UnusedAlias; int main(void){struct Retained r={1}; return ++g+r.x;}";
+    let (dir, m) = analyze(code);
+    assert_eq!(field(&m)["blockers"], json!([]), "{m:#}");
+    let plan: pangs_manifest::ContextRewriteField =
+        serde_json::from_value(field(&m).clone()).unwrap();
+    let mut edits = pangs_manifest::compose_source_edits(&[plan]).unwrap();
+    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
+    let mut rewritten = code.to_owned();
+    for edit in edits {
+        rewritten.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    assert!(!rewritten.contains("} Unused;"));
+    assert!(!rewritten.contains("__attribute__"));
+    assert!(rewritten.contains("struct Retained { int x; }"));
+    let source = dir.path().join("pruned.c");
+    fs::write(&source, rewritten).unwrap();
+    let check = Command::new(clang())
+        .args(["-fsyntax-only"])
         .arg(source)
         .output()
         .unwrap();

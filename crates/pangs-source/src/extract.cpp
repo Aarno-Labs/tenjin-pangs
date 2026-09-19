@@ -42,9 +42,9 @@ struct Node {
 struct Facts {
   std::map<std::string, Node> nodes;
   Array edges, calls, uses, functions, records, variables, invocations, pruned_declarations;
-  Array pruning_edits;
+  Array pruning_edits, unprunable_declarations;
   bool pruning_complete = true;
-  std::set<std::string> globals, mutable_storage, identifiers, no_initializer, initialized;
+  std::set<std::string> globals, identifiers, no_initializer, initialized;
   std::map<std::string, std::set<std::string>> clone_users;
 };
 
@@ -55,7 +55,11 @@ class Retention : public RecursiveASTVisitor<Retention> {
   std::set<const Decl *> retained;
   std::vector<Decl *> pending;
   std::set<const Decl *> visited;
+  std::set<const Stmt *> folded_operands;
 public:
+  bool TraverseStmt(Stmt *s) {
+    return !s || folded_operands.count(s) || RecursiveASTVisitor::TraverseStmt(s);
+  }
   void keep(const Decl *d) {
     if (!d || !retained.insert(d->getCanonicalDecl()).second) return;
     if (auto *f = dyn_cast<FunctionDecl>(d)) {
@@ -83,6 +87,33 @@ public:
     if (auto *cleanup = v->getAttr<CleanupAttr>()) keep(cleanup->getFunctionDecl());
     return true;
   }
+  bool VisitEnumConstantDecl(EnumConstantDecl *d) {
+    folded_operands.insert(d->getInitExpr()); return true;
+  }
+  bool VisitFieldDecl(FieldDecl *d) {
+    if (d->isBitField()) folded_operands.insert(d->getBitWidth());
+    return true;
+  }
+  bool TraverseAlignedAttr(AlignedAttr *) { return true; }
+  bool TraverseTypeTraitExpr(TypeTraitExpr *) { return true; }
+  bool TraverseGenericSelectionExpr(GenericSelectionExpr *e) {
+    // AstExporter::VisitGenericSelectionExpr exports only this expression:
+    // neither the controlling operand nor the unselected associations are
+    // dependencies of C2Rust's typed AST.
+    return TraverseStmt(e->getResultExpr());
+  }
+  bool TraverseTypeOfExprType(TypeOfExprType *t) { return TraverseType(t->desugar()); }
+  bool TraverseTypeOfExprTypeLoc(TypeOfExprTypeLoc loc) {
+    return TraverseType(loc.getTypePtr()->desugar());
+  }
+  bool TraverseConstantArrayType(ConstantArrayType *t) {
+    return TraverseType(t->getElementType());
+  }
+  bool TraverseConstantArrayTypeLoc(ConstantArrayTypeLoc loc) {
+    // The exporter retains the element type and evaluated bound, not the
+    // source bound's sizeof/type/enum dependencies. VLAs are different.
+    return TraverseTypeLoc(loc.getElementLoc());
+  }
   explicit Retention(ASTContext &ctx) {
     for (auto *d : ctx.getTranslationUnitDecl()->decls()) {
       if (auto *f = dyn_cast<FunctionDecl>(d)) {
@@ -102,6 +133,34 @@ public:
   }
 };
 
+// C2Rust's logical pruning does not require deleting every discarded spelling
+// from intermediate C. Plain header declarations are harmless, and deleting
+// them needlessly forces Tenjin's refolder to expand whole system headers.
+// Keep those spellings, but remove bodies/storage and any declarations whose
+// syntax (including referenced types) can name rewritten functions/globals.
+class PhysicalPruning : public RecursiveASTVisitor<PhysicalPruning> {
+  std::set<const Decl *> visited;
+public:
+  bool required = false;
+  bool TraverseDecl(Decl *d) {
+    return !d || !visited.insert(d).second || RecursiveASTVisitor::TraverseDecl(d);
+  }
+  bool VisitFunctionDecl(FunctionDecl *d) {
+    required |= d->doesThisDeclarationHaveABody(); return true;
+  }
+  bool VisitVarDecl(VarDecl *d) {
+    required |= d->hasGlobalStorage() && d->isThisDeclarationADefinition();
+    required |= d->hasAttr<CleanupAttr>();
+    return true;
+  }
+  bool VisitDeclRefExpr(DeclRefExpr *) { required = true; return true; }
+  bool VisitTypedefType(TypedefType *t) { return TraverseDecl(t->getDecl()); }
+  bool VisitTagType(TagType *t) {
+    auto *d = t->getDecl();
+    return TraverseDecl(d->getDefinition() ? d->getDefinition() : d);
+  }
+};
+
 class Extract : public RecursiveASTVisitor<Extract> {
   ASTContext &ctx;
   SourceManager &sm;
@@ -110,6 +169,7 @@ class Extract : public RecursiveASTVisitor<Extract> {
   std::string function, initializer;
   std::set<const Decl *> typed;
   unsigned unknown_count = 0;
+  std::set<const Stmt *> folded_operands;
 
   std::string file(SourceLocation loc) {
     return sm.getFilename(sm.getSpellingLoc(loc)).str();
@@ -217,6 +277,9 @@ class Extract : public RecursiveASTVisitor<Extract> {
   }
   void collectReferences(const Stmt *s, std::vector<std::string> &result) {
     if (!s) return;
+    if (auto *g = dyn_cast<GenericSelectionExpr>(s)) {
+      collectReferences(g->getResultExpr(), result); return;
+    }
     if (auto *d = dyn_cast<DeclRefExpr>(s)) {
       if (callable(d->getType())) result.push_back(id(d->getDecl()));
     } else if (auto *m = dyn_cast<MemberExpr>(s)) {
@@ -234,6 +297,7 @@ class Extract : public RecursiveASTVisitor<Extract> {
   std::vector<std::string> values(const Expr *e) {
     if (!e) return {};
     e = e->IgnoreParenImpCasts();
+    if (auto *g = dyn_cast<GenericSelectionExpr>(e)) return values(g->getResultExpr());
     if (auto *d = dyn_cast<DeclRefExpr>(e)) {
       if (callable(d->getType())) return {id(d->getDecl())};
     }
@@ -296,35 +360,127 @@ class Extract : public RecursiveASTVisitor<Extract> {
   }
   void blockOpaqueOperands(const Stmt *s, const std::string &reason) {
     if (!s) return;
+    if (auto *g = dyn_cast<GenericSelectionExpr>(s)) {
+      blockOpaqueOperands(g->getResultExpr(), reason); return;
+    }
     if (auto *e = dyn_cast<Expr>(s)) {
       for (auto &n : values(e)) out.nodes[n].blockers.insert(reason);
       blockAggregate(e->getType(), reason);
     }
     for (auto *child : s->children()) blockOpaqueOperands(child, reason);
   }
-  bool ordinaryRead(const Expr *e) {
-    // Follow the lvalue through array/record selection and parentheses. A read
-    // of table[i] does not require mutable storage merely because table decays.
+  Object site(SourceLocation loc) {
+    return Object{{"file", file(loc)}, {"line", sm.getSpellingLineNumber(loc)},
+                  {"col", sm.getSpellingColumnNumber(loc)}, {"offset", offset(loc)},
+                  {"function", function}};
+  }
+  Array observations(const Expr *e) {
+    Array result;
+    auto record = [&](const char *kind, const Expr *at) {
+      result.push_back(Object{{"kind", kind}, {"site", site(at->getBeginLoc())}});
+    };
+    // sizeof/alignof operands survive declaration pruning but are not emitted
+    // as evaluations. Do not turn sizeof(++g) into a storage obligation.
+    auto ancestor = DynTypedNode::create(*e);
+    for (unsigned depth = 0; depth < 128; ++depth) {
+      auto parents = ctx.getParents(ancestor);
+      if (parents.size() != 1) break;
+      if (auto *trait = parents[0].get<UnaryExprOrTypeTraitExpr>()) {
+        // A sizeof VLA can evaluate its bound. In particular, a retained
+        // sizeof(int[++g]) still emits an update even inside if(0).
+        if (trait->getKind() != UETT_SizeOf || !trait->getTypeOfArgument()->isVariablyModifiedType()) {
+          record("unevaluated", e); return result;
+        }
+      }
+      ancestor = parents[0];
+    }
+    bool decayed = false;
     for (unsigned depth = 0; depth < 64; ++depth) {
       auto parents = ctx.getParents(*e);
-      if (parents.size() != 1) return false;
+      if (parents.size() != 1) break;
       if (auto *cast = parents[0].get<ImplicitCastExpr>()) {
-        if (cast->getCastKind() == CK_LValueToRValue) return true;
-        if (cast->getCastKind() != CK_ArrayToPointerDecay && cast->getCastKind() != CK_NoOp)
-          return false;
+        if (cast->getCastKind() == CK_LValueToRValue) {
+          record(e->getType()->isPointerType() ? "pointer-read" : "read", e);
+          return result;
+        }
+        if (cast->getCastKind() == CK_ArrayToPointerDecay) {
+          record("array-decay", e); decayed = true;
+        } else if (cast->getCastKind() != CK_NoOp) break;
         e = cast;
       } else if (auto *paren = parents[0].get<ParenExpr>()) e = paren;
+      else if (auto *generic = parents[0].get<GenericSelectionExpr>()) {
+        if (generic->getResultExpr() != e) break;
+        e = generic;
+      }
       else if (auto *member = parents[0].get<MemberExpr>()) {
-        if (member->isArrow()) return false;
+        if (member->isArrow()) break;
         e = member;
-      } else if (auto *subscript = parents[0].get<ArraySubscriptExpr>()) e = subscript;
+      } else if (auto *subscript = parents[0].get<ArraySubscriptExpr>()) {
+        if (subscript->getBase() != e) break;
+        e = subscript; decayed = false;
+      }
       else if (auto *unary = parents[0].get<UnaryOperator>()) {
-        if (unary->getOpcode() != UO_Deref) return false;
-        e = unary;
-      } else if (parents[0].get<UnaryExprOrTypeTraitExpr>()) return true;
-      else return false;
+        if (unary->getOpcode() == UO_AddrOf) { record("address", unary); return result; }
+        if (unary->isIncrementDecrementOp()) { record("update", unary); return result; }
+        // Dereferencing a decayed array is a pointer operation, not a direct
+        // Rust static lvalue (C2Rust lowers it through the const raw address).
+        break;
+      } else if (auto *binary = parents[0].get<BinaryOperator>()) {
+        if (binary->isAssignmentOp() && binary->getLHS() == e) {
+          record("assignment", binary); return result;
+        }
+        break;
+      } else break;
     }
+    if (!decayed) record("unclassified-use", e);
+    return result;
+  }
+  bool containsObjectPointer(QualType t, std::set<const Type *> *seen = nullptr) {
+    std::set<const Type *> local;
+    if (!seen) seen = &local;
+    t = t.getCanonicalType();
+    if (!seen->insert(t.getTypePtr()).second) return false;
+    if (t->isPointerType()) return !t->getPointeeType()->isFunctionType();
+    if (t->isVariableArrayType() || t->isReferenceType() || t->isBlockPointerType()) return true;
+    if (auto *a = ctx.getAsArrayType(t)) return containsObjectPointer(a->getElementType(), seen);
+    if (auto *a = t->getAs<AtomicType>()) return containsObjectPointer(a->getValueType(), seen);
+    if (auto *v = t->getAs<VectorType>()) return containsObjectPointer(v->getElementType(), seen);
+    if (auto *r = t->getAs<RecordType>()) if (auto *def = r->getDecl()->getDefinition())
+      for (auto *f : def->fields()) if (containsObjectPointer(f->getType(), seen)) return true;
     return false;
+  }
+  void initializerFeatures(const Stmt *s, std::set<std::string> &features) {
+    if (!s) return;
+    if (auto *g = dyn_cast<GenericSelectionExpr>(s)) {
+      initializerFeatures(g->getResultExpr(), features); return;
+    }
+    if (isa<TypeTraitExpr>(s)) return;
+    // Corresponds to C2Rust static_initializer_is_uncompilable. Keep the
+    // concrete syntax, not the conclusion that storage must be mutable.
+    if (isa<UnaryExprOrTypeTraitExpr>(s)) return;
+    if (isa<ArraySubscriptExpr>(s)) features.insert("array-subscript");
+    if (isa<MemberExpr>(s)) features.insert("member-access");
+    if (isa<AbstractConditionalOperator>(s)) features.insert("conditional");
+    if (auto *u = dyn_cast<UnaryOperator>(s))
+      if (u->getOpcode() == UO_Minus && u->getType()->isUnsignedIntegerType())
+        features.insert("unsigned-negation");
+    if (auto *c = dyn_cast<CastExpr>(s)) {
+      if (c->getCastKind() == CK_PointerToIntegral) features.insert("pointer-to-integer");
+      if (c->getCastKind() == CK_IntegralToPointer && c->getType()->isFunctionPointerType())
+        features.insert("integer-to-function-pointer");
+    }
+    if (auto *b = dyn_cast<BinaryOperator>(s)) {
+      if ((b->isAdditiveOp() || b->isMultiplicativeOp()) &&
+          (b->getType()->isPointerType() || (b->getType()->isUnsignedIntegerType() &&
+           !(isa<UnaryExprOrTypeTraitExpr>(b->getLHS()->IgnoreParens()) &&
+             isa<UnaryExprOrTypeTraitExpr>(b->getRHS()->IgnoreParens())))))
+        features.insert("pointer-or-unsigned-arithmetic");
+    }
+    if (auto *init = dyn_cast<InitListExpr>(s))
+      if (auto *r = init->getType()->getAs<RecordType>())
+        if (auto *def = r->getDecl()->getDefinition(); def && def->isStruct())
+          for (auto *f : def->fields()) if (f->isBitField()) features.insert("bitfield-initializer");
+    for (auto *child : s->children()) initializerFeatures(child, features);
   }
   // Parameter list locations come from TypeLoc, including nested declarators.
   void typeEdits(const std::string &node, TypeLoc loc, bool named) {
@@ -420,6 +576,44 @@ class Extract : public RecursiveASTVisitor<Extract> {
 public:
   Extract(ASTContext &ctx, Facts &out, const Retention &retention)
       : ctx(ctx), sm(ctx.getSourceManager()), out(out), retention(retention) {}
+  bool TraverseStmt(Stmt *s) {
+    return !s || folded_operands.count(s) || RecursiveASTVisitor::TraverseStmt(s);
+  }
+  void foldExpression(SourceRange range, const std::string &value) {
+    auto begin = range.getBegin();
+    auto end = Lexer::getLocForEndOfToken(range.getEnd(), 0, sm, ctx.getLangOpts());
+    if (editable(begin) && editable(end))
+      out.pruning_edits.push_back(edit(begin, end, value, "prune-expression"));
+    else {
+      out.pruning_complete = false;
+      out.unprunable_declarations.push_back(Object{{"kind", "uneditable-folded-expression"},
+          {"site", site(begin)}});
+    }
+  }
+  void foldExpression(Expr *e, const std::string &value) {
+    if (!e) return;
+    folded_operands.insert(e);
+    if (!isa<IntegerLiteral>(e->IgnoreParenImpCasts())) foldExpression(e->getSourceRange(), value);
+  }
+  bool VisitEnumConstantDecl(EnumConstantDecl *d) {
+    llvm::SmallString<32> value;
+    d->getInitVal().toString(value, 10);
+    foldExpression(d->getInitExpr(), value.str().str() + (d->getInitVal().isSigned() ? "LL" : "ULL"));
+    return true;
+  }
+  bool VisitFieldDecl(FieldDecl *d) {
+    if (d->isBitField()) foldExpression(d->getBitWidth(), std::to_string(d->getBitWidthValue(ctx)));
+    return true;
+  }
+  bool TraverseAlignedAttr(AlignedAttr *a) {
+    auto value = std::to_string(a->getAlignment(ctx) / ctx.getCharWidth());
+    if (a->isAlignmentExpr()) foldExpression(a->getAlignmentExpr(), value);
+    else if (auto *t = a->getAlignmentType()) foldExpression(t->getTypeLoc().getSourceRange(), value);
+    return true;
+  }
+  bool TraverseTypeTraitExpr(TypeTraitExpr *e) {
+    foldExpression(e, e->getValue() ? "1" : "0"); return true;
+  }
   bool TraverseDecl(Decl *d) {
     if (!d) return true;
     // Names remain reserved in the unmodified C snapshot, even when C2Rust
@@ -428,43 +622,153 @@ public:
     if (!isa<TranslationUnitDecl>(d) && !retention.contains(d)) return true;
     return RecursiveASTVisitor::TraverseDecl(d);
   }
+  bool TraverseGenericSelectionExpr(GenericSelectionExpr *e) {
+    auto *selected = e->getResultExpr();
+    auto begin = e->getBeginLoc(), selected_begin = selected->getBeginLoc();
+    auto selected_end = Lexer::getLocForEndOfToken(selected->getEndLoc(), 0, sm, ctx.getLangOpts());
+    auto end = Lexer::getLocForEndOfToken(e->getEndLoc(), 0, sm, ctx.getLangOpts());
+    if (editable(begin) && editable(selected_begin) && editable(selected_end) && editable(end)) {
+      // Pruned declarations may still be named in the controlling operand or
+      // discarded alternatives. Remove those spellings before C validation,
+      // leaving the selected expression's offsets available for nested edits.
+      out.pruning_edits.push_back(edit(begin, selected_begin, "(", "prune-expression"));
+      out.pruning_edits.push_back(edit(selected_end, end, ")", "prune-expression"));
+    } else {
+      out.pruning_complete = false;
+      out.unprunable_declarations.push_back(Object{{"kind", "uneditable-generic-selection"},
+          {"site", site(begin)}});
+    }
+    return TraverseStmt(selected);
+  }
+  bool printableType(QualType t) {
+    if (t->getAs<TypedefType>()) return true;
+    if (t->isBuiltinType()) return true;
+    if (auto *tag = t->getAs<TagType>())
+      return tag->getDecl()->getIdentifier() || tag->getDecl()->getTypedefNameForAnonDecl();
+    if (t->isPointerType()) return printableType(t->getPointeeType());
+    if (auto *a = ctx.getAsArrayType(t)) return !t->isVariableArrayType() && printableType(a->getElementType());
+    if (auto *a = t->getAs<AtomicType>()) return printableType(a->getValueType());
+    return false;
+  }
+  bool TraverseTypeOfExprType(TypeOfExprType *t) { return TraverseType(t->desugar()); }
+  bool TraverseTypeOfExprTypeLoc(TypeOfExprTypeLoc loc) {
+    auto t = loc.getTypePtr()->desugar();
+    auto begin = loc.getBeginLoc();
+    auto end = Lexer::getLocForEndOfToken(loc.getEndLoc(), 0, sm, ctx.getLangOpts());
+    if (!callable(t) && printableType(t) && editable(begin) && editable(end)) {
+      // C2Rust exports the resulting type, not this operand. It may mention
+      // declarations removed by retention or calls whose signatures change.
+      out.pruning_edits.push_back(edit(begin, end,
+          "__typeof__(" + t.getAsString(ctx.getPrintingPolicy()) + ")", "prune-expression"));
+    } else {
+      out.pruning_complete = false;
+      out.unprunable_declarations.push_back(Object{{"kind", "unsupported-typeof-rewrite"},
+          {"site", site(begin)}});
+    }
+    return TraverseType(t);
+  }
+  bool TraverseConstantArrayType(ConstantArrayType *t) { return TraverseType(t->getElementType()); }
+  bool TraverseConstantArrayTypeLoc(ConstantArrayTypeLoc loc) {
+    if (auto *bound = loc.getSizeExpr(); bound && !isa<IntegerLiteral>(bound->IgnoreParenImpCasts())) {
+      auto begin = bound->getBeginLoc();
+      auto end = Lexer::getLocForEndOfToken(bound->getEndLoc(), 0, sm, ctx.getLangOpts());
+      if (editable(begin) && editable(end)) {
+        out.pruning_edits.push_back(edit(begin, end,
+            std::to_string(loc.getTypePtr()->getSize().getLimitedValue()) + "ULL", "prune-expression"));
+      } else {
+        out.pruning_complete = false;
+        out.unprunable_declarations.push_back(Object{{"kind", "uneditable-constant-array-bound"},
+            {"site", site(begin)}});
+      }
+    }
+    return TraverseTypeLoc(loc.getElementLoc());
+  }
+  SourceLocation declarationTerminator(SourceLocation from) {
+    // Clang's TypedefDecl extent can end at the identifier, before trailing
+    // GNU attributes (notably libc's register_t mode attribute). Find the
+    // physical semicolon, respecting nested attribute/asm expressions.
+    unsigned nesting = 0;
+    for (unsigned count = 0; count < 4096; ++count) {
+      auto next = Lexer::findNextToken(from, sm, ctx.getLangOpts());
+      if (!next || next->is(tok::eof) || !editable(next->getLocation())) break;
+      if (next->is(tok::semi) && nesting == 0) return next->getLocation().getLocWithOffset(1);
+      if (next->isOneOf(tok::l_paren, tok::l_square, tok::l_brace)) ++nesting;
+      if (next->isOneOf(tok::r_paren, tok::r_square, tok::r_brace) && nesting) --nesting;
+      from = next->getLocation();
+    }
+    return {};
+  }
   void recordPruning() {
     // Discarded bodies/initializers must not leave invalid C behind when a
     // selected recipe removes a global or changes a function's signature.
     // Emit anchored deletions, applied only when localization is materialized.
-    std::map<unsigned, std::vector<Decl *>> groups;
+    std::map<unsigned, std::vector<Decl *>> starts;
     for (auto *d : ctx.getTranslationUnitDecl()->decls()) {
       if (d->isImplicit() || !editable(d->getBeginLoc())) continue;
       if (isa<FunctionDecl>(d) || isa<VarDecl>(d) || isa<TagDecl>(d) || isa<TypedefNameDecl>(d))
-        groups[offset(d->getBeginLoc())].push_back(d);
+        starts[offset(d->getBeginLoc())].push_back(d);
     }
-    for (auto &entry : groups) {
-      bool kept = false, discarded = false;
+    // A typedef and its embedded tag have different begin offsets but overlap.
+    // Treat the entire physical declaration as one group, or we'd both produce
+    // conflicting deletions and risk deleting a retained tag with an unused alias.
+    std::vector<std::vector<Decl *>> groups;
+    unsigned group_end = 0;
+    for (auto &entry : starts) {
+      if (groups.empty() || entry.first >= group_end) groups.emplace_back();
       for (auto *d : entry.second) {
+        groups.back().push_back(d);
+        auto after = Lexer::getLocForEndOfToken(d->getEndLoc(), 0, sm, ctx.getLangOpts());
+        group_end = std::max(group_end, offset(after));
+      }
+    }
+    for (auto &group : groups) {
+      unsigned variable_count = 0;
+      for (auto *d : group) variable_count += isa<VarDecl>(d);
+      if (variable_count > 1)
+        for (auto *d : group) if (auto *v = dyn_cast<VarDecl>(d))
+          out.nodes["global:" + v->getNameAsString()].blockers.insert("source-joined-global-declaration");
+      bool kept = false, discarded = false, types_only = true;
+      for (auto *d : group) {
         kept |= retention.contains(d);
         discarded |= !retention.contains(d);
-      }
-      if (!discarded) continue;
-      if (kept) { out.pruning_complete = false; continue; }
-      SourceLocation begin, end;
-      bool complete = true;
-      for (auto *d : entry.second) {
-        auto after = Lexer::getLocForEndOfToken(d->getEndLoc(), 0, sm, ctx.getLangOpts());
-        if (auto *f = dyn_cast<FunctionDecl>(d); !f || !f->doesThisDeclarationHaveABody()) {
-          auto semi = Lexer::findNextToken(d->getEndLoc(), sm, ctx.getLangOpts());
-          // A tag can share its declaration with a variable/typedef. The
-          // outer declarator supplies that group's terminating semicolon.
-          if (semi && semi->is(tok::semi)) after = semi->getLocation().getLocWithOffset(1);
-          else if (!isa<TagDecl>(d)) { complete = false; continue; }
-        }
-        if (begin.isInvalid()) begin = d->getBeginLoc();
-        if (end.isInvalid() || offset(after) > offset(end)) end = after;
+        types_only &= isa<TagDecl>(d) || isa<TypedefNameDecl>(d);
         if (!retention.contains(d)) {
           auto *named = dyn_cast<NamedDecl>(d);
           out.pruned_declarations.push_back(Object{{"name", named ? named->getNameAsString() : ""},
               {"file", file(d->getLocation())}, {"offset", offset(d->getLocation())},
               {"kind", d->getDeclKindName()}});
         }
+      }
+      if (!discarded) continue;
+      PhysicalPruning physical;
+      for (auto *d : group) if (!retention.contains(d)) physical.TraverseDecl(d);
+      if (!physical.required) continue;
+      if (kept) {
+        // An unused typedef alias of a retained tag has no independent body or
+        // initializer to invalidate. Leave its spelling for C2Rust to discard.
+        if (!types_only) {
+          out.pruning_complete = false;
+          out.unprunable_declarations.push_back(Object{{"kind", "mixed-declaration-group"},
+              {"site", site(group.front()->getBeginLoc())}});
+        }
+        continue;
+      }
+      SourceLocation begin, end;
+      bool complete = true;
+      for (auto *d : group) {
+        auto after = Lexer::getLocForEndOfToken(d->getEndLoc(), 0, sm, ctx.getLangOpts());
+        if (auto *f = dyn_cast<FunctionDecl>(d); !f || !f->doesThisDeclarationHaveABody()) {
+          auto semi = declarationTerminator(d->getEndLoc());
+          if (semi.isValid()) after = semi;
+          else {
+            complete = false;
+            out.unprunable_declarations.push_back(Object{{"kind", "missing-terminator"},
+                {"site", site(d->getEndLoc())}, {"declaration_kind", d->getDeclKindName()}});
+            continue;
+          }
+        }
+        if (begin.isInvalid()) begin = d->getBeginLoc();
+        if (end.isInvalid() || offset(after) > offset(end)) end = after;
       }
       out.pruning_complete &= complete;
       if (complete && begin.isValid() && end.isValid())
@@ -554,10 +858,21 @@ public:
       const bool definition = d->isThisDeclarationADefinition();
       if (definition) out.globals.insert(d->getNameAsString());
       Array slots;
+      std::set<std::string> features;
+      initializerFeatures(d->getInit(), features);
+      if (d->hasInit() && (d->getType()->isSpecificBuiltinType(BuiltinType::LongDouble) ||
+                         d->getType()->isSpecificBuiltinType(BuiltinType::Float128)))
+        features.insert("extended-float-initializer");
+      Array feature_array;
+      for (auto &feature : features) feature_array.push_back(feature);
       if (callable(d->getType())) slots.push_back(id(d));
       else for (auto &n : aggregate(d->getType())) slots.push_back(n);
       out.variables.push_back(Object{{"name", d->getNameAsString()}, {"id", id(d)},
           {"signature", typeSignature(d->getType())}, {"defined", definition},
+          {"declaration", function.empty() ? d->getNameAsString() : function + ":" + d->getNameAsString()},
+          {"site", site(d->getLocation())},
+          {"contains_object_pointer", containsObjectPointer(d->getType())},
+          {"initializer_features", std::move(feature_array)},
           {"callable_nodes", std::move(slots)}});
       if (d->hasInit()) out.initialized.insert(d->getNameAsString());
       if (d->isThisDeclarationADefinition() && !d->hasInit())
@@ -567,17 +882,18 @@ public:
     }
     init(id(d), d->getType(), d->getInit()); return true;
   }
+  bool VisitDeclStmt(DeclStmt *s) {
+    if (!s->isSingleDecl()) for (auto *d : s->decls())
+      if (auto *v = dyn_cast<VarDecl>(d); v && v->hasGlobalStorage())
+        out.nodes["global:" + v->getNameAsString()].blockers.insert("source-joined-global-declaration");
+    return true;
+  }
   bool VisitDeclRefExpr(DeclRefExpr *e) {
     if (auto *g = dyn_cast<VarDecl>(e->getDecl())) if (g->hasGlobalStorage()) {
       Object use{{"global", g->getNameAsString()}, {"function", function},
                  {"initializer", initializer}, {"file", file(e->getBeginLoc())},
-                 {"offset", offset(e->getBeginLoc())}};
+                 {"offset", offset(e->getBeginLoc())}, {"observations", observations(e)}};
       out.uses.push_back(std::move(use));
-      // A retained lvalue which is not an ordinary read may be written through,
-      // including through a call omitted by IR. This is representation evidence,
-      // deliberately not a semantic runtime-written fact.
-      if (!ordinaryRead(e))
-        out.mutable_storage.insert(g->getNameAsString());
     }
     return true;
   }
@@ -769,9 +1085,8 @@ extern "C" char *pangs_source_extract(const char *database) {
         nodes[entry.first] = Object{{"function", entry.second.function},
           {"blockers", std::move(blockers)}, {"edits", std::move(entry.second.edits)}};
       }
-      Array globals, mutable_storage, no_initializer;
+      Array globals, no_initializer;
       for (auto &g : facts.globals) globals.push_back(g);
-      for (auto &g : facts.mutable_storage) mutable_storage.push_back(g);
       for (auto &g : facts.no_initializer) if (!facts.initialized.count(g)) no_initializer.push_back(g);
       result = Object{{"nodes", std::move(nodes)}, {"edges", std::move(facts.edges)},
         {"calls", std::move(facts.calls)}, {"uses", std::move(facts.uses)},
@@ -780,8 +1095,9 @@ extern "C" char *pangs_source_extract(const char *database) {
         {"pruning_edits", std::move(facts.pruning_edits)},
         {"pruned_declarations", std::move(facts.pruned_declarations)},
         {"pruning_complete", facts.pruning_complete},
+        {"unprunable_declarations", std::move(facts.unprunable_declarations)},
         {"globals", std::move(globals)},
-        {"mutable_storage", std::move(mutable_storage)}, {"no_initializer", std::move(no_initializer)},
+        {"no_initializer", std::move(no_initializer)},
         {"compiler", getClangFullVersion()}};
     }
   }

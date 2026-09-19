@@ -1092,6 +1092,26 @@ fn missing_group_failure(member: &Key, guard: &str) -> GuardFailure {
 }
 
 fn unavailable_outcome(strategy: Strategy, facts: &Facts) -> Option<OverrideOutcome> {
+    if strategy != Strategy::Unhandled {
+        match facts.source_obligations() {
+            Err(_) => return Some(OverrideOutcome::RejectedNoRecipe),
+            Ok(Some(source)) => {
+                let unsupported = matches!(strategy, Strategy::OnceLock | Strategy::Mutex)
+                    || (strategy == Strategy::Immutable
+                        && !source_immutable_failures(&source).is_empty())
+                    || (strategy == Strategy::Localize
+                        && facts.localization.as_ref().is_some_and(|l| {
+                            l.blocker_samples
+                                .iter()
+                                .any(|b| b.code.starts_with("source-"))
+                        }));
+                if unsupported {
+                    return Some(OverrideOutcome::RejectedNoRecipe);
+                }
+            }
+            Ok(None) => {}
+        }
+    }
     if facts.atomic_declaration.value && !matches!(strategy, Strategy::Atomic | Strategy::Unhandled)
     {
         return Some(OverrideOutcome::RejectedStrategyUnavailable);
@@ -1184,6 +1204,27 @@ fn guard_failures(key: &Key, facts: &Facts, guards: &[String]) -> Vec<GuardFailu
 }
 
 fn witness_for_guard(facts: &Facts, guard: &str) -> Witness {
+    if guard.starts_with("source-") {
+        if let Ok(Some(source)) = facts.source_obligations() {
+            let observation = source.observations.iter().find(|o| match guard {
+                "source-retained-assignment" => matches!(o.kind.as_str(), "assignment" | "update"),
+                "source-unclassified-use" => o.kind == "unclassified-use",
+                _ => false,
+            });
+            return Witness {
+                kind: guard.into(),
+                site: observation.map(|o| o.site.clone()).or(source.declaration_site),
+                symbol: source.declaration,
+                note: Some(match guard {
+                    "source-retained-assignment" => "Retained source assigns to this storage; LLVM runtime written is unchanged".into(),
+                    "source-default-type-not-sync" => "C2Rust's default Rust type contains an object raw pointer and cannot be an immutable static".into(),
+                    "source-section-initializer" => format!("C2Rust emits initializer assignments for: {}", source.initializer_features.join(", ")),
+                    _ => "Source representation obligation is not discharged by this emitter".into(),
+                }),
+                extra: Extra::new(),
+            };
+        }
+    }
     let evidenced = match guard {
         "written" => facts.written.witness.as_ref(),
         "omega_escaped_address" => facts.omega_escaped_address.witness.as_ref(),
@@ -1312,6 +1353,17 @@ fn violation_taint_blocks(strategy: Strategy, facts: &Facts) -> bool {
 }
 
 fn evaluate(strategy: Strategy, facts: &Facts) -> GuardResult {
+    if facts.extra.contains_key("source_obligations") {
+        if facts.source_obligations().is_err() {
+            return GuardResult::Failed(vec!["source-invalid-contract".into()]);
+        }
+        // Tenjin currently materializes localization, native C atomics and
+        // immutable statics. It has no OnceLock/Mutex recipe consumer. LLVM
+        // eligibility certificates alone cannot authorize those representations.
+        if matches!(strategy, Strategy::OnceLock | Strategy::Mutex) {
+            return GuardResult::Failed(vec!["source-unsupported-strategy".into()]);
+        }
+    }
     if strategy == Strategy::Atomic {
         return if facts.atomic_declaration.value {
             GuardResult::Applicable
@@ -1367,6 +1419,18 @@ fn evaluate(strategy: Strategy, facts: &Facts) -> GuardResult {
             if facts.omega_escaped_address.value {
                 failed.push("omega_escaped_address".to_owned());
             }
+            // Source feasibility is a strategy guard, not a mutation of LLVM
+            // semantic evidence and not a post-selection demotion. A failure
+            // allows the normal cascade to consider the remaining strategies.
+            match facts.source_obligations() {
+                Err(_) => failed.push("source-invalid-contract".into()),
+                Ok(None) => {} // IR-only clients have no emitter contract.
+                Ok(Some(source)) => {
+                    failed.extend(source_immutable_failures(&source));
+                    // address/array-decay are supported by C2Rust's existing
+                    // const-address lowering; they do not require static mut.
+                }
+            }
             failed_result(failed)
         }
         Strategy::OnceLock => certificate_guard("phase_stationarity", &facts.phase_stationarity),
@@ -1379,6 +1443,41 @@ fn evaluate(strategy: Strategy, facts: &Facts) -> GuardResult {
         },
         Strategy::Unhandled => unreachable!("unhandled is not evaluated"),
     }
+}
+
+fn source_immutable_failures(source: &pangs_manifest::SourceObligations) -> Vec<String> {
+    let mut failed = Vec::new();
+    if source.declaration.is_none() {
+        failed.push("source-unmapped-global".into());
+    }
+    if source.contains_object_pointer {
+        failed.push("source-default-type-not-sync".into());
+    }
+    if !source.initializer_features.is_empty() {
+        failed.push("source-section-initializer".into());
+    }
+    if source
+        .observations
+        .iter()
+        .any(|o| matches!(o.kind.as_str(), "assignment" | "update"))
+    {
+        failed.push("source-retained-assignment".into());
+    }
+    if source.observations.iter().any(|o| {
+        !matches!(
+            o.kind.as_str(),
+            "assignment"
+                | "update"
+                | "read"
+                | "pointer-read"
+                | "address"
+                | "array-decay"
+                | "unevaluated"
+        )
+    }) {
+        failed.push("source-unclassified-use".into());
+    }
+    failed
 }
 
 fn push_failed_certificate(failed: &mut Vec<String>, name: &str, slot: Option<&Certificate>) {
@@ -1452,6 +1551,61 @@ mod tests {
             }),
             extra: Extra::new(),
         }
+    }
+
+    #[test]
+    fn source_contract_limits_only_representations_not_semantic_certificates() {
+        let mut facts = base_facts();
+        facts.phase_stationarity = Some(certified());
+        facts.mutex_eligibility = Some(certified());
+        let runtime = facts.written.clone();
+        facts.extra.insert(
+            "source_obligations".into(),
+            json!({
+                "emitter": pangs_manifest::SOURCE_EMITTER,
+                "declaration": "f:g", "declaration_site": null,
+                "contains_object_pointer": false, "initializer_features": [],
+                "observations": [{"kind": "assignment", "site": {
+                    "file": "test.i", "line": 3, "col": 5, "function": "f"
+                }}],
+            }),
+        );
+        assert_eq!(
+            evaluate(Strategy::Immutable, &facts),
+            GuardResult::Failed(vec!["source-retained-assignment".into()])
+        );
+        assert_eq!(facts.written, runtime);
+        assert_eq!(
+            unavailable_outcome(Strategy::Immutable, &facts),
+            Some(OverrideOutcome::RejectedNoRecipe)
+        );
+        assert!(facts.phase_stationarity.as_ref().unwrap().is_certified());
+        for strategy in [Strategy::OnceLock, Strategy::Mutex] {
+            assert_eq!(
+                unavailable_outcome(strategy, &facts),
+                Some(OverrideOutcome::RejectedNoRecipe)
+            );
+            assert_eq!(
+                evaluate(strategy, &facts),
+                GuardResult::Failed(vec!["source-unsupported-strategy".into()])
+            );
+        }
+        let witness = witness_for_guard(&facts, "source-retained-assignment");
+        assert_eq!(witness.site.unwrap().line, 3);
+        assert_eq!(witness.symbol.as_deref(), Some("f:g"));
+        facts.extra.get_mut("source_obligations").unwrap()["observations"] = json!([
+            {"kind": "address", "site": {"file": "test.i", "line": 3}}
+        ]);
+        assert_eq!(
+            evaluate(Strategy::Immutable, &facts),
+            GuardResult::Applicable
+        );
+        facts.extra.get_mut("source_obligations").unwrap()["emitter"] = json!("unknown");
+        assert!(facts.validate().is_err());
+        assert_eq!(
+            evaluate(Strategy::Localize, &facts),
+            GuardResult::Failed(vec!["source-invalid-contract".into()])
+        );
     }
 
     fn certified() -> Certificate {

@@ -547,6 +547,17 @@ representation. For `immutable` and `localize`, group membership is policy/layou
 advice rather than a joint runtime representation, so an execution failure may demote
 only the affected member.
 
+**Source-plan v2 amendment:** the generic demotion protocol above is not used
+by Tenjin's source-aware pipeline. With `--source-compdb`, disposition also
+checks `facts.source_obligations` against the fixed default C2Rust emitter
+profile. Retained assignments, unsupported default static types/initializers,
+and known missing recipes are feasibility guards, not changes to LLVM semantic
+facts. The normal cascade tries the remaining strategies. An accepted-risk
+override cannot manufacture a missing source representation or recipe.
+Tenjin makes one private materialization attempt; a failure reports a contract
+violation without changing the manifest's decisions or retrying policy. See
+`SOURCE_PLANNING.md` for retention, capabilities and executable conformance tests.
+
 ## 6. Coupling groups (shared component)
 
 `ONCELOCK.md` §2.3's co-quiescence groups are one instance of a general fact:

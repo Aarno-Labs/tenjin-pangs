@@ -441,8 +441,48 @@ pub struct Facts {
     pub extra: Extra,
 }
 
+/// Default Tenjin C2Rust emission (no preserve-unused-functions or guided
+/// representation). Bump this identifier when its retention/lowering changes.
+pub const SOURCE_EMITTER: &str = "tenjin-c2rust-default-v1";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceObservation {
+    pub kind: String,
+    pub site: Site,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceObligations {
+    pub emitter: String,
+    /// C2Rust declaration specifier, including function scope for local statics.
+    pub declaration: Option<String>,
+    pub declaration_site: Option<Site>,
+    pub contains_object_pointer: bool,
+    /// Syntactic initializer features; disposition interprets these against
+    /// the emitter's static-initializer lowering, not LLVM's written fact.
+    pub initializer_features: Vec<String>,
+    pub observations: Vec<SourceObservation>,
+}
+
 impl Facts {
+    pub fn source_obligations(&self) -> Result<Option<SourceObligations>, Error> {
+        self.extra
+            .get("source_obligations")
+            .map(|value| {
+                let source: SourceObligations =
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        Error::InvalidInvariant(format!("invalid source obligations: {error}"))
+                    })?;
+                if source.emitter != SOURCE_EMITTER {
+                    return Err(Error::InvalidInvariant("unsupported source emitter".into()));
+                }
+                Ok(source)
+            })
+            .transpose()
+    }
+
     pub fn validate(&self) -> Result<(), Error> {
+        self.source_obligations()?;
         self.written.validate("written", true)?;
         self.omega_escaped_address
             .validate("omega_escaped_address", true)?;
