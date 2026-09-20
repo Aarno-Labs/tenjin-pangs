@@ -1,4 +1,4 @@
-# Source obligations and localization contract (version 2)
+# Source obligations and localization contract (version 3)
 
 `pangs analyze module.bc --dispose --repo-root ROOT --source-compdb COMMANDS ...`
 augments the analysis-owned localization candidates before disposition. The
@@ -16,12 +16,14 @@ driver's cc1 job preserves `.i` input mode (ClangTool 14 itself rejects these
 jobs). This is not a separate extractor executable or interchange service.
 
 The existing manifest schema remains 8; the independent required **source
-plan version is 2**. IR-only schema-8 manifests remain readable but do not
+plan version is 3**. IR-only schema-8 manifests remain readable but do not
 satisfy Tenjin's localization contract. `context_rewrite.source` records
 normalized source paths, compilation commands, expanded cc1 options, compiler
 version, construction recipe, and extraction/closure measurements. Each field
 carries `source_edits` and reason edges. The selected projection carries the
-deduplicated, conflict-checked edit union. Edits have byte ranges, replacement,
+deduplicated, conflict-checked edit union. Conditional `source_wrappers` recipes
+are included only for functions that none of the selected fields needs to change.
+Edits have byte ranges, replacement,
 and kind. Tenjin controls source
 changes and the order of analysis and rewriting; neither side checks for
 changes to the analyzed inputs or stores source hashes or original edit text.
@@ -104,20 +106,46 @@ rediscovering declarations or stripping the function name.
 Supported source constraints include direct calls, global references,
 indirect calls through fields/variables/arrays, initializers, assignments,
 conditional producers, direct argument/parameter flow, and pointer comparison
-constraints. All producers of a changed slot receive the same signature.
+constraints. A changed slot receives context-taking function values. Functions
+that need localized storage change signature, as do the callers that must pass
+them context. Other producers use `_xjw` wrappers that ignore the context and
+forward the original arguments and return value. Their original declarations,
+definitions, direct callers and unrelated callback slots remain unchanged.
+
+Function-value occurrences are distinct graph nodes: changing a function reaches
+all its occurrences, but changing an occurrence does not require changing that
+function. This source closure replaces the IR-only recipe's all-target signature
+closure; LLVM's runtime facts, access/lifetime gates and unknown-entry checks
+remain intact. An external producer can be adapted when those gates permit it;
+an unresolved runtime callback escape still blocks localization.
+
+Each original function has one adapter identity. Externally linked functions
+get one external wrapper definition for the entire program and declarations in
+the participating TUs; private functions get private wrappers. Comparisons join
+the relevant slots and occurrences, so comparisons use the same adapter rather
+than comparing an adapter to its original. Opaque/cast escapes, weak/alias symbols,
+`returns_twice` functions (which cannot safely return through a forwarding frame),
+unsupported wrapper signatures and generated-name collisions are rejected.
+The wrapper's declaration types must already be visible at its insertion point.
+The selected projection omits an adapter if another selected field already
+requires its original function to take context. PANGS composes and validates
+the final edit list. Tenjin checks its supported operations, paths, ranges and
+overlaps, then applies the supplied edits without interpreting wrapper recipes
+or independently choosing adapters.
+
 Single-level callback typedefs are cloned per affected use; equal signatures
 and shared typedef names do not themselves create value flow. Declarations of
 externally linked functions and shared fields are checked across TUs. Private
 function copies, including static inline functions from headers, may have
 different signatures in different TUs. `main` retains its ABI.
 
-Version 2 deliberately blocks, with scoped witnesses, unsupported callable
+Version 3 deliberately blocks, with scoped witnesses, unsupported callable
 returns/nested higher-order values, typedef alias chains, pointer-to-pointer
 callable storage, union callable storage, aggregate copies, opaque/cast or
-variadic transfers, external callbacks/producers/storage, external-inline
+variadic transfers, external callback consumers/storage, external-inline
 boundaries, assembly operands, lifecycle entries, context
 name collisions, static initializer dependencies, and owned synthetic storage
-requiring a relocation recipe. It emits no identity-changing adapters.
+requiring a relocation recipe.
 The automatic context-in-main recipe also leaves storage in place when its
 initializer refers to a private function in another TU. Changing the callback
 type is still supported; moving its storage would require a separate recipe

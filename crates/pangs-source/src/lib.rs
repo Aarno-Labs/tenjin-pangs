@@ -11,7 +11,7 @@ use pangs_api::{Analysis, Callee, Caller};
 use pangs_manifest::{
     ContextRewriteBlocker, ContextRewriteCallsite, ContextRewriteField, Extra, Localization,
     LocalizationBlocker, LocalizationVerdict, Manifest, Site, SourceEdit, SourceObligations,
-    SourceObservation, Witness, SOURCE_EMITTER, SOURCE_PLAN_VERSION,
+    SourceObservation, SourceWrapper, Witness, SOURCE_EMITTER, SOURCE_PLAN_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -57,9 +57,24 @@ struct Function {
     signature: String,
 }
 #[derive(Debug, Deserialize)]
+struct Producer {
+    function: String,
+    edit: SourceEdit,
+}
+#[derive(Debug, Deserialize)]
+struct Wrapper {
+    function: String,
+    internal: bool,
+    blockers: BTreeSet<String>,
+    declaration: SourceEdit,
+    definition: SourceEdit,
+}
+#[derive(Debug, Deserialize)]
 struct Facts {
     nodes: BTreeMap<String, Node>,
     edges: Vec<[String; 2]>,
+    producers: BTreeMap<String, Producer>,
+    wrappers: Vec<Wrapper>,
     calls: Vec<Call>,
     uses: Vec<Use>,
     functions: Vec<Function>,
@@ -368,7 +383,11 @@ pub fn augment_manifest(
     }
     let mut calls_by_target: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for function in &facts.functions {
-        if adjacency.contains_key(&format!("fn:{}", function.name)) {
+        if facts
+            .producers
+            .values()
+            .any(|p| p.function == function.name)
+        {
             let prefix = format!("param:{}:", function.name);
             for (key, node) in &mut facts.nodes {
                 if key.starts_with(&prefix) {
@@ -377,6 +396,15 @@ pub fn augment_manifest(
                 }
             }
         }
+    }
+    // Changing a function changes every value of that function. Changing a
+    // slot only changes its participating occurrences: other producers can be
+    // adapted without changing their bodies, callers, or unrelated slots.
+    for (node, producer) in &facts.producers {
+        adjacency
+            .entry(format!("fn:{}", producer.function))
+            .or_default()
+            .insert(node.clone());
     }
     for (index, call) in facts.calls.iter().enumerate() {
         for node in &call.targets {
@@ -470,10 +498,20 @@ pub fn augment_manifest(
             extra: Extra::new(),
         });
         let mut seeds = field
-            .functions
+            .accessors
             .iter()
             .map(|f| format!("fn:{f}"))
             .collect::<BTreeSet<_>>();
+        // The IR-only recipe widens every target of an indirect call. Rebuild
+        // that rewrite closure from actual accessors and source occurrences;
+        // source adapters can keep other targets (including externs) unchanged.
+        let ir_rewrite_gate = |kind: &str| {
+            matches!(
+                kind,
+                "unknown-caller-taint" | "unknown-callee-taint" | "unlocatable-callsite"
+            )
+        };
+        field.blockers.retain(|b| !ir_rewrite_gate(&b.kind));
         // Moving a private callback's initializer to another TU would require
         // exporting the function or an initialization recipe in its owning TU.
         // This constrains moving the storage, not changing its callback type.
@@ -572,6 +610,40 @@ pub fn augment_manifest(
                     .push(blocker("source-unmapped-function", node));
             }
         }
+        let mut wrappers: BTreeMap<String, BTreeSet<SourceEdit>> = BTreeMap::new();
+        for node in &reached {
+            let Some(producer) = facts.producers.get(node) else {
+                continue;
+            };
+            if functions.contains(&producer.function) {
+                continue;
+            }
+            wrappers
+                .entry(producer.function.clone())
+                .or_default()
+                .insert(producer.edit.clone());
+        }
+        for (function, wrapper_edits) in &mut wrappers {
+            let declarations = facts
+                .wrappers
+                .iter()
+                .filter(|w| &w.function == function)
+                .collect::<Vec<_>>();
+            if declarations.is_empty() {
+                field
+                    .blockers
+                    .push(blocker("source-missing-wrapper-recipe", function));
+            }
+            for (i, wrapper) in declarations.iter().enumerate() {
+                for kind in &wrapper.blockers {
+                    field.blockers.push(blocker(kind, function));
+                }
+                wrapper_edits.insert(wrapper.declaration.clone());
+                if i == 0 || wrapper.internal {
+                    wrapper_edits.insert(wrapper.definition.clone());
+                }
+            }
+        }
         field.functions = functions.into_iter().collect();
         field.rewrite_callsites.clear();
         for i in calls {
@@ -599,8 +671,7 @@ pub fn augment_manifest(
                 extra: BTreeMap::from([("source_offset".into(), json!(call.offset))]),
             });
         }
-        let mut normalized = Vec::new();
-        for mut edit in edits {
+        let normalize = |mut edit: SourceEdit| -> Result<SourceEdit> {
             let file = fs::canonicalize(&edit.file)?;
             ensure!(
                 files.contains_key(&file),
@@ -611,9 +682,28 @@ pub fn augment_manifest(
                 .to_str()
                 .context("non-UTF8 source path")?
                 .into();
-            normalized.push(edit);
-        }
+            Ok(edit)
+        };
+        let normalized = edits
+            .into_iter()
+            .map(&normalize)
+            .collect::<Result<Vec<_>>>()?;
+        let wrappers = wrappers
+            .into_iter()
+            .map(|(function, edits)| {
+                Ok(SourceWrapper {
+                    function,
+                    edits: edits
+                        .into_iter()
+                        .map(&normalize)
+                        .collect::<Result<Vec<_>>>()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         field.extra.insert("source_edits".into(), json!(normalized));
+        field
+            .extra
+            .insert("source_wrappers".into(), json!(wrappers));
         field.extra.insert("source_reasons".into(), json!(reasons));
         if pangs_manifest::compose_source_edits(&[field.clone()]).is_err() {
             field
@@ -626,6 +716,7 @@ pub fn augment_manifest(
             .as_ref()
             .map(|l| l.blocker_samples.clone())
             .unwrap_or_default();
+        samples.retain(|b| !ir_rewrite_gate(&b.code));
         samples.extend(field.blockers.iter().map(|b| LocalizationBlocker {
             code: b.kind.clone(),
             witness: Witness {

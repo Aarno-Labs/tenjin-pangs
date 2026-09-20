@@ -17,7 +17,7 @@ pub const SCHEMA_VERSION: u32 = 8;
 
 /// Independently versioned source/materializer contract. A v8 manifest without
 /// this contract remains a valid IR-only manifest, not a source certificate.
-pub const SOURCE_PLAN_VERSION: u32 = 2;
+pub const SOURCE_PLAN_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SourceEdit {
@@ -28,18 +28,60 @@ pub struct SourceEdit {
     pub kind: String,
 }
 
+/// Adapt selected function-value occurrences unless another selected field
+/// already requires the original function to receive the context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceWrapper {
+    pub function: String,
+    pub edits: Vec<SourceEdit>,
+}
+
 /// Shared identical obligations are applied once. Incompatible or overlapping
 /// edits are never resolved by insertion order.
 pub fn compose_source_edits(fields: &[ContextRewriteField]) -> Result<Vec<SourceEdit>, Error> {
     let mut edits = BTreeSet::new();
+    let functions = fields
+        .iter()
+        .flat_map(|f| &f.functions)
+        .collect::<BTreeSet<_>>();
     for field in fields {
         if let Some(value) = field.extra.get("source_edits") {
             let field_edits: Vec<SourceEdit> = serde_json::from_value(value.clone())
                 .map_err(|e| Error::InvalidInvariant(format!("invalid source edits: {e}")))?;
             edits.extend(field_edits);
         }
+        if let Some(value) = field.extra.get("source_wrappers") {
+            let wrappers: Vec<SourceWrapper> = serde_json::from_value(value.clone())
+                .map_err(|e| Error::InvalidInvariant(format!("invalid source wrappers: {e}")))?;
+            for wrapper in wrappers {
+                if !functions.contains(&wrapper.function) {
+                    edits.extend(wrapper.edits);
+                }
+            }
+        }
     }
-    let edits = edits.into_iter().collect::<Vec<_>>();
+    // Several adapters can be declared or defined at the same TU boundary.
+    // Concatenate only these generated declarations, in deterministic order.
+    let mut combined: Vec<SourceEdit> = Vec::new();
+    for edit in edits {
+        if let Some(previous) = combined.last_mut() {
+            if previous.file == edit.file
+                && previous.start == edit.start
+                && previous.start == previous.end
+                && edit.start == edit.end
+                && previous.kind == edit.kind
+                && matches!(
+                    edit.kind.as_str(),
+                    "wrapper-declaration" | "wrapper-definition"
+                )
+            {
+                previous.replacement.push_str(&edit.replacement);
+                continue;
+            }
+        }
+        combined.push(edit);
+    }
+    let edits = combined;
     for edit in &edits {
         if edit.end < edit.start {
             return Err(Error::InvalidInvariant("invalid source edit range".into()));

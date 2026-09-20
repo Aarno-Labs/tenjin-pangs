@@ -138,13 +138,13 @@ fn private_initializer_functions_constrain_storage_not_callback_types() {
 }
 
 #[test]
-fn source_only_indirect_chain_closes_all_producers_and_compiles() {
+fn source_only_indirect_chain_adapts_unchanged_producers_and_compiles() {
     let code = "static int g;\nstatic int needs(void){return ++g;}\nstatic int ordinary(void){return 2;}\nstruct Ops { int (*fn)(void); };\nstatic struct Ops ops = {needs};\nstatic int dead(void){ ops.fn = ordinary; return ops.fn(); }\nint main(void){if(0) return dead(); return needs();}\n";
     let (dir, m) = analyze(code);
     let f = field(&m);
     assert_eq!(f["blockers"], json!([]), "{f:#}");
-    assert_eq!(f["functions"], json!(["dead", "main", "needs", "ordinary"]));
-    assert_eq!(m["context_rewrite"]["source"]["version"], 2);
+    assert_eq!(f["functions"], json!(["dead", "main", "needs"]));
+    assert_eq!(m["context_rewrite"]["source"]["version"], 3);
     let source_metadata = &m["context_rewrite"]["source"];
     for key in ["module_sha256", "compdb_sha256", "compdb_path"] {
         assert!(source_metadata.get(key).is_none(), "{source_metadata}");
@@ -155,8 +155,8 @@ fn source_only_indirect_chain_closes_all_producers_and_compiles() {
     for edit in f["source_edits"].as_array().unwrap() {
         assert!(edit.get("expected").is_none(), "{edit}");
     }
-    let mut edits: Vec<pangs_manifest::SourceEdit> =
-        serde_json::from_value(f["source_edits"].clone()).unwrap();
+    let plan = serde_json::from_value(f.clone()).unwrap();
+    let mut edits = pangs_manifest::compose_source_edits(&[plan]).unwrap();
     edits.sort_by_key(|e| std::cmp::Reverse(e.start));
     let mut rewritten = code.to_owned();
     for edit in edits {
@@ -251,6 +251,58 @@ fn identical_slot_signatures_do_not_establish_flow() {
         !f["functions"].as_array().unwrap().contains(&json!("b")),
         "{f:#}"
     );
+}
+
+#[test]
+fn unchanged_function_occurrences_do_not_join_unrelated_uses() {
+    let (_, m) = analyze("static int g; int needs(int x){return ++g+x;} int plain(int x){return x;} int direct(void){return plain(1);} int separate(void){int (*q)(int)=plain;return q(2);} int main(int argc,char **argv){int (*p)(int)=argc>1?needs:plain;return p(1)+direct()+separate()+(p==plain);}");
+    let f = field(&m);
+    assert_eq!(f["blockers"], json!([]), "{f:#}");
+    assert_eq!(f["functions"], json!(["main", "needs"]));
+    assert_eq!(f["source_wrappers"].as_array().unwrap().len(), 1);
+    assert_eq!(f["source_wrappers"][0]["function"], "plain");
+    assert_eq!(
+        f["source_wrappers"][0]["edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "wrapper-use")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn wrapper_name_collisions_and_aliases_are_planning_constraints() {
+    for (extra, expected) in [
+        (
+            "int plain_xjw; int plain(int x){return x;}",
+            "source-generated-name-collision",
+        ),
+        (
+            "int plain(int); __attribute__((weak)) int plain(int x){return x;}",
+            "source-wrapper-symbol-alias",
+        ),
+        (
+            "int plain(int) __asm__(\"needs\");",
+            "source-wrapper-symbol-alias",
+        ),
+        (
+            "__attribute__((returns_twice)) int plain(int x){return x;}",
+            "source-wrapper-returns-twice",
+        ),
+    ] {
+        let (_, m) = analyze(&format!("static int g; int needs(int x){{return ++g+x;}} {extra} int main(int argc,char **argv){{int (*p)(int)=argc>1?needs:plain;return p(1);}}"));
+        assert!(
+            field(&m)["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["kind"] == expected),
+            "{}",
+            field(&m)
+        );
+    }
 }
 
 #[test]

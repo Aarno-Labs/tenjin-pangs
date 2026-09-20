@@ -41,6 +41,8 @@ struct Node {
 };
 struct Facts {
   std::map<std::string, Node> nodes;
+  std::map<std::string, Object> producers;
+  Array wrappers;
   Array edges, calls, uses, functions, records, variables, invocations, pruned_declarations;
   Array pruning_edits, unprunable_declarations;
   bool pruning_complete = true;
@@ -168,6 +170,7 @@ class Extract : public RecursiveASTVisitor<Extract> {
   const Retention &retention;
   std::string function, initializer;
   std::set<const Decl *> typed;
+  std::set<const FunctionDecl *> wrapper_declarations;
   unsigned unknown_count = 0;
   std::set<const Stmt *> folded_operands;
 
@@ -281,7 +284,10 @@ class Extract : public RecursiveASTVisitor<Extract> {
       collectReferences(g->getResultExpr(), result); return;
     }
     if (auto *d = dyn_cast<DeclRefExpr>(s)) {
-      if (callable(d->getType())) result.push_back(id(d->getDecl()));
+      if (callable(d->getType())) {
+        auto refs = values(d);
+        result.insert(result.end(), refs.begin(), refs.end());
+      }
     } else if (auto *m = dyn_cast<MemberExpr>(s)) {
       if (callable(m->getType())) result.push_back(id(m->getMemberDecl()));
     }
@@ -299,6 +305,20 @@ class Extract : public RecursiveASTVisitor<Extract> {
     e = e->IgnoreParenImpCasts();
     if (auto *g = dyn_cast<GenericSelectionExpr>(e)) return values(g->getResultExpr());
     if (auto *d = dyn_cast<DeclRefExpr>(e)) {
+      if (auto *f = dyn_cast<FunctionDecl>(d->getDecl())) {
+        auto begin = d->getLocation();
+        auto end = Lexer::getLocForEndOfToken(begin, 0, sm, ctx.getLangOpts());
+        auto key = "producer:" + file(begin) + ":" + std::to_string(offset(begin));
+        out.nodes[key];
+        if (f->getName() == "main")
+          out.nodes[key].blockers.insert("source-call-to-main");
+        if (!editable(begin) || !editable(end))
+          out.nodes[key].blockers.insert("source-uneditable-function-value");
+        out.producers.emplace(key, Object{{"function", f->getNameAsString()},
+          {"edit", edit(begin, end, f->getNameAsString() + "_xjw", "wrapper-use")}});
+        id(f);
+        return {key};
+      }
       if (callable(d->getType())) return {id(d->getDecl())};
     }
     if (auto *m = dyn_cast<MemberExpr>(e)) {
@@ -826,6 +846,7 @@ public:
     auto &node = out.nodes[n];
     auto name = f->getNameAsString();
     auto loc = f->getLocation();
+    wrapper(f);
     out.functions.push_back(Object{{"name", name}, {"defined", f->isThisDeclarationADefinition()},
       {"file", file(loc)}, {"offset", offset(loc)},
       {"internal", !f->isExternallyVisible()},
@@ -851,6 +872,69 @@ public:
       out.edges.push_back(Array{rn, "boundary:" + name});
     }
     return true;
+  }
+  // Check that a generated file-scope prototype can name this type here.
+  bool wrapperTypeVisible(QualType t, SourceLocation before) {
+    if (auto *alias = dyn_cast<TypedefType>(t.getTypePtr())) {
+      auto *d = alias->getDecl();
+      return d->getDeclContext()->isTranslationUnit() && offset(d->getLocation()) < offset(before);
+    }
+    if (auto *tag = t->getAs<TagType>()) {
+      auto *d = tag->getDecl()->getCanonicalDecl();
+      return d->getDeclContext()->isTranslationUnit() && offset(d->getLocation()) < offset(before);
+    }
+    if (t->isPointerType()) return wrapperTypeVisible(t->getPointeeType(), before);
+    if (auto *a = ctx.getAsArrayType(t)) return wrapperTypeVisible(a->getElementType(), before);
+    return t->isBuiltinType();
+  }
+  // One declaration per TU, and a candidate definition after all source types
+  // are complete. The planner chooses one definition for each external symbol.
+  void wrapper(FunctionDecl *f) {
+    if (!wrapper_declarations.insert(f->getCanonicalDecl()).second) return;
+    auto name = f->getNameAsString();
+    auto begin = f->getBeginLoc();
+    auto end = sm.getLocForEndOfFile(sm.getMainFileID());
+    Array blockers;
+    auto *proto = f->getType()->getAs<FunctionProtoType>();
+    if (!proto || proto->isVariadic() || proto->getCallConv() != CC_C ||
+        callable(f->getReturnType()))
+      blockers.push_back("source-unsupported-wrapper-signature");
+    for (auto *p : f->parameters())
+      if (callable(p->getType()) || !printableType(p->getType()) || !wrapperTypeVisible(p->getType(), begin))
+        blockers.push_back("source-unsupported-wrapper-signature");
+    if (!printableType(f->getReturnType()) || !wrapperTypeVisible(f->getReturnType(), begin))
+      blockers.push_back("source-unsupported-wrapper-signature");
+    if (!f->getDeclContext()->isTranslationUnit() || !editable(begin))
+      blockers.push_back("source-wrapper-declaration-scope");
+    for (auto *decl : f->redecls()) {
+      if (decl->hasAttr<AliasAttr>() || decl->hasAttr<WeakAttr>() || decl->hasAttr<WeakRefAttr>() ||
+          decl->hasAttr<AsmLabelAttr>() || decl->hasAttr<IFuncAttr>())
+        blockers.push_back("source-wrapper-symbol-alias");
+      if (decl->hasAttr<ReturnsTwiceAttr>())
+        blockers.push_back("source-wrapper-returns-twice");
+    }
+    std::string params = "struct XjGlobals *xjg", args;
+    for (unsigned i = 0; i < f->getNumParams(); ++i) {
+      auto arg = "_xjw_arg_" + std::to_string(i);
+      std::string parameter;
+      llvm::raw_string_ostream stream(parameter);
+      f->getParamDecl(i)->getType().print(stream, ctx.getPrintingPolicy(), arg);
+      stream.flush();
+      params += ", " + parameter;
+      if (i) args += ", ";
+      args += arg;
+    }
+    std::string signature;
+    llvm::raw_string_ostream stream(signature);
+    f->getReturnType().print(stream, ctx.getPrintingPolicy(), name + "_xjw(" + params + ")");
+    stream.flush();
+    if (!f->isExternallyVisible()) signature = "static " + signature;
+    auto body = "\n" + signature + " { (void)xjg; " +
+        (f->getReturnType()->isVoidType() ? "" : "return ") + name + "(" + args + "); }\n";
+    out.wrappers.push_back(Object{{"function", name}, {"internal", !f->isExternallyVisible()},
+      {"blockers", std::move(blockers)},
+      {"declaration", edit(begin, begin, "\n" + signature + ";\n", "wrapper-declaration")},
+      {"definition", edit(end, end, body, "wrapper-definition")}});
   }
   bool VisitDeclaratorDecl(DeclaratorDecl *d) {
     if (isa<FunctionDecl>(d) || !typed.insert(d).second) return true;
@@ -950,9 +1034,8 @@ public:
     out.nodes["fn:" + function].blockers.insert("source-inline-assembly"); return true;
   }
   bool VisitCallExpr(CallExpr *c) {
-    auto targets = values(c->getCallee());
     auto *direct = c->getDirectCallee();
-    if (direct) targets = {id(direct)};
+    auto targets = direct ? std::vector<std::string>{id(direct)} : values(c->getCallee());
     for (unsigned i = 0; i < c->getNumArgs(); ++i) {
       auto *arg = c->getArg(i);
       auto a = values(arg);
@@ -985,13 +1068,13 @@ public:
       for (auto &n : targets) out.nodes[n].blockers.insert("source-uneditable-call");
       return true;
     }
-    auto begin = left->getLocation().getLocWithOffset(1);
+    auto begin = left->getLocation();
     Array ts; for (auto &n : targets) { out.nodes[n]; ts.push_back(n); }
     auto loc = sm.getSpellingLoc(c->getBeginLoc());
     out.calls.push_back(Object{{"caller", function}, {"targets", std::move(ts)},
       {"file", file(loc)}, {"line", sm.getSpellingLineNumber(loc)},
       {"col", sm.getSpellingColumnNumber(loc)}, {"offset", offset(loc)},
-      {"edit", edit(begin, begin, std::string("((struct XjGlobals*)0)") +
+      {"edit", edit(begin, begin.getLocWithOffset(1), std::string("(((struct XjGlobals*)0)") +
                         (c->getNumArgs() ? ", " : ""), "call")}});
     return true;
   }
@@ -1102,9 +1185,17 @@ extern "C" char *pangs_source_extract(const char *database) {
           {"blockers", std::move(blockers)}, {"edits", std::move(entry.second.edits)}};
       }
       Array globals, no_initializer;
+      Object producers;
+      for (auto &entry : facts.producers) producers[entry.first] = std::move(entry.second);
+      for (auto &value : facts.wrappers) {
+        auto &w = *value.getAsObject();
+        if (facts.identifiers.count(w.getString("function")->str() + "_xjw"))
+          w.getArray("blockers")->push_back("source-generated-name-collision");
+      }
       for (auto &g : facts.globals) globals.push_back(g);
       for (auto &g : facts.no_initializer) if (!facts.initialized.count(g)) no_initializer.push_back(g);
       result = Object{{"nodes", std::move(nodes)}, {"edges", std::move(facts.edges)},
+        {"producers", std::move(producers)}, {"wrappers", std::move(facts.wrappers)},
         {"calls", std::move(facts.calls)}, {"uses", std::move(facts.uses)},
         {"functions", std::move(facts.functions)}, {"records", std::move(facts.records)},
         {"variables", std::move(facts.variables)}, {"invocations", std::move(facts.invocations)},
