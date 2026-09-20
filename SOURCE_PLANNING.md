@@ -118,6 +118,10 @@ variadic transfers, external callbacks/producers/storage, external-inline
 boundaries, assembly operands, lifecycle entries, context
 name collisions, static initializer dependencies, and owned synthetic storage
 requiring a relocation recipe. It emits no identity-changing adapters.
+The automatic context-in-main recipe also leaves storage in place when its
+initializer refers to a private function in another TU. Changing the callback
+type is still supported; moving its storage would require a separate recipe
+that initializes it in the owning TU without changing function identity.
 Some checks conservatively reject safe programs; these are coverage limits,
 not accepted-risk proofs. New forms need an extraction rule and executable
 recipe with regressions before removing their blockers.
@@ -131,6 +135,9 @@ Tenjin pipeline and is not a substitute for disposition's feasibility guards.
 Tenjin supplies the effective database from its bitcode builder, checks the
 plan's supported operations and internal consistency, applies signature edits
 on a private copy, and performs its existing context-storage materialization.
+It makes initializer function declarations visible in `main` and places the
+required complete type definitions before each generated context-header include.
+Late definitions are moved rather than duplicated.
 It validates C with both provided compilers and calls `validate-source` before publication.
 Unexplained C errors abort without publishing partial edits.
 Materialization gets one private attempt. Any unexpected failure reports a

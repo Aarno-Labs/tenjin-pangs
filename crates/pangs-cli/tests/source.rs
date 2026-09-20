@@ -7,13 +7,38 @@ fn clang() -> PathBuf {
 }
 
 fn analyze(code: &str) -> (TempDir, Value) {
+    analyze_sources(&[("test.i", code)])
+}
+
+fn analyze_sources(sources: &[(&str, &str)]) -> (TempDir, Value) {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("test.i");
     let bc = dir.path().join("test.bc");
-    fs::write(&source, code).unwrap();
-    let output = Command::new(clang())
-        .args(["-x", "c", "-g", "-O0", "-c", "-emit-llvm"])
-        .arg(&source)
+    let mut commands = Vec::new();
+    let mut modules = Vec::new();
+    for (index, (name, code)) in sources.iter().enumerate() {
+        let source = dir.path().join(name);
+        let module = dir.path().join(format!("{index}.bc"));
+        fs::write(&source, code).unwrap();
+        let output = Command::new(clang())
+            .args(["-x", "c", "-g", "-O0", "-c", "-emit-llvm"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&module)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        modules.push(module);
+        commands.push(json!({
+            "directory": dir.path(), "file": source,
+            "arguments": [clang(), PathBuf::from("-x"), PathBuf::from("c"), source.clone()]
+        }));
+    }
+    let output = Command::new(clang().with_file_name("llvm-link"))
+        .args(&modules)
         .arg("-o")
         .arg(&bc)
         .output()
@@ -24,15 +49,7 @@ fn analyze(code: &str) -> (TempDir, Value) {
         String::from_utf8_lossy(&output.stderr)
     );
     let db = dir.path().join("commands.json");
-    fs::write(
-        &db,
-        serde_json::to_vec(&json!([{
-            "directory": dir.path(), "file": source,
-            "arguments": [clang(), PathBuf::from("-x"), PathBuf::from("c"), source.clone()]
-        }]))
-        .unwrap(),
-    )
-    .unwrap();
+    fs::write(&db, serde_json::to_vec(&commands).unwrap()).unwrap();
     let out = dir.path().join("out");
     let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
         .arg("analyze")
@@ -69,6 +86,55 @@ fn field(m: &Value) -> &Value {
         .iter()
         .find(|f| f["llvm_name"] == "g")
         .unwrap()
+}
+
+#[test]
+fn private_initializer_functions_constrain_storage_not_callback_types() {
+    for private in [false, true] {
+        let code = format!(
+            "int g; {}int foo(int x){{return ++g+x;}} int (*dispatch)(int)=foo;",
+            if private { "static " } else { "" }
+        );
+        let (_, m) = analyze_sources(&[
+            (
+                "main.i",
+                "extern int (*dispatch)(int); int main(void){return dispatch(7);}",
+            ),
+            ("callbacks.i", &code),
+        ]);
+        let dispatch = m["context_rewrite"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["llvm_name"] == "dispatch")
+            .unwrap();
+        assert_eq!(
+            dispatch["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["kind"] == "source-private-initializer-function"),
+            private,
+            "{dispatch:#}"
+        );
+        assert_eq!(field(&m)["blockers"], json!([]), "{m:#}");
+        assert!(
+            m["context_rewrite"]["selected"]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["llvm_name"] == "g"),
+            "{m:#}"
+        );
+    }
+    let (_, m) = analyze("int g; static int foo(int x){return ++g+x;} int (*dispatch)(int)=foo; int main(void){return dispatch(7);}");
+    let dispatch = m["context_rewrite"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["llvm_name"] == "dispatch")
+        .unwrap();
+    assert_eq!(dispatch["blockers"], json!([]), "{dispatch:#}");
 }
 
 #[test]

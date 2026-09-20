@@ -388,6 +388,11 @@ pub fn augment_manifest(
         .map(|f| (f.global.clone(), f))
         .collect::<BTreeMap<_, _>>();
     let mut fields = Vec::new();
+    let main_file = facts
+        .functions
+        .iter()
+        .find(|f| f.name == "main" && f.defined)
+        .map(|f| f.file.as_str());
     for global in &mut manifest.globals {
         let name = global
             .meta
@@ -469,6 +474,23 @@ pub fn augment_manifest(
             .iter()
             .map(|f| format!("fn:{f}"))
             .collect::<BTreeSet<_>>();
+        // Moving a private callback's initializer to another TU would require
+        // exporting the function or an initialization recipe in its owning TU.
+        // This constrains moving the storage, not changing its callback type.
+        for dependency in declarations
+            .iter()
+            .flat_map(|v| v["initializer_functions"].as_array().into_iter().flatten())
+        {
+            if dependency["internal"] == true && dependency["site"]["file"].as_str() != main_file {
+                let function = dependency["name"]
+                    .as_str()
+                    .context("initializer function name")?;
+                let mut b = blocker("source-private-initializer-function", function);
+                b.extra
+                    .insert("source_site".into(), dependency["site"].clone());
+                field.blockers.push(b);
+            }
+        }
         for usage in &uses {
             if !usage.initializer.is_empty() {
                 let mut b = blocker("source-static-initializer-dependency", &usage.initializer);

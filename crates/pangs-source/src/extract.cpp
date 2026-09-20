@@ -449,6 +449,17 @@ class Extract : public RecursiveASTVisitor<Extract> {
       for (auto *f : def->fields()) if (containsObjectPointer(f->getType(), seen)) return true;
     return false;
   }
+  void initializerFunctions(const Stmt *s, Array &functions) {
+    if (!s) return;
+    if (auto *g = dyn_cast<GenericSelectionExpr>(s)) {
+      initializerFunctions(g->getResultExpr(), functions); return;
+    }
+    if (auto *ref = dyn_cast<DeclRefExpr>(s))
+      if (auto *f = dyn_cast<FunctionDecl>(ref->getDecl()))
+        functions.push_back(Object{{"name", f->getNameAsString()},
+            {"internal", !f->isExternallyVisible()}, {"site", site(ref->getLocation())}});
+    for (auto *child : s->children()) initializerFunctions(child, functions);
+  }
   void initializerFeatures(const Stmt *s, std::set<std::string> &features) {
     if (!s) return;
     if (auto *g = dyn_cast<GenericSelectionExpr>(s)) {
@@ -867,6 +878,8 @@ public:
         features.insert("extended-float-initializer");
       Array feature_array;
       for (auto &feature : features) feature_array.push_back(feature);
+      Array initializer_functions;
+      initializerFunctions(d->getInit(), initializer_functions);
       if (callable(d->getType())) slots.push_back(id(d));
       else for (auto &n : aggregate(d->getType())) slots.push_back(n);
       out.variables.push_back(Object{{"name", d->getNameAsString()}, {"id", id(d)},
@@ -875,6 +888,7 @@ public:
           {"site", site(d->getLocation())},
           {"contains_object_pointer", containsObjectPointer(d->getType())},
           {"initializer_features", std::move(feature_array)},
+          {"initializer_functions", std::move(initializer_functions)},
           {"callable_nodes", std::move(slots)}});
       if (d->hasInit()) out.initialized.insert(d->getNameAsString());
       if (d->isThisDeclarationADefinition() && !d->hasInit())
