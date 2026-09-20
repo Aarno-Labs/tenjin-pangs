@@ -6,7 +6,7 @@ fn recipe(replacement: &str, start: usize, end: usize) -> ContextRewriteField {
     extra.insert(
         "source_edits".into(),
         json!([{
-            "file":"test.i", "start":start, "end":end, "expected":"x".repeat(end-start),
+            "file":"test.i", "start":start, "end":end,
             "replacement":replacement, "kind":"signature"
         }]),
     );
@@ -36,4 +36,9 @@ fn composition_deduplicates_shared_edits_and_rejects_conflicts() {
             .len(),
         2
     );
+}
+
+#[test]
+fn composition_rejects_reversed_ranges() {
+    assert!(compose_source_edits(&[recipe("invalid", 2, 1)]).is_err());
 }

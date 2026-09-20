@@ -187,7 +187,7 @@ class Extract : public RecursiveASTVisitor<Extract> {
   Object edit(SourceLocation begin, SourceLocation end, std::string replacement,
               const std::string &kind) {
     return Object{{"file", file(begin)}, {"start", offset(begin)},
-                  {"end", offset(end)}, {"expected", text(begin, end)},
+                  {"end", offset(end)},
                   {"replacement", std::move(replacement)}, {"kind", kind}};
   }
   std::string recordId(const RecordDecl *r) {
@@ -498,11 +498,13 @@ class Extract : public RecursiveASTVisitor<Extract> {
         if (!editable(left) || !editable(right)) {
           out.nodes[node].blockers.insert("source-uneditable-declaration"); return;
         }
-        auto begin = left.getLocWithOffset(1);
-        // No parameters: replace all whitespace and the optional `void` token.
-        auto end = fn.getNumParams() ? begin : right;
+        // Replacing the opening paren leaves the first parameter's spelling
+        // free for a separate typedef-use edit at the following byte offset.
+        // With no parameters, replace the whitespace and optional `void`.
+        auto begin = fn.getNumParams() ? left : left.getLocWithOffset(1);
+        auto end = fn.getNumParams() ? left.getLocWithOffset(1) : right;
         std::string arg = named ? "struct XjGlobals *xjg" : "struct XjGlobals *";
-        if (fn.getNumParams()) arg += ", ";
+        if (fn.getNumParams()) arg = "(" + arg + ", ";
         out.nodes[node].edits.push_back(edit(begin, end, arg, "signature"));
         return;
       }
@@ -701,7 +703,7 @@ public:
   void recordPruning() {
     // Discarded bodies/initializers must not leave invalid C behind when a
     // selected recipe removes a global or changes a function's signature.
-    // Emit anchored deletions, applied only when localization is materialized.
+    // Emit deletions, applied only when localization is materialized.
     std::map<unsigned, std::vector<Decl *>> starts;
     for (auto *d : ctx.getTranslationUnitDecl()->decls()) {
       if (d->isImplicit() || !editable(d->getBeginLoc())) continue;

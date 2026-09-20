@@ -17,12 +17,14 @@ jobs). This is not a separate extractor executable or interchange service.
 
 The existing manifest schema remains 8; the independent required **source
 plan version is 2**. IR-only schema-8 manifests remain readable but do not
-satisfy Tenjin's localization contract. `context_rewrite.source` records source
-hashes and normalized paths, compilation commands and their hash, expanded
-cc1 options, compiler version, linked-module hash, construction recipe, and
-extraction/closure measurements. Each field carries `source_edits` and reason
-edges. The selected projection carries the deduplicated, conflict-checked edit
-union. Edits have byte ranges, expected original text, replacement, and kind.
+satisfy Tenjin's localization contract. `context_rewrite.source` records
+normalized source paths, compilation commands, expanded cc1 options, compiler
+version, construction recipe, and extraction/closure measurements. Each field
+carries `source_edits` and reason edges. The selected projection carries the
+deduplicated, conflict-checked edit union. Edits have byte ranges, replacement,
+and kind. Tenjin controls source
+changes and the order of analysis and rewriting; neither side checks for
+changes to the analyzed inputs or stores source hashes or original edit text.
 
 Runtime written/escape/points-to/call-graph facts are unchanged. Concrete source
 observations are recorded under `facts.source_obligations`: assignments,
@@ -50,16 +52,16 @@ exported type/value rather than references in the folded-away syntax. Ordinary
 `sizeof` expression dependencies and variable-length array bounds remain
 distinct from these folded forms.
 
-Localization recipes include anchored `prune-declaration` edits for discarded
+Localization recipes include `prune-declaration` edits for discarded
 declarations, so their old references cannot invalidate intermediate C after
 global removal or signature rewriting. They are applied only with a selected
 localization recipe. Logical C2Rust pruning does not require physically deleting
 plain unused header declarations: PANGS preserves harmless type/prototype
 spellings to avoid unnecessary header expansion in Tenjin's refolder. Discarded
 bodies, storage and declarations with value references (including transitively
-through types) still receive physical pruning edits. Anchored `prune-expression` edits similarly remove
-exporter-discarded syntax, while preserving the selected `_Generic` expression's
-offsets for nested signature/call edits. Unprintable or callable `typeof`
+through types) still receive physical pruning edits. `prune-expression` edits
+similarly remove exporter-discarded syntax, while preserving the selected
+`_Generic` expression's offsets for nested signature/call edits. Unprintable or callable `typeof`
 rewrites and declaration groups that cannot be pruned independently block
 localization explicitly; the consumer never guesses a repair.
 
@@ -104,8 +106,10 @@ indirect calls through fields/variables/arrays, initializers, assignments,
 conditional producers, direct argument/parameter flow, and pointer comparison
 constraints. All producers of a changed slot receive the same signature.
 Single-level callback typedefs are cloned per affected use; equal signatures
-and shared typedef names do not themselves create value flow. Declaration
-occurrences and shared fields are checked across TUs. `main` retains its ABI.
+and shared typedef names do not themselves create value flow. Declarations of
+externally linked functions and shared fields are checked across TUs. Private
+function copies, including static inline functions from headers, may have
+different signatures in different TUs. `main` retains its ABI.
 
 Version 2 deliberately blocks, with scoped witnesses, unsupported callable
 returns/nested higher-order values, typedef alias chains, pointer-to-pointer
@@ -119,16 +123,16 @@ not accepted-risk proofs. New forms need an extraction rule and executable
 recipe with regressions before removing their blockers.
 
 `pangs validate-source --source-compdb COMMANDS [--removed-global NAME ...]`
-checks rewritten C and cross-TU function/global/record consistency without
-running the solver or repairing source. The older `pangs reproject` command
-remains available for explicit artifact demotion, but it is not part of the
+checks rewritten C and cross-TU consistency of external functions, globals and
+records without running the solver or repairing source. The older
+`pangs reproject` command remains available for explicit artifact demotion, but it is not part of the
 Tenjin pipeline and is not a substitute for disposition's feasibility guards.
 
-Tenjin supplies the effective database from its bitcode builder, verifies the
-source contract and anchors, applies signature edits on a private copy, and
-performs its existing context-storage materialization. It validates C with
-both provided compilers and calls `validate-source` before publication. Stale
-inputs or unexplained C errors abort without publishing partial edits.
+Tenjin supplies the effective database from its bitcode builder, checks the
+plan's supported operations and internal consistency, applies signature edits
+on a private copy, and performs its existing context-storage materialization.
+It validates C with both provided compilers and calls `validate-source` before publication.
+Unexplained C errors abort without publishing partial edits.
 Materialization gets one private attempt. Any unexpected failure reports a
 source-plan contract violation, preserves the original source and manifest,
 and does not demote, retry or run policy. Known limitations belong in the

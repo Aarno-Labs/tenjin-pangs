@@ -79,6 +79,16 @@ fn source_only_indirect_chain_closes_all_producers_and_compiles() {
     assert_eq!(f["blockers"], json!([]), "{f:#}");
     assert_eq!(f["functions"], json!(["dead", "main", "needs", "ordinary"]));
     assert_eq!(m["context_rewrite"]["source"]["version"], 2);
+    let source_metadata = &m["context_rewrite"]["source"];
+    for key in ["module_sha256", "compdb_sha256", "compdb_path"] {
+        assert!(source_metadata.get(key).is_none(), "{source_metadata}");
+    }
+    for file in source_metadata["files"].as_array().unwrap() {
+        assert!(file.get("sha256").is_none(), "{file}");
+    }
+    for edit in f["source_edits"].as_array().unwrap() {
+        assert!(edit.get("expected").is_none(), "{edit}");
+    }
     let mut edits: Vec<pangs_manifest::SourceEdit> =
         serde_json::from_value(f["source_edits"].clone()).unwrap();
     edits.sort_by_key(|e| std::cmp::Reverse(e.start));
@@ -86,6 +96,54 @@ fn source_only_indirect_chain_closes_all_producers_and_compiles() {
     for edit in edits {
         rewritten.replace_range(edit.start..edit.end, &edit.replacement);
     }
+    rewritten.insert_str(0, "struct XjGlobals;\n");
+    let source = dir.path().join("test.i");
+    fs::write(&source, rewritten).unwrap();
+    let check = Command::new(clang())
+        .args([
+            "-x",
+            "c",
+            "-fsyntax-only",
+            "-Werror=incompatible-function-pointer-types",
+        ])
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn context_parameter_and_first_parameter_typedef_edits_compose() {
+    let code = "static int g;\ntypedef int (*CB)(int);\nint apply(CB cb, int x);\nint needs(int x){return ++g+x;}\nint apply(CB cb, int x){return cb(x);}\nint main(void){return apply(needs, 1);}\n";
+    let (dir, m) = analyze(code);
+    let f = field(&m);
+    assert_eq!(f["blockers"], json!([]), "{f:#}");
+    assert!(
+        m["context_rewrite"]["selected"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["llvm_name"] == "g"),
+        "{m:#}"
+    );
+    let mut edits: Vec<pangs_manifest::SourceEdit> =
+        serde_json::from_value(m["context_rewrite"]["selected"]["source_edits"].clone()).unwrap();
+    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
+    let mut rewritten = code.to_owned();
+    for edit in edits {
+        rewritten.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    assert_eq!(
+        rewritten
+            .matches("apply(struct XjGlobals *xjg, CB__pangs_context cb, int x)")
+            .count(),
+        2,
+        "{rewritten}"
+    );
     rewritten.insert_str(0, "struct XjGlobals;\n");
     let source = dir.path().join("test.i");
     fs::write(&source, rewritten).unwrap();
@@ -279,6 +337,61 @@ fn cross_tu_and_parse_failures_are_fatal_without_an_accepted_plan() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[test]
+fn cross_tu_static_inline_copies_can_have_different_signatures() {
+    let first = r#"# 1 "shared.h"
+struct XjGlobals { int value; };
+static inline int helper(struct XjGlobals *g){return g->value;}
+# 1 "a.c"
+int a(void){struct XjGlobals g={3}; return helper(&g);}
+"#;
+    let second = r#"# 1 "shared.h"
+struct XjGlobals { int value; };
+static inline int helper(void){return 7;}
+# 1 "b.c"
+int b(void){struct XjGlobals g={3}; return helper()+g.value;}
+"#;
+    for (other, succeeds) in [
+        (second.to_owned(), true),
+        // A private function can also share a name with another TU's export.
+        (
+            second.replace("static inline int helper", "int helper"),
+            true,
+        ),
+        // Independent functions do not exempt shared record types from checks.
+        (second.replace("int value", "long value"), false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.i");
+        let b = dir.path().join("b.i");
+        fs::write(&a, first).unwrap();
+        fs::write(&b, other).unwrap();
+        let db = dir.path().join("commands.json");
+        fs::write(
+            &db,
+            serde_json::to_vec(&json!([
+                {"directory":dir.path(), "file":a, "arguments":[clang(),a.clone()]},
+                {"directory":dir.path(), "file":b, "arguments":[clang(),b.clone()]},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+            .args(["validate-source", "--source-compdb"])
+            .arg(db)
+            .output()
+            .unwrap();
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), succeeds, "{diagnostics}");
+        if !succeeds {
+            assert!(
+                diagnostics.contains("cross-TU record mismatch"),
+                "{diagnostics}"
+            );
+        }
     }
 }
 

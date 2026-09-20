@@ -24,7 +24,6 @@ pub struct SourceEdit {
     pub file: String,
     pub start: usize,
     pub end: usize,
-    pub expected: String,
     pub replacement: String,
     pub kind: String,
 }
@@ -42,7 +41,7 @@ pub fn compose_source_edits(fields: &[ContextRewriteField]) -> Result<Vec<Source
     }
     let edits = edits.into_iter().collect::<Vec<_>>();
     for edit in &edits {
-        if edit.end < edit.start || edit.end - edit.start != edit.expected.len() {
+        if edit.end < edit.start {
             return Err(Error::InvalidInvariant("invalid source edit range".into()));
         }
     }

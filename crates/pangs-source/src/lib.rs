@@ -15,7 +15,6 @@ use pangs_manifest::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 extern "C" {
     fn pangs_source_extract(database: *const c_char) -> *mut c_char;
@@ -76,10 +75,6 @@ struct Facts {
     compiler: String,
 }
 
-fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 fn extract(database: &Path) -> Result<Facts> {
     let path = CString::new(
         database
@@ -114,6 +109,11 @@ fn blocker(kind: &str, node: &str) -> ContextRewriteBlocker {
 fn check_signatures(facts: &Facts) -> Result<()> {
     let mut signatures = BTreeMap::new();
     for function in &facts.functions {
+        // Clang checks declarations within each TU. Internal-linkage functions
+        // in different TUs are independent, even when their names coincide.
+        if function.internal {
+            continue;
+        }
         if let Some(old) = signatures.insert(&function.name, &function.signature) {
             ensure!(
                 old == &function.signature,
@@ -240,7 +240,6 @@ pub fn augment_manifest(
     let commands: Vec<Value> = serde_json::from_slice(&bytes)?;
     ensure!(!commands.is_empty(), "empty source compilation database");
     let mut files = BTreeMap::new();
-    let mut contents = BTreeMap::new();
     for command in &commands {
         let directory = Path::new(
             command["directory"]
@@ -261,12 +260,7 @@ pub fn augment_manifest(
             "multiple command variants for {}",
             file.display()
         );
-        let content = fs::read(&file)?;
-        files.insert(
-            file.clone(),
-            json!({"path": relative, "sha256": hash(&content), "command": command}),
-        );
-        contents.insert(file, content);
+        files.insert(file.clone(), json!({"path": relative, "command": command}));
     }
     let mut facts = extract(database)?;
     for invocation in &facts.invocations {
@@ -284,12 +278,6 @@ pub fn augment_manifest(
         );
     }
     check_signatures(&facts)?;
-    for (file, entry) in &files {
-        ensure!(
-            entry["sha256"] == hash(&fs::read(file)?),
-            "source changed during extraction"
-        );
-    }
     let mut defined = BTreeSet::new();
     let mut definitions = BTreeMap::new();
     for function in &facts.functions {
@@ -596,11 +584,6 @@ pub fn augment_manifest(
                 files.contains_key(&file),
                 "edit outside preprocessed TU snapshot"
             );
-            let content = &contents[&file];
-            ensure!(
-                content.get(edit.start..edit.end) == Some(edit.expected.as_bytes()),
-                "invalid Clang source anchor"
-            );
             edit.file = file
                 .strip_prefix(&root)?
                 .to_str()
@@ -648,9 +631,7 @@ pub fn augment_manifest(
     manifest.context_rewrite.fields = fields;
     manifest.context_rewrite.extra.insert("source".into(), json!({
         "version": SOURCE_PLAN_VERSION, "complete": true, "compiler": facts.compiler,
-        "module_sha256": manifest.run.analysis.input_sha256,
-        "compdb_sha256": hash(&bytes), "files": files.into_values().collect::<Vec<_>>(),
-        "compdb_path": fs::canonicalize(database)?.strip_prefix(&root).ok(),
+        "files": files.into_values().collect::<Vec<_>>(),
         "invocations": facts.invocations,
         "construction": "automatic-context-in-main", "parse_and_plan_ms": started.elapsed().as_millis(),
         "node_count": facts.nodes.len(), "call_count": facts.calls.len(),
