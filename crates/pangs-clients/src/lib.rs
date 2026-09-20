@@ -204,7 +204,9 @@ pub fn assemble_disposition_artifacts(
     let mut pending_storage_members = Vec::new();
     let mut unkeyed_globals = Vec::new();
     for (index, info) in analysis.globals().iter().enumerate() {
-        if !info.mutable || !info.is_definition {
+        // LLVM constants also need a disposition: source constness alone does
+        // not tell the emitter whether immutable Rust storage is supported.
+        if !info.is_definition {
             continue;
         }
         let llvm_name = info.key.clone();
@@ -779,7 +781,7 @@ fn compound_literal_owners(
         let Some(info) = infos.get(initializer_name).copied() else {
             continue;
         };
-        if is_unnamed_compound_literal(info) || !info.mutable || !info.is_definition {
+        if is_unnamed_compound_literal(info) || !info.is_definition {
             continue;
         }
         let Some(owner) = disposition_key(info) else {

@@ -37,6 +37,10 @@ not emitted. Absence from the manifest is never an immutability proof. Source-on
 enter a recipe, but source-only globals are not silently added as disposition
 subjects. Safety gates are rechecked for newly reached functions.
 
+LLVM constant definitions are disposition subjects too, including function-scope
+statics. Their source obligations and emitter capabilities are checked before
+selecting `immutable`; C `const` alone does not imply an immutable Rust static.
+
 Source obligations follow C2Rust's per-TU declaration dependency closure with
 `--preserve-unused-functions` disabled. Roots are externally visible function
 and variable definitions (including the compiler's inline visibility rules)

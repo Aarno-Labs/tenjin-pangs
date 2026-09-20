@@ -157,20 +157,21 @@ One versioned JSON document per analyzed program — **`pangs-manifest.json`,
 artifact consumed by *both* toolchain stages and referenced by override files.
 
 **Population — "client-relevant global" defined precisely:** `globals[]` contains
-every **source-actionable defined mutable global**: every global with a definition in
-the analyzed module whose type is not const-qualified (the existing
-`GlobalInfo.mutable` bit), after the existing ignore-list filter, function-scope
-statics included. Compiler-generated anonymous backing objects remain part of the
-PAG, points-to solution, mod/ref analysis, and raw analysis exports, but are not
+every **source-actionable defined global** in the analyzed module, after the
+existing ignore-list filter, including LLVM constants and function-scope statics.
+Constants pass through the same disposition guards: LLVM's immutable storage
+does not guarantee that the emitter can use an immutable Rust representation.
+Compiler-generated anonymous backing objects remain part of the PAG, points-to
+solution, mod/ref analysis, and raw analysis exports, but are not
 independent disposition subjects. When a backing object has one named
 constant-initializer owner, it appears in that owner's `storage_members`; its safety
 facts are folded conservatively into the owner's fact vector, and materialization
 must move, clone, initialize, or protect the complete storage closure. A backing
 object with no unique owner appears only in `synthetic_globals`, with the failed
-ownership proof, outside the actionable coverage denominator. Excluded:
-`const` globals (nothing to decide — already immutable in source), external
-declarations (no defining TU here; not ours to rewrite). Stationary and never-written
-globals are *included* — they are precisely the `immutable`/`once-lock` candidates.
+ownership proof, outside the actionable coverage denominator. External
+declarations are excluded (no defining TU here; not ours to rewrite). Stationary
+and never-written globals are *included* — they are precisely the
+`immutable`/`once-lock` candidates.
 
 The defining-TU path is optional provenance. When it is available and normalizable,
 the key is source-qualified; otherwise the globally unique symbol name is the key.
@@ -178,7 +179,7 @@ This relies on the translation pipeline's pre-analysis static-variable uniquific
 invariant, recorded in the audit ledger, with manifest duplicate-key validation as a
 hard-error backstop. `unkeyed_globals` is retained only for the exceptional case where
 even the symbol spelling cannot satisfy the key grammar (for example a non-C,
-compiler-generated mutable definition); those records carry no facts or disposition
+compiler-generated definition); those records carry no facts or disposition
 and count as `unhandled`.
 
 ### 3.1 Identity and keying (load-bearing for overrides)

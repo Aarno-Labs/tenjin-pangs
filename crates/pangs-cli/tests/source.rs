@@ -361,6 +361,104 @@ fn typedef_cloning_does_not_change_unrelated_slots() {
 }
 
 #[test]
+fn constant_definitions_receive_source_checked_dispositions() {
+    let (dir, m) = analyze(
+        r#"
+static const float stb__midpoints6[64] = {0.007843f, 0.023529f, 1.0f};
+extern const float external_table[64];
+float refine_block(unsigned q) {
+    static const int weights[4] = {3, 0, 2, 1};
+    return stb__midpoints6[q & 63] + weights[q & 3] + external_table[q & 63];
+}
+"#,
+    );
+    let globals = m["globals"].as_array().unwrap();
+    assert_eq!(globals.len(), 2, "{m:#}");
+    for (llvm_name, declaration) in [
+        ("stb__midpoints6", "stb__midpoints6"),
+        ("refine_block.weights", "refine_block:weights"),
+    ] {
+        let g = globals
+            .iter()
+            .find(|g| g["meta"]["llvm_name"] == llvm_name)
+            .unwrap_or_else(|| panic!("missing {llvm_name}: {m:#}"));
+        assert_eq!(g["facts"]["written"]["value"], false, "{g:#}");
+        assert_eq!(g["disposition"]["chosen"], "immutable", "{g:#}");
+        let source = &g["facts"]["source_obligations"];
+        assert_eq!(source["declaration"], declaration, "{g:#}");
+        assert_eq!(source["contains_object_pointer"], false);
+        assert!(!source["observations"].as_array().unwrap().is_empty());
+    }
+    assert_eq!(m["context_rewrite"]["selected"]["fields"], json!([]));
+    let metrics: Value =
+        serde_json::from_slice(&fs::read(dir.path().join("out/metrics.json")).unwrap()).unwrap();
+    assert_eq!(metrics["mutable_globals_total"], 0);
+    let manifest: pangs_manifest::Manifest = serde_json::from_value(m).unwrap();
+    manifest.validate().unwrap();
+}
+
+#[test]
+fn constant_definitions_still_obey_source_representation_guards() {
+    for (code, guard) in [
+        (
+            "const unsigned g=1u+2u; unsigned read(void){return g;}",
+            "source-section-initializer",
+        ),
+        (
+            "static const int values[2]={1,2}; const int *const g=values; int read(unsigned n){return g[n&1];}",
+            "source-default-type-not-sync",
+        ),
+    ] {
+        let (_, m) = analyze(code);
+        let g = m["globals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["meta"]["llvm_name"] == "g")
+            .unwrap_or_else(|| panic!("missing constant: {m:#}"));
+        assert_eq!(g["facts"]["written"]["value"], false, "{g:#}");
+        assert_ne!(g["disposition"]["chosen"], "immutable", "{g:#}");
+        assert!(g["disposition"]["cascade_trace"].to_string().contains(guard), "{g:#}");
+    }
+}
+
+#[test]
+fn constant_owners_keep_compound_literal_storage_facts() {
+    for constant_storage in [false, true] {
+        let qualifier = if constant_storage { "const " } else { "" };
+        let writer = if constant_storage {
+            ""
+        } else {
+            "void write(int n){*owner=n;}"
+        };
+        let (_, m) = analyze(&format!(
+            "{qualifier}int *const owner=&({qualifier}int){{1}}; int read(void){{return *owner;}} {writer}"
+        ));
+        let globals = m["globals"].as_array().unwrap();
+        assert_eq!(globals.len(), 1, "{m:#}");
+        let owner = &globals[0];
+        assert_eq!(owner["meta"]["llvm_name"], "owner");
+        assert!(owner.get("storage_members").is_some(), "{m:#}");
+        assert_eq!(
+            owner["storage_members"].as_array().unwrap().len(),
+            1,
+            "{owner:#}"
+        );
+        assert_eq!(owner["storage_members"][0]["llvm_name"], ".compoundliteral");
+        assert_eq!(m["synthetic_globals"][0]["owner"], owner["key"]);
+        assert_eq!(owner["facts"]["written"]["value"], !constant_storage);
+        assert!(
+            owner["disposition"]["cascade_trace"]
+                .to_string()
+                .contains("source-default-type-not-sync"),
+            "{owner:#}"
+        );
+        let manifest: pangs_manifest::Manifest = serde_json::from_value(m).unwrap();
+        manifest.validate().unwrap();
+    }
+}
+
+#[test]
 fn read_only_array_selection_does_not_require_mutable_rust_storage() {
     let (_, m) =
         analyze("static int g[2]={1,2}; int main(int argc,char **argv){return (g)[argc&1];}");
