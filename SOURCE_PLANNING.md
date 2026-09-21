@@ -158,6 +158,69 @@ Some checks conservatively reject safe programs; these are coverage limits,
 not accepted-risk proofs. New forms need an extraction rule and executable
 recipe with regressions before removing their blockers.
 
+## Corresponding declarations across translation units
+
+Preprocessing a shared header produces a separate copy of its declarations in
+each translation unit. Independently written declarations can describe the
+same external object or compatible types too. Such declarations must remain
+compatible after rewriting, even when their source text differs: macro
+expansion, typedefs, `int` versus `signed int`, parameter names and whitespace
+can all change the spelling without changing the required interface.
+
+Correspondence is not textual equality, a shared filename, or a matching name
+alone. Independent private declarations need not change together merely
+because they look alike. Conversely, different names can refer to objects
+whose declarations share one type. For example, suppose two TUs each contain:
+
+```c
+extern struct { int x; } g1, g3;
+extern struct { int x; } g2;
+```
+
+Within either TU, `g1` and `g3` share a type; `g2` has a distinct type despite
+its identical layout. Across TUs, declarations of the same external object
+must remain compatible. A correspondence model must account for both these
+relationships, including their transitive consequences. Matching only type
+contents, only variable names, or only sets of variable names is insufficient.
+This example describes the identity problem, not a promise that every
+anonymous-type form is supported by the current planner.
+
+There is no inherently authoritative copy from which to copy all changes.
+Different TUs or localization candidates can impose different requirements
+on corresponding declarations. Planning must combine compatible requirements
+and reject conflicts; choosing one modified definition and overwriting the
+others can discard required transformations.
+
+PANGS separates the semantic operation from its concrete source edit. For
+example, adding a context parameter to a callback field requires finding that
+field's parameter list in each corresponding declaration. The
+[extractor](crates/pangs-source/src/extract.cpp) groups supported declarations
+by identity and uses each declaration's Clang `TypeLoc` to generate its own
+edit. Byte offsets and replacement text need not be equal across TUs. A
+typedef use may need a cloned context-taking typedef where another occurrence
+has an explicit function-pointer declarator. Neither a byte-identical
+definition nor a formatting pass is a prerequisite, and offsets relative to
+one definition must not be reused in another.
+
+Clang supplies syntax and type information, not a complete correspondence
+algorithm for this transformation. The current identities use Clang USRs,
+function/parameter identities and record field positions. The
+[source planner](crates/pangs-source/src/lib.rs) checks canonical signatures
+and record layouts/field types, collects the edits required by each candidate,
+and supplies them for final composition. These mechanisms support the modeled
+cases; unsupported forms need explicit handling rather than inference from
+similar spelling. Post-edit validation checks consistency but does not invent
+missing edits.
+
+Consistent source edits do not by themselves reconstruct shared headers.
+Corresponding declarations can require compatible changes with different final
+spellings. Tenjin separately decides whether those changes can be consolidated
+into a header and preserves them if an include remains expanded; see its
+`docs/passes/refold_and_revert.md`. Refolding convenience must not determine
+which declarations PANGS changes or force independent declarations to agree.
+
+## Validation and materialization
+
 `pangs validate-source --source-compdb COMMANDS [--removed-global NAME ...]`
 checks rewritten C and cross-TU consistency of external functions, globals and
 records without running the solver or repairing source. The older
