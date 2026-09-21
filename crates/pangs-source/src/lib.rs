@@ -27,6 +27,12 @@ struct Node {
     blockers: BTreeSet<String>,
     edits: Vec<SourceEdit>,
 }
+#[derive(Debug, Default, Deserialize)]
+struct ConditionalChange {
+    dependencies: BTreeSet<String>,
+    blockers: BTreeSet<String>,
+    edits: Vec<SourceEdit>,
+}
 #[derive(Debug, Deserialize)]
 struct Call {
     caller: String,
@@ -72,6 +78,7 @@ struct Wrapper {
 #[derive(Debug, Deserialize)]
 struct Facts {
     nodes: BTreeMap<String, Node>,
+    conditional_changes: BTreeMap<String, ConditionalChange>,
     edges: Vec<[String; 2]>,
     producers: BTreeMap<String, Producer>,
     wrappers: Vec<Wrapper>,
@@ -81,9 +88,7 @@ struct Facts {
     records: Vec<Value>,
     variables: Vec<Value>,
     invocations: Vec<Value>,
-    pruning_edits: Vec<SourceEdit>,
     pruned_declarations: Vec<Value>,
-    pruning_complete: bool,
     unprunable_declarations: Vec<Value>,
     globals: BTreeSet<String>,
     no_initializer: BTreeSet<String>,
@@ -557,11 +562,6 @@ pub fn augment_manifest(
                 .blockers
                 .push(blocker("source-owned-storage-recipe-required", name));
         }
-        if !facts.pruning_complete {
-            field
-                .blockers
-                .push(blocker("source-unprunable-declaration", name));
-        }
         if !global.facts.access_set_complete.value {
             field.blockers.push(blocker("access-set-complete", name));
         }
@@ -593,7 +593,28 @@ pub fn augment_manifest(
                 }
             }
         }
-        let mut edits = facts.pruning_edits.iter().cloned().collect::<BTreeSet<_>>();
+        let mut active = reached.clone();
+        let mut conditional = BTreeSet::new();
+        loop {
+            let mut additions = Vec::new();
+            for (node, change) in &facts.conditional_changes {
+                if active.contains(node) {
+                    continue;
+                }
+                if let Some(dependency) = change.dependencies.iter().find(|d| active.contains(*d)) {
+                    additions.push((node.clone(), dependency.clone()));
+                }
+            }
+            if additions.is_empty() {
+                break;
+            }
+            for (node, dependency) in additions {
+                active.insert(node.clone());
+                conditional.insert(node.clone());
+                reasons.push(json!({"from": dependency, "to": node}));
+            }
+        }
+        let mut edits = BTreeSet::new();
         let mut functions = BTreeSet::new();
         for node in &reached {
             if let Some(n) = facts.nodes.get(node) {
@@ -608,6 +629,13 @@ pub fn augment_manifest(
                 field
                     .blockers
                     .push(blocker("source-unmapped-function", node));
+            }
+        }
+        for node in conditional {
+            let change = &facts.conditional_changes[&node];
+            edits.extend(change.edits.iter().cloned());
+            for kind in &change.blockers {
+                field.blockers.push(blocker(kind, &node));
             }
         }
         let mut wrappers: BTreeMap<String, BTreeSet<SourceEdit>> = BTreeMap::new();

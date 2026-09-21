@@ -721,10 +721,11 @@ static int discarded(void){return ++g;}
 int main(void){
     __typeof__(discarded()) x=0;
     int a[sizeof(discarded())];
+    int untouched[2 * sizeof(int)];
     enum { N=sizeof(discarded()) };
     struct Width { unsigned n:sizeof(discarded()); };
     int y __attribute__((aligned(sizeof(discarded()))))=0;
-    return _Generic(g++, int: g, default: discarded()) + x + y + sizeof(a) + N
+    return _Generic(g++, int: g, default: discarded()) + x + y + sizeof(a) + sizeof(untouched) + N
         + __builtin_types_compatible_p(__typeof__(discarded()), int);
 }
 "#;
@@ -766,6 +767,10 @@ int main(void){
         }
         assert!(!rewritten.contains("discarded"), "{rewritten}");
         assert!(!rewritten.contains("_Generic"), "{rewritten}");
+        assert!(
+            rewritten.contains("untouched[2 * sizeof(int)]"),
+            "{rewritten}"
+        );
         let source = dir.path().join("normalized.i");
         fs::write(&source, rewritten).unwrap();
         let check = Command::new(clang())
@@ -779,6 +784,48 @@ int main(void){
             String::from_utf8_lossy(&check.stderr)
         );
     }
+}
+
+#[test]
+fn localization_preserves_unaffected_constant_array_bounds() {
+    let code = "typedef __SIZE_TYPE__ size_t; struct File { char unused2[15 * sizeof(int) - 4 * sizeof(void *) - sizeof(size_t)]; }; static int unrelated(void){return 1;} static int g; int main(void){struct File f; return ++g + sizeof(f);}";
+    let (_, m) = analyze(code);
+    let f = field(&m);
+    assert_eq!(f["blockers"], json!([]), "{f:#}");
+    assert!(
+        f["source_edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|edit| edit["kind"] != "prune-expression"),
+        "{f:#}"
+    );
+    let mut edits: Vec<pangs_manifest::SourceEdit> =
+        serde_json::from_value(f["source_edits"].clone()).unwrap();
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
+    let mut rewritten = code.to_owned();
+    for edit in edits {
+        rewritten.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    assert!(
+        rewritten.contains("15 * sizeof(int) - 4 * sizeof(void *) - sizeof(size_t)"),
+        "{rewritten}"
+    );
+    assert!(rewritten.contains("unrelated(void)"), "{rewritten}");
+}
+
+#[test]
+fn conditional_pruning_dependencies_do_not_join_context_functions() {
+    let code = "static int g; int needs(void){return ++g;} int ordinary(void){return 0;} int folded[sizeof(needs()) + sizeof(ordinary())]; int main(void){return needs() + sizeof(folded);}";
+    let (_, m) = analyze(code);
+    let f = field(&m);
+    assert_eq!(f["blockers"], json!([]), "{f:#}");
+    assert_eq!(f["functions"], json!(["main", "needs"]), "{f:#}");
+    assert!(f["source_edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|edit| edit["kind"] == "prune-expression"));
 }
 
 #[test]

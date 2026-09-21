@@ -39,13 +39,18 @@ struct Node {
   std::set<std::string> blockers;
   Array edits;
 };
+struct ConditionalChange {
+  std::set<std::string> dependencies;
+  std::set<std::string> blockers;
+  Array edits;
+};
 struct Facts {
   std::map<std::string, Node> nodes;
+  std::map<std::string, ConditionalChange> conditional_changes;
   std::map<std::string, Object> producers;
   Array wrappers;
   Array edges, calls, uses, functions, records, variables, invocations, pruned_declarations;
-  Array pruning_edits, unprunable_declarations;
-  bool pruning_complete = true;
+  Array unprunable_declarations;
   std::set<std::string> globals, identifiers, no_initializer, initialized;
   std::map<std::string, std::set<std::string>> clone_users;
 };
@@ -135,11 +140,9 @@ public:
   }
 };
 
-// C2Rust's logical pruning does not require deleting every discarded spelling
-// from intermediate C. Plain header declarations are harmless, and deleting
-// them needlessly forces Tenjin's refolder to expand whole system headers.
-// Keep those spellings, but remove bodies/storage and any declarations whose
-// syntax (including referenced types) can name rewritten functions/globals.
+// Identify discarded declarations whose syntax could become invalid when a
+// referenced function or global is rewritten. The dependency graph decides
+// per localization recipe whether their physical removal is actually needed.
 class PhysicalPruning : public RecursiveASTVisitor<PhysicalPruning> {
   std::set<const Decl *> visited;
 public:
@@ -163,6 +166,23 @@ public:
   }
 };
 
+class DependencyCollector : public RecursiveASTVisitor<DependencyCollector> {
+  void observe(const Decl *d) {
+    if (d) declarations.insert(d->getCanonicalDecl());
+  }
+public:
+  std::set<const Decl *> declarations;
+  bool VisitDeclRefExpr(DeclRefExpr *e) {
+    observe(e->getDecl());
+    if (auto *constant = dyn_cast<EnumConstantDecl>(e->getDecl()))
+      observe(dyn_cast<Decl>(constant->getDeclContext()));
+    return true;
+  }
+  bool VisitMemberExpr(MemberExpr *e) { observe(e->getMemberDecl()); return true; }
+  bool VisitTagType(TagType *t) { observe(t->getDecl()); return true; }
+  bool VisitTypedefType(TypedefType *t) { observe(t->getDecl()); return true; }
+};
+
 class Extract : public RecursiveASTVisitor<Extract> {
   ASTContext &ctx;
   SourceManager &sm;
@@ -170,6 +190,7 @@ class Extract : public RecursiveASTVisitor<Extract> {
   const Retention &retention;
   std::string function, initializer;
   std::set<const Decl *> typed;
+  std::map<const Decl *, std::string> pruning_nodes;
   std::set<const FunctionDecl *> wrapper_declarations;
   unsigned unknown_count = 0;
   std::set<const Stmt *> folded_operands;
@@ -612,13 +633,42 @@ public:
   bool TraverseStmt(Stmt *s) {
     return !s || folded_operands.count(s) || RecursiveASTVisitor::TraverseStmt(s);
   }
-  void foldExpression(SourceRange range, const std::string &value) {
+  std::set<std::string> dependencyNodes(const std::set<const Decl *> &declarations) {
+    std::set<std::string> result;
+    for (auto *d : declarations) {
+      if (auto found = pruning_nodes.find(d); found != pruning_nodes.end()) {
+        result.insert(found->second);
+      } else if (auto *f = dyn_cast<FunctionDecl>(d)) {
+        result.insert("fn:" + f->getNameAsString());
+      } else if (auto *v = dyn_cast<VarDecl>(d); v && v->hasGlobalStorage()) {
+        result.insert("global:" + v->getNameAsString());
+      } else if (auto *v = dyn_cast<ValueDecl>(d); v && callable(v->getType())) {
+        result.insert(id(v));
+      }
+    }
+    return result;
+  }
+  std::set<std::string> dependencies(Stmt *s) {
+    DependencyCollector collector;
+    collector.TraverseStmt(s);
+    return dependencyNodes(collector.declarations);
+  }
+  std::set<std::string> dependencies(TypeLoc loc) {
+    DependencyCollector collector;
+    collector.TraverseTypeLoc(loc);
+    return dependencyNodes(collector.declarations);
+  }
+  void foldExpression(SourceRange range, const std::string &value,
+                      const std::set<std::string> &dependencies) {
+    if (dependencies.empty()) return;
     auto begin = range.getBegin();
     auto end = Lexer::getLocForEndOfToken(range.getEnd(), 0, sm, ctx.getLangOpts());
-    if (editable(begin) && editable(end))
-      out.pruning_edits.push_back(edit(begin, end, value, "prune-expression"));
-    else {
-      out.pruning_complete = false;
+    auto node = "prune-expression:" + file(begin) + ":" + std::to_string(offset(begin));
+    out.conditional_changes[node].dependencies.insert(dependencies.begin(), dependencies.end());
+    if (editable(begin) && editable(end)) {
+      out.conditional_changes[node].edits.push_back(edit(begin, end, value, "prune-expression"));
+    } else {
+      out.conditional_changes[node].blockers.insert("source-uneditable-folded-expression");
       out.unprunable_declarations.push_back(Object{{"kind", "uneditable-folded-expression"},
           {"site", site(begin)}});
     }
@@ -626,7 +676,8 @@ public:
   void foldExpression(Expr *e, const std::string &value) {
     if (!e) return;
     folded_operands.insert(e);
-    if (!isa<IntegerLiteral>(e->IgnoreParenImpCasts())) foldExpression(e->getSourceRange(), value);
+    if (!isa<IntegerLiteral>(e->IgnoreParenImpCasts()))
+      foldExpression(e->getSourceRange(), value, dependencies(e));
   }
   bool VisitEnumConstantDecl(EnumConstantDecl *d) {
     llvm::SmallString<32> value;
@@ -641,7 +692,10 @@ public:
   bool TraverseAlignedAttr(AlignedAttr *a) {
     auto value = std::to_string(a->getAlignment(ctx) / ctx.getCharWidth());
     if (a->isAlignmentExpr()) foldExpression(a->getAlignmentExpr(), value);
-    else if (auto *t = a->getAlignmentType()) foldExpression(t->getTypeLoc().getSourceRange(), value);
+    else if (auto *t = a->getAlignmentType()) {
+      auto loc = t->getTypeLoc();
+      foldExpression(loc.getSourceRange(), value, dependencies(loc));
+    }
     return true;
   }
   bool TraverseTypeTraitExpr(TypeTraitExpr *e) {
@@ -657,17 +711,21 @@ public:
   }
   bool TraverseGenericSelectionExpr(GenericSelectionExpr *e) {
     auto *selected = e->getResultExpr();
+    auto required_by = dependencies(e);
+    if (required_by.empty()) return TraverseStmt(selected);
     auto begin = e->getBeginLoc(), selected_begin = selected->getBeginLoc();
     auto selected_end = Lexer::getLocForEndOfToken(selected->getEndLoc(), 0, sm, ctx.getLangOpts());
     auto end = Lexer::getLocForEndOfToken(e->getEndLoc(), 0, sm, ctx.getLangOpts());
+    auto node = "prune-expression:" + file(begin) + ":" + std::to_string(offset(begin));
+    out.conditional_changes[node].dependencies.insert(required_by.begin(), required_by.end());
     if (editable(begin) && editable(selected_begin) && editable(selected_end) && editable(end)) {
       // Pruned declarations may still be named in the controlling operand or
       // discarded alternatives. Remove those spellings before C validation,
       // leaving the selected expression's offsets available for nested edits.
-      out.pruning_edits.push_back(edit(begin, selected_begin, "(", "prune-expression"));
-      out.pruning_edits.push_back(edit(selected_end, end, ")", "prune-expression"));
+      out.conditional_changes[node].edits.push_back(edit(begin, selected_begin, "(", "prune-expression"));
+      out.conditional_changes[node].edits.push_back(edit(selected_end, end, ")", "prune-expression"));
     } else {
-      out.pruning_complete = false;
+      out.conditional_changes[node].blockers.insert("source-uneditable-generic-selection");
       out.unprunable_declarations.push_back(Object{{"kind", "uneditable-generic-selection"},
           {"site", site(begin)}});
     }
@@ -686,15 +744,19 @@ public:
   bool TraverseTypeOfExprType(TypeOfExprType *t) { return TraverseType(t->desugar()); }
   bool TraverseTypeOfExprTypeLoc(TypeOfExprTypeLoc loc) {
     auto t = loc.getTypePtr()->desugar();
+    auto required_by = dependencies(loc.getTypePtr()->getUnderlyingExpr());
+    if (required_by.empty()) return TraverseType(t);
     auto begin = loc.getBeginLoc();
     auto end = Lexer::getLocForEndOfToken(loc.getEndLoc(), 0, sm, ctx.getLangOpts());
+    auto node = "prune-expression:" + file(begin) + ":" + std::to_string(offset(begin));
+    out.conditional_changes[node].dependencies.insert(required_by.begin(), required_by.end());
     if (!callable(t) && printableType(t) && editable(begin) && editable(end)) {
       // C2Rust exports the resulting type, not this operand. It may mention
       // declarations removed by retention or calls whose signatures change.
-      out.pruning_edits.push_back(edit(begin, end,
+      out.conditional_changes[node].edits.push_back(edit(begin, end,
           "__typeof__(" + t.getAsString(ctx.getPrintingPolicy()) + ")", "prune-expression"));
     } else {
-      out.pruning_complete = false;
+      out.conditional_changes[node].blockers.insert("source-unsupported-typeof-rewrite");
       out.unprunable_declarations.push_back(Object{{"kind", "unsupported-typeof-rewrite"},
           {"site", site(begin)}});
     }
@@ -703,13 +765,17 @@ public:
   bool TraverseConstantArrayType(ConstantArrayType *t) { return TraverseType(t->getElementType()); }
   bool TraverseConstantArrayTypeLoc(ConstantArrayTypeLoc loc) {
     if (auto *bound = loc.getSizeExpr(); bound && !isa<IntegerLiteral>(bound->IgnoreParenImpCasts())) {
+      auto required_by = dependencies(bound);
+      if (required_by.empty()) return TraverseTypeLoc(loc.getElementLoc());
       auto begin = bound->getBeginLoc();
       auto end = Lexer::getLocForEndOfToken(bound->getEndLoc(), 0, sm, ctx.getLangOpts());
+      auto node = "prune-expression:" + file(begin) + ":" + std::to_string(offset(begin));
+      out.conditional_changes[node].dependencies.insert(required_by.begin(), required_by.end());
       if (editable(begin) && editable(end)) {
-        out.pruning_edits.push_back(edit(begin, end,
+        out.conditional_changes[node].edits.push_back(edit(begin, end,
             std::to_string(loc.getTypePtr()->getSize().getLimitedValue()) + "ULL", "prune-expression"));
       } else {
-        out.pruning_complete = false;
+        out.conditional_changes[node].blockers.insert("source-uneditable-constant-array-bound");
         out.unprunable_declarations.push_back(Object{{"kind", "uneditable-constant-array-bound"},
             {"site", site(begin)}});
       }
@@ -754,6 +820,11 @@ public:
         group_end = std::max(group_end, offset(after));
       }
     }
+    struct PlannedPruning {
+      std::vector<Decl *> declarations;
+      std::string node;
+    };
+    std::vector<PlannedPruning> planned;
     for (auto &group : groups) {
       unsigned variable_count = 0;
       for (auto *d : group) variable_count += isa<VarDecl>(d);
@@ -776,17 +847,22 @@ public:
       PhysicalPruning physical;
       for (auto *d : group) if (!retention.contains(d)) physical.TraverseDecl(d);
       if (!physical.required) continue;
+      auto begin = group.front()->getBeginLoc();
+      auto node = "prune-declaration:" + file(begin) + ":" + std::to_string(offset(begin));
+      for (auto *d : group)
+        if (!retention.contains(d)) pruning_nodes[d->getCanonicalDecl()] = node;
+      planned.push_back({group, node});
       if (kept) {
-        // An unused typedef alias of a retained tag has no independent body or
-        // initializer to invalidate. Leave its spelling for C2Rust to discard.
+        // The discarded portion cannot be removed independently. Only a plan
+        // which would invalidate it is blocked.
         if (!types_only) {
-          out.pruning_complete = false;
+          out.conditional_changes[node].blockers.insert("source-mixed-declaration-group");
           out.unprunable_declarations.push_back(Object{{"kind", "mixed-declaration-group"},
               {"site", site(group.front()->getBeginLoc())}});
         }
         continue;
       }
-      SourceLocation begin, end;
+      SourceLocation end;
       bool complete = true;
       for (auto *d : group) {
         auto after = Lexer::getLocForEndOfToken(d->getEndLoc(), 0, sm, ctx.getLangOpts());
@@ -800,12 +876,24 @@ public:
             continue;
           }
         }
-        if (begin.isInvalid()) begin = d->getBeginLoc();
         if (end.isInvalid() || offset(after) > offset(end)) end = after;
       }
-      out.pruning_complete &= complete;
-      if (complete && begin.isValid() && end.isValid())
-        out.pruning_edits.push_back(edit(begin, end, "", "prune-declaration"));
+      if (complete && begin.isValid() && end.isValid()) {
+        out.conditional_changes[node].edits.push_back(edit(begin, end, "", "prune-declaration"));
+      } else {
+        out.conditional_changes[node].blockers.insert("source-missing-declaration-terminator");
+      }
+    }
+    // A discarded declaration only needs physical removal if localization
+    // changes something in its syntax. Dependencies on another discarded
+    // declaration propagate that requirement through these pruning nodes.
+    for (auto &entry : planned) {
+      DependencyCollector collector;
+      for (auto *d : entry.declarations)
+        if (!retention.contains(d)) collector.TraverseDecl(d);
+      auto dependencies = dependencyNodes(collector.declarations);
+      dependencies.erase(entry.node);
+      out.conditional_changes[entry.node].dependencies.insert(dependencies.begin(), dependencies.end());
     }
   }
   bool TraverseFunctionDecl(FunctionDecl *d) {
@@ -1184,6 +1272,14 @@ extern "C" char *pangs_source_extract(const char *database) {
         nodes[entry.first] = Object{{"function", entry.second.function},
           {"blockers", std::move(blockers)}, {"edits", std::move(entry.second.edits)}};
       }
+      Object conditional_changes;
+      for (auto &entry : facts.conditional_changes) {
+        Array dependencies, blockers;
+        for (auto &d : entry.second.dependencies) dependencies.push_back(d);
+        for (auto &b : entry.second.blockers) blockers.push_back(b);
+        conditional_changes[entry.first] = Object{{"dependencies", std::move(dependencies)},
+          {"blockers", std::move(blockers)}, {"edits", std::move(entry.second.edits)}};
+      }
       Array globals, no_initializer;
       Object producers;
       for (auto &entry : facts.producers) producers[entry.first] = std::move(entry.second);
@@ -1194,14 +1290,13 @@ extern "C" char *pangs_source_extract(const char *database) {
       }
       for (auto &g : facts.globals) globals.push_back(g);
       for (auto &g : facts.no_initializer) if (!facts.initialized.count(g)) no_initializer.push_back(g);
-      result = Object{{"nodes", std::move(nodes)}, {"edges", std::move(facts.edges)},
+      result = Object{{"nodes", std::move(nodes)},
+        {"conditional_changes", std::move(conditional_changes)}, {"edges", std::move(facts.edges)},
         {"producers", std::move(producers)}, {"wrappers", std::move(facts.wrappers)},
         {"calls", std::move(facts.calls)}, {"uses", std::move(facts.uses)},
         {"functions", std::move(facts.functions)}, {"records", std::move(facts.records)},
         {"variables", std::move(facts.variables)}, {"invocations", std::move(facts.invocations)},
-        {"pruning_edits", std::move(facts.pruning_edits)},
         {"pruned_declarations", std::move(facts.pruned_declarations)},
-        {"pruning_complete", facts.pruning_complete},
         {"unprunable_declarations", std::move(facts.unprunable_declarations)},
         {"globals", std::move(globals)},
         {"no_initializer", std::move(no_initializer)},

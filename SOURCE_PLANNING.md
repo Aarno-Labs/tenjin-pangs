@@ -58,18 +58,16 @@ exported type/value rather than references in the folded-away syntax. Ordinary
 `sizeof` expression dependencies and variable-length array bounds remain
 distinct from these folded forms.
 
-Localization recipes include `prune-declaration` edits for discarded
-declarations, so their old references cannot invalidate intermediate C after
-global removal or signature rewriting. They are applied only with a selected
-localization recipe. Logical C2Rust pruning does not require physically deleting
-plain unused header declarations: PANGS preserves harmless type/prototype
-spellings to avoid unnecessary header expansion in Tenjin's refolder. Discarded
-bodies, storage and declarations with value references (including transitively
-through types) still receive physical pruning edits. `prune-expression` edits
-similarly remove exporter-discarded syntax, while preserving the selected
-`_Generic` expression's offsets for nested signature/call edits. Unprintable or callable `typeof`
-rewrites and declaration groups that cannot be pruned independently block
-localization explicitly; the consumer never guesses a repair.
+Logical C2Rust pruning does not by itself require source edits. PANGS preserves
+discarded declarations and folded expressions unless a selected localization
+would invalidate something they name. Dependency edges then pull in the needed
+`prune-declaration` and `prune-expression` edits transitively. This keeps, for
+example, an unrelated constant array bound in its original form while still
+removing a discarded function and a folded `sizeof` expression that names it.
+For `_Generic`, pruning preserves the selected expression's offsets for nested
+signature and call edits. Unprintable or callable `typeof` rewrites and
+declaration groups that cannot be pruned independently block only plans that
+reach them; the consumer never guesses a repair.
 
 ## Emitter profile and disposition
 
