@@ -520,10 +520,12 @@ fn aggregate_copy_and_opaque_storage_are_explicitly_blocked() {
 }
 
 #[test]
-fn cross_tu_and_parse_failures_are_fatal_without_an_accepted_plan() {
+fn cross_tu_function_type_disagreement_is_preserved_but_parse_failures_are_fatal() {
     for (second, succeeds) in [
         ("int f(int x){return x;}", true),
-        ("long f(long x){return x;}", false),
+        // Separate TUs can deliberately use different source types for one
+        // external symbol while retaining a link-compatible machine ABI.
+        ("long f(long x){return x;}", true),
         ("int f(int x){return ; BROKEN }", false),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -554,6 +556,39 @@ fn cross_tu_and_parse_failures_are_fatal_without_an_accepted_plan() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn context_rewrite_preserves_per_tu_function_types() {
+    let (_, m) = analyze_sources(&[
+        (
+            "caller.i",
+            "typedef double scalar_t; extern int f(scalar_t *); int main(void){scalar_t x=0; return f(&x);}",
+        ),
+        (
+            "definition.i",
+            "typedef float scalar_t; static int g; int f(scalar_t *x){return ++g+(int)*x;}",
+        ),
+    ]);
+    let recipe = field(&m);
+    assert_eq!(recipe["blockers"], json!([]), "{recipe:#}");
+    assert_eq!(recipe["functions"], json!(["f", "main"]), "{recipe:#}");
+    assert!(
+        m["context_rewrite"]["selected"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field["llvm_name"] == "g"),
+        "{m:#}"
+    );
+    let signature_files = recipe["source_edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|edit| edit["kind"] == "signature")
+        .map(|edit| edit["file"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(signature_files, ["caller.i", "definition.i"]);
 }
 
 #[test]

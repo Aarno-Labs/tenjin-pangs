@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Validate rewritten source, including cross-TU declaration consistency.
+    /// Validate rewritten source, including shared object and record consistency.
     ValidateSource {
         #[arg(long)]
         source_compdb: PathBuf,

@@ -5,7 +5,7 @@ augments the analysis-owned localization candidates before disposition. The
 database must describe the exact preprocessed, static-uniquified translation
 units used to build the module, with effective compiler/target/ABI flags.
 Different commands for the same file, ambiguous global/function names, parse
-failures, and incompatible cross-TU declarations fail explicitly.
+failures, and incompatible shared object or record declarations fail explicitly.
 
 `pangs-source` links Clang 14's C++ APIs in-process because parameter-list
 `TypeLoc`s and semantic aggregate initializers are needed. Build with
@@ -136,10 +136,14 @@ overlaps, then applies the supplied edits without interpreting wrapper recipes
 or independently choosing adapters.
 
 Single-level callback typedefs are cloned per affected use; equal signatures
-and shared typedef names do not themselves create value flow. Declarations of
-externally linked functions and shared fields are checked across TUs. Private
-function copies, including static inline functions from headers, may have
-different signatures in different TUs. `main` retains its ABI.
+and shared typedef names do not themselves create value flow. Function types
+remain per-TU facts: existing declarations and definitions of one external
+symbol may deliberately differ while retaining a link-compatible ABI. PANGS
+adds context to each affected declaration from its own `TypeLoc` instead of
+requiring their original trailing types to agree. Shared global object types and
+record layouts remain cross-TU invariants. Private function copies, including
+static inline functions from headers, are likewise independent. `main` retains
+its ABI.
 
 Version 3 deliberately blocks, with scoped witnesses, unsupported callable
 returns/nested higher-order values, typedef alias chains, pointer-to-pointer
@@ -203,8 +207,8 @@ one definition must not be reused in another.
 Clang supplies syntax and type information, not a complete correspondence
 algorithm for this transformation. The current identities use Clang USRs,
 function/parameter identities and record field positions. The
-[source planner](crates/pangs-source/src/lib.rs) checks canonical signatures
-and record layouts/field types, collects the edits required by each candidate,
+[source planner](crates/pangs-source/src/lib.rs) checks canonical shared-object
+types and record layouts/field types, collects the edits required by each candidate,
 and supplies them for final composition. These mechanisms support the modeled
 cases; unsupported forms need explicit handling rather than inference from
 similar spelling. Post-edit validation checks consistency but does not invent
@@ -220,8 +224,8 @@ which declarations PANGS changes or force independent declarations to agree.
 ## Validation and materialization
 
 `pangs validate-source --source-compdb COMMANDS [--removed-global NAME ...]`
-checks rewritten C and cross-TU consistency of external functions, globals and
-records without running the solver or repairing source. The older
+checks rewritten C and cross-TU consistency of shared globals and records
+without running the solver or repairing source. The older
 `pangs reproject` command remains available for explicit artifact demotion, but it is not part of the
 Tenjin pipeline and is not a substitute for disposition's feasibility guards.
 

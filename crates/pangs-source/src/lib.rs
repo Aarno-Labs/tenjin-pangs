@@ -60,7 +60,6 @@ struct Function {
     offset: usize,
     internal: bool,
     external_inline: bool,
-    signature: String,
 }
 #[derive(Debug, Deserialize)]
 struct Producer {
@@ -126,22 +125,7 @@ fn blocker(kind: &str, node: &str) -> ContextRewriteBlocker {
     }
 }
 
-fn check_signatures(facts: &Facts) -> Result<()> {
-    let mut signatures = BTreeMap::new();
-    for function in &facts.functions {
-        // Clang checks declarations within each TU. Internal-linkage functions
-        // in different TUs are independent, even when their names coincide.
-        if function.internal {
-            continue;
-        }
-        if let Some(old) = signatures.insert(&function.name, &function.signature) {
-            ensure!(
-                old == &function.signature,
-                "cross-TU signature mismatch: {}",
-                function.name
-            );
-        }
-    }
+fn check_shared_data_types(facts: &Facts) -> Result<()> {
     let mut variables: BTreeMap<&str, (&Value, String)> = BTreeMap::new();
     for variable in &facts.variables {
         let name = variable["name"].as_str().context("missing global name")?;
@@ -234,7 +218,7 @@ mod tests {
 /// Validation only: no LLVM analysis, closure, repair, or disposition selection.
 pub fn validate_sources(database: &Path, removed_globals: &[String]) -> Result<()> {
     let facts = extract(database)?;
-    check_signatures(&facts)?;
+    check_shared_data_types(&facts)?;
     for usage in &facts.uses {
         ensure!(
             !removed_globals.contains(&usage.global),
@@ -297,7 +281,7 @@ pub fn augment_manifest(
             invocation["file"]
         );
     }
-    check_signatures(&facts)?;
+    check_shared_data_types(&facts)?;
     let mut defined = BTreeSet::new();
     let mut definitions = BTreeMap::new();
     for function in &facts.functions {

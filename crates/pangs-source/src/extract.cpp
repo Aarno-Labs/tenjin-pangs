@@ -938,8 +938,7 @@ public:
     out.functions.push_back(Object{{"name", name}, {"defined", f->isThisDeclarationADefinition()},
       {"file", file(loc)}, {"offset", offset(loc)},
       {"internal", !f->isExternallyVisible()},
-      {"external_inline", f->isInlined() && f->isExternallyVisible()},
-      {"signature", typeSignature(f->getType())}});
+      {"external_inline", f->isInlined() && f->isExternallyVisible()}});
     if (f->isInlined() && f->isExternallyVisible())
       node.blockers.insert("source-external-inline-definition");
     if (f->hasAttr<ConstructorAttr>() || f->hasAttr<DestructorAttr>() ||
