@@ -126,21 +126,20 @@ fn blocker(kind: &str, node: &str) -> ContextRewriteBlocker {
 }
 
 fn check_shared_data_types(facts: &Facts) -> Result<()> {
-    let mut variables: BTreeMap<&str, (&Value, String)> = BTreeMap::new();
+    let mut variables: BTreeMap<&str, (&str, String)> = BTreeMap::new();
     for variable in &facts.variables {
         let name = variable["name"].as_str().context("missing global name")?;
+        let identity = variable["id"].as_str().context("missing global identity")?;
         let signature = variable["signature"]
             .as_str()
             .context("missing global type")?;
-        let (identity, previous) = variables
-            .entry(name)
-            .or_insert_with(|| (&variable["id"], signature.into()));
-        ensure!(
-            *identity == &variable["id"],
-            "ambiguous source global: {name}; uniquify statics first"
-        );
+        let (previous_name, previous) = variables
+            .entry(identity)
+            .or_insert_with(|| (name, signature.into()));
         *previous = merge_variable_types(previous, signature).with_context(|| {
-            format!("incompatible source declarations for {name}: {previous} vs {signature}")
+            format!(
+                "incompatible source declarations for {previous_name}: {previous} vs {signature}"
+            )
         })?;
     }
     let mut records = BTreeMap::new();
@@ -417,6 +416,16 @@ pub fn augment_manifest(
             .rsplit('.')
             .next()
             .unwrap_or(&global.meta.llvm_name);
+        let source_identities = facts
+            .variables
+            .iter()
+            .filter(|v| v["name"] == name)
+            .filter_map(|v| v["id"].as_str())
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            source_identities.len() <= 1,
+            "ambiguous source global: {name}; uniquify statics first"
+        );
         let uses = facts
             .uses
             .iter()

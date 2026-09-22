@@ -710,7 +710,10 @@ public:
     // Names remain reserved in the unmodified C snapshot, even when C2Rust
     // would omit their declarations. Extraction itself never changes source.
     if (auto *n = dyn_cast<NamedDecl>(d)) out.identifiers.insert(n->getNameAsString());
-    if (!isa<TranslationUnitDecl>(d) && !retention.contains(d)) return true;
+    // Record fields may become retained when localization embeds the record in
+    // XjGlobals. TraverseRecordDecl handles previously unused copies narrowly.
+    if (!isa<TranslationUnitDecl>(d) && !retention.contains(d) &&
+        !isa<RecordDecl>(d)) return true;
     return RecursiveASTVisitor::TraverseDecl(d);
   }
   bool TraverseGenericSelectionExpr(GenericSelectionExpr *e) {
@@ -914,6 +917,22 @@ public:
   }
   bool VisitNamedDecl(NamedDecl *d) {
     out.identifiers.insert(d->getNameAsString()); return true;
+  }
+  bool TraverseRecordDecl(RecordDecl *r) {
+    if (retention.contains(r))
+      return RecursiveASTVisitor::TraverseRecordDecl(r);
+    // Do not traverse expressions in a record C2Rust would originally prune:
+    // their cleanup edits may overlap the declaration-pruning edit. Record its
+    // shape and callable field TypeLocs only, since localization can make this
+    // type newly retained through an XjGlobals field.
+    VisitRecordDecl(r);
+    for (auto *d : r->decls())
+      if (auto *nested = dyn_cast<RecordDecl>(d)) TraverseDecl(nested);
+    for (auto *f : r->fields()) {
+      VisitNamedDecl(f);
+      if (callable(f->getType())) VisitDeclaratorDecl(f);
+    }
+    return true;
   }
   bool VisitRecordDecl(RecordDecl *r) {
     if (!r->isCompleteDefinition() || r->isInvalidDecl()) return true;

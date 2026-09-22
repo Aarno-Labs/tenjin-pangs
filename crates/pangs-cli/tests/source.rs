@@ -224,6 +224,34 @@ fn compound_literal_assignment_connects_callback_fields_and_producers() {
 }
 
 #[test]
+fn callback_field_edits_cover_record_copies_that_localization_makes_retained() {
+    let (_, m) = analyze_sources(&[
+        (
+            "main.i",
+            "static int g;\nstatic int needs(void){return ++g;}\n\
+             struct Ops { int (*fn)(void); };\nstatic struct Ops ops={needs};\n\
+             int main(void){return ops.fn();}\n",
+        ),
+        (
+            "other.i",
+            "struct Ops { int (*fn)(void); };\nint other(void){return 0;}\n",
+        ),
+    ]);
+
+    let edits = m["context_rewrite"]["selected"]["source_edits"]
+        .as_array()
+        .unwrap();
+    assert!(
+        edits.iter().any(|edit| {
+            edit["file"].as_str().unwrap().ends_with("other.i")
+                && edit["kind"] == "signature"
+                && edit["replacement"].as_str().unwrap().contains("XjGlobals")
+        }),
+        "{m:#}"
+    );
+}
+
+#[test]
 fn context_parameter_and_first_parameter_typedef_edits_compose() {
     let code = "static int g;\ntypedef int (*CB)(int);\nint apply(CB cb, int x);\nint needs(int x){return ++g+x;}\nint apply(CB cb, int x){return cb(x);}\nint main(void){return apply(needs, 1);}\n";
     let (dir, m) = analyze(code);
@@ -685,6 +713,39 @@ int b(void){struct XjGlobals g={3}; return helper()+g.value;}
             );
         }
     }
+}
+
+#[test]
+fn source_validation_allows_independent_static_local_storage_with_the_same_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("test.i");
+    fs::write(
+        &source,
+        "int first(void){static int cache; return cache;}\n\
+         int main(void){static long cache; return (int)cache;}\n",
+    )
+    .unwrap();
+    let db = dir.path().join("commands.json");
+    fs::write(
+        &db,
+        serde_json::to_vec(&json!([
+            {"directory":dir.path(), "file":source, "arguments":[clang(),source.clone()]},
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .args(["validate-source", "--source-compdb"])
+        .arg(db)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
