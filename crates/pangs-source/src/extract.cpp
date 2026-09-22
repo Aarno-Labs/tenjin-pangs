@@ -606,6 +606,10 @@ class Extract : public RecursiveASTVisitor<Extract> {
   void init(const std::string &node, QualType t, const Expr *e) {
     if (!e) return;
     e = e->IgnoreParenImpCasts();
+    if (auto *compound = dyn_cast<CompoundLiteralExpr>(e)) {
+      init(node, t, compound->getInitializer());
+      return;
+    }
     if (auto *list = dyn_cast<InitListExpr>(e)) {
       if (auto *semantic = list->getSemanticForm()) list = semantic;
       if (auto *a = ctx.getAsArrayType(t)) {
@@ -1090,8 +1094,14 @@ public:
       connect(left, right);
       if (e->isAssignmentOp() && !callable(e->getLHS()->getType()))
         for (auto &n : right) out.nodes[n].blockers.insert("source-opaque-callable-store");
-      if (e->getLHS()->getType()->isRecordType())
-        blockAggregate(e->getLHS()->getType(), "source-aggregate-copy");
+      if (e->getLHS()->getType()->isRecordType()) {
+        // A compound literal exposes the value assigned to each callback field;
+        // an ordinary aggregate copy does not.
+        if (isa<CompoundLiteralExpr>(e->getRHS()->IgnoreParenImpCasts()))
+          init("", e->getLHS()->getType(), e->getRHS());
+        else
+          blockAggregate(e->getLHS()->getType(), "source-aggregate-copy");
+      }
     }
     return true;
   }

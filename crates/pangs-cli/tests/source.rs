@@ -183,6 +183,47 @@ fn source_only_indirect_chain_adapts_unchanged_producers_and_compiles() {
 }
 
 #[test]
+fn compound_literal_assignment_connects_callback_fields_and_producers() {
+    let code = "static int g;\nstatic int needs(void){return ++g;}\nstatic int ordinary(void){return 2;}\nstruct Ops { int (*fn)(void); };\nstatic struct Ops ops;\nstatic void configure(int choose){ops=(struct Ops){choose?needs:ordinary};}\nint main(void){configure(1);return ops.fn();}\n";
+    let (dir, m) = analyze(code);
+    let f = field(&m);
+    assert_eq!(f["blockers"], json!([]), "{f:#}");
+    assert_eq!(f["functions"], json!(["main", "needs"]));
+    assert_eq!(f["source_wrappers"].as_array().unwrap().len(), 1);
+    assert_eq!(f["source_wrappers"][0]["function"], "ordinary");
+
+    let plan = serde_json::from_value(f.clone()).unwrap();
+    let mut edits = pangs_manifest::compose_source_edits(&[plan]).unwrap();
+    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
+    let mut rewritten = code.to_owned();
+    for edit in edits {
+        rewritten.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    assert!(
+        rewritten.contains("choose?needs:ordinary_xjw"),
+        "{rewritten}"
+    );
+    rewritten.insert_str(0, "struct XjGlobals;\n");
+    let source = dir.path().join("test.i");
+    fs::write(&source, &rewritten).unwrap();
+    let check = Command::new(clang())
+        .args([
+            "-x",
+            "c",
+            "-fsyntax-only",
+            "-Werror=incompatible-function-pointer-types",
+        ])
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}\n{rewritten}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
 fn context_parameter_and_first_parameter_typedef_edits_compose() {
     let code = "static int g;\ntypedef int (*CB)(int);\nint apply(CB cb, int x);\nint needs(int x){return ++g+x;}\nint apply(CB cb, int x){return cb(x);}\nint main(void){return apply(needs, 1);}\n";
     let (dir, m) = analyze(code);
