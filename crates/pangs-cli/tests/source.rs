@@ -661,6 +661,65 @@ fn context_rewrite_preserves_per_tu_function_types() {
 }
 
 #[test]
+fn cross_tu_private_record_layouts_are_independent() {
+    let first = "typedef struct Oper { int reg; } Oper; static Oper make_arm(void){return (Oper){1};} int arm(void){return make_arm().reg;}";
+    let second = "typedef struct Oper { long reg; int flags; } Oper; static Oper make_x86(void){return (Oper){2,3};} int x86(void){return make_x86().flags;}";
+    for (external, succeeds) in [
+        ("", true),
+        ("static Oper cache;", true),
+        ("extern Oper operand;", false),
+        ("extern Oper *operand;", false),
+        ("extern int consume(Oper);", false),
+        ("extern Oper produce(void);", false),
+        (
+            "struct Envelope { Oper operands[2]; }; extern struct Envelope envelope;",
+            false,
+        ),
+        (
+            "typedef int (*Consumer)(Oper); extern Consumer consumer;",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        // Same basename and relative compiler inputs must still identify
+        // different TUs when the commands use different working directories.
+        let a = dir.path().join("arm/emit.i");
+        let b = dir.path().join("x86/emit.i");
+        fs::create_dir(a.parent().unwrap()).unwrap();
+        fs::create_dir(b.parent().unwrap()).unwrap();
+        fs::write(&a, format!("{first}\n{external}")).unwrap();
+        fs::write(&b, format!("{second}\n{external}")).unwrap();
+        let db = dir.path().join("commands.json");
+        fs::write(
+            &db,
+            serde_json::to_vec(&json!([
+                {"directory":a.parent(), "file":a, "arguments":[clang(),"emit.i"]},
+                {"directory":b.parent(), "file":b, "arguments":[clang(),"emit.i"]},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+            .args(["validate-source", "--source-compdb"])
+            .arg(db)
+            .output()
+            .unwrap();
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "{external}: {diagnostics}"
+        );
+        if !succeeds {
+            assert!(
+                diagnostics.contains("cross-TU record mismatch"),
+                "{diagnostics}"
+            );
+        }
+    }
+}
+
+#[test]
 fn cross_tu_record_layouts_allow_per_tu_field_spellings() {
     // glibc exposes struct tm's extension fields with or without a __ prefix
     // depending on each TU's feature macros, without changing their ABI.
@@ -748,12 +807,14 @@ fn cross_tu_callback_fields_with_different_names_share_their_field_position() {
 fn cross_tu_static_inline_copies_can_have_different_signatures() {
     let first = r#"# 1 "shared.h"
 struct XjGlobals { int value; };
+extern struct XjGlobals shared;
 static inline int helper(struct XjGlobals *g){return g->value;}
 # 1 "a.c"
 int a(void){struct XjGlobals g={3}; return helper(&g);}
 "#;
     let second = r#"# 1 "shared.h"
 struct XjGlobals { int value; };
+extern struct XjGlobals shared;
 static inline int helper(void){return 7;}
 # 1 "b.c"
 int b(void){struct XjGlobals g={3}; return helper()+g.value;}

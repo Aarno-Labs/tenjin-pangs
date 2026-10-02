@@ -145,7 +145,8 @@ fn check_shared_data_types(facts: &Facts) -> Result<()> {
     let mut records = BTreeMap::new();
     for record in &facts.records {
         let id = record["id"].as_str().context("missing record identity")?;
-        if let Some(previous) = records.insert(id, record) {
+        let scope = record["scope"].as_str().context("missing record scope")?;
+        if let Some(previous) = records.insert((scope, id), record) {
             ensure!(
                 record_layout(previous)? == record_layout(record)?,
                 "cross-TU record mismatch: {id}: {previous} vs {record}"

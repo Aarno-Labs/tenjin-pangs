@@ -150,6 +150,12 @@ between TUs (for example glibc's `tm_zone` versus `__tm_zone` under different
 feature macros). The layout check still compares field types, offsets, bit widths,
 record kind, size, and alignment. Anonymous type signatures retain member names.
 
+Record tags themselves have no C linkage. Layouts of records used only within
+one TU are validated in that TU's scope, even when another TU uses the same tag.
+Records exposed by external objects or function types remain subject to cross-TU
+layout checks, including records reached through nested fields, pointers, arrays,
+and callback signatures.
+
 Version 3 deliberately blocks, with scoped witnesses, unsupported callable
 returns/nested higher-order values, typedef alias chains, pointer-to-pointer
 callable storage, union callable storage, aggregate copies, opaque/cast or

@@ -20,6 +20,7 @@
 #include <clang/Tooling/Tooling.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/Host.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/raw_ostream.h>
 #include <cstdlib>
 #include <cstring>
@@ -183,11 +184,54 @@ public:
   bool VisitTypedefType(TypedefType *t) { observe(t->getDecl()); return true; }
 };
 
+// A tag has no C linkage. Its USR alone does not make unrelated TU-local
+// definitions a shared type (e.g. antcc's ARM and x86 Oper and Frame types).
+// Record layouts need cross-TU validation when exposed by an external object
+// or function type. Follow nested members, pointers, arrays and callbacks too.
+class SharedRecords : public RecursiveASTVisitor<SharedRecords> {
+  ASTContext &ctx;
+  std::set<const TagDecl *> records;
+
+  void collect(QualType t) {
+    if (t.isNull()) return;
+    t = t.getCanonicalType();
+    if (auto *r = t->getAs<RecordType>()) {
+      auto *decl = r->getDecl();
+      if (!records.insert(decl->getCanonicalDecl()).second) return;
+      if (auto *definition = decl->getDefinition())
+        if (!definition->isInvalidDecl())
+          for (auto *field : definition->fields()) collect(field->getType());
+    } else if (t->isPointerType()) collect(t->getPointeeType());
+    else if (auto *a = ctx.getAsArrayType(t)) collect(a->getElementType());
+    else if (auto *f = t->getAs<FunctionType>()) {
+      collect(f->getReturnType());
+      if (auto *p = dyn_cast<FunctionProtoType>(f))
+        for (auto parameter : p->param_types()) collect(parameter);
+    }
+  }
+public:
+  explicit SharedRecords(ASTContext &ctx) : ctx(ctx) {
+    TraverseDecl(ctx.getTranslationUnitDecl());
+  }
+  bool VisitFunctionDecl(FunctionDecl *d) {
+    if (d->isExternallyVisible()) collect(d->getType());
+    return true;
+  }
+  bool VisitVarDecl(VarDecl *d) {
+    if (d->hasGlobalStorage() && d->isExternallyVisible()) collect(d->getType());
+    return true;
+  }
+  bool contains(const RecordDecl *r) const {
+    return records.count(r->getCanonicalDecl());
+  }
+};
+
 class Extract : public RecursiveASTVisitor<Extract> {
   ASTContext &ctx;
   SourceManager &sm;
   Facts &out;
   const Retention &retention;
+  SharedRecords shared_records;
   std::string function, initializer;
   std::set<const Decl *> typed;
   std::map<const RecordDecl *, std::string> anonymous_type_signatures;
@@ -685,7 +729,8 @@ class Extract : public RecursiveASTVisitor<Extract> {
 
 public:
   Extract(ASTContext &ctx, Facts &out, const Retention &retention)
-      : ctx(ctx), sm(ctx.getSourceManager()), out(out), retention(retention) {}
+      : ctx(ctx), sm(ctx.getSourceManager()), out(out), retention(retention),
+        shared_records(ctx) {}
   bool TraverseStmt(Stmt *s) {
     return !s || folded_operands.count(s) || RecursiveASTVisitor::TraverseStmt(s);
   }
@@ -994,6 +1039,11 @@ public:
     }
     auto record = recordShape(r);
     record["id"] = recordId(r);
+    llvm::SmallString<256> scope(sm.getFilename(sm.getLocForStartOfFile(sm.getMainFileID())));
+    sm.getFileManager().getVirtualFileSystem().makeAbsolute(scope);
+    llvm::sys::path::remove_dots(scope, true);
+    record["scope"] = shared_records.contains(r)
+        ? "" : scope.str().str();
     out.records.push_back(std::move(record));
     return true;
   }
