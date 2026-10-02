@@ -155,9 +155,11 @@ fn check_shared_data_types(facts: &Facts) -> Result<()> {
     Ok(())
 }
 
-// C permits an external incomplete array to be completed by a later or
-// cross-TU definition. Accumulate known bounds so [] cannot hide conflicting
-// [N] and [M] declarations elsewhere in the database.
+// C permits an incomplete array to be completed by a later or cross-TU
+// definition. Extraction puts the actual outer array dimensions after a
+// delimited element signature, including for arrays of function pointers.
+// Accumulate known bounds so [] cannot hide conflicting [N] and [M]
+// declarations elsewhere in the database.
 fn merge_variable_types(a: &str, b: &str) -> Option<String> {
     if a == b {
         return Some(a.into());
@@ -211,6 +213,32 @@ mod tests {
         );
         assert_eq!(merge_variable_types(&t, "const unsigned int[100]"), None);
         assert_eq!(merge_variable_types("int[2]", "float[2]"), None);
+    }
+
+    #[test]
+    fn normalized_function_pointer_arrays_accumulate_bounds() {
+        let element = "array([record:c:@S@JSParseState]int (*)(struct JSParseState *, int, int))";
+        let incomplete = format!("{element}[]");
+        let complete = format!("{element}[12]");
+        let merged = merge_variable_types(&incomplete, &complete).unwrap();
+        assert_eq!(merged, complete);
+        assert_eq!(merge_variable_types(&merged, &incomplete), Some(complete));
+        assert_eq!(
+            merge_variable_types(&merged, &format!("{element}[13]")),
+            None
+        );
+        assert_eq!(
+            merge_variable_types(&format!("{element}[][2]"), &format!("{element}[3][2]")),
+            Some(format!("{element}[3][2]"))
+        );
+        assert_eq!(
+            merge_variable_types("array(int (*)[2])[]", "array(int (*)[3])[12]"),
+            None
+        );
+        assert_eq!(
+            merge_variable_types("array(int (*)[2])[12]", "int (*)[2][12]"),
+            None
+        );
     }
 }
 

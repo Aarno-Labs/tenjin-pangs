@@ -749,6 +749,177 @@ fn source_validation_allows_independent_static_local_storage_with_the_same_name(
 }
 
 #[test]
+fn same_tu_incomplete_function_pointer_array_is_completed_by_initializer() {
+    let (dir, _) = analyze(
+        r#"
+struct JSParseState { int value; };
+typedef int JSParseFunc(struct JSParseState *, int, int);
+static JSParseFunc *parse_func_table[];
+static int parse(struct JSParseState *s, int a, int b) {
+    return s->value + a + b;
+}
+static JSParseFunc *parse_func_table[] = {
+    parse, parse, parse, parse, parse, parse,
+    parse, parse, parse, parse, parse, parse
+};
+int main(void) {
+    struct JSParseState s = {0};
+    return parse_func_table[11](&s, 1, 2);
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(dir.path().join("test.bc"))
+        .args([
+            "--validate",
+            "--dispose",
+            "--no-overrides",
+            "--build-mode",
+            "executable",
+            "--repo-root",
+        ])
+        .arg(dir.path())
+        .arg("--source-compdb")
+        .arg(dir.path().join("commands.json"))
+        .arg("--out")
+        .arg(dir.path().join("validated"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .args(["validate-source", "--source-compdb"])
+        .arg(dir.path().join("commands.json"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn cross_tu_pointer_arrays_merge_only_compatible_outer_dimensions() {
+    let prefix = "struct JSParseState { int value; };\ntypedef int JSParseFunc(struct JSParseState *, int, int);\n";
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.i");
+    let b = dir.path().join("b.i");
+    let c = dir.path().join("c.i");
+    let db = dir.path().join("commands.json");
+    fs::write(
+        &db,
+        serde_json::to_vec(&json!([
+            {"directory":dir.path(), "file":a, "arguments":[clang(),a.clone()]},
+            {"directory":dir.path(), "file":b, "arguments":[clang(),b.clone()]},
+            {"directory":dir.path(), "file":c, "arguments":[clang(),c.clone()]},
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    for (incomplete, complete, other, succeeds) in [
+        (
+            "JSParseFunc *table[]",
+            "JSParseFunc *table[12]",
+            "JSParseFunc *table[]",
+            true,
+        ),
+        (
+            "JSParseFunc *table[]",
+            "JSParseFunc *table[12]",
+            "JSParseFunc *table[13]",
+            false,
+        ),
+        (
+            "JSParseFunc *table[]",
+            "JSParseFunc *table[12]",
+            "int (*table[12])(struct JSParseState *, long, int)",
+            false,
+        ),
+        (
+            "JSParseFunc *table[]",
+            "JSParseFunc *table[12]",
+            "JSParseFunc *const table[12]",
+            false,
+        ),
+        (
+            "JSParseFunc *table[][2]",
+            "JSParseFunc *table[3][2]",
+            "JSParseFunc *table[][2]",
+            true,
+        ),
+        (
+            "JSParseFunc *table[][2]",
+            "JSParseFunc *table[3][2]",
+            "JSParseFunc *table[3][3]",
+            false,
+        ),
+        (
+            "JSParseFunc *table[][2]",
+            "JSParseFunc *table[3][2]",
+            "JSParseFunc *table[4][2]",
+            false,
+        ),
+        (
+            "JSParseFunc *table[]",
+            "JSParseFunc *table[12]",
+            "JSParseFunc *table[12][1]",
+            false,
+        ),
+        (
+            "int (*table[])[2]",
+            "int (*table[12])[2]",
+            "int (*table[])[2]",
+            true,
+        ),
+        (
+            "int (*table[])[2]",
+            "int (*table[12])[2]",
+            "int (*table[12])[3]",
+            false,
+        ),
+        (
+            "int (*table[])[2]",
+            "int (*table[12])[2]",
+            "int (*table)[2][12]",
+            false,
+        ),
+    ] {
+        for (file, declaration, name) in [
+            (&a, incomplete, "retain_a"),
+            (&b, complete, "retain_b"),
+            (&c, other, "retain_c"),
+        ] {
+            // Keep each declaration in the source dependency closure.
+            fs::write(
+                file,
+                format!(
+                    "{prefix}extern {declaration};\nvoid *{name}(void){{return (void *)&table;}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+            .args(["validate-source", "--source-compdb"])
+            .arg(&db)
+            .output()
+            .unwrap();
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), succeeds, "{other}: {diagnostics}");
+        if !succeeds {
+            assert!(
+                diagnostics.contains("incompatible source declarations for table"),
+                "{diagnostics}"
+            );
+        }
+    }
+}
+
+#[test]
 fn cross_tu_anonymous_pointee_typedefs_and_incomplete_arrays() {
     let declaration = "typedef const struct {char c;} *internstr;\nextern internstr tagtypetags[];\nint main(void){return tagtypetags[0] ? tagtypetags[0]->c : 0;}\n";
     let definition = "\n\n/* Different preprocessed header position. */\ntypedef const struct {char c;} *internstr;\ninternstr tagtypetags[1<<10];\n";

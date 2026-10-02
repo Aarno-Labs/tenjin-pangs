@@ -249,6 +249,24 @@ class Extract : public RecursiveASTVisitor<Extract> {
     collectTypeRecords(t, identities);
     return identities + t.getCanonicalType().getAsString(policy);
   }
+  std::string variableTypeSignature(QualType t) {
+    QualType element = t;
+    std::string dimensions;
+    while (auto *array = ctx.getAsArrayType(element)) {
+      if (auto *constant = dyn_cast<ConstantArrayType>(array))
+        dimensions += "[" + std::to_string(constant->getSize().getZExtValue()) + "]";
+      else if (isa<IncompleteArrayType>(array)) dimensions += "[]";
+      else return typeSignature(t);
+      element = array->getElementType();
+    }
+    if (dimensions.empty()) return typeSignature(t);
+    // Clang prints function-pointer array bounds inside the declarator, as
+    // int (*[N])(args). Normalize actual outer array dimensions to suffixes
+    // so the validator can merge incomplete bounds for every element type.
+    // Delimit the element type to distinguish arrays of pointers to arrays
+    // from pointers to multidimensional arrays, and keep their bounds apart.
+    return "array(" + typeSignature(element) + ")" + dimensions;
+  }
   Object recordShape(const RecordDecl *r) {
     const auto &layout = ctx.getASTRecordLayout(r);
     Array fields;
@@ -1104,7 +1122,7 @@ public:
       if (callable(d->getType())) slots.push_back(id(d));
       else for (auto &n : aggregate(d->getType())) slots.push_back(n);
       out.variables.push_back(Object{{"name", d->getNameAsString()}, {"id", id(d)},
-          {"signature", typeSignature(d->getType())}, {"defined", definition},
+          {"signature", variableTypeSignature(d->getType())}, {"defined", definition},
           {"declaration", function.empty() ? d->getNameAsString() : function + ":" + d->getNameAsString()},
           {"site", site(d->getLocation())},
           {"contains_object_pointer", containsObjectPointer(d->getType())},
