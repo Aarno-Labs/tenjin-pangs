@@ -749,6 +749,167 @@ fn source_validation_allows_independent_static_local_storage_with_the_same_name(
 }
 
 #[test]
+fn cross_tu_anonymous_pointee_typedefs_and_incomplete_arrays() {
+    let declaration = "typedef const struct {char c;} *internstr;\nextern internstr tagtypetags[];\nint main(void){return tagtypetags[0] ? tagtypetags[0]->c : 0;}\n";
+    let definition = "\n\n/* Different preprocessed header position. */\ntypedef const struct {char c;} *internstr;\ninternstr tagtypetags[1<<10];\n";
+    let (dir, _) = analyze_sources(&[
+        ("c.nolines.i", declaration),
+        ("c_type.nolines.i", definition),
+    ]);
+    // Exercise the reported analyze --validate path, including artifact
+    // validation, as well as the standalone source validator below.
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .arg("analyze")
+        .arg(dir.path().join("test.bc"))
+        .args([
+            "--validate",
+            "--dispose",
+            "--no-overrides",
+            "--build-mode",
+            "executable",
+            "--repo-root",
+        ])
+        .arg(dir.path())
+        .arg("--source-compdb")
+        .arg(dir.path().join("commands.json"))
+        .arg("--out")
+        .arg(dir.path().join("validated"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for (other, succeeds) in [
+        (definition.to_owned(), true),
+        (definition.replace("char c", "signed char c"), false),
+        (definition.replace("char c", "char d"), false),
+        (definition.replace("char c;", "char c; char d;"), false),
+        (definition.replace("const struct", "struct"), false),
+        (definition.replace("struct {", "union {"), false),
+        (definition.replace("struct {", "struct Tagged {"), false),
+        (
+            definition.replace("struct {", "struct __attribute__((aligned(8))) {"),
+            false,
+        ),
+    ] {
+        fs::write(dir.path().join("c_type.nolines.i"), other).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+            .args(["validate-source", "--source-compdb"])
+            .arg(dir.path().join("commands.json"))
+            .output()
+            .unwrap();
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), succeeds, "{diagnostics}");
+        if !succeeds {
+            assert!(
+                diagnostics.contains("incompatible source declarations for tagtypetags"),
+                "{diagnostics}"
+            );
+        }
+    }
+
+    // An incomplete declaration must not mask disagreement between two
+    // complete declarations, even with compatible anonymous element types.
+    fs::write(dir.path().join("c_type.nolines.i"), definition).unwrap();
+    fs::write(
+        dir.path().join("c.nolines.i"),
+        declaration.replace("int main", "extern internstr tagtypetags[512];\nint main"),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+        .args(["validate-source", "--source-compdb"])
+        .arg(dir.path().join("commands.json"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("incompatible source declarations for tagtypetags"));
+}
+
+#[test]
+fn cross_tu_anonymous_pointee_shapes_include_nested_members() {
+    // The anonymous pointee is reached through a shared tagged record; its
+    // own filename-based record identity differs between the two TUs.
+    let fields =
+        "struct {char c;} nested; unsigned int bits:3; int values[2]; int (*callback)(int);";
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.i");
+    let b = dir.path().join("b.i");
+    fs::write(
+        &a,
+        format!("struct Box {{ const struct {{{fields}}} *value; }}; extern struct Box box;"),
+    )
+    .unwrap();
+    let db = dir.path().join("commands.json");
+    fs::write(
+        &db,
+        serde_json::to_vec(&json!([
+            {"directory":dir.path(), "file":a, "arguments":[clang(),a.clone()]},
+            {"directory":dir.path(), "file":b, "arguments":[clang(),b.clone()]},
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    for (other_fields, succeeds) in [
+        (fields.to_owned(), true),
+        (fields.replace("char c", "signed char c"), false),
+        (fields.replace("bits:3", "bits:4"), false),
+        (fields.replace("values[2]", "values[3]"), false),
+        (
+            fields.replace("(*callback)(int)", "(*callback)(long)"),
+            false,
+        ),
+        (
+            fields.replace("struct {char c;} nested;", "struct {char d;} nested;"),
+            false,
+        ),
+    ] {
+        fs::write(
+            &b,
+            format!(
+                "\n\nstruct Box {{ const struct {{{other_fields}}} *value; }}; struct Box box;"
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+            .args(["validate-source", "--source-compdb"])
+            .arg(&db)
+            .output()
+            .unwrap();
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), succeeds, "{diagnostics}");
+        if !succeeds {
+            assert!(
+                diagnostics.contains("cross-TU record mismatch"),
+                "{diagnostics}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compatible_anonymous_callback_types_keep_independent_storage() {
+    let (_, m) = analyze(
+        "static int g;\nstatic int needs(void){return ++g;}\n\
+         static struct {int (*fn)(void);} ops={needs};\n\
+         extern struct {int (*fn)(void);} external_ops;\n\
+         int main(void){return ops.fn() + external_ops.fn();}\n",
+    );
+    assert_eq!(field(&m)["blockers"], json!([]), "{m:#}");
+    assert!(
+        m["context_rewrite"]["selected"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["llvm_name"] == "g"),
+        "{m:#}"
+    );
+}
+
+#[test]
 fn cross_tu_anonymous_records_and_incomplete_arrays() {
     let declaration = "struct S { union {int a; struct {int x;} aa;}; union {int b; struct {int y;} bb;}; }; extern const int table[]; extern struct S object; int retain(void){return object.a + table[0];}";
     for (other, succeeds) in [

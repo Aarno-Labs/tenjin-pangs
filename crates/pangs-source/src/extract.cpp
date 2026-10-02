@@ -190,6 +190,7 @@ class Extract : public RecursiveASTVisitor<Extract> {
   const Retention &retention;
   std::string function, initializer;
   std::set<const Decl *> typed;
+  std::map<const RecordDecl *, std::string> anonymous_type_signatures;
   std::map<const Decl *, std::string> pruning_nodes;
   std::set<const FunctionDecl *> wrapper_declarations;
   unsigned unknown_count = 0;
@@ -241,16 +242,49 @@ class Extract : public RecursiveASTVisitor<Extract> {
   }
   std::string typeSignature(QualType t) {
     auto policy = ctx.getPrintingPolicy();
-    // Layouts and nested fields are checked separately using recordId().
+    // Tagged layouts and nested fields are checked separately using recordId().
     // Source paths printed in anonymous tag names are not type differences.
     policy.AnonymousTagLocations = false;
     std::string identities;
     collectTypeRecords(t, identities);
     return identities + t.getCanonicalType().getAsString(policy);
   }
+  Object recordShape(const RecordDecl *r) {
+    const auto &layout = ctx.getASTRecordLayout(r);
+    Array fields;
+    unsigned i = 0;
+    for (auto *f : r->fields()) {
+      fields.push_back(Object{{"name", f->getNameAsString()},
+          {"type", typeSignature(f->getType())},
+          {"bit_width", f->isBitField() ? static_cast<int64_t>(f->getBitWidthValue(ctx)) : -1},
+          {"offset_bits", static_cast<int64_t>(layout.getFieldOffset(i++))}});
+    }
+    return Object{{"kind", r->getKindName().str()}, {"fields", std::move(fields)},
+        {"size", layout.getSize().getQuantity()},
+        {"alignment", layout.getAlignment().getQuantity()}};
+  }
+  std::string recordTypeSignature(const RecordDecl *r) {
+    if (r->getIdentifier()) return recordId(r);
+    auto *definition = r->getDefinition();
+    if (!definition || definition->isInvalidDecl()) return recordId(r);
+    auto found = anonymous_type_signatures.find(definition);
+    if (found != anonymous_type_signatures.end()) return found->second;
+    // C anonymous records in separate TUs are compared by their members, not
+    // Clang's filename/offset USRs. In particular, a typedef to a pointer to
+    // an anonymous struct does not give that struct a typedef-based USR.
+    // Keep recordId() for storage/flow identities: compatible record types
+    // do not imply that unrelated callback fields share storage.
+    std::string signature;
+    llvm::raw_string_ostream stream(signature);
+    stream << "anonymous:" << Value(recordShape(definition));
+    stream.flush();
+    anonymous_type_signatures.emplace(definition, signature);
+    return signature;
+  }
   void collectTypeRecords(QualType t, std::string &result) {
     t = t.getCanonicalType();
-    if (auto *r = t->getAs<RecordType>()) result += "[record:" + recordId(r->getDecl()) + "]";
+    if (auto *r = t->getAs<RecordType>())
+      result += "[record:" + recordTypeSignature(r->getDecl()) + "]";
     else if (t->isPointerType()) collectTypeRecords(t->getPointeeType(), result);
     else if (auto *a = ctx.getAsArrayType(t)) collectTypeRecords(a->getElementType(), result);
     else if (auto *f = t->getAs<FunctionType>()) {
@@ -936,20 +970,13 @@ public:
   }
   bool VisitRecordDecl(RecordDecl *r) {
     if (!r->isCompleteDefinition() || r->isInvalidDecl()) return true;
-    const auto &layout = ctx.getASTRecordLayout(r);
-    Array fields;
-    unsigned i = 0;
     for (auto *f : r->fields()) {
-      fields.push_back(Object{{"name", f->getNameAsString()},
-          {"type", typeSignature(f->getType())},
-          {"bit_width", f->isBitField() ? static_cast<int64_t>(f->getBitWidthValue(ctx)) : -1},
-          {"offset_bits", static_cast<int64_t>(layout.getFieldOffset(i++))}});
       if (r->isUnion() && callable(f->getType()))
         out.nodes[id(f)].blockers.insert("source-union-callable-storage");
     }
-    out.records.push_back(Object{{"id", recordId(r)},
-        {"fields", std::move(fields)}, {"size", layout.getSize().getQuantity()},
-        {"alignment", layout.getAlignment().getQuantity()}});
+    auto record = recordShape(r);
+    record["id"] = recordId(r);
+    out.records.push_back(std::move(record));
     return true;
   }
   bool VisitFunctionDecl(FunctionDecl *f) {
