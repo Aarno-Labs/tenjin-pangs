@@ -147,12 +147,32 @@ fn check_shared_data_types(facts: &Facts) -> Result<()> {
         let id = record["id"].as_str().context("missing record identity")?;
         if let Some(previous) = records.insert(id, record) {
             ensure!(
-                previous == record,
+                record_layout(previous)? == record_layout(record)?,
                 "cross-TU record mismatch: {id}: {previous} vs {record}"
             );
         }
     }
     Ok(())
+}
+
+fn record_layout(record: &Value) -> Result<Value> {
+    let mut layout = record.clone();
+    let fields = layout["fields"]
+        .as_array_mut()
+        .context("missing record fields")?;
+    for field in fields {
+        // Cross-TU field identities use positions, not source spellings.
+        // Feature macros can rename ABI-identical fields (e.g. glibc tm_zone
+        // versus __tm_zone). Preserve those names in the extracted facts for
+        // diagnostics and source edits, but compare their layouts and types.
+        // Anonymous type signatures still include member names: this only
+        // changes the layout check after matching a shared record identity.
+        field
+            .as_object_mut()
+            .context("invalid record field")?
+            .remove("name");
+    }
+    Ok(layout)
 }
 
 // C permits an incomplete array to be completed by a later or cross-TU

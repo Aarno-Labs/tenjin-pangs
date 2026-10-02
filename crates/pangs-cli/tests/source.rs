@@ -661,6 +661,90 @@ fn context_rewrite_preserves_per_tu_function_types() {
 }
 
 #[test]
+fn cross_tu_record_layouts_allow_per_tu_field_spellings() {
+    // glibc exposes struct tm's extension fields with or without a __ prefix
+    // depending on each TU's feature macros, without changing their ABI.
+    let first =
+        "struct tm { int tm_sec; long tm_gmtoff; const char *tm_zone; }; extern struct tm clock;";
+    let second =
+        "struct tm { int tm_sec; long __tm_gmtoff; const char *__tm_zone; }; struct tm clock;";
+    for (other, succeeds) in [
+        (second.to_owned(), true),
+        // Field spelling is per-TU; this also applies to ordinary identifiers.
+        (second.replace("tm_sec", "seconds"), true),
+        // Equal sizes alone do not establish compatible field types.
+        (
+            second.replace("long __tm_gmtoff", "unsigned long __tm_gmtoff"),
+            false,
+        ),
+        (second.replace("const char *", "char *"), false),
+        (
+            second.replace("struct tm {", "struct __attribute__((packed)) tm {"),
+            false,
+        ),
+        (
+            second.replace("int tm_sec;", "int tm_sec; int extra;"),
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.i");
+        let b = dir.path().join("b.i");
+        fs::write(&a, first).unwrap();
+        fs::write(&b, &other).unwrap();
+        let db = dir.path().join("commands.json");
+        fs::write(
+            &db,
+            serde_json::to_vec(&json!([
+                {"directory":dir.path(), "file":a, "arguments":[clang(),a.clone()]},
+                {"directory":dir.path(), "file":b, "arguments":[clang(),b.clone()]},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pangs"))
+            .args(["validate-source", "--source-compdb"])
+            .arg(db)
+            .output()
+            .unwrap();
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), succeeds, "{other}: {diagnostics}");
+        if !succeeds {
+            assert!(
+                diagnostics.contains("cross-TU record mismatch"),
+                "{diagnostics}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cross_tu_callback_fields_with_different_names_share_their_field_position() {
+    let (_, m) = analyze_sources(&[
+        (
+            "main.i",
+            "struct Ops { int (*invoke)(void); }; extern struct Ops ops; int main(void){return ops.invoke();}",
+        ),
+        (
+            "callbacks.i",
+            "struct Ops { int (*__invoke)(void); }; static int g; int needs(void){return ++g;} struct Ops ops={needs};",
+        ),
+    ]);
+    let recipe = field(&m);
+    assert_eq!(recipe["blockers"], json!([]), "{recipe:#}");
+    assert_eq!(recipe["functions"], json!(["main", "needs"]), "{recipe:#}");
+    let edited_files = recipe["source_edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|edit| edit["kind"] == "signature")
+        .map(|edit| edit["file"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(edited_files.contains(&"main.i"), "{recipe:#}");
+    assert!(edited_files.contains(&"callbacks.i"), "{recipe:#}");
+}
+
+#[test]
 fn cross_tu_static_inline_copies_can_have_different_signatures() {
     let first = r#"# 1 "shared.h"
 struct XjGlobals { int value; };

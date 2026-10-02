@@ -145,6 +145,11 @@ record layouts remain cross-TU invariants. Private function copies, including
 static inline functions from headers, are likewise independent. `main` retains
 its ABI.
 
+Shared record fields correspond by position, so their source names may differ
+between TUs (for example glibc's `tm_zone` versus `__tm_zone` under different
+feature macros). The layout check still compares field types, offsets, bit widths,
+record kind, size, and alignment. Anonymous type signatures retain member names.
+
 Version 3 deliberately blocks, with scoped witnesses, unsupported callable
 returns/nested higher-order values, typedef alias chains, pointer-to-pointer
 callable storage, union callable storage, aggregate copies, opaque/cast or
