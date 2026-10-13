@@ -13,6 +13,7 @@ use pangs_manifest::{
     LocalizationBlocker, LocalizationVerdict, Manifest, Site, SourceEdit, SourceObligations,
     SourceObservation, SourceWrapper, Witness, SOURCE_EMITTER, SOURCE_PLAN_VERSION,
 };
+use pangs_pir::{external_call_contract, AbiClass, ExternalResultContract, Param, Signature};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -50,7 +51,68 @@ struct Use {
     initializer: String,
     file: String,
     offset: usize,
-    observations: Vec<SourceObservation>,
+    observations: Vec<UseObservation>,
+}
+#[derive(Debug, Deserialize)]
+struct UseObservation {
+    #[serde(flatten)]
+    observation: SourceObservation,
+    address_call: Option<AddressCall>,
+}
+#[derive(Debug, Deserialize)]
+struct AddressCall {
+    callee: String,
+    external: bool,
+    abi_integer: bool,
+    ccc: bool,
+    fixed_params: usize,
+    vararg: bool,
+    arg_count: usize,
+    result_discarded: bool,
+    other_arguments_safe: bool,
+}
+
+/// The same exception applies to explicit addresses and unconsumed array decay.
+/// Keep it independent of the selected context set: only these synchronous
+/// external functions qualify, never internal helpers or stream callbacks.
+fn approved_address_call(usage: &UseObservation, definitions: &BTreeSet<String>) -> bool {
+    let Some(call) = &usage.address_call else {
+        return false;
+    };
+    if !matches!(
+        call.callee.as_str(),
+        "strcpy"
+            | "strncpy"
+            | "strcat"
+            | "strcmp"
+            | "strncmp"
+            | "strlen"
+            | "memcpy"
+            | "memmove"
+            | "memset"
+            | "memcmp"
+    ) || !call.external
+        || definitions.contains(&call.callee)
+        || !call.abi_integer
+        || !call.ccc
+        || !call.other_arguments_safe
+    {
+        return false;
+    }
+    let Some(contract) = external_call_contract(&call.callee) else {
+        return false;
+    };
+    let signature = Signature {
+        ret: AbiClass::Integer,
+        params: vec![Param::Integer; call.fixed_params],
+        vararg: call.vararg,
+        cc: "ccc".into(),
+    };
+    contract.matches_signature(&signature, call.arg_count, !call.result_discarded)
+        && (!matches!(
+            contract.result,
+            ExternalResultContract::AliasArg(_) | ExternalResultContract::AliasArgOrFresh(_)
+        ) || call.result_discarded)
 }
 #[derive(Debug, Deserialize)]
 struct Function {
@@ -361,6 +423,19 @@ pub fn augment_manifest(
                 .insert("source-exported-entry".into());
         }
     }
+    // Also reject a replacement present in LLVM (including an asm-renamed
+    // definition), even if this source TU only sees an external declaration.
+    let address_call_definitions = defined
+        .iter()
+        .cloned()
+        .chain(
+            analysis
+                .functions()
+                .iter()
+                .filter(|f| !f.external)
+                .map(|f| f.key.strip_prefix('@').unwrap_or(&f.key).to_owned()),
+        )
+        .collect::<BTreeSet<_>>();
     for (name, node) in &mut facts.nodes {
         if let Some(function) = name.strip_prefix("fn:") {
             if function != "main" && !defined.contains(function) {
@@ -487,7 +562,7 @@ pub fn augment_manifest(
             .collect::<Vec<_>>();
         let mut observations = uses
             .iter()
-            .flat_map(|u| u.observations.iter().cloned())
+            .flat_map(|u| u.observations.iter().map(|o| o.observation.clone()))
             .collect::<Vec<_>>();
         let relative_site = |site: &mut Site| -> Result<()> {
             site.file = Path::new(&site.file)
@@ -559,6 +634,32 @@ pub fn augment_manifest(
             )
         };
         field.blockers.retain(|b| !ir_rewrite_gate(&b.kind));
+        for usage in &uses {
+            for observation in &usage.observations {
+                if matches!(
+                    observation.observation.kind.as_str(),
+                    "address" | "decayed-address"
+                ) && !approved_address_call(observation, &address_call_definitions)
+                {
+                    let mut site = observation.observation.site.clone();
+                    relative_site(&mut site)?;
+                    let node = if usage.function.is_empty() {
+                        format!("global:{name}")
+                    } else {
+                        format!("fn:{}", usage.function)
+                    };
+                    let mut b = blocker("source-address-use", &node);
+                    if !usage.initializer.is_empty() {
+                        b.initializer = Some(usage.initializer.clone());
+                    }
+                    b.extra
+                        .insert("source_site".into(), serde_json::to_value(site)?);
+                    b.extra
+                        .insert("observation".into(), json!(observation.observation.kind));
+                    field.blockers.push(b);
+                }
+            }
+        }
         // Moving a private callback's initializer to another TU would require
         // exporting the function or an initialization recipe in its owning TU.
         // This constrains moving the storage, not changing its callback type.
@@ -787,17 +888,29 @@ pub fn augment_manifest(
             .map(|l| l.blocker_samples.clone())
             .unwrap_or_default();
         samples.retain(|b| !ir_rewrite_gate(&b.code));
-        samples.extend(field.blockers.iter().map(|b| LocalizationBlocker {
-            code: b.kind.clone(),
-            witness: Witness {
-                kind: b.kind.clone(),
-                site: None,
-                symbol: Some(name.into()),
-                note: Some(format!("source obligation: {:?}", b.extra)),
-                extra: Extra::new(),
-            },
-            extra: Extra::new(),
-        }));
+        samples.extend(
+            field
+                .blockers
+                .iter()
+                .map(|b| {
+                    Ok(LocalizationBlocker {
+                        code: b.kind.clone(),
+                        witness: Witness {
+                            kind: b.kind.clone(),
+                            site: b
+                                .extra
+                                .get("source_site")
+                                .map(|s| serde_json::from_value(s.clone()))
+                                .transpose()?,
+                            symbol: Some(name.into()),
+                            note: Some(format!("source obligation: {:?}", b.extra)),
+                            extra: Extra::new(),
+                        },
+                        extra: Extra::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>, serde_json::Error>>()?,
+        );
         global.facts.localization = Some(Localization {
             component: manifest.context_rewrite.id.clone(),
             verdict: if samples.is_empty() {

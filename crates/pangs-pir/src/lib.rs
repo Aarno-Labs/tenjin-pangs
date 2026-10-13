@@ -161,6 +161,12 @@ pub fn external_call_contract(callee: &str) -> Option<ExternalCallContract> {
         }
         "strncmp" | "memcmp" => contract(3, false, Result::Scalar, R01),
         "strcpy" => contract(2, false, Result::AliasArg(0), W0_R1),
+        "strcat" => contract(
+            2,
+            false,
+            Result::AliasArg(0),
+            &[ExternalArgEffect::ReadWrite(0), ExternalArgEffect::Read(1)],
+        ),
         "strncpy" => contract(3, false, Result::AliasArg(0), W0_R1),
         "memcpy" | "memmove" => ExternalCallContract {
             copy: Some(ExternalCopyContract {

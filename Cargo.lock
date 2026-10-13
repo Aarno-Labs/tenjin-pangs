@@ -1001,6 +1001,7 @@ dependencies = [
  "cc",
  "pangs-api",
  "pangs-manifest",
+ "pangs-pir",
  "serde",
  "serde_json",
  "tempfile",

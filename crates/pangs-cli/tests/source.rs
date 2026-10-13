@@ -89,6 +89,121 @@ fn field(m: &Value) -> &Value {
 }
 
 #[test]
+fn exclusive_context_rejects_independent_write_and_read_aliases() {
+    for body in [
+        "g[0]='A'; out[0]='B'; return g[0];",
+        "g[0]='A'; return out[0];",
+    ] {
+        let (_, m) = analyze(&format!(
+            "static unsigned char g[4]; static int counter; \
+             static int fillinfo(unsigned char *out){{ ++counter; {body} }} \
+             int main(void){{return fillinfo(g);}}"
+        ));
+        let f = field(&m);
+        assert!(
+            f["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["kind"] == "source-address-use"),
+            "{f:#}"
+        );
+        let global = m["globals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["meta"]["llvm_name"] == "g")
+            .unwrap();
+        assert_eq!(global["facts"]["localization"]["verdict"], "blocked");
+        let witness = global["facts"]["localization"]["blocker_samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["code"] == "source-address-use")
+            .unwrap();
+        assert_eq!(witness["witness"]["site"]["file"], "test.i");
+        assert!(witness["witness"]["site"]["line"].as_u64().unwrap() > 0);
+        let selected = m["context_rewrite"]["selected"]["fields"]
+            .as_array()
+            .unwrap();
+        assert!(!selected.iter().any(|f| f["llvm_name"] == "g"));
+        assert!(
+            selected.iter().any(|f| f["llvm_name"] == "counter"),
+            "{m:#}"
+        );
+    }
+}
+
+#[test]
+fn exclusive_context_address_exception_is_narrow_and_shared() {
+    let declarations = "typedef unsigned long size_t; \
+        extern char *strcpy(char *, const char *); \
+        extern char *strcat(char *, const char *); \
+        extern size_t strlen(const char *); \
+        extern int strcmp(const char *, const char *); \
+        extern void *memset(void *, int, size_t); \
+        extern void *memcpy(void *, const void *, size_t); \
+        static int helper(const char *p){ return p[0]; }";
+    for (expression, allowed) in [
+        ("g[0] = 'A'", true),
+        ("sizeof(&g)", true),
+        ("strcpy(g, \"a\")", true),
+        ("strcpy(&g[0], \"a\")", true),
+        ("strcat(g, \"a\")", true),
+        ("strlen(g)", true),
+        ("strcmp(g, \"a\")", true),
+        ("memset(g, 0, sizeof(g))", true),
+        ("memset(&g, 0, sizeof(g))", true),
+        ("int n=2; memset(g, 0, sizeof(char[n]))", true),
+        ("helper(g)", false),
+        ("*g", false),
+        ("g + 1", false),
+        ("char *p = g; helper(\"a\"); *p = 0", false),
+        ("char *p = strcpy(g, \"a\"); *p = 0", false),
+        ("char *p = ({strcpy(g, \"a\");}); *p = 0", false),
+        ("memcpy(g, g + 1, 2)", false),
+        ("memset(g, helper(\"a\"), sizeof(g))", false),
+        ("memset(g, 0, sizeof(int[g[0] + 1]))", false),
+    ] {
+        let (_, m) = analyze(&format!(
+            "{declarations} static char g[8]; \
+             int main(void){{g[0]=0; {expression}; return g[0];}}"
+        ));
+        let rejected = field(&m)["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["kind"] == "source-address-use");
+        assert_eq!(!rejected, allowed, "{expression}: {m:#}");
+        if allowed {
+            assert_eq!(field(&m)["blockers"], json!([]), "{expression}: {m:#}");
+        }
+    }
+}
+
+#[test]
+fn exclusive_context_rejects_replacements_bad_abis_and_internal_member_addresses() {
+    for code in [
+        "static char g[8]; char *strcpy(char *d,const char *s){d[0]=s[0];return d;} \
+         int main(void){strcpy(g,\"a\");return g[0];}",
+        "static char g[8]; extern double strlen(const char *); \
+         int main(void){g[0]=0;return strlen(g);}",
+        "static struct { int x; } g; static void helper(int *p){*p=1;} \
+         int main(void){helper(&g.x);return g.x;}",
+    ] {
+        let (_, m) = analyze(code);
+        assert!(
+            field(&m)["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["kind"] == "source-address-use"),
+            "{m:#}"
+        );
+    }
+}
+
+#[test]
 fn private_initializer_functions_constrain_storage_not_callback_types() {
     for private in [false, true] {
         let code = format!(
@@ -144,7 +259,7 @@ fn source_only_indirect_chain_adapts_unchanged_producers_and_compiles() {
     let f = field(&m);
     assert_eq!(f["blockers"], json!([]), "{f:#}");
     assert_eq!(f["functions"], json!(["dead", "main", "needs"]));
-    assert_eq!(m["context_rewrite"]["source"]["version"], 3);
+    assert_eq!(m["context_rewrite"]["source"]["version"], 4);
     let source_metadata = &m["context_rewrite"]["source"];
     for key in ["module_sha256", "compdb_sha256", "compdb_path"] {
         assert!(source_metadata.get(key).is_none(), "{source_metadata}");

@@ -70,34 +70,39 @@
     },
     "source_edit": {
       "type": "object",
-      "required": ["file", "start", "end", "expected", "replacement", "kind"],
+      "required": ["file", "start", "end", "replacement", "kind"],
       "properties": {
         "file": { "type": "string", "minLength": 1 },
         "start": { "type": "integer", "minimum": 0 },
         "end": { "type": "integer", "minimum": 0 },
-        "expected": { "type": "string" },
         "replacement": { "type": "string" },
-        "kind": { "enum": ["signature", "call", "typedef-clone", "typedef-use"] }
+        "kind": { "enum": ["signature", "call", "typedef-clone", "typedef-use", "prune-declaration", "prune-expression", "wrapper-declaration", "wrapper-definition", "wrapper-use"] }
       },
       "additionalProperties": false
     },
     "source_plan": {
       "type": "object",
-      "required": ["version", "complete", "compiler", "module_sha256", "compdb_sha256", "files", "construction"],
+      "required": ["version", "complete", "compiler", "files", "construction", "emitter", "retention"],
       "properties": {
-        "version": { "const": 1 },
+        "version": { "const": 4, "description": "Argument-only context propagation; localization Ok includes exclusive-borrow eligibility." },
         "complete": { "const": true },
         "compiler": { "type": "string", "minLength": 1 },
-        "module_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "compdb_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "emitter": { "const": "tenjin-c2rust-default-v1" },
+        "retention": {
+          "type": "object", "required": ["policy", "version", "preserve_unused_functions"],
+          "properties": {
+            "policy": { "const": "c2rust-declaration-dependencies" },
+            "version": { "const": 1 },
+            "preserve_unused_functions": { "const": false }
+          }
+        },
         "construction": { "const": "automatic-context-in-main" },
         "files": {
           "type": "array", "minItems": 1,
           "items": {
-            "type": "object", "required": ["path", "sha256", "command"],
+            "type": "object", "required": ["path", "command"],
             "properties": {
               "path": { "type": "string", "minLength": 1 },
-              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
               "command": { "type": "object" }
             }
           }

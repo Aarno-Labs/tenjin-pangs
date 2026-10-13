@@ -511,10 +511,125 @@ class Extract : public RecursiveASTVisitor<Extract> {
                   {"col", sm.getSpellingColumnNumber(loc)}, {"offset", offset(loc)},
                   {"function", function}};
   }
+  bool conflictingTypeBound(QualType t, const VarDecl *global) {
+    if (auto *array = ctx.getAsArrayType(t)) {
+      if (auto *vla = dyn_cast<VariableArrayType>(array))
+        if (conflictingArgument(vla->getSizeExpr(), global)) return true;
+      return conflictingTypeBound(array->getElementType(), global);
+    }
+    if (auto *pointer = t->getAs<PointerType>())
+      return conflictingTypeBound(pointer->getPointeeType(), global);
+    return false;
+  }
+  // Ignore genuinely unevaluated operands. sizeof a VLA can evaluate type
+  // bounds which are not Stmt children, as well as its expression operand.
+  bool conflictingArgument(const Stmt *s, const VarDecl *global) {
+    if (!s) return false;
+    if (auto *g = dyn_cast<GenericSelectionExpr>(s))
+      return conflictingArgument(g->getResultExpr(), global);
+    if (auto *trait = dyn_cast<UnaryExprOrTypeTraitExpr>(s)) {
+      if (trait->getKind() != UETT_SizeOf || !trait->getTypeOfArgument()->isVariablyModifiedType())
+        return false;
+      return conflictingTypeBound(trait->getTypeOfArgument(), global)
+          || (!trait->isArgumentType() && conflictingArgument(trait->getArgumentExpr(), global));
+    }
+    if (isa<TypeTraitExpr>(s)) return false;
+    if (isa<CallExpr>(s)) return true;
+    if (auto *ref = dyn_cast<DeclRefExpr>(s))
+      if (ref->getDecl()->getCanonicalDecl() == global->getCanonicalDecl()) return true;
+    for (auto *child : s->children())
+      if (conflictingArgument(child, global)) return true;
+    return false;
+  }
+  bool directStoragePlace(const Expr *e, const VarDecl *global) {
+    e = e->IgnoreParenImpCasts();
+    if (auto *ref = dyn_cast<DeclRefExpr>(e))
+      return ref->getDecl()->getCanonicalDecl() == global->getCanonicalDecl();
+    if (auto *member = dyn_cast<MemberExpr>(e))
+      return !member->isArrow() && directStoragePlace(member->getBase(), global);
+    if (auto *index = dyn_cast<ArraySubscriptExpr>(e))
+      return directStoragePlace(index->getBase(), global)
+          && !conflictingArgument(index->getIdx(), global);
+    return false;
+  }
+  bool discardedResult(const Expr *e) {
+    for (unsigned depth = 0; depth < 64; ++depth) {
+      auto parents = ctx.getParents(*e);
+      if (parents.size() != 1) return false;
+      if (auto *paren = parents[0].get<ParenExpr>()) { e = paren; continue; }
+      if (auto *cast = parents[0].get<CastExpr>()) return cast->getType()->isVoidType();
+      if (auto *compound = parents[0].get<CompoundStmt>()) {
+        // The final expression of a GNU statement expression is its result,
+        // not an ordinary discarded expression statement.
+        if (!compound->body_empty() && compound->body_back() == e) {
+          auto enclosing = ctx.getParents(*compound);
+          if (enclosing.size() != 1) return false;
+          if (auto *expression = enclosing[0].get<StmtExpr>()) {
+            e = expression; continue;
+          }
+        }
+        return true;
+      }
+      if (auto *s = parents[0].get<IfStmt>()) return s->getThen() == e || s->getElse() == e;
+      if (auto *s = parents[0].get<WhileStmt>()) return s->getBody() == e;
+      if (auto *s = parents[0].get<DoStmt>()) return s->getBody() == e;
+      if (auto *s = parents[0].get<ForStmt>())
+        return s->getBody() == e || s->getInit() == e || s->getInc() == e;
+      if (auto *s = parents[0].get<LabelStmt>()) return s->getSubStmt() == e;
+      if (auto *s = parents[0].get<SwitchCase>()) return s->getSubStmt() == e;
+      if (auto *s = parents[0].get<BinaryOperator>())
+        return s->getOpcode() == BO_Comma && s->getLHS() == e;
+      return false;
+    }
+    return false;
+  }
+  Value addressCall(const Expr *e, const VarDecl *global) {
+    // Only parentheses and implicit conversions may separate the address from
+    // the call argument. Explicit casts/arithmetic and retained aliases are
+    // deliberately outside the v4 exception.
+    for (unsigned depth = 0; depth < 64; ++depth) {
+      auto parents = ctx.getParents(*e);
+      if (parents.size() != 1) return nullptr;
+      if (auto *paren = parents[0].get<ParenExpr>()) { e = paren; continue; }
+      if (auto *cast = parents[0].get<ImplicitCastExpr>()) { e = cast; continue; }
+      auto *call = parents[0].get<CallExpr>();
+      auto *callee = call ? call->getDirectCallee() : nullptr;
+      if (!callee) return nullptr;
+      auto *prototype = callee->getType()->getAs<FunctionProtoType>();
+      if (!prototype) return nullptr;
+      auto *argument = e->IgnoreParenImpCasts();
+      if (auto *address = dyn_cast<UnaryOperator>(argument)) {
+        if (address->getOpcode() != UO_AddrOf || !directStoragePlace(address->getSubExpr(), global))
+          return nullptr;
+      } else if (!argument->getType()->isArrayType() || !directStoragePlace(argument, global))
+        return nullptr;
+      bool found = false, other_safe = true;
+      for (auto *arg : call->arguments()) {
+        if (arg == e) found = true;
+        else if (conflictingArgument(arg, global)) other_safe = false;
+      }
+      if (!found) return nullptr;
+      auto integer = [](QualType t) { return t->isIntegralOrEnumerationType() || t->isPointerType(); };
+      bool abi_integer = integer(prototype->getReturnType());
+      for (auto t : prototype->param_types()) abi_integer &= integer(t);
+      return Object{{"callee", callee->getNameAsString()},
+        {"external", callee->isExternallyVisible() && !callee->getDefinition()
+          && !callee->hasAttr<AsmLabelAttr>() && !callee->hasAttr<AliasAttr>()},
+        {"abi_integer", abi_integer}, {"ccc", prototype->getCallConv() == CC_C},
+        {"fixed_params", prototype->getNumParams()}, {"vararg", prototype->isVariadic()},
+        {"arg_count", call->getNumArgs()}, {"result_discarded", discardedResult(call)},
+        {"other_arguments_safe", other_safe}};
+    }
+    return nullptr;
+  }
   Array observations(const Expr *e) {
     Array result;
+    auto *global = cast<VarDecl>(cast<DeclRefExpr>(e)->getDecl());
     auto record = [&](const char *kind, const Expr *at) {
-      result.push_back(Object{{"kind", kind}, {"site", site(at->getBeginLoc())}});
+      Object observation{{"kind", kind}, {"site", site(at->getBeginLoc())}};
+      if (llvm::StringRef(kind) == "address" || llvm::StringRef(kind) == "decayed-address")
+        observation["address_call"] = addressCall(at, global);
+      result.push_back(std::move(observation));
     };
     // sizeof/alignof operands survive declaration pruning but are not emitted
     // as evaluations. Do not turn sizeof(++g) into a storage obligation.
@@ -569,7 +684,8 @@ class Extract : public RecursiveASTVisitor<Extract> {
         break;
       } else break;
     }
-    if (!decayed) record("unclassified-use", e);
+    if (decayed) record("decayed-address", e);
+    else record("unclassified-use", e);
     return result;
   }
   bool containsObjectPointer(QualType t, std::set<const Type *> *seen = nullptr) {

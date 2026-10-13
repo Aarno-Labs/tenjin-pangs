@@ -1472,6 +1472,7 @@ fn source_immutable_failures(source: &pangs_manifest::SourceObligations) -> Vec<
                 | "pointer-read"
                 | "address"
                 | "array-decay"
+                | "decayed-address"
                 | "unevaluated"
         )
     }) {
